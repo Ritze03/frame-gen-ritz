@@ -1,7 +1,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 // Passes 10+11: 7x7 box of e (replicate border), trust t = ramp(e, 12..40), count untrusted pixels,
-// out = mix(avg(wa, wc), a, t). The global decisions (scene cut, >15% untrusted) are applied by
+// out = mix((1-t) wa + t wc, near, u) with near = a (t <= 0.5) or c; at t = 0.5 the blend is
+// 0.5 * (wa + wc) exactly as in the 2x path. The global decisions (scene cut, >15% untrusted) are applied by
 // fallback.comp once every workgroup has added to the counter.
 #include "common.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -42,9 +43,16 @@ void main() {
         if (t > 0.5) atomicAdd(cnt, 1u);
         vec3 wa, wc;
         mismatch(p, wa, wc);
-        vec4 a = texelFetch(texPrev, p, 0);
+        vec4 a = pc.nearC != 0 ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
         vec3 a8 = floor(a.rgb * 255.0 + 0.5);
-        vec3 o = 0.5 * (wa + wc) * (1.0 - t) + a8 * t;
+        vec3 m;
+        if (pc.mid != 0) {
+            m = 0.5 * (wa + wc);
+        } else {
+            precise vec3 mt = pc.wA * wa + pc.wC * wc;
+            m = mt;
+        }
+        vec3 o = m * (1.0 - t) + a8 * t;
         imageStore(outImg, p, vec4(clamp(floor(o + 0.5), 0.0, 255.0) * (1.0 / 255.0), a.a));
     }
     barrier();

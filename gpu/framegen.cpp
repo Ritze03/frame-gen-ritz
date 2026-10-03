@@ -16,6 +16,7 @@
 #include "error_spv.h"
 #include "resolve_spv.h"
 #include "fallback_spv.h"
+#include "lookup_spv.h"
 
 namespace framegen {
 
@@ -33,9 +34,12 @@ namespace framegen {
 struct PC {
     int32_t w, h, bw, bh, pw, ph, offA, offC, srcA, srcC, fIn, fOut, fPar, radius, medIdx,
         W, H, fw, fh, pf, eOff, eStride, nBlocks;
+    float s, ka, kc, wA, wC;
+    int32_t nearC, mid;
 };
+static_assert(sizeof(PC) <= 128, "push constants beyond the guaranteed minimum");
 
-enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_COUNT };
+enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP, P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
@@ -51,15 +55,21 @@ struct Interpolator::Impl {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipes[P_COUNT]{};
     VkDescriptorPool pool = VK_NULL_HANDLE;
-    VkDescriptorSet sets[kSetRing]{};
-    uint32_t setIdx = 0;
-    uint32_t frameRecords = 0;   // records since the last beginFrame()
+    // Two rings: synth sets (all 6 bindings) and estimate sets (binding 5, out, never written: no estimate
+    // pass uses it, and no stale view of an earlier synth can linger in it).
+    enum { R_SYNTH, R_EST };
+    VkDescriptorSet sets[2][kSetRing]{};
+    uint32_t setIdx[2]{};
+    uint32_t frameSets[2]{};     // sets taken from each ring since the last beginFrame()
+    // latest recordEstimate (recordSynth uses its results)
+    bool haveEst = false;
+    VkImageView estPrev = VK_NULL_HANDLE, estCurr = VK_NULL_HANDLE;
 
     // size dependent
     uint32_t W = 0, H = 0;
     int fw = 0, fh = 0;
     std::vector<Level> lv;
-    int fieldSub = 0, fieldPF = 0, eOff = 0, eStride = 0;
+    int fieldSub = 0, fieldPF = 0, fieldT = 0, eOff = 0, eStride = 0;
     VkBuffer buf[3]{};
     VkDeviceMemory mem[3]{};
     VkDeviceSize bufSize[3]{};
@@ -71,6 +81,7 @@ struct Interpolator::Impl {
     std::vector<const char*> qnames;
     uint32_t qcount = 0;
 
+    VkDescriptorSet takeSet(int ring, VkImageView prev, VkImageView curr, VkImageView out);
     bool createSizeDependent();
     void destroySizeDependent();
     bool makeBuffer(int i, VkDeviceSize size);
@@ -121,6 +132,8 @@ bool Interpolator::Impl::createSizeDependent() {
     fieldSub = fieldOff;
     fieldOff += lv[0].bw * lv[0].bh;
     fieldPF = fieldOff;
+    fieldOff += fw * fh;
+    fieldT = fieldOff;   // per-pixel field looked up at time t (synth scratch, t != 0.5)
     fieldOff += fw * fh;
     eStride = (int)(W + 3) / 4;
     eOff = 64;
@@ -185,7 +198,7 @@ bool Interpolator::init(const InitInfo& ii) {
         {luma_spv, sizeof(luma_spv)}, {down_spv, sizeof(down_spv)}, {medhist_spv, sizeof(medhist_spv)},
         {search_spv, sizeof(search_spv)}, {median3_spv, sizeof(median3_spv)}, {subpix_spv, sizeof(subpix_spv)},
         {pixfield_spv, sizeof(pixfield_spv)}, {error_spv, sizeof(error_spv)}, {resolve_spv, sizeof(resolve_spv)},
-        {fallback_spv, sizeof(fallback_spv)}};
+        {fallback_spv, sizeof(fallback_spv)}, {lookup_spv, sizeof(lookup_spv)}};
     for (int i = 0; i < P_COUNT; i++) {
         VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smci.codeSize = spv[i].size;
@@ -200,21 +213,21 @@ bool Interpolator::init(const InitInfo& ii) {
         if (r != VK_SUCCESS) { destroy(); return false; }
     }
 
-    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kSetRing},
-                                  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kSetRing},
-                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kSetRing}};
+    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * 2 * kSetRing},
+                                  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 2 * kSetRing},
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kSetRing}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpci.maxSets = kSetRing;
+    dpci.maxSets = 2 * kSetRing;
     dpci.poolSizeCount = 3;
     dpci.pPoolSizes = ps;
     if (m->CreateDescriptorPool(d, &dpci, nullptr, &m->pool) != VK_SUCCESS) { destroy(); return false; }
-    VkDescriptorSetLayout layouts[kSetRing];
+    VkDescriptorSetLayout layouts[2 * kSetRing];
     for (auto& l : layouts) l = m->dsl;
     VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsai.descriptorPool = m->pool;
-    dsai.descriptorSetCount = kSetRing;
+    dsai.descriptorSetCount = 2 * kSetRing;
     dsai.pSetLayouts = layouts;
-    if (m->AllocateDescriptorSets(d, &dsai, m->sets) != VK_SUCCESS) { destroy(); return false; }
+    if (m->AllocateDescriptorSets(d, &dsai, &m->sets[0][0]) != VK_SUCCESS) { destroy(); return false; }
 
     if (!resize(ii.width, ii.height, ii.viewFormat)) { destroy(); return false; }
     return true;
@@ -229,6 +242,7 @@ bool Interpolator::resize(uint32_t w, uint32_t h, VkFormat fmt) {
     if (ok && w == m->W && h == m->H) { m->info.viewFormat = fmt; return true; }   // buffers do not depend on the format
     m->destroySizeDependent();
     m->W = m->H = 0;
+    m->haveEst = false;
     if (!ok) return false;
     m->info.viewFormat = fmt;
     m->W = w; m->H = h;
@@ -271,7 +285,7 @@ bool Interpolator::setProfiling(bool on) {
 }
 
 void Interpolator::beginFrame() {
-    if (m) m->frameRecords = 0;
+    if (m) m->frameSets[0] = m->frameSets[1] = 0;
 }
 
 bool Interpolator::readTimings(std::vector<const char*>& names, std::vector<uint64_t>& ticks) {
@@ -286,29 +300,23 @@ bool Interpolator::readTimings(std::vector<const char*>& names, std::vector<uint
     return true;
 }
 
-bool Interpolator::record(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float) {
-    if (!m || !m->W) return false;
-    Impl& I = *m;
-    // The next set in the ring may still be referenced by an earlier record of this submission.
-    assert(I.frameRecords < kSetRing && "framegen: more than kSetRing records since beginFrame()");
-    if (I.frameRecords >= kSetRing) return false;
-    I.frameRecords++;
-    VkDevice d = I.info.device;
-    VkDescriptorSet set = I.sets[I.setIdx];
-    I.setIdx = (I.setIdx + 1) % kSetRing;
-
+VkDescriptorSet Interpolator::Impl::takeSet(int ring, VkImageView prev, VkImageView curr, VkImageView out) {
+    VkDescriptorSet set = sets[ring][setIdx[ring]];
+    setIdx[ring] = (setIdx[ring] + 1) % kSetRing;
+    frameSets[ring]++;
     VkDescriptorBufferInfo bi[3];
     VkDescriptorImageInfo ii[3] = {{VK_NULL_HANDLE, prev, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, curr, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet wr[6]{};
-    for (int i = 0; i < 6; i++) {
+    uint32_t n = ring == R_SYNTH ? 6 : 5;   // estimate sets never get binding 5 (out)
+    for (uint32_t i = 0; i < n; i++) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[i].dstSet = set;
         wr[i].dstBinding = i;
         wr[i].descriptorCount = 1;
         if (i < 3) {
-            bi[i] = {I.buf[i], 0, VK_WHOLE_SIZE};
+            bi[i] = {buf[i], 0, VK_WHOLE_SIZE};
             wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             wr[i].pBufferInfo = &bi[i];
         } else {
@@ -316,57 +324,89 @@ bool Interpolator::record(VkCommandBuffer cb, VkImageView prev, VkImageView curr
             wr[i].pImageInfo = &ii[i - 3];
         }
     }
-    I.UpdateDescriptorSets(d, 6, wr, 0, nullptr);
+    UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
+    return set;
+}
 
-    I.qcount = 0;
-    I.qnames.clear();
-    auto stamp = [&](const char* name) {
-        if (!I.profiling || !I.qpool || I.qcount >= Impl::kMaxQ) return;
+namespace {
+const VkPipelineStageFlags CS = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+const VkAccessFlags RW = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+uint32_t divUp(int a, int b) { return (uint32_t)((a + b - 1) / b); }
+
+// Command helpers shared by recordEstimate and recordSynth.
+struct Rec {
+    Interpolator::Impl& I;
+    VkCommandBuffer cb;
+    PC pc{};
+    Rec(Interpolator::Impl& i, VkCommandBuffer c) : I(i), cb(c) {
+        pc.W = (int)I.W; pc.H = (int)I.H; pc.fw = I.fw; pc.fh = I.fh;
+        pc.pf = I.fieldPF; pc.eOff = I.eOff; pc.eStride = I.eStride;
+        pc.nBlocks = I.lv[0].bw * I.lv[0].bh;
+        pc.ka = pc.kc = 1.0f; pc.wA = pc.wC = 0.5f; pc.mid = 1;
+    }
+    // Appends a timestamp to the current profile (one is open only after a profiled recordEstimate).
+    void stamp(const char* name) {
+        if (!I.profiling || !I.qpool || I.qcount == 0 || I.qcount >= Interpolator::Impl::kMaxQ) return;
         I.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, I.qpool, I.qcount++);
         I.qnames.push_back(name);
-    };
-    auto barrier = [&](VkPipelineStageFlags src, VkAccessFlags srcA, VkPipelineStageFlags dst, VkAccessFlags dstA) {
+    }
+    void barrier(VkPipelineStageFlags src, VkAccessFlags srcA, VkPipelineStageFlags dst, VkAccessFlags dstA) {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, srcA, dstA};
         I.CmdPipelineBarrier(cb, src, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    };
-    const VkPipelineStageFlags CS = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    const VkAccessFlags RW = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    auto cbar = [&] { barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW); };
-
-    if (I.profiling && I.qpool) I.CmdResetQueryPool(cb, I.qpool, 0, Impl::kMaxQ);
-    stamp("start");
-    // WAR against the previous record's reads of our buffers, then clear the counters.
-    barrier(CS, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-    I.CmdFillBuffer(cb, I.buf[2], 0, 64 * 4, 0);
-    barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
-    I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);
-
-    PC pc{};
-    pc.W = (int)I.W; pc.H = (int)I.H; pc.fw = I.fw; pc.fh = I.fh;
-    pc.pf = I.fieldPF; pc.eOff = I.eOff; pc.eStride = I.eStride;
-    pc.nBlocks = I.lv[0].bw * I.lv[0].bh;
-    auto run = [&](Pipe p, uint32_t gx, uint32_t gy) {
+    }
+    void cbar() { barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW); }
+    // WAR/WAW against every earlier record's use of our buffers, then zero the first `words` of u[].
+    void clearCounters(uint32_t words, VkDescriptorSet set) {
+        barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        I.CmdFillBuffer(cb, I.buf[2], 0, words * 4, 0);
+        barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
+        I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);
+    }
+    void run(Pipe p, uint32_t gx, uint32_t gy) {
         I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.pipes[p]);
         I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
         I.CmdDispatch(cb, gx, gy, 1);
-    };
-    auto div = [](int a, int b) { return (uint32_t)((a + b - 1) / b); };
+    }
+};
+}  // namespace
+
+bool Interpolator::recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageView curr) {
+    if (!m || !m->W) return false;
+    Impl& I = *m;
+    // The next set in the ring may still be referenced by an earlier record of this submission.
+    assert(I.frameSets[Impl::R_EST] < kSetRing && "framegen: more than kSetRing recordEstimate() since beginFrame()");
+    if (I.frameSets[Impl::R_EST] >= kSetRing) return false;
+    VkDescriptorSet set = I.takeSet(Impl::R_EST, prev, curr, VK_NULL_HANDLE);
+    I.haveEst = true;
+    I.estPrev = prev;
+    I.estCurr = curr;
+
+    I.qcount = 0;
+    I.qnames.clear();
+    if (I.profiling && I.qpool) {   // a new profile
+        I.CmdResetQueryPool(cb, I.qpool, 0, Impl::kMaxQ);
+        I.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, I.qpool, I.qcount++);
+        I.qnames.push_back("start");
+    }
+    Rec r(I, cb);
+    r.clearCounters(64, set);   // untrusted count, SAD sum, per-level medians
+    PC& pc = r.pc;
 
     // 1. luma + 2x downsample
     const Level& l0 = I.lv[0];
     pc.w = l0.w; pc.h = l0.h; pc.offA = l0.offA; pc.offC = l0.offC;
-    run(P_LUMA, div(l0.w, 8), div(l0.h, 8));
-    cbar();
-    stamp("luma");
+    r.run(P_LUMA, divUp(l0.w, 8), divUp(l0.h, 8));
+    r.cbar();
+    r.stamp("luma");
     // 2. pyramid
     for (size_t i = 1; i < I.lv.size(); i++) {
         const Level &s = I.lv[i - 1], &t = I.lv[i];
         pc.w = t.w; pc.h = t.h; pc.pw = s.w; pc.ph = s.h;
         pc.offA = t.offA; pc.offC = t.offC; pc.srcA = s.offA; pc.srcC = s.offC;
-        run(P_DOWN, div(t.w, 8), div(t.h, 8));
-        cbar();
+        r.run(P_DOWN, divUp(t.w, 8), divUp(t.h, 8));
+        r.cbar();
     }
-    stamp("pyramid");
+    r.stamp("pyramid");
     // 3-5. per level, coarse -> fine
     static const char* lvNames[] = {"level 0 (finest)", "level 1", "level 2", "level 3", "level 4", "level 5", "level 6", "level 7"};
     int n = (int)I.lv.size();
@@ -382,41 +422,84 @@ bool Interpolator::record(VkCommandBuffer cb, VkImageView prev, VkImageView curr
             pc.pw = p.bw; pc.ph = p.bh; pc.fPar = p.fM;
             pc.medIdx = 4 + 2 * i;
             pc.radius = 2;   // RADIUS
-            run(P_MEDHIST, 1, 1);
-            cbar();
+            r.run(P_MEDHIST, 1, 1);
+            r.cbar();
         }
         pc.fOut = l.fS;
-        run(P_SEARCH, l.bw, l.bh);
-        cbar();
+        r.run(P_SEARCH, l.bw, l.bh);
+        r.cbar();
         pc.fIn = l.fS; pc.fOut = l.fM;
-        run(P_MEDIAN3, div(l.bw, 8), div(l.bh, 8));
-        cbar();
-        stamp(lvNames[std::min(i, 7)]);
+        r.run(P_MEDIAN3, divUp(l.bw, 8), divUp(l.bh, 8));
+        r.cbar();
+        r.stamp(lvNames[std::min(i, 7)]);
     }
     // 6. sub-pixel refinement (+ SAD sum for the scene-cut test)
     pc.w = l0.w; pc.h = l0.h; pc.bw = l0.bw; pc.bh = l0.bh; pc.offA = l0.offA; pc.offC = l0.offC;
     pc.fIn = l0.fM; pc.fOut = I.fieldSub;
-    run(P_SUBPIX, l0.bw, l0.bh);
-    cbar();
-    stamp("subpixel");
+    r.run(P_SUBPIX, l0.bw, l0.bh);
+    r.cbar();
+    r.stamp("subpixel");
     // 8. per-pixel vector choice at flow res
     pc.fIn = I.fieldSub;
-    run(P_PIXFIELD, div(I.fw, 16), div(I.fh, 16));
-    cbar();
-    stamp("pixel field");
-    // 9. full-res mismatch
-    run(P_ERROR, div(I.eStride, 8), div((int)I.H, 8));
-    cbar();
-    stamp("mismatch");
-    // 10-11. box + trust + resolve
-    run(P_RESOLVE, div((int)I.W, 16), div((int)I.H, 16));
-    cbar();
-    stamp("resolve");
-    // global fallbacks (scene cut / too much untrusted) -> frame a
-    run(P_FALLBACK, div((int)I.W, 64), div((int)I.H, 64));
-    barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
-    stamp("fallback");
+    r.run(P_PIXFIELD, divUp(I.fw, 16), divUp(I.fh, 16));
+    r.cbar();
+    r.stamp("pixel field");
     return true;
 }
 
+bool Interpolator::recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t) {
+    if (!m || !m->W || !(t > 0.0f && t < 1.0f)) return false;
+    Impl& I = *m;
+    if (!I.haveEst || prev != I.estPrev || curr != I.estCurr) return false;
+    assert(I.frameSets[Impl::R_SYNTH] < kSetRing && "framegen: more than kSetRing recordSynth() since beginFrame()");
+    if (I.frameSets[Impl::R_SYNTH] >= kSetRing) return false;
+    VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, prev, curr, out);
+
+    Rec r(I, cb);
+    // Serialises this synth after the estimate and after any earlier synth (shared field-at-t, mismatch and
+    // counter scratch): the CS -> transfer -> CS chain orders all earlier reads/writes of our buffers.
+    r.clearCounters(1, set);   // untrusted count only; the SAD sum belongs to the estimate
+    PC& pc = r.pc;
+    const bool mid = t == 0.5f;
+    pc.nearC = t > 0.5f;
+    if (!mid) {
+        // numpy float32 constants of interp.synth / field_at (computed in double, then rounded)
+        double td = t;
+        pc.s = (float)(2.0 * td - 1.0);
+        pc.ka = (float)(2.0 * td);
+        pc.kc = (float)(2.0 * (1.0 - td));
+        pc.wA = (float)(1.0 - td);
+        pc.wC = (float)td;
+        pc.mid = 0;
+        // 9a. field lookup at time t (flow res)
+        pc.fIn = I.fieldPF; pc.fOut = I.fieldT;
+        r.run(P_LOOKUP, divUp(I.fw, 8), divUp(I.fh, 8));
+        r.cbar();
+        pc.pf = I.fieldT;
+        r.stamp("lookup");
+    }
+    // 9. full-res mismatch
+    r.run(P_ERROR, divUp(I.eStride, 8), divUp((int)I.H, 8));
+    r.cbar();
+    r.stamp("mismatch");
+    // 10-11. box + trust + resolve
+    r.run(P_RESOLVE, divUp((int)I.W, 16), divUp((int)I.H, 16));
+    r.cbar();
+    r.stamp("resolve");
+    // global fallbacks (scene cut / too much untrusted) -> the nearer real frame
+    r.run(P_FALLBACK, divUp((int)I.W, 64), divUp((int)I.H, 64));
+    r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
+    r.stamp("fallback");
+    return true;
+}
+
+bool Interpolator::record(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t) {
+    if (!m || !m->W || !(t > 0.0f && t < 1.0f)) return false;
+    // both rings must have room, so that a refused record() records nothing
+    assert(m->frameSets[0] < kSetRing && m->frameSets[1] < kSetRing && "framegen: more than kSetRing records since beginFrame()");
+    if (m->frameSets[Impl::R_EST] >= kSetRing || m->frameSets[Impl::R_SYNTH] >= kSetRing) return false;
+    return recordEstimate(cb, prev, curr) && recordSynth(cb, prev, curr, out, t);
+}
+
 }  // namespace framegen
+

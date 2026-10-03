@@ -1,7 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 // Global decisions: mean finest-level SAD > CUT_SAD (scene cut) or untrusted share > GLOBAL_FRAC
-// -> present frame a. Every workgroup exits immediately in the normal case.
+// -> present the nearer real frame (a for t <= 0.5, c after). Every workgroup exits immediately in the normal case.
 #include "common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -14,6 +14,6 @@ void main() {
     for (int j = 0; j < 8; j++)
         for (int i = 0; i < 8; i++) {
             ivec2 p = ivec2(gl_WorkGroupID.xy) * 64 + ivec2(i, j) * 8 + ivec2(gl_LocalInvocationID.xy);
-            if (p.x < pc.W && p.y < pc.H) imageStore(outImg, p, texelFetch(texPrev, p, 0));
+            if (p.x < pc.W && p.y < pc.H) imageStore(outImg, p, pc.nearC != 0 ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0));
         }
 }

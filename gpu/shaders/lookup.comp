@@ -1,0 +1,18 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Pass 9a (t != 0.5 only, flow res): the per-pixel field h lives on the midpoint grid; content at midpoint p
+// sits at q = p + (2t - 1) h(p) at time t, so g(q) = h(q - (2t - 1) g(q)): 2 bilinear fixed-point steps
+// started from h(q) (interp.field_at). Reads the field at fIn, writes g to fOut.
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= pc.fw || q.y >= pc.fh) return;
+    vec2 g = field[pc.fIn + q.y * pc.fw + q.x];
+    for (int k = 0; k < 2; k++) {   // LOOKUP_ITERS
+        precise vec2 pos = vec2(q) - pc.s * g;   // float32 product then difference, like numpy
+        g = sampleF(pc.fIn, pos);
+    }
+    field[pc.fOut + q.y * pc.fw + q.x] = g;
+}

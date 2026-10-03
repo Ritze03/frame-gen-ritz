@@ -1,6 +1,9 @@
 // fgtest: runs framegen::Interpolator on raw RGBA8 frame pairs and/or benchmarks it.
-//   fgtest [--bgra] [--bench N] W H prev.rgba curr.rgba out.rgba [prev curr out ...]
-// Files are tightly packed RGBA8, W*H*4 bytes. --bgra uses B8G8R8A8_UNORM images/views for
+//   fgtest [--bgra] [--split] [--t T1,T2,..] [--bench N [--mult M]] W H prev.rgba curr.rgba out.rgba [prev curr out ...]
+// Files are tightly packed RGBA8, W*H*4 bytes. --t: generated times (default 0.5). With one t and no --split
+// each pair uses record(t); otherwise recordEstimate once + recordSynth per t, each into its own output
+// image, all in one command buffer. With several t the k-th output goes to out.rgba.<k>.
+// --bench N --mult M: per real pair one estimate + M-1 synths at t = k/M (M = 2: record(0.5)). --bgra uses B8G8R8A8_UNORM images/views for
 // inputs and output (the file data stays RGBA; channels are swizzled on upload/readback).
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
@@ -67,11 +70,19 @@ static void imgBarrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkAc
 
 int main(int argc, char** argv) {
     bool bgra = false;
-    int bench = 0;
+    int bench = 0, mult = 2;
+    bool split = false;
+    std::vector<float> ts{0.5f};
     std::vector<std::string> pos;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bgra")) bgra = true;
         else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mult") && i + 1 < argc) mult = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--split")) split = true;
+        else if (!strcmp(argv[i], "--t") && i + 1 < argc) {
+            ts.clear();
+            for (char* tok = strtok(argv[++i], ","); tok; tok = strtok(nullptr, ",")) ts.push_back((float)atof(tok));
+        }
         else pos.push_back(argv[i]);
     }
     if (pos.size() < 5 || (pos.size() - 2) % 3) {
@@ -164,9 +175,14 @@ int main(int argc, char** argv) {
 
     Img prev = makeImage(W, H, fmt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     Img curr = makeImage(W, H, fmt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    Img out = makeImage(W, H, fmt, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    size_t nOut = std::max(ts.size(), (size_t)std::max(mult - 1, 1));
+    std::vector<Img> outs;
+    for (size_t k = 0; k < nOut; k++)
+        outs.push_back(makeImage(W, H, fmt, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT));
+    Img& out = outs[0];
     begin();
-    for (Img* i : {&prev, &curr, &out}) imgBarrier(cb, i->img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    for (Img* i : {&prev, &curr}) imgBarrier(cb, i->img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    for (Img& o : outs) imgBarrier(cb, o.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
     submit();
 
     framegen::InitInfo info;
@@ -199,16 +215,35 @@ int main(int argc, char** argv) {
         upload(pos[p], prev);
         upload(pos[p + 1], curr);
         begin();
-        if (!fg.record(cb, prev.view, curr.view, out.view)) { fprintf(stderr, "fg.record failed\n"); return 1; }
-        imgBarrier(cb, out.img, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        vkCmdCopyImageToBuffer(cb, out.img, VK_IMAGE_LAYOUT_GENERAL, stg, 1, &region);
+        if (ts.size() == 1 && !split) {
+            if (!fg.record(cb, prev.view, curr.view, out.view, ts[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
+        } else {
+            if (!fg.recordEstimate(cb, prev.view, curr.view)) { fprintf(stderr, "fg.recordEstimate failed\n"); return 1; }
+            for (size_t k = 0; k < ts.size(); k++)
+                if (!fg.recordSynth(cb, prev.view, curr.view, outs[k].view, ts[k])) { fprintf(stderr, "fg.recordSynth failed\n"); return 1; }
+        }
         submit();
-        swz(map);
-        FILE* f = fopen(pos[p + 2].c_str(), "wb");
-        fwrite(map, 1, bytes, f);
-        fclose(f);
+        for (size_t k = 0; k < ts.size(); k++) {
+            begin();
+            imgBarrier(cb, outs[k].img, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            vkCmdCopyImageToBuffer(cb, outs[k].img, VK_IMAGE_LAYOUT_GENERAL, stg, 1, &region);
+            submit();
+            swz(map);
+            std::string path = pos[p + 2] + (ts.size() > 1 ? "." + std::to_string(k) : "");
+            FILE* f = fopen(path.c_str(), "wb");
+            fwrite(map, 1, bytes, f);
+            fclose(f);
+        }
     }
 
+    // one real pair: 2x = record(0.5); M x = recordEstimate + M-1 recordSynth at k/M into distinct outputs
+    auto pair = [&]() -> bool {
+        if (mult <= 2) return fg.record(cb, prev.view, curr.view, out.view);
+        if (!fg.recordEstimate(cb, prev.view, curr.view)) return false;
+        for (int k = 1; k < mult; k++)
+            if (!fg.recordSynth(cb, prev.view, curr.view, outs[k - 1].view, (float)k / mult)) return false;
+        return true;
+    };
     if (bench > 0) {
         double tp = props.limits.timestampPeriod * 1e-6;   // ticks -> ms
         if (!fg.setProfiling(true)) { fprintf(stderr, "setProfiling failed\n"); return 1; }
@@ -220,9 +255,9 @@ int main(int argc, char** argv) {
         for (int it = 0; it < bench + 5; it++) {
             begin();
             fg.setProfiling(false);
-            for (int k = 0; k < 8; k++) fg.record(cb, prev.view, curr.view, out.view);
+            for (int k = 0; k < 8; k++) pair();
             fg.setProfiling(true);
-            if (!fg.record(cb, prev.view, curr.view, out.view)) { fprintf(stderr, "fg.record failed\n"); return 1; }
+            if (!pair()) { fprintf(stderr, "fg.record failed\n"); return 1; }
             submit();
             std::vector<uint64_t> ticks;
             if (!fg.readTimings(names, ticks)) { fprintf(stderr, "readTimings failed\n"); return 1; }
@@ -233,9 +268,10 @@ int main(int argc, char** argv) {
             total.push_back(sum);
         }
         auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
-        printf("timing %ux%u, %d runs (profiled record after 8 warm records), median ms:\n", W, H, bench);
-        for (size_t i = 0; i < names.size(); i++) printf("  %-18s %8.4f\n", names[i], med(per[i]));
-        printf("  %-18s %8.4f   (min %.4f)\n", "TOTAL", med(total), *std::min_element(total.begin(), total.end()));
+        auto mn = [](const std::vector<double>& v) { return *std::min_element(v.begin(), v.end()); };
+        printf("timing %ux%u %dx, %d runs (profiled pair after 8 warm pairs), ms: median (min)\n", W, H, mult, bench);
+        for (size_t i = 0; i < names.size(); i++) printf("  %-18s %8.4f (%.4f)\n", names[i], med(per[i]), mn(per[i]));
+        printf("  %-18s %8.4f (%.4f)\n", "TOTAL per pair", med(total), mn(total));
 
         // Back-to-back: 'bench' records in one command buffer, GPU kept busy -> steady clocks.
         fg.setProfiling(false);
@@ -244,27 +280,32 @@ int main(int argc, char** argv) {
         qp.queryCount = 2;
         VkQueryPool pool;
         CK(vkCreateQueryPool(dev, &qp, nullptr, &pool));
-        int batch = std::min(bench, (int)framegen::Interpolator::kSetRing - 1);
+        int batch = std::min(bench, (int)(framegen::Interpolator::kSetRing - 1) / std::max(mult - 1, 1));
         std::vector<double> per1;
         for (int rep = 0; rep < 5; rep++) {
             begin();
             vkCmdResetQueryPool(cb, pool, 0, 2);
             vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
             for (int i = 0; i < batch; i++)
-                if (!fg.record(cb, prev.view, curr.view, out.view)) { fprintf(stderr, "fg.record failed\n"); return 1; }
+                if (!pair()) { fprintf(stderr, "fg.record failed\n"); return 1; }
             vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, 1);
             submit();
             uint64_t ts[2];
             CK(vkGetQueryPoolResults(dev, pool, 0, 2, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
             per1.push_back((ts[1] - ts[0]) * tp / batch);
         }
-        printf("  back-to-back (%d per command buffer, 5 reps): median %.4f ms per frame\n", batch, med(per1));
+        printf("  back-to-back (%d pairs per command buffer, 5 reps): per pair median %.4f (min %.4f) ms\n", batch, med(per1), mn(per1));
         vkDestroyQueryPool(dev, pool, nullptr);
     }
 
     vkDeviceWaitIdle(dev);
     fg.destroy();
-    for (Img* i : {&prev, &curr, &out}) {
+    for (Img& o : outs) {
+        vkDestroyImageView(dev, o.view, nullptr);
+        vkDestroyImage(dev, o.img, nullptr);
+        vkFreeMemory(dev, o.mem, nullptr);
+    }
+    for (Img* i : {&prev, &curr}) {
         vkDestroyImageView(dev, i->view, nullptr);
         vkDestroyImage(dev, i->img, nullptr);
         vkFreeMemory(dev, i->mem, nullptr);

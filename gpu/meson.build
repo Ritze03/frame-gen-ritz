@@ -13,7 +13,7 @@ shader_gen = generator(glslang,
 shaders = shader_gen.process(
   'shaders/luma.comp', 'shaders/down.comp', 'shaders/medhist.comp', 'shaders/search.comp',
   'shaders/median3.comp', 'shaders/subpix.comp', 'shaders/pixfield.comp', 'shaders/error.comp',
-  'shaders/resolve.comp', 'shaders/fallback.comp')
+  'shaders/resolve.comp', 'shaders/fallback.comp', 'shaders/lookup.comp')
 
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
 framegen_lib = static_library('framegen', 'framegen.cpp', shaders,
