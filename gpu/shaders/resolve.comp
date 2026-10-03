@@ -1,0 +1,52 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Passes 10+11: 7x7 box of e (replicate border), trust t = ramp(e, 12..40), count untrusted pixels,
+// out = mix(avg(wa, wc), a, t). The global decisions (scene cut, >15% untrusted) are applied by
+// fallback.comp once every workgroup has added to the counter.
+#include "common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int TS = 16, AP = 3, TT = TS + 2 * AP;
+shared float te[TT * TT];
+shared float hs[TT * TS];
+shared uint cnt;
+
+uint eAt(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(pc.W - 1, pc.H - 1));
+    return (u[pc.eOff + p.y * pc.eStride + (p.x >> 2)] >> (8 * (p.x & 3))) & 255u;
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - AP;
+    if (lid == 0) cnt = 0u;
+    for (int i = lid; i < TT * TT; i += TS * TS)
+        te[i] = float(eAt(t0 + ivec2(i % TT, i / TT)));
+    barrier();
+    for (int i = lid; i < TT * TS; i += TS * TS) {   // horizontal 7-sums: TT rows x TS cols
+        int r = i / TS, c = i % TS;
+        float s = 0.0;
+        for (int k = 0; k < 7; k++) s += te[r * TT + c + k];
+        hs[i] = s;
+    }
+    barrier();
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = p.x < pc.W && p.y < pc.H;
+    float t = 0.0;
+    if (inside) {
+        float s = 0.0;
+        for (int k = 0; k < 7; k++) s += hs[(l.y + k) * TS + l.x];
+        float e = s * (1.0 / 49.0);
+        t = clamp((e - TRUST0) / (TRUST1 - TRUST0), 0.0, 1.0);
+        if (t > 0.5) atomicAdd(cnt, 1u);
+        vec3 wa, wc;
+        mismatch(p, wa, wc);
+        vec4 a = texelFetch(texPrev, p, 0);
+        vec3 a8 = floor(a.rgb * 255.0 + 0.5);
+        vec3 o = 0.5 * (wa + wc) * (1.0 - t) + a8 * t;
+        imageStore(outImg, p, vec4(clamp(floor(o + 0.5), 0.0, 255.0) * (1.0 / 255.0), a.a));
+    }
+    barrier();
+    if (lid == 0 && cnt > 0u) atomicAdd(u[U_UNTRUSTED], cnt);
+}

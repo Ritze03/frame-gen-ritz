@@ -1,0 +1,38 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Global median seed candidate: np.median over the fine level's "own parent" vectors (each parent
+// counted once per fine block that maps to it), per component. Vectors are integers below the finest
+// level, so an exact weighted histogram replaces the sort. Writes 2 * median to u[medIdx..+1].
+#include "common.glsl"
+layout(local_size_x = 256) in;
+shared uint hx[256], hy[256];
+
+float kth(bool isX, uint k) {
+    uint acc = 0u;
+    for (int b = 0; b < 256; b++) {
+        acc += isX ? hx[b] : hy[b];
+        if (acc > k) return float(b - 128);
+    }
+    return 127.0;
+}
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    hx[t] = 0u; hy[t] = 0u;
+    barrier();
+    int n = pc.bw * pc.bh;
+    for (int i = int(t); i < n; i += 256) {
+        int ix = i % pc.bw, iy = i / pc.bw;
+        int px = min(ix / 2, pc.pw - 1), py = min(iy / 2, pc.ph - 1);
+        ivec2 v = ivec2(roundEven(field[pc.fPar + py * pc.pw + px]));
+        atomicAdd(hx[clamp(v.x + 128, 0, 255)], 1u);
+        atomicAdd(hy[clamp(v.y + 128, 0, 255)], 1u);
+    }
+    barrier();
+    if (t < 2u) {
+        bool isX = t == 0u;
+        uint k1 = uint(n - 1) / 2u, k2 = uint(n) / 2u;
+        float m = 0.5 * (kth(isX, k1) + kth(isX, k2));
+        u[pc.medIdx + int(t)] = floatBitsToUint(2.0 * m);
+    }
+}

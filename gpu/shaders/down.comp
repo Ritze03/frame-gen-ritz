@@ -1,0 +1,25 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Pass 2: pyramid level = INTER_AREA 0.5 of the previous level (mean of the valid pixels of each 2x2).
+// w,h = destination size, pw,ph = source size.
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= pc.w || o.y >= pc.h) return;
+    float sa = 0.0, sc = 0.0;
+    int n = 0;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            ivec2 p = 2 * o + ivec2(i, j);
+            if (p.x < pc.pw && p.y < pc.ph) {
+                sa += luma[pc.srcA + p.y * pc.pw + p.x];
+                sc += luma[pc.srcC + p.y * pc.pw + p.x];
+                n++;
+            }
+        }
+    float s = n == 4 ? 0.25 : 1.0 / float(n);
+    luma[pc.offA + o.y * pc.w + o.x] = sa * s;
+    luma[pc.offC + o.y * pc.w + o.x] = sc * s;
+}

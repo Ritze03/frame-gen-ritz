@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Pass 1: luma (cv2 BGR2GRAY, rounded to uint8) + INTER_AREA 2x downsample of a and c to flow res.
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+float y8(sampler2D t, ivec2 p) {
+    uvec3 c = uvec3(texelFetch(t, p, 0).rgb * 255.0 + 0.5);
+    return float((c.r * 4899u + c.g * 9617u + c.b * 1868u + 8192u) >> 14);
+}
+
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= pc.w || o.y >= pc.h) return;
+    float sa = 0.0, sc = 0.0;
+    int n = 0;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            ivec2 p = 2 * o + ivec2(i, j);
+            if (p.x < pc.W && p.y < pc.H) { sa += y8(texPrev, p); sc += y8(texCurr, p); n++; }
+        }
+    luma[pc.offA + o.y * pc.w + o.x] = sa / float(n);
+    luma[pc.offC + o.y * pc.w + o.x] = sc / float(n);
+}

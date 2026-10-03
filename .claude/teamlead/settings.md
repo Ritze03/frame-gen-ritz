@@ -1,0 +1,2 @@
+effort: medium
+opus: always

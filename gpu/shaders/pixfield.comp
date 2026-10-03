@@ -1,0 +1,62 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Pass 8: per-pixel half-vector at flow res. Candidates: bilinear block field, own block, block above,
+// below, left, right, zero. Cost = 5x5 box (replicate border) of |a(q-h) - c(q+h)|, each window pixel
+// using its own candidate vector (as cv2.blur over the per-candidate error image does);
+// -SMOOTH_BONUS for the bilinear field, -ZERO_BONUS for zero. First candidate wins ties.
+#include "common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int TS = 16, AP = 2, TT = TS + 2 * AP, NC = 7;
+shared float err[NC][TT * TT];
+
+vec2 blockV(ivec2 b) {
+    b = clamp(b, ivec2(0), ivec2(pc.bw - 1, pc.bh - 1));
+    return field[pc.fIn + b.y * pc.bw + b.x];
+}
+
+vec2 cand(int k, ivec2 q) {
+    ivec2 b = q / BLOCK;
+    if (k == 0) {   // cv2.resize(v, (bw*8, bh*8), INTER_LINEAR)
+        vec2 s = (vec2(q) + 0.5) / float(BLOCK) - 0.5;
+        vec2 fl = floor(s);
+        vec2 f = s - fl;
+        ivec2 i = ivec2(fl);
+        return mix(mix(blockV(i), blockV(i + ivec2(1, 0)), f.x),
+                   mix(blockV(i + ivec2(0, 1)), blockV(i + ivec2(1, 1)), f.x), f.y);
+    }
+    if (k == 1) return blockV(b);
+    if (k == 2) return blockV(b + ivec2(0, -1));
+    if (k == 3) return blockV(b + ivec2(0, 1));
+    if (k == 4) return blockV(b + ivec2(-1, 0));
+    if (k == 5) return blockV(b + ivec2(1, 0));
+    return vec2(0.0);
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - AP;
+    for (int i = lid; i < TT * TT; i += TS * TS) {
+        ivec2 q = clamp(t0 + ivec2(i % TT, i / TT), ivec2(0), ivec2(pc.w - 1, pc.h - 1));
+        for (int k = 0; k < NC; k++) {
+            vec2 v = cand(k, q);
+            err[k][i] = abs(sampleL(pc.offA, vec2(q) - v, pc.w, pc.h) - sampleL(pc.offC, vec2(q) + v, pc.w, pc.h));
+        }
+    }
+    barrier();
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= pc.w || q.y >= pc.h) return;
+    int bk = 0;
+    float best = 0.0;
+    for (int k = 0; k < NC; k++) {
+        float sum = 0.0;
+        for (int y = 0; y < 5; y++)
+            for (int x = 0; x < 5; x++) sum += err[k][(l.y + y) * TT + l.x + x];
+        float c = sum * (1.0 / 25.0);
+        if (k == 0) c -= SMOOTH_BONUS;
+        if (k == NC - 1) c -= ZERO_BONUS;
+        if (k == 0 || c < best) { best = c; bk = k; }
+    }
+    field[pc.pf + q.y * pc.fw + q.x] = cand(bk, q);
+}

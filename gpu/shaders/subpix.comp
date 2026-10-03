@@ -1,0 +1,72 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Pass 6 (finest level): sub-pixel refinement, 3x3 at 0.5 px then 3x3 at 0.25 px around the
+// median-filtered integer vector, cost = SAD + LAMBDA*step*|d|_1, bilinear taps from LDS.
+// Also accumulates the winning SAD for the scene-cut test (fixed point, 1/256).
+#include "common.glsl"
+layout(local_size_x = 64) in;
+
+const int T = 13, O = 2;   // tile covers block +- (0.75 + bilinear) px
+shared float ta[T * T], tc[T * T];
+shared float cost[9], sads[9], rows[72];
+shared vec2 offS;
+
+float tap(bool isA, vec2 p) {   // bilinear in tile coords (p >= 0); weights exact for 1/4 px
+    vec2 fl = floor(p);
+    vec2 f = p - fl;
+    int i = int(fl.y) * T + int(fl.x);
+    float p00, p01, p10, p11;
+    if (isA) { p00 = ta[i]; p01 = ta[i + 1]; p10 = ta[i + T]; p11 = ta[i + T + 1]; }
+    else     { p00 = tc[i]; p01 = tc[i + 1]; p10 = tc[i + T]; p11 = tc[i + T + 1]; }
+    return p00 * ((1.0 - f.y) * (1.0 - f.x)) + p01 * ((1.0 - f.y) * f.x)
+         + p10 * (f.y * (1.0 - f.x)) + p11 * (f.y * f.x);
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 blk = ivec2(gl_WorkGroupID.xy);
+    ivec2 b0 = blk * BLOCK;
+    int bi0 = pc.fIn + blk.y * pc.bw + blk.x;
+    ivec2 s = ivec2(roundEven(field[bi0]));
+    for (int i = lid; i < T * T; i += 64) {
+        int x = i % T, y = i / T;
+        ta[i] = L(pc.offA, b0.x - s.x - O + x, b0.y - s.y - O + y, pc.w, pc.h);
+        tc[i] = L(pc.offC, b0.x + s.x - O + x, b0.y + s.y - O + y, pc.w, pc.h);
+    }
+    if (lid == 0) offS = vec2(0.0);
+    barrier();
+    for (int pass = 0; pass < 2; pass++) {
+        float step = pass == 0 ? 0.5 : 0.25;
+        vec2 base = offS;
+        for (int it = lid; it < 72; it += 64) {   // (candidate, block row) per thread
+            int k = it >> 3, y = it & 7;
+            vec2 o = base + vec2(k % 3 - 1, k / 3 - 1) * step;
+            float sum = 0.0;
+            for (int x = 0; x < 8; x++)
+                sum += abs(tap(true, vec2(x + O, y + O) - o) - tap(false, vec2(x + O, y + O) + o));
+            rows[it] = sum;
+        }
+        barrier();
+        if (lid < 9) {
+            vec2 d = vec2(lid % 3 - 1, lid / 3 - 1);
+            float sum = 0.0;
+            for (int y = 0; y < 8; y++) sum += rows[lid * 8 + y];
+            sads[lid] = sum * (1.0 / 64.0);
+            cost[lid] = sads[lid] + LAMBDA * step * (abs(d.x) + abs(d.y));
+        }
+        barrier();
+        if (lid == 0) {
+            int bi = 0;
+            float best = cost[0];
+            for (int k = 1; k < 9; k++)
+                if (cost[k] < best) { best = cost[k]; bi = k; }
+            offS = base + vec2(bi % 3 - 1, bi / 3 - 1) * step;
+            if (pass == 1) {
+                field[pc.fOut + blk.y * pc.bw + blk.x] = vec2(s) + offS;
+                // uint sum (<= 65280 per block) can only wrap above 65793 blocks: never at <= 4K (32400), at 8K only if mean SAD > 129.
+                atomicAdd(u[U_SADSUM], uint(roundEven(sads[bi] * 256.0)));
+            }
+        }
+        barrier();
+    }
+}
