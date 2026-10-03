@@ -81,3 +81,74 @@ GLOBAL_FRAC off 5.22 / 0.179, MISMATCH_BOX 13 5.22 / 0.178, TRUST (16,48) 5.29 /
   mismatch test cannot see it. Global-median seed fixes the stride-1 case, not the stride-2 one.
 - Very fast flicks: below GLOBAL_FRAC the output is a patchwork of warped and held regions with visible seams.
 - Changing HUD text (timers, ammo) shows the old value (fallback to a): harmless.
+
+## Running experiments on the user's machine
+The user games on this box: run every python/ffmpeg command at idle priority,
+`chrt -i 0 nice -n 19 ionice -c 3 python3 ...` (SCHED_IDLE is inherited by worker pools and ffmpeg children),
+render.py with at most `--jobs 8`, and at most ~8 concurrent harness/experiment processes in total
+(`OPENCV_FOR_THREADS_NUM=1` per process when several run at once).
+
+# Multi-frame generation (branch `multi-frame`)
+API: `est = estimate(a, c)` (passes 1-8, once per real pair) + `synth(a, c, est, t)` (passes 9-11 per t);
+`interpolate(a, c, t=0.5)`, `interpolate_multi(a, c, n)` -> the n-1 frames at t = k/n.
+`interpolate(a, c)` is byte-identical to main (checked on 10 real 1080p pairs from all three clips).
+
+Per-t stages:
+- field lookup at time t: h is defined on the midpoint grid; content at midpoint p is at q = p + (2t-1) h(p) at time t,
+  so g(q) = h(q - (2t-1) g(q)), 2 bilinear fixed-point steps at flow res starting from h(q). Then warp
+  wa = a(q - 2t g), wc = c(q + 2(1-t) g) at full res.
+- blend (1-t) wa + t wc; per-pixel fallback and both global fallbacks (cut, >15% untrusted) present the nearer real frame
+  (a for t <= 0.5, c for t > 0.5). t = 0.5 takes the exact 2x code path.
+
+## Experiments (scale 0.5, cached clean windows: 40/40/40 for 3x, 40/40/38 for 4x; battlefield/obs1/obs2)
+Mean gain over dup (nearer real frame) across the 6 clip x N cells / mean harm%:
+- naive lookup h(q): 4.093 / 0.128; 1 step 4.113 / 0.128; **2 steps 4.169 / 0.137**; 3 steps 4.117 / 0.129
+  (odd step counts land near the 1-step result: at motion edges the iteration flips between the two sides)
+- 2 steps with nearest instead of bilinear lookup: 4.167 / 0.139 (same; kept bilinear)
+- 50/50 blend instead of time-weighted: 4.129 / 0.138 -> time-weighted kept
+- per-t re-run of the per-pixel candidate choice with t-aware taps (candidates fetched at the looked-up midpoint
+  position, the looked-up field as an extra candidate): 4.165 / 0.140, costs one more pixel-field pass per t -> rejected
+- GLOBAL_FRAC 0.25: 4.234 / 0.145; off: 4.257 / 0.148; TRUST (16,48): 4.363 / 0.167. Same PSNR-vs-harm trade as at 2x;
+  kept the 2x constants (the user approved the look of the 2x settings).
+All of these are small (< 0.1 dB between lookup variants): most generated pixels are in smooth motion where h(q) ~ h(p).
+
+## Results at scale 1.0 (official harness)
+2x regression: branch `--mult 2` == main harness exactly (n / dup / blend / interp / worse% / harm%:
+battlefield --every 17: 200 / 24.36 / 26.90 / 31.33 / 4.5 / 0.08; obs1 --every 240: 117 / 25.88 / 28.04 / 30.63 / 2.6 / 0.12;
+obs2 --every 190: 98 / 24.38 / 26.60 / 29.86 / 1.0 / 0.12); global fallback rate at 2x: 0.5 / 1.7 / 0.0 %.
+
+| clip | N | windows | t | dup | blend | interp | worse% | harm% | fallback% |
+|---|---|---|---|---|---|---|---|---|---|
+| battlefield (--every 17) | 3 | 150 | 1/3 | 23.92 | 25.36 | 29.14 | 2.0 | 0.13 | 2.0 |
+| | | | 2/3 | 24.02 | 25.39 | 29.22 | 2.7 | 0.15 | 2.7 |
+| | | | mean | 23.97 | 25.37 | 29.18 | 2.3 | 0.14 | 2.3 |
+| battlefield (--every 17) | 4 | 150 | 1/4 | 24.12 | 25.03 | 27.86 | 7.3 | 0.14 | 4.0 |
+| | | | 1/2 | 21.50 | 23.84 | 26.60 | 3.3 | 0.20 | 2.7 |
+| | | | 3/4 | 24.12 | 25.04 | 28.02 | 5.3 | 0.15 | 5.3 |
+| | | | mean | 23.25 | 24.64 | 27.49 | 5.3 | 0.16 | 4.0 |
+| obs1 (--every 60) | 3 | 150 | 1/3 | 26.60 | 27.67 | 30.00 | 5.3 | 0.14 | 3.3 |
+| | | | 2/3 | 25.86 | 27.25 | 29.72 | 3.3 | 0.13 | 4.0 |
+| | | | mean | 26.23 | 27.46 | 29.86 | 4.3 | 0.14 | 3.7 |
+| obs1 (--every 30) | 4 | 150 | 1/4 | 25.82 | 26.64 | 28.64 | 7.3 | 0.14 | 5.3 |
+| | | | 1/2 | 24.01 | 25.87 | 27.72 | 5.3 | 0.20 | 4.7 |
+| | | | 3/4 | 25.54 | 26.45 | 28.48 | 5.3 | 0.14 | 5.3 |
+| | | | mean | 25.13 | 26.32 | 28.28 | 6.0 | 0.16 | 5.1 |
+| obs2 (--every 75) | 3 | 148 | 1/3 | 23.97 | 25.32 | 28.32 | 0.7 | 0.11 | 6.1 |
+| | | | 2/3 | 24.40 | 25.55 | 28.42 | 2.0 | 0.13 | 6.1 |
+| | | | mean | 24.19 | 25.44 | 28.37 | 1.4 | 0.12 | 6.1 |
+| obs2 (--every 35) | 4 | 121 | 1/4 | 23.51 | 24.43 | 26.32 | 3.3 | 0.13 | 11.6 |
+| | | | 1/2 | 21.76 | 23.74 | 25.30 | 0.8 | 0.20 | 9.9 |
+| | | | 3/4 | 23.70 | 24.56 | 26.44 | 4.1 | 0.16 | 10.7 |
+| | | | mean | 22.99 | 24.24 | 26.02 | 2.8 | 0.16 | 10.7 |
+
+(--max 150 windows. Usable-window share on the OBS clips with DUP_DIFF 0.6, first 6000 frames: obs2 52.6 / 31.4 / 10.5 %
+for N = 2/3/4, obs1 26.7 / 16.5 / 6.7 %; hence the smaller --every there. The OBS game ran at ~90 fps, so even
+"clean" windows have uneven real timing, which caps every method's score on those clips.)
+
+Fallback is decided per t, so inside one pair some generated frames can fall back and others not
+(e.g. 4x: generated, held a, generated): a candidate for a per-pair decision if it shows in the videos.
+
+Cost (CPU, same runs): estimate ~1.0-1.4 s + ~0.31-0.42 s per synth at 1080p -> per real pair 3x = 1.23x and
+4x = 1.45x the 2x cost; per generated frame 0.62x (3x) and 0.48x (4x) of 2x.
+GPU estimate at 1440p from the 2x per-pass table: per pair luma..pixel field = 0.368 ms, per t mismatch + resolve +
+fallback = 0.087 ms (+ the 2 field taps of the lookup, fused into the mismatch pass) -> 2x 0.455, 3x ~0.56, 4x ~0.66 ms.
