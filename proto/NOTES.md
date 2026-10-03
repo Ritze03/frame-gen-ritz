@@ -152,3 +152,11 @@ Cost (CPU, same runs): estimate ~1.0-1.4 s + ~0.31-0.42 s per synth at 1080p -> 
 4x = 1.45x the 2x cost; per generated frame 0.62x (3x) and 0.48x (4x) of 2x.
 GPU estimate at 1440p from the 2x per-pass table: per pair luma..pixel field = 0.368 ms, per t mismatch + resolve +
 fallback = 0.087 ms (+ the 2 field taps of the lookup, fused into the mismatch pass) -> 2x 0.455, 3x ~0.56, 4x ~0.66 ms.
+
+## Review videos (review/multi/, outside git)
+`render.py --mult N -o gen_Nx_clip.mp4 --full full_Nx_clip.mp4 --jobs 8` at idle priority, sequential.
+gen = generated frames only at 120(N-1)/N fps (80 / 90), full = real + generated at 120 fps.
+Segments as the 2x reviews: battlefield 0-28.6 s, obs1 184-214 s, obs2 52-82 s. ~6-8 min per clip and N.
+Source windows containing a duplicated capture frame (game at ~90 fps): obs2 526/1200 (3x), 502/900 (4x);
+obs1 346/1200, 332/900; battlefield 24 per N. In those the "real" frames are unevenly spaced, so the OBS
+full-stream videos judder from the source timing itself; battlefield is the clean smoothness reference.
