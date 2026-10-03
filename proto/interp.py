@@ -26,6 +26,16 @@ GPU passes (flow res = 1/FLOW_SCALE of the frame; L = pyramid levels, 4 at 1440p
      (one atomic add per workgroup)                       (1 pass)
  11  out = mix(0.5*(wa+wc), a, t); if the untrusted share > GLOBAL_FRAC present a instead
      (the decision needs pass 10's count, so either a separate pass or apply it next frame)
+
+Multi-frame generation (3x, 4x: interpolate_multi): passes 1-8 run once per real pair (estimate()),
+passes 9-11 once per generated time t = k/n (synth()). At t = 0.5 synth is exactly the 2x path. Otherwise:
+  9a field lookup at time t (flow res, tiny): content at midpoint p is at q = p + (2t-1) h(p) at time t,
+     so g(q) = h(q - (2t-1) g(q)), LOOKUP_ITERS=2 bilinear fixed-point steps started from h(q)
+     (fusable into pass 9: two extra bilinear taps of the flow-res field per pixel)
+  9  sample a(q - 2t g), c(q + 2(1-t) g)
+ 11  out = mix((1-t) wa + t wc, near, untrust), near = a for t <= 0.5 else c; the global fallbacks
+     (cut, untrusted share) also present the nearer real frame, so a failed pair looks like the base
+     frame rate for one step rather than a stutter back to a
 """
 import cv2
 import numpy as np
@@ -44,6 +54,11 @@ ZERO_BONUS = 1.0       # per-pixel cost bonus for the zero vector (static HUD st
 MISMATCH_BOX = 7       # box filter over |wa - wc| before it becomes a trust value
 TRUST = (12.0, 40.0)   # mismatch (8-bit levels) where the fallback to frame a starts / is complete
 GLOBAL_FRAC = 0.15     # more than this share of untrusted pixels -> present frame a
+# multi-frame generation (t != 0.5 only; t = 0.5 is the 2x path, unchanged)
+LOOKUP_ITERS = 2       # fixed-point steps of the midpoint-grid field lookup at time t (0 = naive h(q); 3 is worse
+                       # than 2: at motion edges the iteration oscillates and even counts land on the right side)
+LOOKUP_INTERP = cv2.INTER_LINEAR
+TIME_BLEND = True      # mix the warped pair (1-t, t) instead of 50/50
 
 
 def luma(img):
@@ -168,27 +183,79 @@ def pixel_field(v, ya, yc):
     return pick(cands, costs)[0]
 
 
-def interpolate(a, c):
-    """Frame halfway between uint8 BGR frames a and c."""
+def estimate(a, c):
+    """Everything that depends only on the real pair (a, c): passes 1-8. Run once per pair, then
+    synth() any number of in-between times from it."""
     v, sad, ya, yc = flow(a, c)
-    if sad > CUT_SAD:
-        return a.copy()
+    pf = None if sad > CUT_SAD else pixel_field(v, ya, yc)
+    return {"sad": sad, "pf": pf}
+
+
+def field_at(pf, t):
+    """Midpoint-grid half-vector field -> field on the grid of time t (flow res).
+    Content at midpoint p sits at q = p + (2t - 1) h(p) at time t, so the vector for q is h at the
+    midpoint position p = q - (2t - 1) h(p): a fixed-point lookup started from h(q)."""
+    s = np.float32(2 * t - 1)
+    if s == 0 or LOOKUP_ITERS == 0:
+        return pf
+    gx, gy = grid(*pf.shape[:2])
+    g = pf
+    for _ in range(LOOKUP_ITERS):
+        g = cv2.remap(pf, gx - s * g[..., 0], gy - s * g[..., 1], LOOKUP_INTERP, borderMode=cv2.BORDER_REPLICATE)
+    return g
+
+
+def warp_t(a, c, hx, hy, t):
+    """Sample a at q - 2t h and c at q + 2(1 - t) h (bilinear); t = 0.5 is warp_pair."""
+    if t == 0.5:
+        return warp_pair(a, c, hx, hy)
+    gx, gy = grid(*a.shape[:2])
+    ka, kc = np.float32(2 * t), np.float32(2 * (1 - t))
+    wa = cv2.remap(a, gx - ka * hx, gy - ka * hy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    wc = cv2.remap(c, gx + kc * hx, gy + kc * hy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return wa, wc
+
+
+def synth(a, c, est, t, why=False):
+    """Frame at time t (0 < t < 1) between a and c from estimate(a, c): passes 9-11 per t.
+    Every fallback (per pixel and global) holds the nearer real frame (a for t <= 0.5, c after).
+    why=True returns (frame, reason) with reason None / "cut" / "untrusted"."""
+    near = a if t <= 0.5 else c
+    ret = (lambda f, r: (f, r)) if why else (lambda f, r: f)
+    if est["sad"] > CUT_SAD:
+        return ret(near.copy(), "cut")
     H, W = a.shape[:2]
-    pf = pixel_field(v, ya, yc)
+    pf = field_at(est["pf"], t)
     hv = cv2.resize(pf, (pf.shape[1] * FLOW_SCALE, pf.shape[0] * FLOW_SCALE), interpolation=cv2.INTER_LINEAR)
     hv = np.pad(hv[:H, :W], ((0, max(0, H - hv.shape[0])), (0, max(0, W - hv.shape[1])), (0, 0)), mode="edge")
     hv *= FLOW_SCALE
-    wa, wc = warp_pair(a, c, hv[..., 0], hv[..., 1])
+    wa, wc = warp_t(a, c, hv[..., 0], hv[..., 1], t)
     wa, wc = wa.astype(np.float32), wc.astype(np.float32)
     # where the two warped samples disagree (occlusion, wrong vector, changing HUD) the region falls
-    # back to frame a: briefly holding still is invisible, a ghost or a smear is not
+    # back to the nearer real frame: briefly holding still is invisible, a ghost or a smear is not
     e = cv2.blur(np.abs(wa - wc).max(2), (MISMATCH_BOX, MISMATCH_BOX), borderType=cv2.BORDER_REPLICATE)
-    t = np.clip((e - TRUST[0]) / (TRUST[1] - TRUST[0]), 0, 1)
-    if (t > 0.5).mean() > GLOBAL_FRAC:  # too much of the frame is untrusted (fast flick): no guessing
-        return a.copy()
-    t = t[..., None]
-    out = 0.5 * (wa + wc) * (1 - t) + a.astype(np.float32) * t
-    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    u = np.clip((e - TRUST[0]) / (TRUST[1] - TRUST[0]), 0, 1)
+    if (u > 0.5).mean() > GLOBAL_FRAC:  # too much of the frame is untrusted (fast flick): no guessing
+        return ret(near.copy(), "untrusted")
+    u = u[..., None]
+    if t == 0.5 or not TIME_BLEND:
+        mix = 0.5 * (wa + wc)
+    else:
+        mix = np.float32(1 - t) * wa + np.float32(t) * wc
+    out = mix * (1 - u) + near.astype(np.float32) * u
+    return ret(np.clip(out + 0.5, 0, 255).astype(np.uint8), None)
+
+
+def interpolate(a, c, t=0.5):
+    """Frame at time t (default halfway) between uint8 BGR frames a and c."""
+    return synth(a, c, estimate(a, c), t)
+
+
+def interpolate_multi(a, c, n):
+    """The n - 1 frames at t = 1/n .. (n-1)/n between a and c (n = 2, 3, 4: 2x, 3x, 4x frame generation).
+    The motion estimate runs once per pair; only passes 9-11 run per generated frame."""
+    est = estimate(a, c)
+    return [synth(a, c, est, k / n) for k in range(1, n)]
 
 
 if __name__ == "__main__":
@@ -204,6 +271,14 @@ if __name__ == "__main__":
     p_interp = cv2.PSNR(interpolate(a, c)[m], b[m])
     print(f"blend {p_blend:.1f} dB, interp {p_interp:.1f} dB")
     assert p_interp > p_blend + 10, "interpolation should beat a plain blend on a clean pan"
+    # multi-frame: 3x and 4x on the same pan, each generated frame must land at k/n of the shift
+    for n in (3, 4):
+        for k, o in enumerate(interpolate_multi(a, c, n), 1):
+            ref = shift(tex, 24 * k // n, -12 * k // n)
+            p_b = cv2.PSNR(cv2.addWeighted(a, 1 - k / n, c, k / n, 0)[m], ref[m])
+            p_o = cv2.PSNR(o[m], ref[m])
+            print(f"{n}x t={k}/{n}: blend {p_b:.1f} dB, interp {p_o:.1f} dB")
+            assert p_o > p_b + 10, f"frame t={k}/{n} should sit at {k}/{n} of the pan"
     # static HUD over the same pan: the HUD must stay sharp and in place
     hud = (slice(300, 340), slice(60, 260))
     for f in (a, b, c):
