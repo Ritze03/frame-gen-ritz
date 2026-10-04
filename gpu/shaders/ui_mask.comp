@@ -1,0 +1,34 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Observe, whole screen: the full-resolution mask from the still cells: 255 within 1 px of a pixel of a still cell,
+// 128 within 2 px (the box's dilation, applied to the upsampled cell mask). Only flagged 32x32 tiles are written
+// (the others exit at once and are never read), and nothing at all if the frame is suppressed (too much still).
+// One workgroup = 8 mask words x 8 rows = 32 x 8 pixels; 4 workgroups per tile.
+#include "ui_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 tile = ivec2(gl_WorkGroupID.x, gl_WorkGroupID.y / 4);
+    if (tile.x >= pc.tilesX || tile.y >= pc.tilesY || !tileLive(tile)) return;
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x * 4 >= pc.W || g.y >= pc.H) return;
+    int D = pc.cell;
+    uint word = 0u;
+    for (int k = 0; k < 4; k++) {
+        ivec2 p = ivec2(g.x * 4 + k, g.y);
+        if (p.x >= pc.W) break;
+        uint a = 0u;
+        ivec2 lo = max(p - 2, ivec2(0)) / D;
+        ivec2 hi = min(p + 2, ivec2(pc.W - 1, pc.H - 1)) / D;
+        for (int cy = lo.y; cy <= hi.y; cy++)
+            for (int cx = lo.x; cx <= hi.x; cx++)
+                if ((st[cy * pc.cw + cx] >> 24) >= uint(pc.still)) {
+                    ivec2 d = max(max(ivec2(cx, cy) * D - p, p - (ivec2(cx, cy) * D + D - 1)), ivec2(0));
+                    int dist = max(d.x, d.y);
+                    if (dist <= 1) a = 255u;
+                    else if (dist == 2) a = max(a, 128u);
+                }
+        word |= a << uint(8 * k);
+    }
+    mk[pc.maskOff + g.y * pc.maskStride + g.x] = word;
+}

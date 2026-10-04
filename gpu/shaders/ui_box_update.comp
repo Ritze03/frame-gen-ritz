@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Observe, box: per box pixel (full resolution), a saturating count of consecutive real frames on which the
+// pixel did not change: max channel |new - previous ORIGINAL| <= thr -> count + 1, else 0. The state word keeps the
+// ORIGINAL pixel, never the inpainted one, so the next frame compares against what the game drew. In place:
+// each thread touches only its own word. reset: the state describes no previous frame, every counter starts at 0.
+#include "ui_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.boxW || p.y >= pc.boxH) return;
+    vec3 now = floor(texelFetch(src, ivec2(pc.boxX, pc.boxY) + p, 0).rgb * 255.0 + 0.5);
+    int i = p.y * pc.boxW + p.x;
+    uint old = st[i];
+    uint count = 0u;
+    if (pc.reset == 0) {
+        vec3 prev = vec3(float(old & 255u), float((old >> 8) & 255u), float((old >> 16) & 255u));
+        vec3 d = abs(now - prev);
+        if (max(d.r, max(d.g, d.b)) <= pc.thr) count = min((old >> 24) + 1u, 255u);
+    }
+    uvec3 q = uvec3(now);
+    st[i] = q.r | (q.g << 8) | (q.b << 16) | (count << 24);
+}

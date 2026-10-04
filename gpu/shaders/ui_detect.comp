@@ -1,0 +1,70 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Observe pass 1: copy the real frame into the library's clean image (every pixel), and, whole screen only,
+// detect still cells at 1/cell resolution outside the box. One thread per cell.
+//   cell mean (rounded to 8 bit) vs the previous frame's stored mean: max channel diff <= thr -> count + 1
+//   (saturating at 255), else 0. A cell overlapping the box never counts (the full-res box owns those pixels).
+//   Cells with count >= still are "still": counted into M[0] and their 32x32 tiles (plus the tiles within the
+//   2 px dilation) are flagged in M[4 + tile], which is what lets every later whole-screen pass skip the rest.
+#include "ui_common.glsl"
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+shared uint sBits;
+shared uint sCnt;
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    if (lid == 0u) { sBits = 0u; sCnt = 0u; }
+    barrier();
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    int D = pc.cell;
+    if (c.x < pc.cw && c.y < pc.ch) {
+        ivec2 p0 = c * D;
+        vec3 sum = vec3(0.0);
+        int n = 0;
+        for (int j = 0; j < D; j++)
+            for (int i = 0; i < D; i++) {
+                ivec2 p = p0 + ivec2(i, j);
+                if (p.x < pc.W && p.y < pc.H) {
+                    vec4 v = texelFetch(src, p, 0);
+                    imageStore(dst, p, v);
+                    sum += floor(v.rgb * 255.0 + 0.5);
+                    n++;
+                }
+            }
+        if (pc.wholeScreen != 0) {
+            vec3 mean = sum / float(n);
+            bool inBox = p0.x < pc.boxX + pc.boxW && p0.x + D > pc.boxX && p0.y < pc.boxY + pc.boxH && p0.y + D > pc.boxY;
+            int ci = c.y * pc.cw + c.x;
+            uint old = st[ci];
+            uint count = 0u;
+            if (pc.reset == 0 && !inBox) {
+                vec3 prev = vec3(float(old & 255u), float((old >> 8) & 255u), float((old >> 16) & 255u));
+                vec3 d = abs(mean - prev);
+                if (max(d.r, max(d.g, d.b)) <= pc.thr) count = min((old >> 24) + 1u, 255u);
+            }
+            uvec3 q = uvec3(floor(mean + 0.5));
+            st[ci] = q.r | (q.g << 8) | (q.b << 16) | (count << 24);
+            if (count >= uint(pc.still)) {
+                atomicAdd(sCnt, 1u);
+                // tiles within 2 px of the cell; the workgroup (8 cells = 8 D px, D | 4) lies inside one tile
+                ivec2 g0 = ivec2(gl_WorkGroupID.xy) * (8 * D) / TILE;
+                ivec2 lo = max(p0 - 2, ivec2(0)) / TILE;
+                ivec2 hi = min(p0 + D - 1 + 2, ivec2(pc.W - 1, pc.H - 1)) / TILE;
+                for (int ty = lo.y; ty <= hi.y; ty++)
+                    for (int tx = lo.x; tx <= hi.x; tx++)
+                        atomicOr(sBits, 1u << uint((ty - g0.y + 1) * 3 + (tx - g0.x + 1)));
+            }
+        }
+    }
+    barrier();
+    if (pc.wholeScreen == 0 || lid != 0u) return;
+    if (sCnt != 0u) atomicAdd(mk[0], sCnt);
+    ivec2 g0 = ivec2(gl_WorkGroupID.xy) * (8 * D) / TILE;
+    for (int b = 0; b < 9; b++)
+        if (((sBits >> uint(b)) & 1u) != 0u) {
+            ivec2 t = g0 + ivec2(b % 3 - 1, b / 3 - 1);
+            atomicOr(mk[4 + t.y * pc.tilesX + t.x], 1u);
+        }
+}

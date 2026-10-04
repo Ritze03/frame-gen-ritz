@@ -42,8 +42,9 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 | `proto/render.py` | Renders review videos (generated frames only, or the full real + generated stream) |
 | `proto/NOTES.md` | Experiment log: what was tried, measured and kept |
 | `gpu/framegen.h`, `gpu/framegen.cpp` | The Vulkan library (`framegen::Interpolator`) |
-| `gpu/shaders/*.comp` | GLSL compute passes |
+| `gpu/shaders/*.comp` | GLSL compute passes (`ui_*.comp`: static-UI protection) |
 | `gpu/fgtest.cpp` | Test and benchmark tool for raw RGBA frame files |
+| `gpu/uitest.cpp` | Validation and benchmark of static-UI protection on a synthetic scene |
 | `gpu/compare.py` | GPU vs Python reference checks, and the benchmark runs |
 | `INTEGRATION.md` | Integration spec for gamescope-ritz, full API contract, settings, costs |
 | `FRAMEGEN_RESEARCH.md` | Background research on image-based frame generation |
@@ -83,6 +84,41 @@ ninja -C build
 
 This builds the static library `framegen` (the shaders are embedded as SPIR-V headers) and the `fgtest` tool. The library needs only the Vulkan headers, because it loads every device function through `vkGetDeviceProcAddr`.
 
+## Static UI protection
+
+A crosshair, a minimap frame or a health bar is static while the picture behind it moves. In a block-based motion search such a pixel shares its block with moving background, so either the crosshair is dragged along or the background around it freezes. `hudBonus` (zero-vector bias) only trades one for the other. Static UI protection removes the problem at the source, per pixel, and belongs in the library so that any host gets it by flipping one setting:
+
+- **Detect** (every real frame, `recordObserve`): a pixel is *still* when no channel moved more than `uiStillThreshold` (3.5 levels) since the previous real frame. After `uiStillFrames` (8) consecutive still frames it is masked; the mask is dilated by 2 px (1 px fully, the second px at half weight) to catch anti-aliased rims. The comparison is always against the previous *original*, never against the inpainted copy.
+- **Inpaint**: the library keeps its own "clean" copy of each real frame. Every masked pixel in it is replaced by the 1/d²-weighted average of the first unmasked pixel along each of 8 directions (reach `uiInpaintReach`, 12 px). The motion estimate and the warps run on the clean copies and never see the UI.
+- **Patch back**: after each generated frame, `out = mix(out, real pixel, mask)`. Masked pixels therefore show the exact pixels of the real frame.
+- There is deliberately no "is this a crosshair" test. Static for N frames *is* the detector. If the camera is still, static background is masked too, which is harmless: it is patched back with the identical real pixels, and any pixel that changes leaves the mask on the very next pair.
+
+Two modes (`Settings::uiProtection`, a runtime setting, `Off` by default and byte-identical to a library without the feature):
+
+| Mode | What is protected | How |
+|---|---|---|
+| `Crosshair` | the **box** (default: a centred square of 3% of the frame area, 333 px at 1440p) | full resolution, every pixel |
+| `WholeScreen` | the box, plus every solid static HUD element outside it | the box as above; outside it detection at half resolution (2x2 cell means, one counter per cell), the mask is upsampled and dilated at full resolution, and work is skipped for every 32x32 tile that cannot contain a still pixel (GPU-side tile flags); inpaint and patch touch only masked pixels in flagged tiles |
+
+The box is always full resolution in both modes, because the crosshair is the most noticeable thing if it breaks. **Make sure it is big enough for your reticle:** `uiBoxWidth`/`uiBoxHeight` set it in pixels (0 = derive that side from `uiCrosshairArea`, an explicit size wins) and `uiBoxOffsetX`/`uiBoxOffsetY` move its centre from the frame centre (for a game whose reticle is not dead centre). Rule of thumb: 2-3x the crosshair's largest extent, so its spread (shooting, movement) and outline fit. Too small leaves the ends of the crosshair unprotected; too big only costs a few more pixels of work. The box is clamped into the frame.
+
+`WholeScreen` bounds its worst case: if more than `uiMaxStillFraction` (75%) of the cells outside the box are still, that frame's whole-screen passes exit on the GPU (a nearly static picture needs no generated frame to differ from the real one). Costs, memory and measurements are in `INTEGRATION.md`. Limits: only *opaque, solid, static* UI is protected. Semi-transparent UI over moving background, UI whose shape changes every frame (a scrolling kill feed, an animated number) and UI that moves (a floating damage number) are not; they behave as before. The cell-mean detection also treats a very slowly moving gradient (under `uiStillThreshold` per frame) as still, which only means it is shown from the real frame.
+
+Host sketch (details in `gpu/framegen.h`):
+
+```cpp
+Settings s; s.uiProtection = UiProtection::WholeScreen;
+s.uiBoxWidth = 200; s.uiBoxHeight = 200;        // optional: box sized for this game's reticle
+s.uiBoxOffsetX = 0; s.uiBoxOffsetY = -30;       // optional: reticle sits 30 px above the centre
+fg.setSettings(s);                              // or Settings::uiProtection in InitInfo
+
+// per NEW real frame (also frames you will not interpolate), after its pixels are written:
+fg.recordObserve(cb, frameView);
+// per pair, as before:
+fg.recordEstimate(cb, prevView, currView);
+fg.recordSynth(cb, prevView, currView, outView, t);   // curr must still hold the real frame: it is the patch source
+```
+
 ## Testing and benchmarking
 
 Footage is not in the repository. The tools expect 120 fps recordings: `compare.py` reads `battlefield.mp4` and `obs2.mp4` from `footage/` at the repo root (override with `FG_FOOTAGE`). The test clips were a CS2 recording made with OBS and a Battlefield clip. Work files go to `FG_WORK` (default `/tmp/fgwork`). The `fgtest` binary is `gpu/build/fgtest` unless `FGTEST` is set.
@@ -105,6 +141,15 @@ fgtest [--bgra] [--split] [--t T1,T2,..] [--bench N [--mult M]] [--set k=v,..] [
 - `--t`: generated times (default 0.5). With several values, the k-th output goes to `out.rgba.<k>`.
 - `--bench N --mult M`: benchmark N iterations, one estimate + M-1 synths per pair.
 - `--set`: `framegen::Settings` fields by name. `--then`: a `setSettings` change applied between two records (runtime-change test).
+
+`uitest` (needs no footage) validates and benchmarks static-UI protection on a synthetic sequence:
+
+```sh
+gpu/build/uitest check [--bgra] [W H]    # default 1280x720: asserts the exact crosshair / HUD pixels, PSNR, validation
+gpu/build/uitest check --hash            # also prints a hash per generated frame of the Off run (compare against the
+                                         # library before the feature to prove byte-identical output)
+gpu/build/uitest bench [W H]             # per-pass GPU times: moving / still / 70% still scenes, all modes
+```
 
 If Lossless Scaling's implicit Vulkan layer is installed, disable implicit layers when testing and benchmarking: `VK_LOADER_LAYERS_DISABLE='~implicit~'`.
 
@@ -164,6 +209,13 @@ for (int k = 1; k < N; ++k)
 | `smoothBonus` | 0.5 | Bonus for the smooth vector field. Higher = calmer but softer motion edges. |
 | `searchPenalty` | 0.5 | Search cost per pixel step. Higher = steadier on flat or repetitive surfaces, lower = follows small fast detail. |
 | `subpixel` | true | 1/2 + 1/4 px refinement. Off saves about 0.04-0.06 ms per pair, slightly softer on slow pans. |
+| `uiProtection` | Off | `Off`, `Crosshair` or `WholeScreen`: static-UI protection (see above). Runtime. |
+| `uiBoxWidth`, `uiBoxHeight` | 0, 0 | Size of the full-resolution box in pixels; 0 = take that side from `uiCrosshairArea`. Clamped to [4, frame]. Runtime. |
+| `uiCrosshairArea` | 0.03 | Box = square of side sqrt(area * w * h), clamped to [32, min(w, h)]. (0, 1]. |
+| `uiBoxOffsetX`, `uiBoxOffsetY` | 0, 0 | Box centre offset from the frame centre, pixels (+x right, +y down). The box is clamped into the frame. |
+| `uiStillFrames`, `uiStillThreshold` | 8, 3.5 | A pixel is protected after this many consecutive real frames in which no channel moved more than this many levels. |
+| `uiInpaintReach` | 12 | Walk length (1-16 px) of the inpaint. |
+| `uiMaxStillFraction` | 0.75 | WholeScreen: above this still share (of cells outside the box) the whole-screen passes are skipped for that frame. 1 = never. |
 | `flowScale` | 2 | Motion estimation at 1/flowScale resolution: 1, 2 or 4. 4 is much cheaper but can miss thin, fine motion. 1 is much slower and was not better on the test clips. (structural) |
 
 `INTEGRATION.md` lists the accepted ranges, the measured cost of each setting, and a suggested user-facing subset.
@@ -171,7 +223,7 @@ for (int k = 1; k < N; ++k)
 ## Limitations
 
 - 8-bit UNORM RGBA/BGRA only. There is no HDR or 10-bit support, so the caller must skip frame generation or convert first.
-- HUD drawn into the game image can still show artifacts, especially translucent HUD elements and scrolling or changing text. Overlays composited later by gamescope are not affected.
+- HUD drawn into the game image can still show artifacts, especially translucent HUD elements and scrolling or changing text. Solid, static HUD is handled by the optional static-UI protection (`uiProtection`, above); semi-transparent or shape-changing UI is not protected by it either. Overlays composited later by gamescope are not affected.
 - Repetitive structures (stairs, ladders, fences) under fast motion can lock onto the wrong period. Both warps then agree, so the mismatch test cannot catch it.
 - Very fast flicks below the whole-frame fallback threshold can show seams between warped and held regions.
 - Interpolation adds latency, because a generated frame needs the next real frame.

@@ -11,6 +11,13 @@
 
 namespace framegen {
 
+// Static-UI protection mode (Settings::uiProtection); the contract is documented at recordObserve().
+enum class UiProtection : uint32_t {
+    Off = 0,          // nothing is recorded or allocated: output byte-identical to a library without it
+    Crosshair = 1,    // full-resolution protection of one box (default: the centre): crosshair, reticle, hit marker
+    WholeScreen = 2,  // the box at full resolution, plus every solid static HUD element elsewhere (reduced-res detection)
+};
+
 // Tuning knobs. The defaults are the tuned values of proto/interp.py (the approved look); with them the
 // output is byte-identical to the library without settings. Costs and mismatches are in 8-bit luma/RGB
 // levels (0-255). Interpolator::validate() states the accepted ranges; anything else is rejected.
@@ -42,6 +49,48 @@ struct Settings {
     // Sub-pixel (1/2 then 1/4 px) refinement of the block vectors. Off = ~0.05 ms cheaper per real pair,
     // slightly softer/wobblier output on slow pans.
     bool subpixel = true;
+
+    // Static-UI protection: find pixels that have not changed for uiStillFrames real frames (a crosshair, a HUD
+    // box, a minimap frame), remove them from what the motion estimate and the warps see (inpainted from their
+    // surroundings, in the library's own copy of the frame), and paste the exact real pixels back over every
+    // generated frame. The host's frames are only read. Unlike hudBonus it works per pixel: a thin crosshair that
+    // shares a block with moving background neither drags the background nor freezes it. Needs recordObserve()
+    // (or the implicit observe, see there). Runtime: setSettings() switches it on/off/between modes with no GPU
+    // wait (it only ever ALLOCATES, never frees; setSettings returns false if that allocation fails). Off =
+    // byte-identical to a library without it.
+    // Cost (RX 7900 XTX, 2560x1440, GPU time per real frame): Crosshair ~0.07 ms, WholeScreen ~0.09 ms typical
+    // and <= ~0.25 ms in the worst case below the uiMaxStillFraction skip (about half of it is the full-frame copy
+    // into the clean image). Memory: kUiFrames (3) clean copies of the frame (4 bytes/px each: 44 MB at 1440p), under 1 MB
+    // for the box, and for WholeScreen about 1 byte/px of mask per kept frame plus the 1/2-res cell
+    // state (+ ~15 MB at 1440p).
+    UiProtection uiProtection = UiProtection::Off;
+    // The crosshair box: always protected at FULL resolution, in both modes (a crosshair is the most noticeable
+    // thing if it breaks). Size it so the whole reticle fits with room for its spread and outline: about 2-3x the
+    // crosshair's largest extent. Too small cuts the crosshair's ends off the protection, too big only costs a few
+    // more pixels of work (the box is cheap; the default is 333 px at 2560x1440).
+    //   uiBoxWidth/uiBoxHeight: the box size in pixels, [0, 16384]. 0 = take that side from uiCrosshairArea.
+    //   An explicit size wins over the fraction; it is clamped to [4, frame size].
+    uint32_t uiBoxWidth = 0, uiBoxHeight = 0;
+    //   uiCrosshairArea: (0, 1]. The area-derived box is a square of side sqrt(uiCrosshairArea * w * h), clamped to
+    //   [32, min(w, h)]: 0.03 = 333 px at 2560x1440.
+    float uiCrosshairArea = 0.03f;
+    //   uiBoxOffsetX/Y: where the box is centred, in pixels from the frame centre ([-16384, 16384]; +x right,
+    //   +y down; 0 = dead centre). For a game whose reticle is not in the middle. The box is clamped into the frame.
+    int32_t uiBoxOffsetX = 0, uiBoxOffsetY = 0;
+    // A pixel is "still" if no channel moved more than uiStillThreshold (8-bit levels, [0, 255]) between two
+    // consecutive real frames, and is protected after uiStillFrames ([1, 255]) consecutive still frames. Fewer
+    // frames = protected sooner (and more of a briefly paused picture is masked, which is harmless);
+    // a higher threshold tolerates noisy/animated UI (and masks slowly moving gradients).
+    uint32_t uiStillFrames = 8;
+    float uiStillThreshold = 3.5f;
+    // The inpaint walks at most this many pixels ([1, 16]) in each of 8 directions to the first unprotected pixel.
+    // It must exceed half the thickness of the thickest thing to remove (plus the 2 px dilation); beyond that the
+    // inside of a big solid box is left as is (it is static, so it costs the estimate nothing).
+    uint32_t uiInpaintReach = 12;
+    // WholeScreen only: if more than this share of the screen outside the box is still ((0, 1]; 1 = never skip),
+    // that frame's whole-screen mask/inpaint/patch passes are skipped on the GPU. A (nearly) static screen needs
+    // no generated frame to differ from the real one, and this bounds the worst case of a paused/menu picture.
+    float uiMaxStillFraction = 0.75f;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
     // Motion estimation runs at 1/flowScale of the frame size: 1, 2 or 4. 2 = quality (default);
@@ -80,7 +129,7 @@ public:
 
     // Settings (see struct Settings). validate(): true if every field is finite and in range.
     static bool validate(const Settings&);
-    // Runtime change: applies the runtime fields to every record*() recorded after this call (each record
+    // Runtime change: applies the runtime fields (the UI-protection ones too) to every record*() recorded after this call (each record
     // copies them into its own push constants, so in-flight and already-recorded work keeps its values;
     // no retire needed). Returns false and changes nothing if the object is not initialised, the settings
     // are invalid, or flowScale differs from the active one (that needs reconfigure()).
@@ -122,12 +171,46 @@ public:
     // untouched, so the caller must not substitute it) if the object is not initialised, t is outside (0, 1),
     // or its ring already gave out kSetRing sets since the last beginFrame() (asserts in debug builds).
     // The caller must also keep the estimates and the synths of all not-yet-retired submissions
-    // <= kSetRing each, in total.
+    // <= kSetRing each, in total. With protection on, recordObserve takes 1 (Crosshair) or 2 (WholeScreen)
+    // sets of a third ring of kUiSets, and so does every recordSynth (plus an implicit observe in a
+    // recordEstimate): keep those per beginFrame() and per not-yet-retired submission <= kUiSets too.
     // recordSynth also returns false if no recordEstimate was recorded since init/resize, or if prev/curr
     // are not the views of the latest recordEstimate (it always uses the latest estimate).
     bool recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageView curr);
     bool recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t);
     bool record(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t = 0.5f);
+
+    // ---- Static UI protection (Settings::uiProtection != Off) ----
+    // The library keeps, per real frame it has "observed", its own clean copy (UI inpainted out) and the
+    // mask of the still pixels. recordEstimate/recordSynth then read the clean copies, and every synth ends with
+    // out = mix(out, real pixel, mask) over the masked area, reading the real pixels from the `curr` view you pass.
+    // Your views are only read; they stay yours.
+    //
+    // recordObserve(cb, frame): call it ONCE for every new real frame, when `frame` already holds its final
+    // pixels (same layout/usage rules as prev/curr), in presentation order, and for EVERY real frame, also those
+    // you will not interpolate: the stillness counters compare consecutive real frames, so a skipped frame
+    // costs the counters (a gap makes them compare the frames on either side of it: UI that did not change still
+    // counts as still, only the exact "N consecutive frames" is lost). Call it after the frame's pixels are
+    // written and before the recordEstimate that uses it as curr. Returns true (recording nothing) with
+    // protection Off. Returns false and records nothing if the object is not initialised, a descriptor ring is
+    // full (see below) or the first-use allocation failed (protection then stays off for that frame: do not
+    // call recordEstimate on the frame expecting a protected result; calling it is still valid and unprotected).
+    // `frame` is the cache key: when a view is observed again, its earlier entry is replaced, so a host that reuses
+    // views (a ring of images) MUST observe each new content, or the library would pair new pixels with a stale mask.
+    // At least kUiFrames = 3 observed frames are kept (LRU by observe order): the newest pair AND the pair before
+    // it stay usable (a host that synthesises an older pair after the newest frame arrived). recordEstimate(prev,
+    // curr) / recordSynth need both views to still be among them, and recordSynth that nothing evicted them
+    // since the estimate (observing 2 more frames would): else they return false and record nothing.
+    //
+    // Implicit observe: a host that never calls recordObserve still works. Then recordEstimate observes `prev`
+    // if the library has not seen that view, and `curr` if it is not the most recently observed view (so pairs
+    // (A,B), (B,A), (A,B)... or a ring of views work). Caveats: a view that receives new content under the same
+    // handle is not noticed (stale mask: always call recordObserve then), a frame that is never in an estimate pair
+    // is never seen by the counters, and a host that estimates an older pair after a newer frame would re-observe
+    // it (so such hosts must observe explicitly). Once recordObserve has been called, estimates no longer
+    // observe implicitly: a pair of which a view has not been observed (protection was just switched on, an
+    // observe was skipped, the entry was evicted) is simply interpolated unprotected, as with Off.
+    bool recordObserve(VkCommandBuffer cb, VkImageView frame);
 
     // Profiling (test/benchmark only): timestamps after every pass group. recordEstimate (or record)
     // starts a new profile, recordSynth appends its passes to it. Returns false if the query pool cannot
@@ -135,9 +218,14 @@ public:
     bool setProfiling(bool on);
     // Reads the last profile (waits for results). Fills names + GPU ticks per pass group
     // (multiply by VkPhysicalDeviceLimits::timestampPeriod for ns). Returns false if unavailable.
+    // With protection on the profile also holds "ui_detect" (stillness + masks + the clean copy) and
+    // "ui_inpaint" (both recorded by recordObserve; a profile opened by an observe is continued by the next
+    // recordEstimate) and "ui_patch" (the paste-back, per recordSynth).
     bool readTimings(std::vector<const char*>& names, std::vector<uint64_t>& ticks);
 
     static constexpr uint32_t kSetRing = 32;
+    static constexpr uint32_t kUiSets = 64;    // descriptor sets of the UI-protection passes (see above)
+    static constexpr uint32_t kUiFrames = 3;   // observed frames kept (clean copy + mask each)
     static constexpr uint32_t kMinSize = 16;
     struct Impl;
 private:

@@ -1,0 +1,29 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Observe, box: the mask of the box. 255 within 1 px of a pixel whose count >= still, 128 within 2 px (a
+// one-pixel feather), else 0. The 2 px dilation catches the anti-aliased rim of a crosshair whose own pixels are
+// stable but whose blended edge pixels are not quite. One thread per 4 pixels (one mask word).
+#include "ui_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+bool stillAt(ivec2 p) {
+    if (p.x < 0 || p.y < 0 || p.x >= pc.boxW || p.y >= pc.boxH) return false;
+    return (st[p.y * pc.boxW + p.x] >> 24) >= uint(pc.still);
+}
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= pc.maskStride || g.y >= pc.boxH) return;
+    uint word = 0u;
+    for (int k = 0; k < 4; k++) {
+        ivec2 p = ivec2(g.x * 4 + k, g.y);
+        if (p.x >= pc.boxW) break;
+        uint a = 0u;
+        for (int y = -2; y <= 2; y++)
+            for (int x = -2; x <= 2; x++)
+                if (stillAt(p + ivec2(x, y)))
+                    a = max(a, (abs(x) <= 1 && abs(y) <= 1) ? 255u : 128u);
+        word |= a << uint(8 * k);
+    }
+    mk[pc.maskOff + g.y * pc.maskStride + g.x] = word;
+}
