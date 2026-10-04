@@ -1,0 +1,183 @@
+# FrameGen
+
+FrameGen is an image-only frame interpolation library, similar in kind to Lossless Scaling's LSFG or AMD AFMF. It sees only finished frames, with no motion vectors or depth from the game. From two real frames it generates the frames in between, for 2x, 3x or 4x the base frame rate. It is a set of Vulkan compute shaders behind a small C++ API, plus the Python/NumPy reference implementation it was ported from.
+
+It was written for gamescope-ritz, a gamescope fork. There it is meant to run as a compute pass on the game's layer-0 image, before scaling and before the overlay layers (Steam overlay, cursor, performance HUD) are composited on top, so those are never interpolated. This repository contains only the library. The gamescope side (when the extra frames are presented, vblank/VRR pacing) is built separately in gamescope-ritz. `INTEGRATION.md` is the spec for that integration.
+
+FrameGen is original code. It is not derived from LSFG, lsfg-vk or FidelityFX source. `FRAMEGEN_RESEARCH.md` holds background research on how such tools work.
+
+## Design goal
+
+"They can be subtle, but worth the compute. It should only make the motion be perceived more smoothly."
+
+The output only has to make motion look smoother. Wherever the motion estimate is not trustworthy, FrameGen shows the nearer real frame for that pixel (or for the whole frame) instead of guessing. A region that stays still for one frame is not noticeable. A smear or a ghost is.
+
+## How it works
+
+Motion is estimated on luma at half resolution (`flowScale` 2) over an image pyramid. The vectors are *bilateral*: for each 8x8 block of the in-between frame, the search finds a half-vector `h` that minimises the difference between `prev[q - h]` and `curr[q + h]`. The vectors therefore already sit on the output frame's grid, so there is no splatting and there are no holes. Both frames are then warped to time `t`. Where the two warped frames disagree, the output falls back to the nearer real frame.
+
+Per real frame pair (`recordEstimate`, passes 1-8):
+
+1. Luma at flow resolution (`luma.comp`), then a 2x2-average pyramid (`down.comp`).
+2. Per level, coarse to fine: seed candidates per block (parents, zero vector, global median vector of the previous level; `medhist.comp`), then an integer search around the best seed, ±6 px at the coarsest level and ±2 px below it, with a penalty per step (`search.comp`).
+3. 3x3 median of the block vectors (`median3.comp`).
+4. Finest level: sub-pixel refinement at 1/2 and then 1/4 px (`subpix.comp`). A scene cut is detected when the mean block SAD is too high.
+5. Per-pixel vector choice from the smooth field, the pixel's own and neighbouring blocks, and the zero vector. A small bonus for the zero vector keeps static HUD elements in place (`pixfield.comp`).
+
+Per generated frame at time `t` (`recordSynth`, cheap):
+
+6. For `t != 0.5`, look up the field at time `t` (`lookup.comp`). Warp both frames and compute the per-pixel mismatch (`error.comp`).
+7. Turn the 7x7-averaged mismatch into a trust ramp and blend the warped frames, `(1-t)·prev + t·curr`, falling back to the nearer real frame where trust is low (`resolve.comp`).
+8. Whole-frame fallback to the nearer real frame on a scene cut or when more than 15% of pixels are untrusted (`fallback.comp`).
+
+"Nearer real frame" means `prev` for `t <= 0.5` and `curr` otherwise. The docstring of `proto/interp.py` has the full pass description.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `proto/interp.py` | Python/NumPy/OpenCV reference implementation of the algorithm (`estimate`, `synth`, `interpolate`, `interpolate_multi`) |
+| `proto/interp_v0.py` | First version, kept for comparison |
+| `proto/harness.py` | Scores interpolation against the real in-between frames of 120 fps footage |
+| `proto/render.py` | Renders review videos (generated frames only, or the full real + generated stream) |
+| `proto/NOTES.md` | Experiment log: what was tried, measured and kept |
+| `gpu/framegen.h`, `gpu/framegen.cpp` | The Vulkan library (`framegen::Interpolator`) |
+| `gpu/shaders/*.comp` | GLSL compute passes |
+| `gpu/fgtest.cpp` | Test and benchmark tool for raw RGBA frame files |
+| `gpu/compare.py` | GPU vs Python reference checks, and the benchmark runs |
+| `INTEGRATION.md` | Integration spec for gamescope-ritz, full API contract, settings, costs |
+| `FRAMEGEN_RESEARCH.md` | Background research on image-based frame generation |
+
+## Results
+
+GPU cost per real frame pair, RX 7900 XTX (RADV), default settings, timestamp medians from `compare.py bench` (one estimate plus N-1 synths, from `INTEGRATION.md`):
+
+| | 2x | 3x | 4x |
+|---|---|---|---|
+| 1080p | 0.35 ms | 0.42 ms | 0.49 ms |
+| 1440p | 0.50 ms | 0.62 ms | 0.71 ms |
+
+With `flowScale = 4`, 1440p 2x drops to about 0.28 ms (roughly 40% less). Each extra generated frame costs about 0.06 ms at 1080p and 0.1 ms at 1440p.
+
+On 10 real frame pairs, the GPU output scores within ±0.01 dB of the Python reference when both are compared with the real middle frame. RGBA and BGRA output are byte-identical.
+
+Quality against the real in-between frames of the test footage (mean PSNR in dB, `harness.py` at full scale, from `proto/NOTES.md`). "dup" shows the nearer real frame, which is what you see without frame generation:
+
+| clip | 2x dup / interp | 3x dup / interp | 4x dup / interp |
+|---|---|---|---|
+| battlefield | 24.36 / 31.33 | 23.97 / 29.18 | 23.25 / 27.49 |
+| obs1 | 25.88 / 30.63 | 26.23 / 29.86 | 25.13 / 28.28 |
+| obs2 | 24.38 / 29.86 | 24.19 / 28.37 | 22.99 / 26.02 |
+
+The game in the OBS clips ran at about 90 fps, so their "real" frame timing is uneven. That lowers every method's score on those clips.
+
+## Building
+
+Requirements: Meson, Ninja, the Vulkan headers and loader, and `glslangValidator`.
+
+```sh
+cd gpu
+meson setup build
+ninja -C build
+```
+
+This builds the static library `framegen` (the shaders are embedded as SPIR-V headers) and the `fgtest` tool. The library needs only the Vulkan headers, because it loads every device function through `vkGetDeviceProcAddr`.
+
+## Testing and benchmarking
+
+Footage is not in the repository. The tools expect 120 fps recordings: `compare.py` reads `battlefield.mp4` and `obs2.mp4` from `footage/` at the repo root (override with `FG_FOOTAGE`). The test clips were a CS2 recording made with OBS and a Battlefield clip. Work files go to `FG_WORK` (default `/tmp/fgwork`). The `fgtest` binary is `gpu/build/fgtest` unless `FGTEST` is set.
+
+```sh
+python3 gpu/compare.py check [--bgra] [--split]   # 2x: GPU vs Python vs real middle frame, ~10 pairs + fallback cases
+python3 gpu/compare.py multi [--bgra]             # 3x/4x: one estimate + N-1 synths vs interp.synth, plus fallback cases
+python3 gpu/compare.py bench [N]                  # fgtest --bench N --mult 2/3/4 at 1080p and 1440p (default N = 100)
+python3 gpu/compare.py bench 100 --set flowScale=4,subpixel=0   # any mode: --set k=v,... applies Settings to both sides
+```
+
+`fgtest` works on tightly packed RGBA8 files of W*H*4 bytes:
+
+```
+fgtest [--bgra] [--split] [--t T1,T2,..] [--bench N [--mult M]] [--set k=v,..] [--then k=v,..] W H prev.rgba curr.rgba out.rgba [prev curr out ...]
+```
+
+- `--bgra`: use `B8G8R8A8_UNORM` images (the file data stays RGBA).
+- `--split`: `recordEstimate` + `recordSynth` instead of `record`.
+- `--t`: generated times (default 0.5). With several values, the k-th output goes to `out.rgba.<k>`.
+- `--bench N --mult M`: benchmark N iterations, one estimate + M-1 synths per pair.
+- `--set`: `framegen::Settings` fields by name. `--then`: a `setSettings` change applied between two records (runtime-change test).
+
+If Lossless Scaling's implicit Vulkan layer is installed, disable implicit layers when testing and benchmarking: `VK_LOADER_LAYERS_DISABLE='~implicit~'`.
+
+Python reference (needs NumPy and OpenCV; `render.py` also needs ffmpeg):
+
+```sh
+python3 proto/interp.py                                   # self-check: synthetic pan (2x, 3x, 4x) and static HUD
+python3 proto/harness.py footage/battlefield.mp4 --mult 3 # score against real in-between frames
+python3 proto/render.py footage/obs2.mp4 --start 52 --mult 3 -o gen.mp4 --full full.mp4
+```
+
+## Library usage
+
+The library uses plain Vulkan with no gamescope types. It records into a command buffer the caller provides. It never submits work and never touches queues. Condensed calling sequence (see `gpu/framegen.h` and `INTEGRATION.md` for the full contract):
+
+```cpp
+#include "framegen.h"
+
+framegen::InitInfo info;
+info.phys = physicalDevice;
+info.device = device;
+info.gdpa = vkGetDeviceProcAddr;
+info.width = w; info.height = h;                       // >= kMinSize (16)
+info.viewFormat = VK_FORMAT_B8G8R8A8_UNORM;            // or R8G8B8A8_UNORM; never _SRGB, never 10-bit
+info.getMemProps = vkGetPhysicalDeviceMemoryProperties; // required
+framegen::Interpolator fg;
+if (!fg.init(info)) { /* no frame generation for this surface */ }
+
+// per command buffer:
+fg.beginFrame();
+
+// 2x:
+bool ok = fg.record(cb, prevView, currView, outView);  // t = 0.5
+
+// N x (3x, 4x): estimate once per real pair, then one synth per generated frame
+fg.recordEstimate(cb, prevView, currView);
+for (int k = 1; k < N; ++k)
+    slotOk[k - 1] = fg.recordSynth(cb, prevView, currView, outView[k - 1], float(k) / N);
+```
+
+- All views are 2D, single mip/layer, 8-bit UNORM in `viewFormat`, and in `VK_IMAGE_LAYOUT_GENERAL` on entry and exit. `prev`/`curr` need SAMPLED usage and must already be readable. `out` needs STORAGE usage and is owned by the caller.
+- Every `record*()` returns `false` and records nothing if the object is not initialised, `t` is outside (0, 1), or more than `kSetRing` (32) estimates or synths were recorded since `beginFrame()`. `recordSynth()` also fails without a matching `recordEstimate()`. Present an output only if its call returned `true`.
+- Synths end with a compute-to-compute barrier only. Other consumers of `out` (fragment, transfer) need the caller's own barrier.
+- Not thread-safe. All records of one `Interpolator` must go to one queue, in recording order.
+- `resize()`, `destroy()`, re-`init()` and a `flowScale` change through `reconfigure()` free resources that earlier records use. Wait until those records have retired first.
+
+## Settings
+
+`framegen::Settings` (in `gpu/framegen.h`) is passed through `InitInfo::settings`. The defaults are the tuned values that were reviewed visually, and with them the output is byte-identical to the library before settings existed. Runtime fields can be changed at any time with `setSettings()`. `flowScale` is structural and changes only through `init()` or `reconfigure()`. `Interpolator::validate()` checks the ranges.
+
+| Field | Default | Effect |
+|---|---|---|
+| `trustLow`, `trustHigh` | 12, 40 | Mismatch (8-bit levels) where the per-pixel fallback to the nearer real frame starts and where it is complete. Lower = fewer ghosts, more held pixels. |
+| `globalFallback` | 0.15 | Share of untrusted pixels above which the whole frame is the nearer real frame. 1 = off. |
+| `sceneCutSad` | 30 | Mean block SAD above which a pair counts as a scene cut. 255 = off. |
+| `hudBonus` | 1.0 | Zero-vector bonus that keeps static HUD elements in place. Too high can freeze slow motion. 0 = off. |
+| `smoothBonus` | 0.5 | Bonus for the smooth vector field. Higher = calmer but softer motion edges. |
+| `searchPenalty` | 0.5 | Search cost per pixel step. Higher = steadier on flat or repetitive surfaces, lower = follows small fast detail. |
+| `subpixel` | true | 1/2 + 1/4 px refinement. Off saves about 0.04-0.06 ms per pair, slightly softer on slow pans. |
+| `flowScale` | 2 | Motion estimation at 1/flowScale resolution: 1, 2 or 4. 4 is much cheaper but can miss thin, fine motion. 1 is much slower and was not better on the test clips. (structural) |
+
+`INTEGRATION.md` lists the accepted ranges, the measured cost of each setting, and a suggested user-facing subset.
+
+## Limitations
+
+- 8-bit UNORM RGBA/BGRA only. There is no HDR or 10-bit support, so the caller must skip frame generation or convert first.
+- HUD drawn into the game image can still show artifacts, especially translucent HUD elements and scrolling or changing text. Overlays composited later by gamescope are not affected.
+- Repetitive structures (stairs, ladders, fences) under fast motion can lock onto the wrong period. Both warps then agree, so the mismatch test cannot catch it.
+- Very fast flicks below the whole-frame fallback threshold can show seams between warped and held regions.
+- Interpolation adds latency, because a generated frame needs the next real frame.
+- At a low base frame rate (3x, 4x) motion between real frames is larger, so fallbacks are more frequent.
+- Presentation pacing is the caller's job. The library only produces the frames.
+
+## License
+
+MIT, see `LICENSE`.
