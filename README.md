@@ -1,16 +1,16 @@
-# FrameGen
+# frame-gen-ritz
 
-FrameGen is an image-only frame interpolation library, similar in kind to Lossless Scaling's LSFG or AMD AFMF. It sees only finished frames, with no motion vectors or depth from the game. From two real frames it generates the frames in between, for 2x, 3x or 4x the base frame rate. It is a set of Vulkan compute shaders behind a small C++ API, plus the Python/NumPy reference implementation it was ported from.
+frame-gen-ritz is an image-only frame interpolation library, similar in kind to Lossless Scaling's LSFG or AMD AFMF. It sees only finished frames, with no motion vectors or depth from the game. From two real frames it generates the frames in between, for 2x, 3x or 4x the base frame rate. It is a set of Vulkan compute shaders behind a small C++ API, plus the Python/NumPy reference implementation it was ported from.
 
 It was written for gamescope-ritz, a gamescope fork. There it is meant to run as a compute pass on the game's layer-0 image, before scaling and before the overlay layers (Steam overlay, cursor, performance HUD) are composited on top, so those are never interpolated. This repository contains only the library. The gamescope side (when the extra frames are presented, vblank/VRR pacing) is built separately in gamescope-ritz. `INTEGRATION.md` is the spec for that integration.
 
-FrameGen is original code. It is not derived from LSFG, lsfg-vk or FidelityFX source. `FRAMEGEN_RESEARCH.md` holds background research on how such tools work.
+frame-gen-ritz is original code. It is not derived from LSFG, lsfg-vk or FidelityFX source. `FRAMEGEN_RESEARCH.md` holds background research on how such tools work.
 
 ## Design goal
 
 "They can be subtle, but worth the compute. It should only make the motion be perceived more smoothly."
 
-The output only has to make motion look smoother. Wherever the motion estimate is not trustworthy, FrameGen shows the nearer real frame for that pixel (or for the whole frame) instead of guessing. A region that stays still for one frame is not noticeable. A smear or a ghost is.
+The output only has to make motion look smoother. Wherever the motion estimate is not trustworthy, frame-gen-ritz shows the nearer real frame for that pixel (or for the whole frame) instead of guessing. A region that stays still for one frame is not noticeable. A smear or a ghost is.
 
 ## How it works
 
