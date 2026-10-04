@@ -1,0 +1,26 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// After a generated frame is complete: out = mix(out, real pixel, mask) over the mask rectangle. The real pixel is
+// the observed frame the synth leads up to (`curr`, binding 0). Mask 255 gives the exact real pixel. Whole screen:
+// only flagged tiles, none if the frame is suppressed. The generated frame is read AND written (each thread touches
+// only its own texels). One thread per mask word; 4 workgroups per tile in y like ui_mask.comp.
+#include "ui_common.glsl"
+layout(set = 0, binding = 1, rgba8) uniform image2D img;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= pc.maskStride || g.y >= pc.maskH) return;
+    if (pc.gate != 0 && !tileLive((ivec2(pc.maskX, pc.maskY) + ivec2(g.x * 4, g.y)) / TILE)) return;
+    uint word = mk[pc.maskOff + g.y * pc.maskStride + g.x];
+    if (word == 0u) return;
+    for (int k = 0; k < 4; k++) {
+        uint a = (word >> uint(8 * k)) & 255u;
+        ivec2 rel = ivec2(g.x * 4 + k, g.y);
+        if (a == 0u || rel.x >= pc.maskW) continue;
+        ivec2 p = ivec2(pc.maskX, pc.maskY) + rel;
+        vec4 o = imageLoad(img, p);
+        vec3 real = texelFetch(src, p, 0).rgb;
+        imageStore(img, p, vec4(mix(o.rgb, real, float(a) * (1.0 / 255.0)), o.a));
+    }
+}

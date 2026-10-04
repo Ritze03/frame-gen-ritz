@@ -71,10 +71,11 @@ public:
   // prev/curr: SAMPLED usage, made readable by the caller (gamescope: prepareSrcImage + insertBarrier).
   // out: STORAGE usage, caller-owned. Ends with COMPUTE SHADER_WRITE -> COMPUTE SHADER_READ.
   // recordSynth ends with COMPUTE SHADER_WRITE -> COMPUTE SHADER_READ; recordEstimate ends with a COMPUTE -> COMPUTE barrier.
+  bool recordObserve(VkCommandBuffer cb, VkImageView frame);                               // once per NEW real frame, only if Settings::uiProtection != Off (see "Static UI protection")
   bool recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageView curr);            // passes 1-8, once per real pair
   bool recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t);   // frame at t in (0,1)
   bool record(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t = 0.5f); // = estimate + synth
-  static constexpr uint32_t kSetRing = 32, kMinSize = 16;
+  static constexpr uint32_t kSetRing = 32, kUiSets = 64, kUiFrames = 3, kMinSize = 16;
 };
 }
 ```
@@ -123,3 +124,93 @@ The settings only change the per-pair estimate; the per-synth cost (~0.06 ms at 
 3. **Artifact safety: Low / Default / High** — trust ramp, e.g. High = (8, 28), Default = (12, 40), Low = (16, 56); optionally also `globalFallback` 0.10 / 0.15 / 0.25. Plain language: "Higher shows the real frame instead of guessing where motion is hard to track: fewer ghosting/smearing artefacts, but more spots that look like the base frame rate."
 4. **Static HUD protection: Off / Normal / Strong** — `hudBonus` 0 / 1 / 2.5. Plain language: "Keeps crosshairs, text and other fixed overlays from wobbling or being dragged along with the scene. Too strong can make slow-moving areas stutter."
 5. Expert only (config/convar, no overlay entry): `searchPenalty`, `smoothBonus`, `sceneCutSad`, `globalFallback` on its own, and a "scene-cut detection" toggle (`sceneCutSad` 255 = off). The Low/High preset values above are suggestions within the validated ranges; only the defaults were reviewed visually by the user.
+
+## Static UI protection (`Settings::uiProtection`)
+The crosshair protection that used to live in the host (gamescope-ritz `FrameGenHost.cpp`: `RecordCrosshairDetect`/`RecordCrosshairPatch`, `cs_fg_crosshair_*.comp`, `cs_fg_inpaint.comp`) is part of the library, in two modes. The reason it is in the library: any host gets it by flipping a setting, the repository is public, and the algorithm only needs the frames.
+
+**Settings** (all runtime, `setSettings()`; defaults = today's host values; `validate()` checks every range):
+
+| Field | Default | Range | Meaning |
+|---|---|---|---|
+| `uiProtection` | `Off` | `Off`, `Crosshair`, `WholeScreen` | `Off` records nothing and allocates nothing; output byte-identical to the library before this feature (verified: `uitest check --hash` against `e2f3b61`). |
+| `uiBoxWidth`, `uiBoxHeight` | 0, 0 | 0-16384 | The full-resolution box, pixels. 0 = that side from `uiCrosshairArea`. An explicit size wins; clamped to [4, frame]. |
+| `uiCrosshairArea` | 0.03 | (0, 1] | Area-derived box: square of side `round(sqrt(area*w*h))`, clamped to [32, min(w, h)] (333 px at 2560x1440). |
+| `uiBoxOffsetX`, `uiBoxOffsetY` | 0, 0 | -16384..16384 | Box centre relative to the frame centre (+x right, +y down). Clamped so the box stays inside the frame. |
+| `uiStillFrames` | 8 | 1-255 | Consecutive still real frames before a pixel is masked. |
+| `uiStillThreshold` | 3.5 | 0-255 (8-bit levels) | A pixel is still if no channel moved more than this since the previous real frame. |
+| `uiInpaintReach` | 12 | 1-16 | Inpaint walk length per direction. |
+| `uiMaxStillFraction` | 0.75 | (0, 1] | WholeScreen: skip the whole-screen passes of a frame whose still share outside the box exceeds this (1 = never). |
+
+**How to size the box for your crosshair.** The box is always protected at full resolution, in both modes. Make it 2-3x the crosshair's largest extent (the whole reticle including its spread while shooting/moving and its outline), and set `uiBoxOffsetX/Y` if the reticle is not at the frame centre. Too small: the ends of the reticle fall outside the protection (`uitest check` shows this with a 20x20 box on a 35x35 px crosshair: 61 of 305 crosshair pixels wrong). Too big: only costs a few more pixels of work. Size changes at runtime need no GPU wait: the box buffers only ever grow (see "Memory").
+
+**API contract** (full text in `gpu/framegen.h`):
+- `recordObserve(cb, frame)`: once per NEW real frame, in order, for every real frame (also those never interpolated), after its pixels are final. Returns true and records nothing when `Off`. The library keys its entries by `frame`, so a host that reuses views (a ring of images) must observe each new content. At least `kUiFrames` = 3 observed frames are kept (LRU), so synthesising the pair before the newest one (gamescope's "Smoothness" priority) still works. `recordEstimate(prev, curr)` and `recordSynth` read the library's clean copies of those frames; `recordSynth` additionally reads the real pixels from the `curr` view you pass, so `curr` must still hold the real frame at synth time (this was already required).
+- Implicit observe: a host that never calls `recordObserve` is observed by `recordEstimate` (prev if unseen, curr unless it is the newest observed view). Caveat: new content under the same view handle is not noticed, and a frame never used in a pair is never seen by the counters. Once `recordObserve` was called, estimates do not observe implicitly; a pair of which a view was not observed (just switched on, skipped, evicted) is interpolated unprotected like `Off`.
+- `recordSynth` returns false if an observe evicted one of the pair's two entries since its `recordEstimate` (observe two newer frames between them) or re-observed one of the views.
+- Descriptor sets: a third ring of `kUiSets` = 64 sets. `recordObserve` takes 1 (Crosshair) or 2 (WholeScreen), each `recordSynth` takes up to 2, an implicit observe in `recordEstimate` takes the same as `recordObserve`. Keep them per `beginFrame()` and per not-yet-retired submission <= 64 (a normal 4x frame needs about 3 + 2x3). Exhaustion returns false and records nothing.
+- Retire rule: `resize()`, `destroy()` and `reconfigure()` that changes `flowScale` free all UI resources; same rule as the other buffers (all earlier records retired). `setSettings()` only creates (the first time a mode is switched on: 3 clean images + buffers, WholeScreen: + masks and cell state) and returns false if that allocation fails (settings unchanged). Growing the box allocates a bigger buffer at the next `recordObserve`; the old one goes to a graveyard that is freed by the next `resize`/`destroy`, so no GPU wait is needed. The clean images are always `R8G8B8A8_UNORM` in logical channel order, independent of `viewFormat`, and are moved UNDEFINED -> GENERAL by a one-off barrier at the first `recordObserve`.
+- Profile names: `ui_detect` (clean copy, stillness, masks) and `ui_inpaint` per `recordObserve`; `ui_patch` per `recordSynth`. An observe opens the profile the next `recordEstimate` continues.
+
+**Algorithm** (shaders `gpu/shaders/ui_*.comp`, common header `ui_common.glsl`, all embedded with the usual `--vn <name>_spv`):
+
+| Pass | File | When | What |
+|---|---|---|---|
+| clean copy + cell detect | `ui_detect.comp` | every observe | One thread per 2x2 cell (`kUiCell` in `framegen.cpp`; 1, 2 or 4 work): copies the real frame into the clean image. WholeScreen: cell mean (8-bit) vs the stored previous mean, max channel diff <= `uiStillThreshold` -> count+1, else 0; cells overlapping the box never count; a cell with count >= `uiStillFrames` is still: it flags its 32x32 tile (and the neighbours within the 2 px dilation) and is counted into the frame's header word. |
+| box counters | `ui_box_update.comp` | every observe | Per box pixel (full res): the stored word holds the previous ORIGINAL pixel + count, updated in place. |
+| box mask | `ui_box_mask.comp` | every observe | 5x5 neighbourhood of the counters: 255 within 1 px of a still pixel, 128 within 2 px. One thread per 4 pixels (packed bytes). |
+| whole-screen mask | `ui_mask.comp` | WholeScreen | Per flagged 32x32 tile only: the same dilation applied to the upsampled cell mask at full res. Exits at once for unflagged tiles and for a suppressed frame (still share > `uiMaxStillFraction`). |
+| inpaint | `ui_inpaint.comp` | every observe, whole screen then box | 16x16 tile, mask + `uiInpaintReach` halo in shared memory, one thread per pixel, 8 walks then 8 independent fetches; 1/d^2 weights over the first unmasked pixel in each direction; masked pixels only. A tile with no masked pixel, or entirely inside the masked area, exits early. Whole screen: unflagged tiles count as unmasked. |
+| patch | `ui_patch.comp` | every `recordSynth`, whole screen then box | `out = mix(out, real, mask)` over the mask rectangle (flagged tiles only for whole screen). Real = the `curr` view. |
+
+Box passes are sized to the box (e.g. 333x333 at 1440p); whole-screen passes run per cell (1/4 of the pixels) or per flagged tile. Resolutions: box = full; detection = 1/2 per axis; mask, inpaint, patch = full, restricted to flagged tiles.
+
+**Why the real pixels come from `curr`.** The patch uses the observed frame the synth leads up to (`curr`): pixels are still for >= `uiStillFrames` frames there, so `prev` is the same within the threshold. The library therefore stores no full-resolution copies of originals, only the clean copy.
+
+**Skip rule.** WholeScreen counts the still cells outside the box on the GPU (one atomic per workgroup). If more than `uiMaxStillFraction` of all cells are still, the mask, inpaint and patch passes of that frame exit at the first instruction (the clean copy is still made): a picture that static needs no generated frame to differ from the real one. The counters keep updating, so there is no flicker of the mask, only of whether it is applied. The box is never skipped.
+
+**Memory** (4 bytes/px clean copy, 3 kept frames; 1440p / 1080p): Crosshair 44.2 + <1 MB / 24.9 + <1 MB (clean copies + box buffers, 333 px box); WholeScreen adds 3 full-frame masks (1 byte/px: 11.1 MB / 6.2 MB) and the cell state (1/4 of the pixels x 4 bytes: 3.7 MB / 2.1 MB).
+
+**Cost** (RX 7900 XTX, GPU timestamp medians of the pass groups, per real frame: one `recordObserve` + one `recordSynth`; `uitest bench`). Scenes: *moving* = textured background panning 14,6 px/frame with 16 independent moving objects, static crosshair and HUD box; *still* = every frame identical; *70% still* = the left 70% identical, the right 30% as moving (just below the default skip limit). "no skip" = `uiMaxStillFraction = 1`.
+
+| scene / mode (1440p) | ui_detect | ui_inpaint | ui_patch | UI total |
+|---|---|---|---|---|
+| moving, Crosshair | 0.052 | 0.012 | 0.002 | 0.067 ms |
+| moving, WholeScreen | 0.057 | 0.032 | 0.006 | 0.095 ms |
+| still, Crosshair | 0.055 | 0.013 | 0.004 | 0.071 ms |
+| still, WholeScreen (frame skipped, 100% > 75%) | 0.057 | 0.019 | 0.007 | 0.083 ms |
+| 70% still, WholeScreen | 0.114 | 0.110 | 0.027 | 0.251 ms |
+| still, WholeScreen, no skip (worst case) | 0.138 | 0.143 | 0.037 | 0.318 ms |
+
+| scene / mode (1080p) | ui_detect | ui_inpaint | ui_patch | UI total |
+|---|---|---|---|---|
+| moving, Crosshair | 0.038 | 0.012 | 0.002 | 0.052 ms |
+| moving, WholeScreen | 0.040 | 0.023 | 0.004 | 0.068 ms |
+| still, Crosshair | 0.039 | 0.012 | 0.003 | 0.055 ms |
+| still, WholeScreen (skipped) | 0.042 | 0.016 | 0.005 | 0.062 ms |
+| 70% still, WholeScreen | 0.073 | 0.081 | 0.017 | 0.172 ms |
+| still, WholeScreen, no skip (worst case) | 0.084 | 0.094 | 0.023 | 0.200 ms |
+
+About half of `ui_detect` is the full-frame copy into the clean image (bandwidth). The timestamp sums over-count the marginal cost: back-to-back per pair (8 pairs in one command buffer, estimate + one synth) at 1440p: Off 0.47 ms, Crosshair 0.50, WholeScreen 0.52 (moving); 70% still WholeScreen 0.68 ms.
+
+**Validation** (`uitest check`, synthetic 12-frame sequence: background panning 14,6 px/frame, 16 independent moving objects, a static opaque crosshair at the centre and a static opaque HUD box in a corner; last pair interpolated at t = 0.5 and 0.25): the crosshair pixels (305) and HUD pixels (6960) of the generated frame must equal the real ones within 1 level. Results at 1280x720:
+
+| | crosshair wrong | HUD wrong | background PSNR |
+|---|---|---|---|
+| Off | 16 / 305 | 182 / 6960 | 29.11 dB |
+| Crosshair | 0 | 182 (not protected) | 29.11 dB |
+| WholeScreen | 0 | 0 | 29.05 dB |
+| Crosshair, explicit 80x60 box | 0 | - | 29.11 dB |
+| Crosshair, 20x20 box (smaller than the reticle) | 61 | - | 29.11 dB |
+| crosshair offset (+37, -23), 120x120 box with the same offset | 0 | - | 29.27 dB |
+| offset crosshair, WholeScreen + offset box | 0 | 0 | 29.20 dB |
+
+At 2560x1440 (same scene): Off 11/305 crosshair and 112/27840 HUD pixels wrong, background PSNR 36.91 dB; Crosshair 0 / 112, 36.80 dB; WholeScreen 0 / 0, 36.75 dB. The 0.1-0.2 dB background difference is the price of showing real pixels where a pixel was judged still (identical background that happens to be still is shown from the real frame).
+
+Also checked: implicit observe is bit-identical to explicit observe; runtime switching Off -> Crosshair -> WholeScreen mid-stream protects both; WholeScreen -> Off mid-stream gives output bit-identical to an Off run; RGBA and BGRA; `validate()` rejections; no Vulkan validation or synchronization-validation messages for RGBA (BGRA output views give the library's existing `rgba8`-on-BGRA storage-format warning, now also for the patch pass that reads `out`).
+
+**What gamescope-ritz must do** (a later task; not done here):
+1. Add the six new shaders to the `custom_target` list that compiles the library's shaders (`--vn <name>_spv`, include dir for `ui_common.glsl`): `ui_detect.comp`, `ui_box_update.comp`, `ui_box_mask.comp`, `ui_mask.comp`, `ui_inpaint.comp`, `ui_patch.comp` (+ the header `ui_common.glsl`, a dependency of all six).
+2. Set `Settings::uiProtection` (and the box fields from its own settings: size, offset, still frames) in `ToLibrarySettings()`; `setSettings` can fail (allocation), keep the old value then.
+3. Call `recordObserve(cb, frameView)` once per new real frame at the point where it currently copies a real frame into its ring slot and runs `RecordCrosshairDetect`, including frames it will not interpolate.
+4. Delete `EnsureCrosshair`/`ReleaseCrosshair`/`RecordCrosshairDetect`/`RecordCrosshairPatch`, the per-slot patch textures, `cs_fg_crosshair_detect.comp`, `cs_fg_inpaint.comp`, `cs_fg_crosshair_patch.comp`; the library now owns the clean copies, so the host's ring slots hold real, un-inpainted frames. The host must keep `curr` valid until the last synth of its pair retires (as before).
+5. Account for `kUiSets` (64) per submission in its pacing guard, like `kMaxSynthsPerPair` for the 32-set rings.
