@@ -59,6 +59,14 @@ namespace
 		// seen by that paint.
 		Ns leadNs = 0;
 		bool uiRepaints = false;       // a cursor / overlay repaint on every vblank
+		// The three features beyond the cadence: frame generation on/off, the lag-spike
+		// buffer's extra delay and motion blur.
+		bool frameGen = true;
+		Ns extraDelayNs = 0;
+		bool blur = false;
+		int blurSamples = 4;
+		double blurAmount = 0.5;
+		BlurRelative blurRelative = BlurRelative::ShownFrame;
 		uint64_t focusKey = 1;
 		FrameFormat layer{ 1920, 1080, 87 };
 
@@ -90,6 +98,12 @@ namespace
 			in.pauseAtRefresh = pauseAtRefresh;
 			in.canExceedRefresh = canExceed;
 			in.costGuard = costGuard;
+			in.frameGen = frameGen;
+			in.extraDelayNs = extraDelayNs;
+			in.blur = blur;
+			in.blurSamples = blurSamples;
+			in.blurAmount = blurAmount;
+			in.blurRelative = blurRelative;
 			return in;
 		}
 
@@ -1860,4 +1874,379 @@ TEST_CASE( "pacing: blur window follows the pacer's decision", "[pacing][blur]" 
 		CHECK( wide.t1 - wide.t0 >= narrow.t1 - narrow.t0 );
 	}
 	CHECK( nSynth > 0 );
+}
+
+// ---------------------------------------------------------------------------
+//  The three features on one timeline: frame generation (which instants get an
+//  output), the lag-spike buffer (how far behind), motion blur (the window each
+//  output shows). Each works alone, every combination works.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+	// An output that went through the renderer's one call (recordSynthBlur(prev, curr, out, t0, t1)).
+	bool IsRendered( const Pacer::Decision &d ) { return d.prevId != 0; }
+
+	int CountNew( const Driver &drv, Ns t0, Ns t1 )
+	{
+		return drv.CountOutputs( t0, t1 );
+	}
+}
+
+TEST_CASE( "pacing: FG off, no blur, no delay is a pure pass-through", "[pacing][combine]" )
+{
+	Driver drv;
+	drv.frameGen = false;
+	WarmUp( drv, 32.0 );
+	const Pacer::Decision d = drv.log.back().d;
+	CHECK( d.inert );
+	CHECK_FALSE( drv.pacer.Planning() );
+	CHECK( drv.Status().reason == Reason::Off );
+	CHECK( d.t0 == 1.0f );
+	CHECK( d.t1 == 1.0f );
+	CHECK( d.prevId == 0 );
+}
+
+TEST_CASE( "pacing: FG off + blur: one output per real frame, window [1 - s, 1]", "[pacing][combine]" )
+{
+	Driver drv;
+	drv.refreshHz = 125.0;
+	drv.frameGen = false;
+	drv.blur = true;
+	drv.blurAmount = 0.5;
+	WarmUp( drv, 32.0, 1000 * MS );
+	const Ns tStart = drv.now;
+	const std::vector<Ns> arrivals = Driver::Periodic( tStart + 3 * MS, 32.0, tStart + 2000 * MS );
+	drv.RunArrivals( arrivals, tStart + 2000 * MS );
+	REQUIRE( drv.pacer.Planning() );
+	CHECK_FALSE( drv.pacer.Generating() );
+	CHECK( drv.pacer.RealRate() );
+	// exactly one output per real frame
+	const int nOut = CountNew( drv, tStart + 100 * MS, tStart + 1900 * MS );
+	int nArr = 0;
+	for ( Ns a : arrivals )
+		nArr += ( a >= tStart + 100 * MS && a < tStart + 1900 * MS ) ? 1 : 0;
+	INFO( "outputs " << nOut << " arrivals " << nArr );
+	CHECK( std::abs( nOut - nArr ) <= 1 );        // the window edges can split a frame from its paint
+	int nChecked = 0;
+	for ( const Painted &p : drv.log )
+	{
+		if ( p.t < tStart + 100 * MS || !p.d.newOutput )
+			continue;
+		nChecked++;
+		CHECK( IsRendered( p.d ) );
+		CHECK( p.d.t == 1.0f );
+		CHECK( Near( p.d.t0, 0.5f ) );
+		CHECK( Near( p.d.t1, 1.0f ) );
+		CHECK( p.d.currId == p.d.showId );     // the real frame itself, blurred over the part before it
+	}
+	CHECK( nChecked > 40 );
+	const Pacer::Report r = drv.Status();
+	CHECK( r.reason == Reason::Off );
+	CHECK_FALSE( r.fgActive );
+	CHECK( r.blurActive );
+	CHECK( r.blurSamples == 4 );
+	CHECK( r.blurWindowMs > 15.0f );           // 0.5 of a 32 ms interval = 16 ms
+	CHECK( r.blurWindowMs < 17.0f );
+	CHECK( r.bufferDelayMs == 0.0f );
+}
+
+TEST_CASE( "pacing: FG 2x + blur: each output has its own window, ending at its instant, the windows tile", "[pacing][combine]" )
+{
+	Driver drv;
+	drv.refreshHz = 125.0;
+	drv.multiplier = 2;
+	drv.blur = true;
+	drv.blurAmount = 1.0;                      // 360 degrees: tiles
+	// Real frames land exactly on a tick (offset 0), so the output instants sit on the
+	// m/M grid and the windows meet end to start. Off the grid (a late tick, jitter)
+	// they overlap or leave a small gap, the way the cadence does.
+	WarmUp( drv, 32.0, 1500 * MS, 0 );
+	REQUIRE( drv.pacer.Generating() );
+	int nSynth = 0, nReal = 0;
+	for ( size_t i = 0; i < drv.log.size(); i++ )
+	{
+		const Painted &p = drv.log[ i ];
+		if ( p.t < 800 * MS || !p.d.newOutput )
+			continue;
+		CHECK( IsRendered( p.d ) );
+		CHECK( p.d.t0 <= p.d.t1 );
+		CHECK( Near( p.d.t1, p.d.t ) );
+		CHECK( p.d.t1 - p.d.t0 > 0.45f );      // one output interval = half the pair
+		CHECK( p.d.t1 - p.d.t0 < 0.55f );
+		( p.d.t < 1.0f ? nSynth : nReal )++;
+		// the previous output of the same pair ended where this one starts
+		for ( size_t k = i; k-- > 0; )
+		{
+			const Painted &q = drv.log[ k ];
+			if ( !q.d.newOutput )
+				continue;
+			if ( q.d.currId == p.d.currId && q.d.t < p.d.t )
+				CHECK( std::fabs( q.d.t1 - p.d.t0 ) < 0.02f );
+			break;
+		}
+	}
+	CHECK( nSynth > 10 );
+	CHECK( nReal > 10 );
+	const Pacer::Report r = drv.Status();
+	CHECK( r.fgActive );
+	CHECK( r.blurActive );
+	CHECK( r.activeN == 2 );
+}
+
+TEST_CASE( "pacing: blur at the refresh: the game reaches the output rate, blur still applies per real frame", "[pacing][combine]" )
+{
+	Driver drv;
+	drv.refreshHz = 60.0;
+	drv.multiplier = 2;
+	drv.blur = true;
+	drv.blurAmount = 0.5;
+	WarmUp( drv, 10.0, 1500 * MS );             // 100 fps on 60 Hz: nothing to generate
+	CHECK_FALSE( drv.pacer.Generating() );
+	REQUIRE( drv.pacer.RealRate() );
+	const Pacer::Report r = drv.Status();
+	CHECK( r.reason == Reason::GameTooFast );
+	CHECK_FALSE( r.fgActive );
+	CHECK( r.blurActive );
+	const Pacer::Decision d = drv.log.back().d;
+	CHECK_FALSE( d.inert );
+	// and with blur off the same game is a plain pass-through again
+	Driver off;
+	off.refreshHz = 60.0;
+	off.multiplier = 2;
+	WarmUp( off, 10.0, 1500 * MS );
+	CHECK( off.log.back().d.inert );
+	CHECK( off.Status().reason == Reason::GameTooFast );
+}
+
+namespace
+{
+	// 16 ms real frames with `nMissing` of them missing after the 50th.
+	std::vector<Ns> GapArrivals( int nMissing, Ns tEnd )
+	{
+		std::vector<Ns> v;
+		for ( int k = 0; ; k++ )
+		{
+			if ( k > 50 && k <= 50 + nMissing )
+				continue;
+			const Ns t = 3 * MS + Ns( k ) * 16 * MS;
+			if ( t >= tEnd )
+				break;
+			v.push_back( t );
+		}
+		return v;
+	}
+
+	// The longest stretch between two consecutive new outputs in [t0, t1), ms.
+	double LongestOutputGapMs( const Driver &drv, Ns t0, Ns t1 )
+	{
+		double flMax = 0.0;
+		Ns tPrev = 0;
+		for ( const Painted &p : drv.log )
+		{
+			if ( p.t < t0 || p.t >= t1 || !p.d.newOutput )
+				continue;
+			if ( tPrev != 0 )
+				flMax = std::max( flMax, double( p.t - tPrev ) / double( MS ) );
+			tPrev = p.t;
+		}
+		return flMax;
+	}
+
+	int CountRenderedSynths( const Driver &drv, Ns t0, Ns t1 )
+	{
+		int n = 0;
+		for ( const Painted &p : drv.log )
+			n += ( p.t >= t0 && p.t < t1 && p.d.newOutput && p.d.prevId != 0 && p.d.t < 1.0f ) ? 1 : 0;
+		return n;
+	}
+}
+
+TEST_CASE( "pacing: FG off + a 50 ms buffer fills a two-frame gap with synths and no hitch", "[pacing][combine]" )
+{
+	const Ns tEnd = 2000 * MS;
+	// The gap sits at real frame 51..52, i.e. 3 + 51 * 16 = 819 .. 851 ms.
+	Driver buffered;
+	buffered.refreshHz = 125.0;
+	buffered.frameGen = false;
+	buffered.extraDelayNs = 50 * MS;
+	buffered.RunArrivals( GapArrivals( 2, tEnd ), tEnd );
+	CHECK( buffered.pacer.HistoryDepth() > kHistory );
+	const double flGapBuffered = LongestOutputGapMs( buffered, 400 * MS, 1900 * MS );
+	const int nFilled = CountRenderedSynths( buffered, 800 * MS, 1200 * MS );
+	INFO( "longest gap between outputs with the buffer: " << flGapBuffered << " ms, synths " << nFilled );
+	CHECK( flGapBuffered <= 24.0 );             // 16 ms frames on 8 ms ticks: no hitch
+	CHECK( nFilled >= 2 );                      // the missing frames were synthesised
+
+	// without the buffer the same stream hitches: nothing can be filled
+	Driver plain;
+	plain.refreshHz = 125.0;
+	plain.frameGen = false;
+	plain.blur = true;                          // keeps the planner active
+	plain.blurAmount = 0.5;
+	plain.RunArrivals( GapArrivals( 2, tEnd ), tEnd );
+	CHECK( LongestOutputGapMs( plain, 400 * MS, 1900 * MS ) > 40.0 );
+	CHECK( CountRenderedSynths( plain, 800 * MS, 1200 * MS ) == 0 );
+	// the delay shows in the status: D is the buffer alone, the buffer is its own line
+	const Pacer::Report r = buffered.Status();
+	CHECK( Near( r.delayMs, 50.0f ) );
+	CHECK( Near( r.bufferDelayMs, 50.0f ) );
+	CHECK_FALSE( r.fgActive );
+}
+
+TEST_CASE( "pacing: FG off + buffer: real frames are shown at their own time plus D", "[pacing][combine]" )
+{
+	Driver drv;
+	drv.refreshHz = 125.0;
+	drv.frameGen = false;
+	drv.extraDelayNs = 40 * MS;
+	const Ns tEnd = 1500 * MS;
+	drv.RunArrivals( Driver::Periodic( 3 * MS, 16.0, tEnd ), tEnd );
+	int n = 0;
+	for ( const Painted &p : drv.log )
+	{
+		if ( p.t < 800 * MS || !p.d.newOutput )
+			continue;
+		// the arrival time of the frame shown: its id is the arrival index + 1
+		const Ns tArr = 3 * MS + Ns( ( p.d.showId - 1 ) * 16 * MS );
+		INFO( "shown at " << p.t / MS << " ms, frame " << p.d.showId << " arrived " << tArr / MS << " ms" );
+		CHECK( p.t >= tArr + 40 * MS );
+		CHECK( p.t < tArr + 40 * MS + 9 * MS );        // within one 8 ms tick of arrival + D
+		n++;
+	}
+	CHECK( n > 30 );
+}
+
+TEST_CASE( "pacing: FG + buffer: delayed, so the gap is interpolated", "[pacing][combine]" )
+{
+	const Ns tEnd = 2000 * MS;
+	Driver drv;
+	drv.refreshHz = 125.0;
+	drv.multiplier = 2;
+	drv.extraDelayNs = 50 * MS;
+	drv.RunArrivals( GapArrivals( 2, tEnd ), tEnd );
+	REQUIRE( drv.pacer.Generating() );
+	const Pacer::Report r = drv.Status();
+	CHECK( r.fgActive );
+	CHECK( r.bufferDelayMs == 50.0f );
+	CHECK( r.delayMs >= 50.0f );
+	CHECK( LongestOutputGapMs( drv, 400 * MS, 1900 * MS ) <= 24.0 );
+	// FG alone, the same: the extra delay is the only difference in the status
+	Driver alone;
+	alone.refreshHz = 125.0;
+	alone.multiplier = 2;
+	alone.RunArrivals( GapArrivals( 0, tEnd ), tEnd );
+	CHECK( alone.Status().bufferDelayMs == 0.0f );
+	CHECK( alone.Status().delayMs < 50.0f );
+}
+
+TEST_CASE( "pacing: all three on at once", "[pacing][combine]" )
+{
+	const Ns tEnd = 2500 * MS;
+	Driver drv;
+	drv.refreshHz = 125.0;
+	drv.multiplier = 2;
+	drv.extraDelayNs = 50 * MS;
+	drv.blur = true;
+	drv.blurSamples = 4;
+	drv.blurAmount = 0.5;
+	drv.RunArrivals( GapArrivals( 2, tEnd ), tEnd );
+	REQUIRE( drv.pacer.Generating() );
+	int n = 0;
+	for ( const Painted &p : drv.log )
+	{
+		if ( p.t < 600 * MS || !p.d.newOutput )
+			continue;
+		n++;
+		INFO( "paint " << p.t / MS << " ms" );
+		CHECK( IsRendered( p.d ) );
+		CHECK( p.d.prevId < p.d.currId );
+		CHECK( p.d.t0 >= 0.0f );
+		CHECK( p.d.t0 <= p.d.t1 );
+		CHECK( p.d.t1 <= 1.0f );
+	}
+	CHECK( n > 60 );
+	CHECK( LongestOutputGapMs( drv, 400 * MS, 2400 * MS ) <= 24.0 );
+	const Pacer::Report r = drv.Status();
+	CHECK( r.fgActive );
+	CHECK( r.blurActive );
+	CHECK( r.blurSamples == 4 );
+	CHECK( r.blurWindowMs > 0.0f );
+	CHECK( r.bufferDelayMs == 50.0f );
+	CHECK( r.activeN == 2 );
+}
+
+TEST_CASE( "pacing: the cost guard budgets the blur samples too", "[pacing][combine]" )
+{
+	auto Make = []( int nSamples )
+	{
+		Driver drv;
+		drv.refreshHz = 125.0;
+		drv.frameGen = false;
+		drv.blur = true;
+		drv.blurSamples = nSamples;
+		drv.estimateMs = 0.3f;
+		drv.synthMs = 0.1f;
+		drv.costSeq = 1;
+		drv.Run( 1000 * MS, 5.0 );              // 200 fps: 25% of 5 ms = 1.25 ms
+		return drv;
+	};
+	// 2 samples: 0.3 + 0.2 fits; 16 samples: 0.3 + 1.6 does not
+	Driver few = Make( 2 );
+	CHECK( few.pacer.Planning() );
+	CHECK_FALSE( few.pacer.CostBlocked() );
+	Driver many = Make( 16 );
+	CHECK( many.pacer.CostBlocked() );
+	CHECK_FALSE( many.pacer.Planning() );
+	CHECK( many.Status().reason == Reason::CostGuard );
+	CHECK( many.log.back().d.inert );
+	// with the guard off the samples are only measured
+	Driver off;
+	off.refreshHz = 125.0;
+	off.frameGen = false;
+	off.blur = true;
+	off.blurSamples = 16;
+	off.estimateMs = 0.3f;
+	off.synthMs = 0.1f;
+	off.costGuard = false;
+	off.Run( 1000 * MS, 5.0 );
+	CHECK( off.pacer.Planning() );
+}
+
+TEST_CASE( "pacing: a reset resets all three together", "[pacing][combine]" )
+{
+	Driver drv;
+	drv.refreshHz = 125.0;
+	drv.frameGen = false;
+	drv.blur = true;
+	drv.extraDelayNs = 30 * MS;
+	WarmUp( drv, 16.0, 1000 * MS );
+	REQUIRE( drv.pacer.Planning() );
+	drv.focusKey = 9;                            // another window
+	const Pacer::Decision d = drv.ArriveAndPaint( drv.now + 16 * MS );
+	CHECK( d.reset );
+	CHECK( drv.pacer.HistoryCount() <= 1 );
+	CHECK_FALSE( drv.pacer.EstimateValid() );
+	// the sequence resumes after the warm-up with the same settings
+	drv.Run( 1000 * MS, 16.0 );
+	CHECK( drv.pacer.Planning() );
+	CHECK( drv.Status().bufferDelayMs == 30.0f );
+}
+
+TEST_CASE( "pacing: switching frame generation on and off live keeps blur and the buffer", "[pacing][combine]" )
+{
+	Driver drv;
+	drv.refreshHz = 125.0;
+	drv.blur = true;
+	drv.multiplier = 2;
+	WarmUp( drv, 32.0, 1000 * MS );
+	CHECK( drv.pacer.Generating() );
+	drv.frameGen = false;
+	drv.Run( 1000 * MS, 32.0 );
+	CHECK_FALSE( drv.pacer.Generating() );
+	CHECK( drv.pacer.RealRate() );
+	CHECK( drv.Status().blurActive );
+	drv.frameGen = true;
+	drv.Run( 1000 * MS, 32.0 );
+	CHECK( drv.pacer.Generating() );
 }

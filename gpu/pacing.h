@@ -20,6 +20,28 @@
 // "frame id" is any host-chosen identity of a real frame (a commit counter, a
 // buffer sequence number): the same id means the same image, 0 means none.
 //
+// THREE FEATURES, ONE CONTENT TIMELINE. Frame generation, motion blur and the
+// lag-spike buffer are separate switches that can all be on at once; each owns
+// exactly one dimension of the same plan, so every combination falls out:
+//   * the BUFFER   -- how far behind real time we show: Inputs::extraDelayNs, added
+//                     to the base delay D (0 = none). The detection that drives it is
+//                     not in this header; the hook is.
+//   * FRAME GEN    -- which instants get an output frame (the cadence): fixed N,
+//                     target fps, pause at refresh. Off (Inputs::frameGen false): one
+//                     output per real frame, at that frame's own time plus D, and a gap
+//                     the delay covers is filled by synths ("real-rate" planning).
+//   * MOTION BLUR  -- what each output shows over time: a window [t0, t1] in the pair
+//                     that brackets the output's content time (see BlurWindow).
+// Every Decision carries {prevId, currId, t0, t1, showId, ...}: the host makes
+// exactly ONE renderer call, recordSynthBlur( prev, curr, out, t0, t1 ), which is a
+// plain synth when t0 == t1 and a real frame when it ends at 1. One estimate per
+// real pair serves all of them; the cost guard budgets the estimate plus every
+// synth of every blur sample; a reset resets all three; Report states each part
+// separately. With frame generation off, no blur and no delay the pacer is a
+// pass-through (Reason::Off, inert). Pause at refresh only concerns the cadence: a
+// game that already reaches the output rate is planned real-rate when blur or the
+// buffer is on (one blurred, delayed output per real frame), else passed through.
+//
 // THE MODEL: PER-TICK FRACTIONAL PACING.
 // There is no "N" inside the pacer. Every output frame -- every present tick that
 // the output cadence says should get a new image -- is generated for its OWN
@@ -171,6 +193,9 @@ namespace framegen::pacing
 	constexpr double kRealSnapT       = 0.98;
 	// Real frames kept for pair selection (the renderer's ring is the same size).
 	constexpr int    kHistory         = 3;
+	// With a lag-spike buffer (Inputs::extraDelayNs > 0) more real frames are kept, so
+	// the content time stays bracketed by a pair; at most this many.
+	constexpr int    kHistoryMax      = 16;
 
 	enum class Mode : uint8_t { Off, Fixed, Target };
 	enum class Priority : uint8_t { LowLatency, Smoothness };
@@ -378,6 +403,71 @@ namespace framegen::pacing
 	}
 
 	// ------------------------------------------------------------------
+	//  Motion-blur window
+	// ------------------------------------------------------------------
+	//
+	// Where, inside the current real pair, the motion-blur pass is to average: the
+	// span [t0, t1] of the pair's own timeline (0 = the previous real frame, 1 = the
+	// newest), the arguments of the renderer's
+	//     recordSynthBlur( cb, prev, curr, out, t0, t1 )
+	// (the interpolation-based motion-blur pass of framegen::Interpolator; prev/curr
+	// are the pair the output is made from, i.e. Decision::prevId/currId, which for a
+	// real-frame output with blur is the previous real frame and that frame).
+	// pacing.h does not depend on that pass; this function only does the arithmetic,
+	// so every host's blur logic is the same. The Pacer calls it for every output
+	// and puts the result in Decision::t0/t1.
+	//
+	// The window always ENDS at the instant the output shows (t): a trailing shutter.
+	// It needs no future frame, so it adds no delay -- a centred window would need
+	// the NEXT pair for the output that is the real frame itself (t = 1). It never
+	// leaves [0, 1]. `amount` is the shutter, 0..1 (clamped), by what it is measured in:
+	//
+	//   Relative::ShownFrame -- in OUTPUT intervals (the time one displayed frame is
+	//     on screen). The window is [t - s*o/g, t] with o the output interval and g
+	//     the game interval, i.e. for output m of M per real pair (t = m/M, o/g = 1/M)
+	//     [(m - s)/M, m/M]; s = 1 tiles the pair exactly, s = 0.5 is a 180 degree
+	//     shutter. Blur only (no interpolation, o = g, t = 1): [1 - s, 1]. A host whose
+	//     t does not sit on m/M (a fractional cadence) gets the lower end clamped at 0:
+	//     the window is cut at the pair's start, never moved.
+	//   Relative::GameFrame  -- in REAL-frame intervals: the "film look", a shutter as
+	//     long as a camera at the game's own rate. Window [a, a + L], L = amount,
+	//     a = clamp(t - L, 0, 1 - L): the length is kept and the window is slid into
+	//     the pair (for t < L it looks slightly ahead of t, and neighbouring outputs'
+	//     windows overlap). The intervals are not used.
+	//
+	// amount <= 0 (or NaN), or an unusable interval for ShownFrame, is a point,
+	// t0 == t1 == clamp(t): no blur. t is clamped first; NaN counts as 0.
+	enum class BlurRelative : uint8_t { ShownFrame, GameFrame };
+
+	struct BlurSpan
+	{
+		float t0 = 0.0f;
+		float t1 = 0.0f;
+	};
+
+	inline BlurSpan BlurWindow( double t, double outputIntervalNs, double gameIntervalNs, double amount, BlurRelative eRelative )
+	{
+		auto Clamp01 = []( double v ) { return v != v ? 0.0 : std::min( std::max( v, 0.0 ), 1.0 ); };
+		const double flT = Clamp01( t );
+		BlurSpan w;
+		w.t0 = w.t1 = float( flT );
+		if ( !( amount > 0.0 ) )
+			return w;
+		const double flS = std::min( amount, 1.0 );
+		if ( eRelative == BlurRelative::GameFrame )
+		{
+			const double flA = std::min( std::max( flT - flS, 0.0 ), 1.0 - flS );
+			w.t0 = float( flA );
+			w.t1 = float( flA + flS );
+			return w;
+		}
+		if ( !( outputIntervalNs > 0.0 ) || !( gameIntervalNs > 0.0 ) )
+			return w;
+		w.t0 = float( Clamp01( flT - flS * outputIntervalNs / gameIntervalNs ) );
+		return w;
+	}
+
+	// ------------------------------------------------------------------
 	//  Interval estimator
 	// ------------------------------------------------------------------
 
@@ -463,16 +553,48 @@ namespace framegen::pacing
 			float  synthMs = -1.0f;    // RenderStatus::lastSynthMs, < 0 = n/a
 			uint32_t costSeq = 0;      // RenderStatus::costSeq: changes with every new measurement
 			bool   rendererOk = true;  // RenderStatus::reason == Ok
+
+			// --- the three features, each owning one dimension of the content timeline ---
+			// Frame generation: WHICH INSTANTS get an output frame (the cadence). false =
+			// off: one output per real frame, at that frame's own time (plus the delay
+			// below); mode/multiplier/targetFps/priority/pauseAtRefresh are then unused.
+			// With frame generation off, no blur and no delay the pacer is a pure
+			// pass-through (Reason::Off, inert).
+			bool   frameGen = true;
+			// Lag-spike buffer: HOW FAR BEHIND real time frames are shown. Added to the
+			// base delay (Low latency / Smoothness while frame generation is on, 0 while it
+			// is off). 0 = none. The buffer's own lag-spike detection is the host's (or a
+			// later library module's) business: this is only the hook it drives. A change
+			// is followed smoothly (the content time never goes backwards).
+			Ns     extraDelayNs = 0;
+			// Motion blur: WHAT EACH OUTPUT SHOWS OVER TIME (the shutter window, ending at
+			// the output's content time). Active when blur && blurAmount > 0 &&
+			// blurSamples >= 2. blurSamples only enters the cost guard (each output
+			// costs blurSamples synths); the pacer returns the window, the renderer
+			// averages it (recordSynthBlur).
+			bool   blur = false;
+			int    blurSamples = 0;
+			double blurAmount = 0.5;   // 0..1, the shutter (see BlurWindow)
+			BlurRelative blurRelative = BlurRelative::ShownFrame;
 		};
 
 		// What to do for this paint.
 		struct Decision
 		{
 			uint64_t newestId = 0;     // the newest real frame (the renderer copies it into its ring on first sight)
-			uint64_t prevId = 0;       // the pair a synth is made from (0 when showing the real frame)
+			uint64_t prevId = 0;       // the pair the output is made from (0 when showing a real frame as it is, see t0/t1)
 			uint64_t currId = 0;
 			uint64_t outId = 0;        // the output frame's identity: the same outId is the same image
-			float    t = 1.0f;         // (0,1): synth at t between prevId and currId; 1: the real frame newestId
+			float    t = 1.0f;         // the content instant this output shows, in the pair's own time: (0,1) a point between prevId and currId; 1: a real frame
+			// THE HOST'S ONE RENDERER CALL. prevId != 0: recordSynthBlur( prev, curr, out, t0, t1 )
+			// with the pair (prevId, currId); it collapses to recordSynth( t1 ) when t0 == t1
+			// (no blur), and to the real frame when t1 is 1 and curr is shown. prevId == 0:
+			// no renderer work, show the real frame showId. t0 == t1 == t when blur is off;
+			// with blur [t0, t1] is BlurWindow() of t (it ends at t, except the film look
+			// near the start of a pair, which slides the window into the pair).
+			float    t0 = 1.0f;
+			float    t1 = 1.0f;
+			uint64_t showId = 0;       // the real frame to show when prevId == 0 (the newest, unless a lag-spike buffer delays)
 			bool inert = false;        // the renderer does nothing at all (not even the ring copy)
 			bool reset = false;        // reset the renderer (forget its previous real frames) BEFORE this paint
 			bool repaintNext = false;  // another output is due: paint again at the next present tick
@@ -493,9 +615,15 @@ namespace framegen::pacing
 			float  targetFps = 0.0f;           // Target mode: the rate aimed for (clamped to the refresh), else 0
 			int    chosenN = 0;                // Fixed: the multiplier; Target: 0
 			int    activeN = 0;                // round(effective multiplier), >= 2 while generating, else 0
-			float  delayMs = 0.0f;             // D
+			float  delayMs = 0.0f;             // D, the total delay (base + the buffer)
 			bool   cappedAtRefresh = true;     // the output is capped at the refresh (Pause at refresh rate, or a backend that cannot go past it)
 			Reason reason = Reason::Normal;
+			// Each feature separately, for its own settings line.
+			bool   fgActive = false;           // frame generation is on and generating (not passing through)
+			bool   blurActive = false;         // motion blur is applied
+			float  blurWindowMs = 0.0f;        // the last window's length in ms of content time (0 = a point)
+			int    blurSamples = 0;            // Inputs::blurSamples while blurActive, else 0
+			float  bufferDelayMs = 0.0f;       // the lag-spike buffer's part of delayMs (Inputs::extraDelayNs)
 		};
 
 		// Is the output capped at the refresh rate under these inputs?
@@ -586,6 +714,7 @@ namespace framegen::pacing
 
 			Decision d;
 			d.newestId = ulNewestId;
+			d.showId = ulNewestId;
 			d.reset = m_bNeedReset;
 			if ( d.reset )
 				m_bNeedReset = false;
@@ -671,10 +800,17 @@ namespace framegen::pacing
 				if ( m_Plan.state == State::Generate )
 				{
 					s.delayMs = float( m_flDelayMs );
+					s.bufferDelayMs = float( double( in.extraDelayNs ) / double( kNsPerMs ) );
+					s.blurActive = BlurActive( in );
+					s.blurWindowMs = float( m_flBlurMs );
+					s.blurSamples = s.blurActive ? in.blurSamples : 0;
 					if ( s.gameFps > 0.0f )
-					{
 						s.effectiveMultiplier = s.presentedFps / s.gameFps;
-						s.activeN = std::max( 2, int( std::lround( s.effectiveMultiplier ) ) );
+					if ( !m_Plan.realRate )
+					{
+						s.fgActive = true;
+						if ( s.gameFps > 0.0f )
+							s.activeN = std::max( 2, int( std::lround( s.effectiveMultiplier ) ) );
 					}
 				}
 			}
@@ -684,7 +820,14 @@ namespace framegen::pacing
 		// --- read-only views, for tests and the host ---
 		bool   EstimateValid() const { return m_Est.Valid(); }
 		double IntervalMs() const { return m_Est.IntervalMs(); }
-		bool   Generating() const { return m_Plan.state == State::Generate; }
+		bool   Generating() const { return m_Plan.state == State::Generate && !m_Plan.realRate; }
+		// The planner is producing outputs (frame generation, or one per real frame for blur / the
+		// buffer) rather than passing real frames through.
+		bool   Planning() const { return m_Plan.state == State::Generate; }
+		// One output per real frame (frame generation off, or the game reaches the output rate).
+		bool   RealRate() const { return m_Plan.state == State::Generate && m_Plan.realRate; }
+		// Real frames the host must keep addressable by id: kHistory, more with a buffer.
+		int    HistoryDepth() const { return m_nDepth; }
 		bool   CostBlocked() const { return m_bCostBlocked; }
 		// The effective output interval (after the cost guard), ms; 0 when not generating.
 		double OutputMs() const { return m_Plan.state == State::Generate ? m_Plan.oMs : 0.0; }
@@ -707,7 +850,12 @@ namespace framegen::pacing
 			State  state = State::Warming;
 			Reason reason = Reason::WarmingUp;
 			bool   inert = false;   // Pass only: the renderer stays completely inert
-			double oMs = 0.0;       // Generate: the effective output interval
+			double oMs = 0.0;       // Generate: the effective output interval (0 in real-rate mode)
+			// Generate only: one output per REAL frame, at its own time (plus the buffer's
+			// delay), with the gaps between real frames filled by synths. That is the
+			// planner's cadence when frame generation is off, or while the game reaches the
+			// output rate (nothing to generate) and blur / the buffer still want a pair.
+			bool   realRate = false;
 		};
 
 		struct HistFrame
@@ -745,6 +893,7 @@ namespace framegen::pacing
 			m_bExpectPaint = false;
 			m_bHavePair = false;
 			m_nPairSynths = 0;
+			m_flBlurMs = 0.0;
 			m_Last = Decision();
 		}
 
@@ -752,9 +901,9 @@ namespace framegen::pacing
 		{
 			if ( m_nHist > 0 && m_Hist[ m_nHist - 1 ].id == ulId )
 				return;
-			if ( m_nHist == kHistory )
+			while ( m_nHist >= m_nDepth )
 			{
-				for ( int i = 1; i < kHistory; i++ )
+				for ( int i = 1; i < m_nHist; i++ )
 					m_Hist[ i - 1 ] = m_Hist[ i ];
 				m_nHist--;
 			}
@@ -767,7 +916,8 @@ namespace framegen::pacing
 		{
 			const bool bCap = CapAtRefresh( in );
 			const uint32_t uKey = uint32_t( in.mode ) | ( uint32_t( in.multiplier ) << 2 ) |
-				( uint32_t( in.targetFps ) << 8 ) | ( uint32_t( in.priority ) << 24 ) | ( uint32_t( bCap ) << 25 );
+				( uint32_t( in.targetFps ) << 8 ) | ( uint32_t( in.priority ) << 24 ) | ( uint32_t( bCap ) << 25 ) |
+				( uint32_t( in.frameGen ) << 26 );
 			if ( uKey != m_uCfgKey )
 			{
 				// The user picked something else: forget the content time and the
@@ -782,6 +932,20 @@ namespace framegen::pacing
 
 			Plan p;
 			m_bExtra = false;
+			m_nDepth = DepthFor( in );
+			const bool bFG = in.frameGen;
+			const bool bBlur = BlurActive( in );
+			const bool bDelay = in.extraDelayNs > 0;
+			if ( !bFG && !bBlur && !bDelay )
+			{
+				// Frame generation off and nothing else asked for a pair: not a feature, a
+				// pass-through. The host may also simply not call the pacer.
+				p.state = State::Pass;
+				p.reason = Reason::Off;
+				p.inert = true;
+				m_Plan = p;
+				return;
+			}
 			if ( !in.rendererOk )
 			{
 				// Keep telling the renderer (not inert): it only re-checks whether it
@@ -822,7 +986,10 @@ namespace framegen::pacing
 			{
 				m_bGen = true;
 			}
-			if ( !m_bGen )
+			// Real-rate: no generated frames (off, or the game reaches the output rate),
+			// but blur and / or the buffer still want a pair for every real frame.
+			const bool bRealRate = !bFG || !m_bGen;
+			if ( bRealRate && !bBlur && !bDelay )
 			{
 				p.state = State::Pass;
 				p.reason = Reason::GameTooFast;
@@ -830,6 +997,8 @@ namespace framegen::pacing
 				m_Plan = p;
 				return;
 			}
+			// What one output costs, in synths: blur averages blurSamples of them.
+			const float flSynthMs = ( in.synthMs >= 0.0f && bBlur ) ? in.synthMs * float( std::max( in.blurSamples, 1 ) ) : in.synthMs;
 
 			double flOutMs = flBaseMs;
 			Reason eReason = Reason::Normal;
@@ -854,7 +1023,7 @@ namespace framegen::pacing
 					{
 						// A measurement of a pair generated by the probe.
 						m_bProbing = false;
-						if ( MaxSynthsPerPair( flInterval, in.estimateMs, in.synthMs ) >= 1 )
+						if ( MaxSynthsPerPair( flInterval, in.estimateMs, flSynthMs ) >= 1 )
 							m_bCostBlocked = false;
 						else
 							m_ulCostBlockedAt = in.now;
@@ -883,7 +1052,7 @@ namespace framegen::pacing
 				}
 				else
 				{
-					const int nMax = MaxSynthsPerPair( flInterval, in.estimateMs, in.synthMs );
+					const int nMax = MaxSynthsPerPair( flInterval, in.estimateMs, flSynthMs );
 					if ( nMax < 1 )
 					{
 						m_bCostBlocked = true;
@@ -895,7 +1064,7 @@ namespace framegen::pacing
 						return;
 					}
 					const double flCostMs = flInterval / double( nMax + 1 );
-					if ( flCostMs > flOutMs + 1e-9 )
+					if ( !bRealRate && flCostMs > flOutMs + 1e-9 )
 					{
 						flOutMs = flCostMs;
 						eReason = Reason::CostGuard;
@@ -904,13 +1073,14 @@ namespace framegen::pacing
 			}
 
 			p.state = State::Generate;
-			p.reason = eReason;
-			p.oMs = flOutMs;
+			p.reason = eReason != Reason::Normal ? eReason : ( !bRealRate ? Reason::Normal : ( bFG ? Reason::GameTooFast : Reason::Off ) );
+			p.oMs = bRealRate ? 0.0 : flOutMs;
+			p.realRate = bRealRate;
 			m_Plan = p;
 
 			// Beyond the refresh: only when the cap is off, with a band so an output
 			// interval hovering at one tick does not flap between the two timers.
-			if ( !bCap )
+			if ( !bCap && !bRealRate )
 			{
 				const double flTickMs = 1000.0 / std::max( in.refreshHz, 1.0 );
 				m_bExtra = flOutMs < flTickMs * ( m_bExtraPrev ? kExtraLeave : kExtraEnter );
@@ -918,8 +1088,31 @@ namespace framegen::pacing
 			m_bExtraPrev = m_bExtra;
 		}
 
-		// The delay D for the current plan, ms.
+		static bool BlurActive( const Inputs &in )
+		{
+			return in.blur && in.blurAmount > 0.0 && in.blurSamples >= 2;
+		}
+
+		// Real frames to keep: kHistory, plus what the buffer's delay reaches back.
+		int DepthFor( const Inputs &in ) const
+		{
+			if ( in.extraDelayNs == 0 )
+				return kHistory;
+			const double flInterval = std::max( m_Est.IntervalMs(), kMinIntervalMs );
+			return std::min( kHistoryMax, kHistory + 1 + int( std::ceil( double( in.extraDelayNs ) / ( flInterval * 1e6 ) ) ) );
+		}
+
+		// The delay D for the current plan, ms: the base delay (Low latency /
+		// Smoothness while generating, 0 in real-rate) plus the buffer's.
 		double DelayFor( const Inputs &in ) const
+		{
+			const double flExtraMs = double( in.extraDelayNs ) / double( kNsPerMs );
+			if ( m_Plan.realRate )
+				return flExtraMs;
+			return DelayBaseFor( in ) + flExtraMs;
+		}
+
+		double DelayBaseFor( const Inputs &in ) const
 		{
 			const double flInterval = m_Est.IntervalMs();
 			if ( in.priority == Priority::Smoothness )
@@ -940,6 +1133,8 @@ namespace framegen::pacing
 			const uint64_t ulNewest = d.newestId;
 			d = last;
 			d.newestId = ulNewest;
+			if ( !m_Plan.realRate || last.showId == 0 )
+				d.showId = ulNewest;
 			d.reset = bReset;
 			d.newOutput = false;
 			d.repaintNext = bRepaintNext;
@@ -969,6 +1164,12 @@ namespace framegen::pacing
 				d.t = 1.0f;
 				d.newOutput = bFresh;
 				m_flDelayMs = 0.0;
+				return;
+			}
+
+			if ( m_Plan.realRate )
+			{
+				PaintRealRate( in, d, bFresh, bPresentTick );
 				return;
 			}
 
@@ -1028,7 +1229,8 @@ namespace framegen::pacing
 
 			// Low latency plays only the newest pair (a new real frame snaps the
 			// content time to it); Smoothness may still be inside an older one.
-			const int jMin = in.priority == Priority::LowLatency ? m_nHist - 2 : 0;
+			// With the buffer's delay older pairs are played too: that delay is the point.
+			const int jMin = ( in.priority == Priority::LowLatency && in.extraDelayNs == 0 ) ? m_nHist - 2 : 0;
 			bool bReal = tau >= newest.arrival;
 			int j = m_nHist - 2;
 			double t = 1.0;
@@ -1047,15 +1249,53 @@ namespace framegen::pacing
 			if ( bReal )
 			{
 				// The real frame itself: nothing more is due until a newer one arrives.
-				d.t = 1.0f;
-				d.prevId = d.currId = 0;
-				d.outId = ++m_ulOutSeq;
+				FinishReal( in, d, m_nHist - 1 );
 				d.repaintNext = false;
 				m_bExpectPaint = false;
 				m_bHavePair = false;
 				return;
 			}
 
+			FinishSynth( in, d, j, t, bLastSynth );
+			d.repaintNext = true;
+			m_bExpectPaint = true;
+		}
+
+		// ---- the shared end of every output: which pair, which window, which image ----
+
+		// The output interval ShownFrame blur is measured in, ns.
+		double BlurOutputNs() const
+		{
+			return ( m_Plan.realRate ? m_Est.IntervalMs() : m_Plan.oMs ) * 1e6;
+		}
+
+		// A real frame hist[jShown] is the output. With blur its window is cut from the
+		// pair (jShown - 1, jShown), ending at the frame itself.
+		void FinishReal( const Inputs &in, Decision &d, int jShown )
+		{
+			d.t = d.t0 = d.t1 = 1.0f;
+			d.prevId = d.currId = 0;
+			d.showId = m_Hist[ jShown ].id;
+			d.outId = ++m_ulOutSeq;
+			m_flBlurMs = 0.0;
+			if ( BlurActive( in ) && jShown >= 1 )
+			{
+				const double flSpan = double( m_Hist[ jShown ].arrival - m_Hist[ jShown - 1 ].arrival );
+				const BlurSpan w = BlurWindow( 1.0, BlurOutputNs(), flSpan, in.blurAmount, in.blurRelative );
+				if ( w.t0 < w.t1 )
+				{
+					d.prevId = m_Hist[ jShown - 1 ].id;
+					d.currId = m_Hist[ jShown ].id;
+					d.t0 = w.t0;
+					d.t1 = w.t1;
+					m_flBlurMs = double( w.t1 - w.t0 ) * flSpan / 1e6;
+				}
+			}
+		}
+
+		// A synth at t between hist[j] and hist[j + 1], with its blur window.
+		void FinishSynth( const Inputs &in, Decision &d, int j, double t, bool bLastSynth )
+		{
 			d.prevId = m_Hist[ j ].id;
 			d.currId = m_Hist[ j + 1 ].id;
 			d.t = float( t );
@@ -1085,8 +1325,117 @@ namespace framegen::pacing
 			{
 				d.outId = ++m_ulOutSeq;
 			}
-			d.repaintNext = true;
-			m_bExpectPaint = true;
+
+			d.t0 = d.t1 = d.t;
+			m_flBlurMs = 0.0;
+			if ( BlurActive( in ) )
+			{
+				const double flSpan = double( m_Hist[ j + 1 ].arrival - m_Hist[ j ].arrival );
+				const BlurSpan w = BlurWindow( d.t, BlurOutputNs(), flSpan, in.blurAmount, in.blurRelative );
+				d.t0 = w.t0;
+				d.t1 = w.t1;
+				m_flBlurMs = double( w.t1 - w.t0 ) * flSpan / 1e6;
+			}
+		}
+
+		// REAL-RATE CADENCE: one output per real frame, at that frame's own time plus
+		// the buffer's delay D (the frame whose time has come: the newest one with
+		// arrival <= tau = V - D), and a gap between real frames -- a lag spike the
+		// delay covers -- is filled by synths at one smoothed game interval spacing from
+		// the last output, between the pair that brackets that instant. Without a
+		// delay nothing is ever bracketed (every real frame is already due the moment it
+		// exists), so the result is exactly one real frame per real frame. A real frame
+		// that arrives within the snap tolerance max(2 ms, 15%) after a planned fill
+		// instant is waited for (shown as itself) instead of being filled before.
+		void PaintRealRate( const Inputs &in, Decision &d, bool bFresh, bool bPresentTick )
+		{
+			if ( !bPresentTick && !bFresh )
+			{
+				// Nothing new to show (a UI / cursor repaint): the same output again.
+				Repeat( d, m_Last, m_bExpectPaint );
+				return;
+			}
+
+			const int64_t V = int64_t( in.presentNs ? in.presentNs : in.now );
+			const double flDelayMs = DelayFor( in );
+			m_flDelayMs = flDelayMs;
+			const int64_t tauNow = V - int64_t( flDelayMs * 1e6 );
+			const double flIntervalMs = m_Est.IntervalMs();
+			const int64_t nIntervalNs = int64_t( flIntervalMs * 1e6 );
+
+			int jDue = -1;
+			for ( int k = m_nHist - 1; k >= 0; k-- )
+			{
+				if ( m_Hist[ k ].arrival <= tauNow )
+				{
+					jDue = k;
+					break;
+				}
+			}
+
+			bool bOut = false;
+			bool bReal = false;
+			int j = 0;
+			double t = 1.0;
+			int64_t tau = 0;
+			if ( jDue >= 0 && ( !m_bTauValid || m_Hist[ jDue ].arrival > m_nTauLast ) )
+			{
+				bOut = bReal = true;
+				j = jDue;
+				tau = m_Hist[ jDue ].arrival;
+			}
+			else if ( m_bTauValid )
+			{
+				// Past the planned instant of the next output and no real frame is due:
+				// fill, if a later real frame is already known to bracket it.
+				const int64_t tauPlan = std::max( m_nTauLast + nIntervalNs, tauNow - nIntervalNs );
+				if ( tauNow >= tauPlan )
+				{
+					for ( int k = m_nHist - 2; k >= 0; k-- )
+					{
+						if ( m_Hist[ k ].arrival <= tauPlan && tauPlan < m_Hist[ k + 1 ].arrival )
+						{
+							const int64_t nTol = int64_t( std::max( 2.0, 0.15 * flIntervalMs ) * 1e6 );
+							if ( m_Hist[ k + 1 ].arrival - tauPlan > nTol )
+							{
+								const int64_t nSpan = std::max<int64_t>( m_Hist[ k + 1 ].arrival - m_Hist[ k ].arrival, 1 );
+								t = std::min( std::max( double( tauPlan - m_Hist[ k ].arrival ) / double( nSpan ), kTMin ), kRealSnapT );
+								bOut = true;
+								j = k;
+								tau = tauPlan;
+							}
+							break;
+						}
+					}
+				}
+			}
+
+			// Something known is still to be shown (its own time, or a fill before it):
+			// ask for the next tick. Nothing known, nothing to wait for: the next
+			// arrival wakes the host.
+			const bool bPending = m_Hist[ m_nHist - 1 ].arrival > ( bOut ? tau : ( m_bTauValid ? m_nTauLast : INT64_MIN ) );
+
+			if ( !bOut )
+			{
+				Repeat( d, m_Last, bPending );
+				m_bExpectPaint = bPending;
+				return;
+			}
+
+			m_nTauLast = tau;
+			m_bTauValid = true;
+			d.newOutput = true;
+			if ( bReal )
+			{
+				FinishReal( in, d, j );
+				m_bHavePair = false;
+			}
+			else
+			{
+				FinishSynth( in, d, j, t, m_Last.t < 1.0f && m_Last.outId != 0 );
+			}
+			d.repaintNext = bPending;
+			m_bExpectPaint = bPending;
 		}
 
 		// -- arrivals / geometry --
@@ -1101,7 +1450,8 @@ namespace framegen::pacing
 		IntervalEstimator m_Est;
 
 		// -- the output sequence in progress --
-		HistFrame m_Hist[ kHistory ];
+		HistFrame m_Hist[ kHistoryMax ];
+		int      m_nDepth = kHistory;          // real frames kept: kHistory, more with a buffer
 		int      m_nHist = 0;
 		bool     m_bTauValid = false;
 		int64_t  m_nTauLast = 0;
@@ -1113,6 +1463,7 @@ namespace framegen::pacing
 		uint64_t m_ulOutSeq = 0;
 		bool     m_bNeedReset = false;
 		double   m_flDelayMs = 0.0;
+		double   m_flBlurMs = 0.0;           // the last output's blur window, ms of content time
 		Decision m_Last;
 		Cause    m_Cause = Cause::Unknown;
 
@@ -1136,68 +1487,4 @@ namespace framegen::pacing
 		bool     m_bStatusStarted = false;
 		Ns       m_ulStatusAt = 0;
 	};
-
-	// ------------------------------------------------------------------
-	//  Motion-blur window
-	// ------------------------------------------------------------------
-	//
-	// Where, inside the current real pair, the motion-blur pass is to average: the
-	// span [t0, t1] of the pair's own timeline (0 = the previous real frame, 1 = the
-	// newest), the arguments of the renderer's
-	//     recordSynthBlur( cb, prev, curr, out, t0, t1 )
-	// (the interpolation-based motion-blur pass of framegen::Interpolator; prev/curr
-	// are the pair the output is made from, i.e. Decision::prevId/currId, or, when the
-	// real frame itself is shown (Decision::t == 1), the previous real frame and the
-	// newest one). pacing.h does not depend on that pass; this function only does the
-	// arithmetic, so every host's blur logic is the same.
-	//
-	// The window always ENDS at the instant the output shows (t): a trailing shutter.
-	// It needs no future frame, so it adds no delay -- a centred window would need
-	// the NEXT pair for the output that is the real frame itself (t = 1). It never
-	// leaves [0, 1]. `amount` is the shutter, 0..1 (clamped), by what it is measured in:
-	//
-	//   Relative::ShownFrame -- in OUTPUT intervals (the time one displayed frame is
-	//     on screen). The window is [t - s*o/g, t] with o the output interval and g
-	//     the game interval, i.e. for output m of M per real pair (t = m/M, o/g = 1/M)
-	//     [(m - s)/M, m/M]; s = 1 tiles the pair exactly, s = 0.5 is a 180 degree
-	//     shutter. Blur only (no interpolation, o = g, t = 1): [1 - s, 1]. A host whose
-	//     t does not sit on m/M (a fractional cadence) gets the lower end clamped at 0:
-	//     the window is cut at the pair's start, never moved.
-	//   Relative::GameFrame  -- in REAL-frame intervals: the "film look", a shutter as
-	//     long as a camera at the game's own rate. Window [a, a + L], L = amount,
-	//     a = clamp(t - L, 0, 1 - L): the length is kept and the window is slid into
-	//     the pair (for t < L it looks slightly ahead of t, and neighbouring outputs'
-	//     windows overlap). The intervals are not used.
-	//
-	// amount <= 0 (or NaN), or an unusable interval for ShownFrame, is a point,
-	// t0 == t1 == clamp(t): no blur. t is clamped first; NaN counts as 0.
-	enum class BlurRelative : uint8_t { ShownFrame, GameFrame };
-
-	struct BlurSpan
-	{
-		float t0 = 0.0f;
-		float t1 = 0.0f;
-	};
-
-	inline BlurSpan BlurWindow( double t, double outputIntervalNs, double gameIntervalNs, double amount, BlurRelative eRelative )
-	{
-		auto Clamp01 = []( double v ) { return v != v ? 0.0 : std::min( std::max( v, 0.0 ), 1.0 ); };
-		const double flT = Clamp01( t );
-		BlurSpan w;
-		w.t0 = w.t1 = float( flT );
-		if ( !( amount > 0.0 ) )
-			return w;
-		const double flS = std::min( amount, 1.0 );
-		if ( eRelative == BlurRelative::GameFrame )
-		{
-			const double flA = std::min( std::max( flT - flS, 0.0 ), 1.0 - flS );
-			w.t0 = float( flA );
-			w.t1 = float( flA + flS );
-			return w;
-		}
-		if ( !( outputIntervalNs > 0.0 ) || !( gameIntervalNs > 0.0 ) )
-			return w;
-		w.t0 = float( Clamp01( flT - flS * outputIntervalNs / gameIntervalNs ) );
-		return w;
-	}
 }

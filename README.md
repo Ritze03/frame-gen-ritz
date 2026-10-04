@@ -230,10 +230,11 @@ for (int k = 1; k < N; ++k)
 pacing::Pacer pacer;
 pacer.OnArrival(frameId, fenceSignalNs, windowId, {w, h, fmt});            // a real frame is usable
 pacing::Pacer::Inputs in;  in.now = nowNs;  in.presentNs = predictedPresentNs;
-in.mode = pacing::Mode::Fixed;  in.multiplier = 3;  in.refreshHz = 144.0;  // ... see INTEGRATION.md
+in.frameGen = true;  in.mode = pacing::Mode::Fixed;  in.multiplier = 3;  in.refreshHz = 144.0;
+in.blur = true;  in.blurSamples = 4;  in.extraDelayNs = 0;                  // ... see INTEGRATION.md
 const auto d = pacer.OnPaint(in, newestFrameId, /*bPresentTick*/ true);     // per present tick
-if (d.t >= 1.0f || d.inert) { /* show the real frame d.newestId */ }
-else                        { /* recordSynth(cb, prev(d.prevId), curr(d.currId), out, d.t) */ }
+if (d.prevId == 0) { /* show the real frame d.showId */ }
+else               { /* recordSynthBlur(cb, prev(d.prevId), curr(d.currId), out, d.t0, d.t1) */ }
 ```
 
 - **Per-tick fractional pacing**: every output frame is generated for its own content time `tau = V - D` between the two newest real frames. No multiplier is chosen or held; a fixed N sets only the output interval and saturates at the refresh, and a game that speeds up or slows down is followed on the very next pair.
@@ -241,7 +242,7 @@ else                        { /* recordSynth(cb, prev(d.prevId), curr(d.currId),
 - **Pause at refresh rate**: on, the output is capped at the refresh and generation stops once the game reaches it; off, the cap is gone and `ExtraTimer()` asks the host to paint on its own timer. `Inputs::canExceedRefresh` is a host capability: where a present between ticks cannot be shown, off behaves as on.
 - **GPU limit**: generation may use at most 25% of a game interval; otherwise the output rate is lowered, then it passes through, with a probe every 10 s. A switch turns it off.
 - **Pass-through** (real frame, renderer inert) only when the game reaches the output rate (a ratio band, 1.02 / 1.10), the renderer is unavailable, or the cost guard trips. **Resets** on a new stream, a format change, a gap over 100 ms, or `Discontinuity()`.
-- **Blur window**: `BlurWindow(t, outputIntervalNs, gameIntervalNs, amount, BlurRelative)` returns the `[t0, t1]` span of the pair for the motion-blur pass (`recordSynthBlur`). Always a trailing window that ends at the shown instant (no future frame, no added delay): `[(m - s)/M, m/M]` for an output shutter `s` in output intervals, or the film look `[a, a + L]` in real-frame intervals; clamped to the pair.
+- **Three features, one timeline**: frame generation (which instants get an output), motion blur (what each output shows over time: a trailing window `[t0, t1]` ending at the output's instant, `BlurWindow`) and the lag-spike buffer (how far behind real time we show: `Inputs::extraDelayNs`, the hook; the detection is a later change) are separate switches that work alone and together. Every `Decision` carries `{prevId, currId, t0, t1, showId}` and the host makes **one** renderer call, `recordSynthBlur(prev, curr, out, t0, t1)`. With frame generation off, the planner runs real-rate: one output per real frame at its own time, gaps the buffer covers filled with synths.
 
 `INTEGRATION.md` has the full host contract, every field, a minimal loop and the reasoning behind each rule. `meson test -C <build> pacing` runs the CPU-only tests (`gpu/pacingtest.cpp`).
 
