@@ -6,6 +6,8 @@
 //   (saturating at 255), else 0. A cell overlapping the box never counts (the full-res box owns those pixels).
 //   Cells with count >= still are "still": counted into M[0] and their 32x32 tiles (plus the tiles within the
 //   2 px dilation) are flagged in M[4 + tile], which is what lets every later whole-screen pass skip the rest.
+// track (recordTrack): the same counters, updated by the same code, and nothing else: no store into the clean image,
+// no tile flags, no still count. The state after N tracked frames is therefore the state after N observed ones.
 #include "ui_common.glsl"
 layout(set = 0, binding = 1, FG_FMT) uniform writeonly image2D dst;
 #ifdef FG_YUV
@@ -31,10 +33,10 @@ void main() {
                 ivec2 p = p0 + ivec2(i, j);
                 if (p.x < pc.W && p.y < pc.H) {
                     vec4 v = texelFetch(src, p, 0);
-                    imageStore(dst, p, v);
+                    if (pc.track == 0) imageStore(dst, p, v);
 #ifdef FG_YUV
                     vec4 vc = texelFetch(srcC, p >> 1, 0);
-                    if (((p.x | p.y) & 1) == 0) imageStore(dstC, p >> 1, vc);
+                    if (pc.track == 0 && ((p.x | p.y) & 1) == 0) imageStore(dstC, p >> 1, vc);
                     sum += fgStillYuv(v.r, vc.rg);
 #else
                     sum += FG_STILL(v.rgb);
@@ -55,7 +57,7 @@ void main() {
             }
             uvec3 q = uvec3(floor(mean + 0.5));
             st[ci] = q.r | (q.g << 8) | (q.b << 16) | (count << 24);
-            if (count >= uint(pc.still)) {
+            if (pc.track == 0 && count >= uint(pc.still)) {
                 atomicAdd(sCnt, 1u);
                 // tiles within 2 px of the cell; the workgroup (8 cells = 8 D px, D | 4) lies inside one tile
                 ivec2 g0 = ivec2(gl_WorkGroupID.xy) * (8 * D) / TILE;
@@ -68,7 +70,7 @@ void main() {
         }
     }
     barrier();
-    if (pc.wholeScreen == 0 || lid != 0u) return;
+    if (pc.wholeScreen == 0 || pc.track != 0 || lid != 0u) return;
     if (sCnt != 0u) atomicAdd(mk[0], sCnt);
     ivec2 g0 = ivec2(gl_WorkGroupID.xy) * (8 * D) / TILE;
     for (int b = 0; b < 9; b++)

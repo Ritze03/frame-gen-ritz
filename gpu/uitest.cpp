@@ -1,6 +1,8 @@
 // uitest: validation + benchmark of framegen's static-UI protection (Settings::uiProtection).
 //   uitest check [--bgra] [--hash] [W H]     default 1280 720
 //   uitest deep [W H]                        Settings::uiHistory: a synth from a pair 10 frames back still finds its clean copies (default 640x360)
+//   uitest track [W H]                       recordTrack: UI protection kept warm while the host does not generate (default 640x360)
+//   uitest trackbench [W H]                  GPU cost of recordTrack vs recordObserve (default 1920x1080 and 2560x1440)
 //   uitest bench [W H]                       per-pass GPU times, moving and still scene (default 1920x1080 and 2560x1440)
 // check: a synthetic sequence of 12 frames: a textured background panning 14 px right / 6 px down per frame with 16 independently moving objects (some crossing the crosshair and the HUD), a static opaque crosshair
 // (plus-shaped arms, centre dot, 1 px black outline) and a static opaque HUD box in a corner. The last pair
@@ -498,6 +500,166 @@ static int deepHistory(int W, int H) {
 }
 #endif
 
+
+// ---------------------------------------------------------------- recordTrack (pass-through keeps the UI counters warm)
+#ifndef UITEST_NO_UI
+// The UI of the real scene CHANGES when the host stops generating (frame `pre`): the crosshair is recoloured and the HUD
+// inverted, then both stay static. A host that does not look at the gap frames sees the old picture on one side of the
+// gap and the new one on the other, so its counters start at 0 after the resume; one that tracks them has counted every
+// gap frame. Sequence: `pre` observed frames (each pair estimated + synthesised), `gap` frames handled per gapMode
+// (0 = nothing, 1 = recordTrack, 2 = recordObserve), then 2 frames observed + the pair (N, N+1) synthesised at t = 0.5:
+// the FIRST generated frame after the resume, returned with the real frame N+1 it is judged against.
+static std::vector<uint8_t> trackedFrame(const Scene& sc, int f, int altFrom) {
+    auto fr = sc.frame(f);
+    if (f >= altFrom)
+        for (size_t i = 0; i < (size_t)sc.W * sc.H; i++) {
+            uint8_t* p = &fr[i * 4];
+            if (sc.ui[i] == 1 && (p[0] | p[1] | p[2])) { p[0] = 64; p[1] = 255; p[2] = 64; }
+            else if (sc.ui[i] == 2) { p[0] = 255 - p[0]; p[1] = 255 - p[1]; p[2] = 255 - p[2]; }
+        }
+    return fr;
+}
+struct TrackRun { std::vector<uint8_t> out, real; bool trackOk = true; };
+static TrackRun trackRun(const Scene& sc, const Settings& s, int pre, int gap, int gapMode, int altFrom = -2) {
+    if (altFrom == -2) altFrom = pre;   // default: the UI changes at the first gap frame; INT_MAX = never
+    Interpolator fg;
+    if (!makeInterp(fg, sc.W, sc.H, s)) { fprintf(stderr, "init failed\n"); exit(1); }
+    Img ring[4];
+    for (auto& r : ring) r = makeImage(sc.W, sc.H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    Img out = makeImage(sc.W, sc.H, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    begin();
+    for (auto& r : ring) imgBarrier(r.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    imgBarrier(out.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    submit();
+    TrackRun res;
+    const int total = pre + gap + 2;
+    for (int f = 0; f < total; f++) {
+        Img& cur = ring[f % 4];
+        auto fr = trackedFrame(sc, f, altFrom);
+        upload(fr, cur, sc.W, sc.H);
+        begin();
+        fg.beginFrame();
+        const bool inGap = f >= pre && f < pre + gap;
+        if (inGap && gapMode == 0) { /* the host does nothing with this frame */ }
+        else if (inGap && gapMode == 1) res.trackOk = fg.recordTrack(cb, cur.view) && res.trackOk;
+        else if (!fg.recordObserve(cb, cur.view)) { fprintf(stderr, "observe failed\n"); exit(1); }
+        if ((f > 0 && f < pre) || f >= pre + gap + 1) {   // both frames of the pair are observed
+            Img& prv = ring[(f - 1) % 4];
+            if (!fg.recordEstimate(cb, prv.view, cur.view) || !fg.recordSynth(cb, prv.view, cur.view, out.view, 0.5f)) { fprintf(stderr, "synth failed\n"); exit(1); }
+        }
+        submit();
+        if (f == total - 1) { res.out = download(out, sc.W, sc.H); res.real = fr; }
+    }
+    vkDeviceWaitIdle(dev);
+    fg.destroy();
+    for (auto& r : ring) { vkDestroyImageView(dev, r.view, nullptr); vkDestroyImage(dev, r.img, nullptr); vkFreeMemory(dev, r.mem, nullptr); }
+    vkDestroyImageView(dev, out.view, nullptr); vkDestroyImage(dev, out.img, nullptr); vkFreeMemory(dev, out.mem, nullptr);
+    return res;
+}
+
+static int trackCheck(int W, int H) {
+    Scene sc(W, H, 44, 0, 0);
+    printf("track %dx%d: crosshair %zu px, hud box %zu px\n", W, H, (size_t)std::count(sc.ui.begin(), sc.ui.end(), 1), (size_t)std::count(sc.ui.begin(), sc.ui.end(), 2));
+    const int PRE = 14, GAP = 20;
+    for (UiProtection mode : {UiProtection::Crosshair, UiProtection::WholeScreen}) {
+        const bool ws = mode == UiProtection::WholeScreen;
+        Settings s; s.uiProtection = mode;
+        printf("%s:\n", ws ? "WholeScreen" : "Crosshair");
+        auto bad = [&](const TrackRun& r) { return measure(sc, r.out, r.real, nullptr); };
+        TrackRun ctl = trackRun(sc, s, PRE, GAP, 0);
+        TrackRun trk = trackRun(sc, s, PRE, GAP, 1);
+        TrackRun obs = trackRun(sc, s, PRE, GAP, 2);
+        TrackRun st = trackRun(sc, s, 0, GAP, 1);   // tracking from the very first frame, before any observe
+        TrackRun stc = trackRun(sc, s, 0, GAP, 0);
+        Metrics mc = bad(ctl), mt = bad(trk), mo = bad(obs), ms = bad(st), msc = bad(stc);
+        printf(" control (gap, nothing)    crosshair wrong %zu/%zu, hud wrong %zu/%zu\n", mc.xhBad, mc.xhN, mc.hudBad, mc.hudN);
+        printf(" recordTrack x%d            crosshair wrong %zu/%zu, hud wrong %zu/%zu\n", GAP, mt.xhBad, mt.xhN, mt.hudBad, mt.hudN);
+        printf(" recordObserve x%d (ref)    crosshair wrong %zu/%zu, hud wrong %zu/%zu\n", GAP, mo.xhBad, mo.xhN, mo.hudBad, mo.hudN);
+        printf(" tracked from frame 0      crosshair wrong %zu/%zu, hud wrong %zu/%zu  (control without: %zu/%zu, hud %zu)\n", ms.xhBad, ms.xhN, ms.hudBad, ms.hudN, msc.xhBad, msc.xhN, msc.hudBad);
+        // informational: a UI that does NOT change during the gap keeps its counters across it even without tracking
+        // (they hold the last frame seen before the gap; unchanged pixels compare equal on the other side)
+        {
+            Metrics mu = bad(trackRun(sc, s, PRE, GAP, 0, 1 << 30)), mut = bad(trackRun(sc, s, PRE, GAP, 1, 1 << 30));
+            printf(" UI unchanged in the gap: no tracking crosshair wrong %zu, hud wrong %zu | tracking crosshair wrong %zu, hud wrong %zu\n", mu.xhBad, mu.hudBad, mut.xhBad, mut.hudBad);
+        }
+        expect(trk.trackOk && st.trackOk, "recordTrack returns true");
+        expect(mc.xhBad > 0, "control: without tracking the first synth after the gap has wrong crosshair pixels (test has teeth)");
+        if (ws) expect(mc.hudBad > 0, "control: without tracking the first synth after the gap has wrong HUD pixels");
+        expect(mt.xhBad == 0, "recordTrack x20: crosshair pixel-exact (<= 1 level) on the very first synth after the resume");
+        if (ws) expect(mt.hudBad == 0, "recordTrack x20: HUD box pixel-exact on the very first synth after the resume");
+        expect(ms.xhBad == 0 && (!ws || ms.hudBad == 0), "tracking from the first frame (nothing observed yet): exact after the resume");
+        expect(msc.xhBad > 0, "control from frame 0: without tracking the first synth is wrong");
+        expect(trk.out == obs.out, "equivalence: first synth after 20 tracked frames is bit-identical to after 20 observed frames");
+        // count-exactness: the counters must reach uiStillFrames (8) at the right frame. Gap g: the new crosshair has count g
+        // at frame N and g + 1 at N + 1 (the frame the mask is read from): masked from g = 7.
+        for (int g : {6, 7}) {
+            TrackRun a = trackRun(sc, s, PRE, g, 1), b = trackRun(sc, s, PRE, g, 2);
+            Metrics ma = bad(a);
+            printf(" gap %d: tracked crosshair wrong %zu/%zu\n", g, ma.xhBad, ma.xhN);
+            expect(a.out == b.out, g == 6 ? "equivalence at the threshold, 6 tracked frames == 6 observed (not yet protected)" : "equivalence at the threshold, 7 tracked frames == 7 observed (protected)");
+            if (g == 6) expect(ma.xhBad > 0, "6 tracked frames: counters at 7 of 8, crosshair not yet protected (counts exactly)");
+            else expect(ma.xhBad == 0, "7 tracked frames: counters at 8 of 8, crosshair protected (counts exactly)");
+        }
+    }
+    // Off: recordTrack is a no-op returning true; the output is byte-identical to a run that never calls it
+    {
+        Settings off;
+        TrackRun a = trackRun(sc, off, PRE, GAP, 1), b = trackRun(sc, off, PRE, GAP, 0);
+        expect(a.trackOk, "Off: recordTrack returns true");
+        expect(a.out == b.out, "Off: output byte-identical with and without recordTrack calls");
+    }
+    return fails ? 1 : 0;
+}
+
+// ---- cost: GPU time per call, back to back (8 per command buffer), moving scene; observe = the same call with recordObserve
+static void trackBench(int W, int H) {
+    const int NIMG = 16;
+    Scene sc(W, H, NIMG, 0, 0);
+    printf("\n== %dx%d ==\n", W, H);
+    Img ring[NIMG];
+    for (auto& r : ring) r = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    begin();
+    for (auto& r : ring) imgBarrier(r.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    submit();
+    for (int i = 0; i < NIMG; i++) upload(sc.frame(i), ring[i], W, H);
+    for (UiProtection mode : {UiProtection::Crosshair, UiProtection::WholeScreen}) {
+        Settings s; s.uiProtection = mode;
+        double ms[2] = {0, 0};
+        for (int track = 0; track < 2; track++) {
+            Interpolator fg;
+            if (!makeInterp(fg, W, H, s)) { fprintf(stderr, "init failed\n"); exit(1); }
+            VkQueryPoolCreateInfo qp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qp.queryType = VK_QUERY_TYPE_TIMESTAMP; qp.queryCount = 2;
+            VkQueryPool qpool;
+            CK(vkCreateQueryPool(dev, &qp, nullptr, &qpool));
+            std::vector<double> v;
+            for (int rep = 0; rep < 14; rep++) {
+                begin();
+                fg.beginFrame();
+                vkCmdResetQueryPool(cb, qpool, 0, 2);
+                vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
+                for (int k = 0; k < 8; k++) {
+                    bool ok = track ? fg.recordTrack(cb, ring[(rep * 8 + k) % NIMG].view) : fg.recordObserve(cb, ring[(rep * 8 + k) % NIMG].view);
+                    if (!ok) { fprintf(stderr, "record failed\n"); exit(1); }
+                }
+                vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 1);
+                submit();
+                uint64_t t2[2];
+                CK(vkGetQueryPoolResults(dev, qpool, 0, 2, sizeof(t2), t2, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+                if (rep >= 4) v.push_back((t2[1] - t2[0]) * tsPeriodMs / 8);
+            }
+            std::sort(v.begin(), v.end());
+            ms[track] = v[v.size() / 2];
+            vkDestroyQueryPool(dev, qpool, nullptr);
+            vkDeviceWaitIdle(dev);
+            fg.destroy();
+        }
+        printf("  %-12s recordObserve %.4f ms   recordTrack %.4f ms   (%.0f %% of an observe)\n", mode == UiProtection::Crosshair ? "Crosshair" : "WholeScreen", ms[0], ms[1], 100.0 * ms[1] / ms[0]);
+    }
+    for (auto& r : ring) { vkDestroyImageView(dev, r.view, nullptr); vkDestroyImage(dev, r.img, nullptr); vkFreeMemory(dev, r.mem, nullptr); }
+}
+#endif
+
 // ---------------------------------------------------------------- bench
 #ifndef UITEST_NO_UI
 static void bench(int W, int H) {
@@ -602,7 +764,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep")) { fprintf(stderr, "usage: uitest check|bench|deep [--bgra] [--hash] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -640,7 +802,23 @@ int main(int argc, char** argv) {
     CK(vkCreateFence(dev, &fci, nullptr, &fence));
 
     int rc = 0;
-    if (pos[0] == "deep") {
+    if (pos[0] == "track" || pos[0] == "trackbench") {
+#ifdef UITEST_NO_UI
+        fprintf(stderr, "track needs the UI API\n");
+        return 2;
+#else
+        if (pos[0] == "track") {
+            int W = pos.size() >= 3 ? atoi(pos[1].c_str()) : 640, H = pos.size() >= 3 ? atoi(pos[2].c_str()) : 360;
+            initStaging((size_t)W * H * 4);
+            rc = trackCheck(W, H);
+            printf(rc ? "RESULT: FAIL (%d)\n" : "RESULT: PASS\n", fails);
+        } else {
+            initStaging((size_t)2560 * 1440 * 4);
+            if (pos.size() >= 3) trackBench(atoi(pos[1].c_str()), atoi(pos[2].c_str()));
+            else { trackBench(1920, 1080); trackBench(2560, 1440); }
+        }
+#endif
+    } else if (pos[0] == "deep") {
 #ifdef UITEST_NO_UI
         fprintf(stderr, "deep needs the UI API\n");
         return 2;

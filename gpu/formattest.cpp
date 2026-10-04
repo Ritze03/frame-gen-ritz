@@ -471,7 +471,8 @@ static InitInfo baseInfo(Enc e, int W, int H, const Settings& s) {
 
 struct Result { Raw out[3]; bool ok = false, notBuilt = false; };   // t = 0.5, 0.25, blur (0.45..0.55, 3 samples) of the last pair
 // Runs the sequence (frames 0..NF-1 of the scene) through a ring of 4 pics; synthesises from the last pair only.
-static Result runSequence(Enc e, const Scene& sc, const Settings& s, bool doBlur) {
+// trackMid: frames 1..NF-4 go through recordTrack instead of recordObserve (and no pair touching one is estimated).
+static Result runSequence(Enc e, const Scene& sc, const Settings& s, bool doBlur, bool trackMid = false) {
     Result res;
     Interpolator fg;
     if (!fg.init(baseInfo(e, sc.W, sc.H, s))) {
@@ -492,8 +493,10 @@ static Result runSequence(Enc e, const Scene& sc, const Settings& s, bool doBlur
         upload(cur, encode(e, sc.frame(f), sc.W, sc.H), sc.W, sc.H);
         begin();
         fg.beginFrame();
-        if (!fg.recordObserve(cb, cur.frame())) { fprintf(stderr, "observe failed\n"); exit(1); }
-        if (f > 0) {
+        const bool tracked = trackMid && f >= 1 && f <= sc.NF - 4;
+        if (tracked) { if (!fg.recordTrack(cb, cur.frame())) { fprintf(stderr, "track failed\n"); exit(1); } }
+        else if (!fg.recordObserve(cb, cur.frame())) { fprintf(stderr, "observe failed\n"); exit(1); }
+        if (f > 0 && !(trackMid && f <= sc.NF - 3)) {
             Pic& prv = ring[(f - 1) % 4];
             if (!fg.recordEstimate(cb, prv.frame(), cur.frame())) { fprintf(stderr, "estimate failed\n"); exit(1); }
             if (f == sc.NF - 1) {
@@ -630,6 +633,11 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     expect(xh == 0 && xh2 == 0, "crosshair pixels equal the real ones (WholeScreen, t = 0.5 and 0.25)");
     expect(hud == 0 && hud2 == 0, "HUD box pixels equal the real ones (WholeScreen)");
     expect(xhOff > 0 || hudOff > 0, "(the scene disturbs the UI without protection: the check has teeth)");
+    {   // recordTrack: 8 frames tracked instead of observed leave the same counters, so the last pair's outputs are bit-identical
+        Result rt = runSequence(e, sc, w, false, true);
+        expect(rt.ok && rt.out[0].p0 == rw.out[0].p0 && rt.out[0].p1 == rw.out[0].p1 && rt.out[1].p0 == rw.out[1].p0 && rt.out[1].p1 == rw.out[1].p1,
+               "recordTrack (WholeScreen): frames tracked instead of observed give bit-identical output");
+    }
     Settings c; c.uiProtection = UiProtection::Crosshair;
     Result rc = runSequence(e, sc, c, false);
     if (rc.ok) {

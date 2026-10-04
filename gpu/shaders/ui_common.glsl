@@ -32,6 +32,7 @@ layout(push_constant) uniform PC {
     int stillLimit;           // still cells above this = whole-screen passes suppressed for this frame
     int maskX, maskY, maskW, maskH, maskStride, maskOff;
     int gate;                 // 1: tile flags + suppression apply (whole screen)
+    int track;                // 1: recordTrack: advance the stillness state only (ui_detect: no copy, no tile flags / counts)
 } pc;
 
 const int TILE = 32;
