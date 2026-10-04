@@ -23,9 +23,9 @@
 // THREE FEATURES, ONE CONTENT TIMELINE. Frame generation, motion blur and the
 // lag-spike buffer are separate switches that can all be on at once; each owns
 // exactly one dimension of the same plan, so every combination falls out:
-//   * the BUFFER   -- how far behind real time we show: Inputs::extraDelayNs, added
-//                     to the base delay D (0 = none). The detection that drives it is
-//                     not in this header; the hook is.
+//   * the BUFFER   -- how far behind real time we show: the LAG-SPIKE BUFFER (below),
+//                     plus the manual hook Inputs::extraDelayNs, both added to the base
+//                     delay D (0 = none).
 //   * FRAME GEN    -- which instants get an output frame (the cadence): fixed N,
 //                     target fps, pause at refresh. Off (Inputs::frameGen false): one
 //                     output per real frame, at that frame's own time plus D, and a gap
@@ -137,6 +137,37 @@
 // display without tearing, an offscreen sink, VR) and "off" then behaves
 // exactly as "on": capped at the refresh, tick-paced. canExceedRefresh is a
 // host-provided capability: the pacer cannot know what the display path allows.
+//
+// THE LAG-SPIKE BUFFER (Inputs::lagBuffer; off by default, then byte-identical).
+// Some games hitch: a frame arrives one, two, three intervals late. The buffer keeps
+// a small adaptive extra delay D_buf, so that when the next hitch comes the content
+// time is still inside the pair that ends at the late frame and the gap is filled with
+// generated frames instead of frozen. It is independent of the multiplier and of
+// blur; it adds to D and to nothing else.
+//   * DETECTION (OnArrival): an interval above kLagSpikeRatio (1.75) x the smoothed
+//     interval is a spike of size  interval - smoothed  ms ("missing frames x
+//     interval"). Kept in a ring of kLagSpikeMax (time, size).
+//   * JUDGEMENT: a spike larger than maxBufferMs is an OUTLIER (a shader compile, a
+//     disk hitch: 10 fps): never sized for, only counted (Report::outliersIgnored).
+//   * RECENCY: weight w(age) = 0.3 + 0.7 x (1 + cos(pi x age / lookback)) / 2 for
+//     age <= lookback (1 when new, 0.3 at the end, smooth), 0 beyond. Base = max over
+//     spikes of size x w: the newest big one dominates, older ones fade but are never
+//     dropped inside the window, so a game that hitches every few minutes keeps a
+//     steady buffer. While spikes recur (>= 1 in the window, >= 2 seen this session)
+//     the base is at least kLagFloorFrac (0.5) x the session's EWMA of spike sizes
+//     (alpha 0.15), so history is not thrown away. Target = base x 1.10 + 1 ms, clamped
+//     to [0, maxBufferMs] (and to what kHistoryMax frames can hold at this game rate).
+//   * RAMP: D_buf never jumps. It moves toward the target by at most kLagRampEps (3 %)
+//     of real time, i.e. content time plays at 0.97x while it grows and 1.03x while it
+//     shrinks (tau stays monotonic). Shrinking starts only after the target has been
+//     more than 3 ms below D_buf for 2 s (the look-back decay, not a flicker).
+//   * TEST MODE: ForceMin pins the target at 0, ForceMax at maxBufferMs (through the same
+//     ramp, no band, no wait).
+//   * HISTORY: HistoryDepth() = ceil((base delay + max(D_buf, target) + manual delay) /
+//     interval) + 2, 3 with no delay: it grows AHEAD of the ramp and shrinks only
+//     after a 2 s dwell and only past frames the content time has left.
+// The buffer works because D >= spike: the late frame has arrived by the time the
+// content time needs the gap filled. The first hitch of a session always freezes.
 
 #include <algorithm>
 #include <cmath>
@@ -193,9 +224,46 @@ namespace framegen::pacing
 	constexpr double kRealSnapT       = 0.98;
 	// Real frames kept for pair selection (the renderer's ring is the same size).
 	constexpr int    kHistory         = 3;
-	// With a lag-spike buffer (Inputs::extraDelayNs > 0) more real frames are kept, so
-	// the content time stays bracketed by a pair; at most this many.
-	constexpr int    kHistoryMax      = 16;
+	// With a delay (the lag-spike buffer, Inputs::extraDelayNs) the number of real frames kept
+	// FOLLOWS the delay: ceil((base delay + buffer) / game interval) + kHistoryMargin
+	// (HistoryDepth(), Report::historyFrames), never fewer than kHistory, never more than
+	// kHistoryMax. The ceiling is ceil(250 ms / kMinIntervalMs) + kHistoryMargin = 63 + 2: it
+	// covers the largest buffer (kLagMaxBufferMs) at the fastest game rate the pacer supports
+	// (250 fps). Each frame the host keeps costs it one frame of memory (see INTEGRATION.md).
+	constexpr int    kHistoryMargin   = 2;
+	constexpr int    kHistoryMax      = 65;
+	// Depth shrinks only after the wanted depth has stayed lower for this long (no allocating
+	// back and forth), and only once the content time has moved past the frames to drop.
+	constexpr double kDepthShrinkDwellMs = 2000.0;
+
+	// ---- the lag-spike buffer's constants (see LagBufferSettings and "LAG-SPIKE BUFFER") ----
+	constexpr double kLagSpikeRatio    = 1.75;    // an interval above this x the smoothed one is a spike
+	constexpr int    kLagSpikeMax      = 64;      // spikes remembered (the lowest-weighted is replaced when full)
+	constexpr double kLagWeightMin     = 0.3;     // a spike's weight at the end of the look-back window (1 when new, 0 beyond)
+	constexpr double kLagMarginFrac    = 0.10;    // target = size x (1 + this) + kLagMarginMs
+	constexpr double kLagMarginMs      = 1.0;
+	constexpr double kLagFloorFrac     = 0.5;     // while spikes recur: the buffer is at least this x the long-run mean size
+	constexpr double kLagEwmaAlpha     = 0.15;    // the long-run mean's weight of a new spike
+	constexpr double kLagRampEps       = 0.03;    // the buffer changes by at most this per unit of real time (content speed 1 +- 3 %)
+	constexpr double kLagRampMaxDtMs   = 100.0;   // one paint never moves the buffer by more than this x kLagRampEps
+	constexpr double kLagShrinkBandMs  = 3.0;     // the buffer shrinks only once it is this far above its target ...
+	constexpr double kLagShrinkDwellMs = 2000.0;  // ... for this long
+	constexpr double kLagMaxBufferMs   = 250.0;   // LagBufferSettings::maxBufferMs's upper bound
+	constexpr double kLagMaxLookbackSec = 600.0;  // ... and lookbackSec's (1 .. this)
+
+	// The lag-spike buffer's test mode: pin the target instead of following the spikes (the
+	// buffer still gets there through the same ramp), so a user can feel each end.
+	enum class LagTestMode : uint8_t { Off, ForceMin, ForceMax };
+
+	// The lag-spike buffer's settings. Off by default: the pacer is then byte-identical to one
+	// without the buffer. Read fresh at every paint; every field is clamped to its range.
+	struct LagBufferSettings
+	{
+		bool   enabled = false;
+		double lookbackSec = 300.0;    // 1 .. kLagMaxLookbackSec: how far back spikes count
+		double maxBufferMs = 50.0;     // 0 .. kLagMaxBufferMs: the buffer's cap; a spike larger than this is an outlier
+		LagTestMode testMode = LagTestMode::Off;   // ForceMin: target 0; ForceMax: target maxBufferMs (needs enabled)
+	};
 
 	enum class Mode : uint8_t { Off, Fixed, Target };
 	enum class Priority : uint8_t { LowLatency, Smoothness };
@@ -561,11 +629,12 @@ namespace framegen::pacing
 			// With frame generation off, no blur and no delay the pacer is a pure
 			// pass-through (Reason::Off, inert).
 			bool   frameGen = true;
-			// Lag-spike buffer: HOW FAR BEHIND real time frames are shown. Added to the
-			// base delay (Low latency / Smoothness while frame generation is on, 0 while it
-			// is off). 0 = none. The buffer's own lag-spike detection is the host's (or a
-			// later library module's) business: this is only the hook it drives. A change
-			// is followed smoothly (the content time never goes backwards).
+			// Lag-spike buffer: HOW FAR BEHIND real time frames are shown, sized from the
+			// game's own frame-time spikes (see "THE LAG-SPIKE BUFFER"). Added to the base delay
+			// (Low latency / Smoothness while frame generation is on, 0 while it is off).
+			LagBufferSettings lagBuffer;
+			// A fixed extra delay on top of the buffer (a host's manual hook; 0 = none). A
+			// change is followed at once (the content time never goes backwards).
 			Ns     extraDelayNs = 0;
 			// Motion blur: WHAT EACH OUTPUT SHOWS OVER TIME (the shutter window, ending at
 			// the output's content time). Active when blur && blurAmount > 0 &&
@@ -623,7 +692,12 @@ namespace framegen::pacing
 			bool   blurActive = false;         // motion blur is applied
 			float  blurWindowMs = 0.0f;        // the last window's length in ms of content time (0 = a point)
 			int    blurSamples = 0;            // Inputs::blurSamples while blurActive, else 0
-			float  bufferDelayMs = 0.0f;       // the lag-spike buffer's part of delayMs (Inputs::extraDelayNs)
+			float  bufferDelayMs = 0.0f;       // the lag-spike buffer's part of delayMs (the live ramped buffer + Inputs::extraDelayNs)
+			float  bufferTargetMs = 0.0f;      // what the buffer is ramping toward (0 with the buffer off)
+			float  lastSpikeMs = 0.0f;         // the size of the newest spike inside the look-back window (0 = none)
+			int    spikesInWindow = 0;         // spikes inside the window that size the buffer
+			int    outliersIgnored = 0;        // spikes inside the window larger than maxBufferMs: ignored for sizing
+			int    historyFrames = kHistory;   // HistoryDepth(): real frames the host keeps (and UI-protection clean copies)
 		};
 
 		// Is the output capped at the refresh rate under these inputs?
@@ -663,14 +737,16 @@ namespace framegen::pacing
 				// Another source, or the same one at another size / format.
 				DropHistory( Cause::Stream, true );
 			}
-			else if ( m_bHaveArrival && tNs > m_ulLastArrival + kGapResetNs )
+			else if ( m_bHaveArrival && tNs > m_ulLastArrival + m_ulGapNs )
 			{
-				// A gap in the game's frames.
+				// A gap in the game's frames (a stall; the lag-spike buffer still counts it).
+				NoteSpike( tNs, tNs - m_ulLastArrival );
 				DropHistory( Cause::Gap, false );
 			}
 			else if ( m_bHaveArrival )
 			{
 				const Ns ulInterval = tNs >= m_ulLastArrival ? tNs - m_ulLastArrival : 0;
+				NoteSpike( tNs, ulInterval );
 				m_Est.AddInterval( ulInterval );
 				m_flLastIntervalMs = ClampIntervalMs( double( ulInterval ) / double( kNsPerMs ) );
 			}
@@ -762,6 +838,11 @@ namespace framegen::pacing
 		Report TakeStatus( const Inputs &in, Ns ulNow )
 		{
 			Report s;
+			s.bufferTargetMs = float( m_flTargetMs );
+			s.lastSpikeMs = float( m_flLagShownMs );
+			s.spikesInWindow = m_nLagInWindow;
+			s.outliersIgnored = m_nLagOutliers;
+			s.historyFrames = m_nDepth;
 			s.chosenN = in.mode == Mode::Fixed ? in.multiplier : 0;
 			s.cappedAtRefresh = CapAtRefresh( in );
 
@@ -786,7 +867,7 @@ namespace framegen::pacing
 			{
 				s.reason = Reason::RendererUnavailable;
 			}
-			else if ( m_bHaveArrival && ulNow > m_ulLastArrival + kGapResetNs )
+			else if ( m_bHaveArrival && ulNow > m_ulLastArrival + m_ulGapNs )
 			{
 				s.reason = Reason::GameStalled;
 			}
@@ -800,7 +881,7 @@ namespace framegen::pacing
 				if ( m_Plan.state == State::Generate )
 				{
 					s.delayMs = float( m_flDelayMs );
-					s.bufferDelayMs = float( double( in.extraDelayNs ) / double( kNsPerMs ) );
+					s.bufferDelayMs = float( double( m_ulExtraNs ) / double( kNsPerMs ) );
 					s.blurActive = BlurActive( in );
 					s.blurWindowMs = float( m_flBlurMs );
 					s.blurSamples = s.blurActive ? in.blurSamples : 0;
@@ -826,7 +907,9 @@ namespace framegen::pacing
 		bool   Planning() const { return m_Plan.state == State::Generate; }
 		// One output per real frame (frame generation off, or the game reaches the output rate).
 		bool   RealRate() const { return m_Plan.state == State::Generate && m_Plan.realRate; }
-		// Real frames the host must keep addressable by id: kHistory, more with a buffer.
+		// Real frames the host must keep addressable by id (and, with UI protection, the clean
+		// copies to keep: Settings::uiHistory): kHistory, more with a delay; follows the
+		// delay, see kHistoryMargin.
 		int    HistoryDepth() const { return m_nDepth; }
 		bool   CostBlocked() const { return m_bCostBlocked; }
 		// The effective output interval (after the cost guard), ms; 0 when not generating.
@@ -838,6 +921,9 @@ namespace framegen::pacing
 		bool   ExtraTimer() const { return m_bExtra; }
 		double DelayMs() const { return m_flDelayMs; }
 		int    HistoryCount() const { return m_nHist; }
+		// The lag-spike buffer: its live (ramped) size and its target, ms.
+		double BufferMs() const { return m_flBufMs; }
+		double BufferTargetMs() const { return m_flTargetMs; }
 		// The content time of the last output frame (tau, ns; 0 before any).
 		int64_t ContentNs() const { return m_bTauValid ? m_nTauLast : 0; }
 
@@ -880,7 +966,204 @@ namespace framegen::pacing
 				m_bGenInit = false;
 				m_bCostBlocked = false;
 				m_bProbing = false;
+				ClearLag();
 			}
+		}
+
+		// ---- the lag-spike buffer ----
+
+		struct Spike
+		{
+			Ns     t = 0;       // arrival time of the late frame
+			double ms = 0.0;    // size: interval - smoothed interval
+		};
+
+		void ClearLag()
+		{
+			m_nSpikes = 0;
+			m_nSpikesTotal = 0;
+			m_flSpikeEwma = 0.0;
+			m_flBufMs = 0.0;
+			m_flTargetMs = 0.0;
+			m_flLowMs = 0.0;
+			m_ulExtraNs = 0;
+			m_ulLagLastAt = 0;
+			m_flLagShownMs = 0.0;
+			m_nLagInWindow = m_nLagOutliers = 0;
+		}
+
+		static double SpikeWeight( double flAgeNs, double flLookbackNs )
+		{
+			if ( flAgeNs > flLookbackNs )
+				return 0.0;
+			return kLagWeightMin + ( 1.0 - kLagWeightMin ) * 0.5 * ( 1.0 + std::cos( 3.14159265358979323846 * flAgeNs / flLookbackNs ) );
+		}
+
+		// Called for every real interval BEFORE it enters the estimator: a spike is an
+		// interval above kLagSpikeRatio x the smoothed one; its size is the excess.
+		void NoteSpike( Ns tNs, Ns ulIntervalNs )
+		{
+			if ( !m_Est.Valid() )
+				return;
+			const double flSmooth = m_Est.IntervalMs();
+			const double flMs = double( ulIntervalNs ) / double( kNsPerMs );
+			if ( !( flMs > kLagSpikeRatio * flSmooth ) )
+				return;
+			const double flSize = flMs - flSmooth;
+			m_ulLagLastAt = tNs;
+			if ( flSize <= m_flLagMaxMs )
+			{
+				m_flSpikeEwma = m_nSpikesTotal == 0 ? flSize : m_flSpikeEwma + kLagEwmaAlpha * ( flSize - m_flSpikeEwma );
+				m_nSpikesTotal++;
+			}
+			Spike sp;
+			sp.t = tNs;
+			sp.ms = flSize;
+			if ( m_nSpikes < kLagSpikeMax )
+			{
+				m_Spikes[ m_nSpikes++ ] = sp;
+				return;
+			}
+			// Full: the entry that contributes least right now (smallest size x weight) goes.
+			int nWorst = 0;
+			double flWorst = 1e300;
+			for ( int i = 0; i < m_nSpikes; i++ )
+			{
+				const double flAge = tNs > m_Spikes[ i ].t ? double( tNs - m_Spikes[ i ].t ) : 0.0;
+				const double flV = m_Spikes[ i ].ms * SpikeWeight( flAge, m_flLagLookbackNs );
+				if ( flV < flWorst )
+				{
+					flWorst = flV;
+					nWorst = i;
+				}
+			}
+			m_Spikes[ nWorst ] = sp;
+		}
+
+		// The buffer's target for the settings, ms (also fills the window counters).
+		double LagTargetMs( const Inputs &in, double flIntervalMs, Ns ulNow )
+		{
+			const LagBufferSettings &lb = in.lagBuffer;
+			// What kHistoryMax frames can hold at this game rate.
+			const double flCap = std::min( m_flLagMaxMs, double( kHistoryMax - kHistory - kHistoryMargin ) * flIntervalMs );
+			m_nLagInWindow = m_nLagOutliers = 0;
+			double flBase = 0.0;
+			m_flLagShownMs = 0.0;
+			int n = 0;
+			for ( int i = 0; i < m_nSpikes; i++ )
+			{
+				const double flAge = ulNow > m_Spikes[ i ].t ? double( ulNow - m_Spikes[ i ].t ) : 0.0;
+				if ( flAge > m_flLagLookbackNs )
+					continue;                                  // expired
+				m_Spikes[ n++ ] = m_Spikes[ i ];
+				if ( m_Spikes[ i ].t == m_ulLagLastAt )
+					m_flLagShownMs = m_Spikes[ i ].ms;
+				if ( m_Spikes[ i ].ms > m_flLagMaxMs )
+				{
+					m_nLagOutliers++;                          // an outlier: never sized for
+					continue;
+				}
+				m_nLagInWindow++;
+				flBase = std::max( flBase, m_Spikes[ i ].ms * SpikeWeight( flAge, m_flLagLookbackNs ) );
+			}
+			m_nSpikes = n;
+			if ( m_nLagInWindow >= 1 && m_nSpikesTotal >= 2 )
+				flBase = std::max( flBase, kLagFloorFrac * m_flSpikeEwma );
+			if ( lb.testMode == LagTestMode::ForceMax )
+				return flCap;
+			if ( lb.testMode == LagTestMode::ForceMin )
+				return 0.0;
+			return flBase > 0.0 ? std::min( flBase * ( 1.0 + kLagMarginFrac ) + kLagMarginMs, flCap ) : 0.0;
+		}
+
+		// Once per paint, before the plan: sizes the target, ramps D_buf toward it.
+		void UpdateBuffer( const Inputs &in, int64_t V )
+		{
+			double flDtMs = 0.0;
+			if ( m_bRampV && V > m_nRampV )
+				flDtMs = std::min( double( V - m_nRampV ) / 1e6, kLagRampMaxDtMs );
+			m_nRampV = V;
+			m_bRampV = true;
+			m_flDtMs = flDtMs;
+
+			const LagBufferSettings &lb = in.lagBuffer;
+			if ( !lb.enabled && m_flBufMs <= 0.0 )
+			{
+				m_flTargetMs = 0.0;
+				m_ulGapNs = kGapResetNs;
+				m_ulExtraNs = in.extraDelayNs;
+				return;
+			}
+			auto Fin = []( double v, double lo, double hi ) { return v != v ? lo : std::min( std::max( v, lo ), hi ); };
+			m_flLagMaxMs = Fin( lb.maxBufferMs, 0.0, kLagMaxBufferMs );
+			m_flLagLookbackNs = Fin( lb.lookbackSec, 1.0, kLagMaxLookbackSec ) * 1e9;
+			// A stall must not reset the pipeline before a spike the buffer is sized for.
+			m_ulGapNs = lb.enabled ? std::max( kGapResetNs, Ns( m_flLagMaxMs * 1e6 ) + 50 * kNsPerMs ) : kGapResetNs;
+
+			const double flInterval = m_Est.IntervalMs() > 0.0 ? m_Est.IntervalMs() : 16.7;
+			m_flTargetMs = lb.enabled ? LagTargetMs( in, flInterval, in.now ) : 0.0;
+
+			const double flStep = kLagRampEps * flDtMs;
+			if ( m_flTargetMs > m_flBufMs )
+			{
+				m_flBufMs = std::min( m_flBufMs + flStep, m_flTargetMs );
+				m_flLowMs = 0.0;
+			}
+			else if ( m_flBufMs > m_flTargetMs )
+			{
+				const bool bNow = !lb.enabled || lb.testMode != LagTestMode::Off;
+				const bool bBelow = m_flTargetMs <= 0.0 ? m_flBufMs > 0.0 : m_flBufMs > m_flTargetMs + kLagShrinkBandMs;
+				if ( bNow )
+				{
+					m_flBufMs = std::max( m_flBufMs - flStep, m_flTargetMs );
+				}
+				else if ( bBelow )
+				{
+					m_flLowMs += flDtMs;
+					if ( m_flLowMs >= kLagShrinkDwellMs )
+					{
+						const double flGoal = m_flTargetMs > 0.0 ? m_flTargetMs + 0.5 * kLagShrinkBandMs : 0.0;
+						m_flBufMs = std::max( m_flBufMs - flStep, flGoal );
+					}
+				}
+				else
+				{
+					m_flLowMs = 0.0;
+				}
+			}
+			else
+			{
+				m_flLowMs = 0.0;
+			}
+			m_ulExtraNs = in.extraDelayNs + Ns( m_flBufMs * 1e6 );
+		}
+
+		// Real frames to keep: kHistory with no delay, else what the delay reaches back (see
+		// kHistoryMargin). Grows at once and AHEAD of the ramp (it counts the target), shrinks
+		// after kDepthShrinkDwellMs and only past frames the content time has left.
+		void UpdateDepth( const Inputs &in )
+		{
+			const double flInterval = std::max( m_Est.IntervalMs(), kMinIntervalMs );
+			const double flExtraMs = double( in.extraDelayNs ) / 1e6 + std::max( m_flBufMs, m_flTargetMs );
+			int nWant = kHistory;
+			if ( flExtraMs > 0.0 )
+			{
+				const double flBaseMs = ( m_Plan.state == State::Generate && !m_Plan.realRate ) ? DelayBaseFor( in ) : 0.0;
+				nWant = std::min( kHistoryMax, std::max( kHistory, int( std::ceil( ( flBaseMs + flExtraMs ) / flInterval - 1e-9 ) ) + kHistoryMargin ) );
+			}
+			if ( nWant >= m_nDepth )
+			{
+				m_nDepth = nWant;
+				m_flDepthLowMs = 0.0;
+				return;
+			}
+			m_flDepthLowMs += m_flDtMs;
+			if ( m_flDepthLowMs < kDepthShrinkDwellMs )
+				return;
+			if ( m_nHist > nWant && m_bTauValid && m_Hist[ m_nHist - nWant ].arrival > m_nTauLast )
+				return;     // the content time is still inside the frames that would go
+			m_nDepth = nWant;
+			m_flDepthLowMs = 0.0;
 		}
 
 		// Everything about the output sequence in progress (the content time, the
@@ -932,10 +1215,11 @@ namespace framegen::pacing
 
 			Plan p;
 			m_bExtra = false;
-			m_nDepth = DepthFor( in );
+			UpdateBuffer( in, int64_t( in.presentNs ? in.presentNs : in.now ) );
+			UpdateDepth( in );
 			const bool bFG = in.frameGen;
 			const bool bBlur = BlurActive( in );
-			const bool bDelay = in.extraDelayNs > 0;
+			const bool bDelay = m_ulExtraNs > 0;
 			if ( !bFG && !bBlur && !bDelay )
 			{
 				// Frame generation off and nothing else asked for a pair: not a feature, a
@@ -1093,20 +1377,11 @@ namespace framegen::pacing
 			return in.blur && in.blurAmount > 0.0 && in.blurSamples >= 2;
 		}
 
-		// Real frames to keep: kHistory, plus what the buffer's delay reaches back.
-		int DepthFor( const Inputs &in ) const
-		{
-			if ( in.extraDelayNs == 0 )
-				return kHistory;
-			const double flInterval = std::max( m_Est.IntervalMs(), kMinIntervalMs );
-			return std::min( kHistoryMax, kHistory + 1 + int( std::ceil( double( in.extraDelayNs ) / ( flInterval * 1e6 ) ) ) );
-		}
-
 		// The delay D for the current plan, ms: the base delay (Low latency /
 		// Smoothness while generating, 0 in real-rate) plus the buffer's.
 		double DelayFor( const Inputs &in ) const
 		{
-			const double flExtraMs = double( in.extraDelayNs ) / double( kNsPerMs );
+			const double flExtraMs = double( m_ulExtraNs ) / double( kNsPerMs );
 			if ( m_Plan.realRate )
 				return flExtraMs;
 			return DelayBaseFor( in ) + flExtraMs;
@@ -1230,7 +1505,7 @@ namespace framegen::pacing
 			// Low latency plays only the newest pair (a new real frame snaps the
 			// content time to it); Smoothness may still be inside an older one.
 			// With the buffer's delay older pairs are played too: that delay is the point.
-			const int jMin = ( in.priority == Priority::LowLatency && in.extraDelayNs == 0 ) ? m_nHist - 2 : 0;
+			const int jMin = ( in.priority == Priority::LowLatency && m_ulExtraNs == 0 ) ? m_nHist - 2 : 0;
 			bool bReal = tau >= newest.arrival;
 			int j = m_nHist - 2;
 			double t = 1.0;
@@ -1451,7 +1726,11 @@ namespace framegen::pacing
 
 		// -- the output sequence in progress --
 		HistFrame m_Hist[ kHistoryMax ];
-		int      m_nDepth = kHistory;          // real frames kept: kHistory, more with a buffer
+		int      m_nDepth = kHistory;          // real frames kept: kHistory, more with a delay
+		double   m_flDepthLowMs = 0.0;         // how long the wanted depth has been lower than m_nDepth
+		double   m_flDtMs = 0.0;               // real time since the previous paint (capped), ms
+		int64_t  m_nRampV = 0;
+		bool     m_bRampV = false;
 		int      m_nHist = 0;
 		bool     m_bTauValid = false;
 		int64_t  m_nTauLast = 0;
@@ -1474,6 +1753,22 @@ namespace framegen::pacing
 		bool     m_bGen = false;
 		bool     m_bExtra = false;       // ExtraTimer(), as of the last Evaluate
 		bool     m_bExtraPrev = false;   // its hysteresis memory (survives pass-through gaps)
+
+		// -- the lag-spike buffer --
+		Spike    m_Spikes[ kLagSpikeMax ];
+		int      m_nSpikes = 0;
+		int      m_nSpikesTotal = 0;           // inlier spikes this session
+		double   m_flSpikeEwma = 0.0;          // their long-run mean size, ms
+		double   m_flBufMs = 0.0;              // D_buf: the live, ramped buffer
+		double   m_flTargetMs = 0.0;
+		double   m_flLowMs = 0.0;              // how long D_buf has been above its target by the shrink band
+		Ns       m_ulExtraNs = 0;              // the manual extra delay + D_buf, as of the last Evaluate
+		Ns       m_ulGapNs = kGapResetNs;      // a gap longer than this between real frames drops the history
+		double   m_flLagMaxMs = 50.0;          // the settings last read
+		double   m_flLagLookbackNs = 300e9;
+		Ns       m_ulLagLastAt = 0;
+		double   m_flLagShownMs = 0.0;         // ... if it is inside the window
+		int      m_nLagInWindow = 0, m_nLagOutliers = 0;
 
 		// -- cost guard --
 		bool     m_bCostBlocked = false;

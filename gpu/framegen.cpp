@@ -83,6 +83,7 @@ struct UiEntry {
     uint64_t seq = 0;                   // observe order (LRU, and "is this still the frame the estimate saw")
     UiBox bx{};                         // the box at observe time
     bool hasBox = false, hasWs = false;
+    bool active = false;                // in the LRU set (Settings::uiHistory of them); an inactive one keeps its memory
 };
 
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP, P_COUNT };
@@ -135,7 +136,7 @@ struct Interpolator::Impl {
     VkDescriptorPool uiPool = VK_NULL_HANDLE;
     VkDescriptorSet uiSets[kUiSets]{};
     uint32_t uiSetIdx = 0, uiFrameSets = 0;
-    UiEntry uiE[kUiFrames];
+    UiEntry uiE[kUiFramesMax];
     UiBuf uiBoxState, uiCellState;   // per-pixel box state / per-cell state (words, see ui_common.glsl)
     std::vector<UiBuf> uiGrave;      // grown-out buffers: freed with the rest (no GPU wait ever needed to grow)
     std::vector<VkImage> uiPendingInit;   // new images still in UNDEFINED layout
@@ -161,6 +162,7 @@ struct Interpolator::Impl {
     bool growBuf(UiBuf& b, VkDeviceSize bytes);
     bool allocEntryImage(UiEntry& e);
     bool uiEnsure();
+    void uiFreeEntry(UiEntry& e);
     void uiDestroy();
     void uiAdopted(const Settings& old);
     int uiFind(VkImageView v) const;
@@ -359,38 +361,74 @@ bool Interpolator::Impl::allocEntryImage(UiEntry& e) {
 // Creates what the active mode needs and does not have yet; never frees. Called by setSettings/reconfigure (the new
 // settings already in `set`) and by (re)creation of the size-dependent resources. The per-box buffers are created
 // lazily by the observe that needs them. False = could not allocate (the caller refuses the settings).
+// Settings::uiHistory = the number of active entries: a raise first re-activates entries that kept their memory, then
+// allocates new ones; a lowering deactivates the least recently observed (their frames are forgotten, the memory is
+// kept until releaseUnusedUi()).
 bool Interpolator::Impl::uiEnsure() {
     if (!W || set.uiProtection == UiProtection::Off) return true;
-    if (!uiImgs) {
-        for (UiEntry& e : uiE)
-            if (!allocEntryImage(e)) { uiDestroy(); return false; }
-        uiImgs = true;
+    const int want = (int)std::min(std::max(set.uiHistory, kUiFrames), kUiFramesMax);
+    const bool first = !uiImgs;
+    int nAct = 0;
+    for (const UiEntry& e : uiE) nAct += e.active;
+    std::vector<int> added;   // activated by this call (rolled back if a later allocation fails)
+    auto rollback = [&]() { for (int i : added) { uiE[i].active = false; uiE[i].key = VK_NULL_HANDLE; uiE[i].seq = 0; } };
+    for (int i = 0; nAct < want && i < (int)kUiFramesMax; i++) {
+        UiEntry& e = uiE[i];
+        if (e.active) continue;
+        if (!e.img && !allocEntryImage(e)) {
+            if (first) uiDestroy(); else { uiFreeEntry(e); rollback(); }
+            return false;
+        }
+        e.active = true; e.key = VK_NULL_HANDLE; e.seq = 0;
+        added.push_back(i);
+        nAct++;
     }
-    if (set.uiProtection == UiProtection::WholeScreen && !uiWsRes) {
+    if (set.uiProtection == UiProtection::WholeScreen) {
         const VkDeviceSize wsWords = 4 + (VkDeviceSize)tilesX * tilesY + (VkDeviceSize)((W + 3) / 4) * H;
-        bool ok = allocBuf(uiCellState, (VkDeviceSize)cw * ch * 4);
-        for (UiEntry& e : uiE) ok = ok && allocBuf(e.ws, wsWords * 4);
+        const bool firstWs = !uiWsRes;
+        bool ok = uiCellState.b || allocBuf(uiCellState, (VkDeviceSize)cw * ch * 4);
+        for (UiEntry& e : uiE) ok = ok && (!e.active || e.ws.b || allocBuf(e.ws, wsWords * 4));
         if (!ok) {
-            freeBuf(uiCellState);
-            for (UiEntry& e : uiE) freeBuf(e.ws);
+            if (firstWs) {
+                freeBuf(uiCellState);
+                for (UiEntry& e : uiE) freeBuf(e.ws);
+            } else {
+                for (int i : added) freeBuf(uiE[i].ws);
+            }
+            if (first) uiDestroy(); else rollback();
             return false;
         }
         uiWsRes = true;
     }
+    // lower: forget the least recently observed frames beyond `want`
+    while (nAct > want) {
+        int lo = -1;
+        for (int i = 0; i < (int)kUiFramesMax; i++)
+            if (uiE[i].active && (lo < 0 || uiE[i].seq < uiE[lo].seq)) lo = i;
+        uiE[lo].active = false; uiE[lo].key = VK_NULL_HANDLE; uiE[lo].seq = 0;
+        nAct--;
+    }
+    uiImgs = true;
     return true;
+}
+
+// Frees one entry's resources (retire rule of resize()/destroy()).
+void Interpolator::Impl::uiFreeEntry(UiEntry& e) {
+    VkDevice d = info.device;
+    if (e.view) DestroyImageView(d, e.view, nullptr);
+    if (e.img) {
+        uiPendingInit.erase(std::remove(uiPendingInit.begin(), uiPendingInit.end(), e.img), uiPendingInit.end());
+        DestroyImage(d, e.img, nullptr);
+    }
+    if (e.imgMem) FreeMemory(d, e.imgMem, nullptr);
+    freeBuf(e.box);
+    freeBuf(e.ws);
+    e = UiEntry{};
 }
 
 // Frees every UI resource. Retire rule of resize()/destroy(): all earlier records must have retired.
 void Interpolator::Impl::uiDestroy() {
-    VkDevice d = info.device;
-    for (UiEntry& e : uiE) {
-        if (e.view) DestroyImageView(d, e.view, nullptr);
-        if (e.img) DestroyImage(d, e.img, nullptr);
-        if (e.imgMem) FreeMemory(d, e.imgMem, nullptr);
-        freeBuf(e.box);
-        freeBuf(e.ws);
-        e = UiEntry{};
-    }
+    for (UiEntry& e : uiE) uiFreeEntry(e);
     freeBuf(uiBoxState);
     freeBuf(uiCellState);
     for (UiBuf& b : uiGrave) freeBuf(b);
@@ -414,8 +452,8 @@ void Interpolator::Impl::uiAdopted(const Settings& old) {
 }
 
 int Interpolator::Impl::uiFind(VkImageView v) const {
-    for (int i = 0; i < (int)kUiFrames; i++)
-        if (v && uiE[i].key == v) return i;
+    for (int i = 0; i < (int)kUiFramesMax; i++)
+        if (v && uiE[i].active && uiE[i].key == v) return i;
     return -1;
 }
 
@@ -423,9 +461,9 @@ int Interpolator::Impl::uiFind(VkImageView v) const {
 int Interpolator::Impl::uiPick(VkImageView v) const {
     int f = uiFind(v);
     if (f >= 0) return f;
-    int best = 0;
-    for (int i = 1; i < (int)kUiFrames; i++)
-        if (uiE[i].seq < uiE[best].seq) best = i;
+    int best = -1;
+    for (int i = 0; i < (int)kUiFramesMax; i++)
+        if (uiE[i].active && (best < 0 || uiE[i].seq < uiE[best].seq)) best = i;
     return best;
 }
 
@@ -660,7 +698,8 @@ bool Interpolator::validate(const Settings& s) {
            s.uiBoxOffsetX >= -16384 && s.uiBoxOffsetX <= 16384 && s.uiBoxOffsetY >= -16384 && s.uiBoxOffsetY <= 16384 &&
            s.uiStillFrames >= 1 && s.uiStillFrames <= 255 && in(s.uiStillThreshold, 0.0f, 255.0f) &&
            s.uiInpaintReach >= 1 && s.uiInpaintReach <= 16 &&
-           in(s.uiMaxStillFraction, 0.0f, 1.0f) && s.uiMaxStillFraction > 0.0f;
+           in(s.uiMaxStillFraction, 0.0f, 1.0f) && s.uiMaxStillFraction > 0.0f &&
+           s.uiHistory >= kUiFrames && s.uiHistory <= kUiFramesMax;
 }
 
 bool Interpolator::setSettings(const Settings& s) {
@@ -684,6 +723,12 @@ bool Interpolator::reconfigure(const Settings& s) {
     if (!m->uiEnsure()) { m->set = old; return false; }
     m->uiAdopted(old);
     return true;
+}
+
+void Interpolator::releaseUnusedUi() {
+    if (!m) return;
+    for (UiEntry& e : m->uiE)
+        if (!e.active && (e.img || e.ws.b || e.box.b)) m->uiFreeEntry(e);
 }
 
 Settings Interpolator::settings() const {
@@ -1012,7 +1057,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageV
         }
         ep = I.uiFind(prev);
         ec = I.uiFind(curr);
-        if (ep < 0 || ec < 0 || ep == ec) return false;   // (implicit: the second observe evicted the first: cannot happen with kUiFrames >= 3)
+        if (ep < 0 || ec < 0 || ep == ec) return false;   // (implicit: the second observe evicted the first: cannot happen with at least kUiFrames >= 3 active entries)
         estP = I.uiE[ep].view;
         estC = I.uiE[ec].view;
     }

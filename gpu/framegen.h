@@ -67,10 +67,19 @@ struct Settings {
     // byte-identical to a library without it.
     // Cost (RX 7900 XTX, 2560x1440, GPU time per real frame): Crosshair ~0.07 ms, WholeScreen ~0.09 ms typical
     // and <= ~0.25 ms in the worst case below the uiMaxStillFraction skip (about half of it is the full-frame copy
-    // into the clean image). Memory: kUiFrames (3) clean copies of the frame (4 bytes/px each: 44 MB at 1440p), under 1 MB
-    // for the box, and for WholeScreen about 1 byte/px of mask per kept frame plus the 1/2-res cell
-    // state (+ ~15 MB at 1440p).
+    // into the clean image). Memory: uiHistory (default kUiFrames = 3) clean copies of the frame (4 bytes/px each: 44 MB
+    // at 1440p for 3, 14.7 MB per kept frame), under 1 MB for the box, and for WholeScreen about 1 byte/px of mask per
+    // kept frame plus the 1/2-res cell state (+ ~15 MB at 1440p).
     UiProtection uiProtection = UiProtection::Off;
+    // How many observed real frames keep their clean copy + mask (LRU by observe order), [kUiFrames, kUiFramesMax].
+    // 3 = the default: the newest pair and the pair before it. A host that synthesises from an OLDER pair (the
+    // pacer's lag-spike buffer plays pairs several frames back) sets it to the number of real frames it keeps:
+    // pacing.h's Pacer::HistoryDepth() / Report::historyFrames, which follows the buffer. Growing allocates the
+    // missing clean copies at once (no GPU wait; false from setSettings if that fails, nothing changed); the new
+    // slots are empty until observed. Lowering it evicts the least recently observed frames but KEEPS their memory
+    // for a later raise; releaseUnusedUi() frees it. With protection Off, or at the default, memory and output are
+    // exactly as before.
+    uint32_t uiHistory = 3;
     // The crosshair box: always protected at FULL resolution, in both modes (a crosshair is the most noticeable
     // thing if it breaks). Size it so the whole reticle fits with room for its spread and outline: about 2-3x the
     // crosshair's largest extent. Too small cuts the crosshair's ends off the protection, too big only costs a few
@@ -235,8 +244,9 @@ public:
     // call recordEstimate on the frame expecting a protected result; calling it is still valid and unprotected).
     // `frame` is the cache key: when a view is observed again, its earlier entry is replaced, so a host that reuses
     // views (a ring of images) MUST observe each new content, or the library would pair new pixels with a stale mask.
-    // At least kUiFrames = 3 observed frames are kept (LRU by observe order): the newest pair AND the pair before
-    // it stay usable (a host that synthesises an older pair after the newest frame arrived). recordEstimate(prev,
+    // At least kUiFrames = 3 observed frames are kept (LRU by observe order; Settings::uiHistory keeps more): the
+    // newest pair AND the pair before it stay usable (a host that synthesises an older pair after the newest frame
+    // arrived). recordEstimate(prev,
     // curr) / recordSynth need both views to still be among them, and recordSynth that nothing evicted them
     // since the estimate (observing 2 more frames would): else they return false and record nothing.
     //
@@ -249,6 +259,13 @@ public:
     // observe implicitly: a pair of which a view has not been observed (protection was just switched on, an
     // observe was skipped, the entry was evicted) is simply interpolated unprotected, as with Off.
     bool recordObserve(VkCommandBuffer cb, VkImageView frame);
+
+    // Frees the clean copies that Settings::uiHistory no longer keeps (they stay allocated, unused, when it is
+    // lowered, so a later raise costs nothing). Retire rule of resize()/destroy(): every earlier record must have
+    // retired (the freed images may be in a submission still running), so call it where the host already waits for the
+    // GPU, e.g. after the depth has stayed lower for a while. No-op if nothing is unused. resize()/reconfigure()
+    // with a new size/flowScale/destroy() free everything anyway.
+    void releaseUnusedUi();
 
     // Profiling (test/benchmark only): timestamps after every pass group. recordEstimate (or record)
     // starts a new profile, recordSynth appends its passes to it. Returns false if the query pool cannot
@@ -265,7 +282,8 @@ public:
     static constexpr uint32_t kSetRing = 32;
     static constexpr uint32_t kUiSets = 64;    // descriptor sets of the UI-protection passes (see above)
     static constexpr uint32_t kBlurMaxSamples = 16;   // Settings::blurSamples upper bound
-    static constexpr uint32_t kUiFrames = 3;   // observed frames kept (clean copy + mask each)
+    static constexpr uint32_t kUiFrames = 3;   // observed frames kept by default (clean copy + mask each)
+    static constexpr uint32_t kUiFramesMax = 65;   // Settings::uiHistory upper bound (= pacing.h's kHistoryMax)
     static constexpr uint32_t kMinSize = 16;
     struct Impl;
 private:

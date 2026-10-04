@@ -1,5 +1,6 @@
 // uitest: validation + benchmark of framegen's static-UI protection (Settings::uiProtection).
 //   uitest check [--bgra] [--hash] [W H]     default 1280 720
+//   uitest deep [W H]                        Settings::uiHistory: a synth from a pair 10 frames back still finds its clean copies (default 640x360)
 //   uitest bench [W H]                       per-pass GPU times, moving and still scene (default 1920x1080 and 2560x1440)
 // check: a synthetic sequence of 12 frames: a textured background panning 14 px right / 6 px down per frame with 16 independently moving objects (some crossing the crosshair and the HUD), a static opaque crosshair
 // (plus-shaped arms, centre dot, 1 px black outline) and a static opaque HUD box in a corner. The last pair
@@ -413,6 +414,90 @@ static int check(int W, int H, bool hash) {
 #endif
 }
 
+// ---------------------------------------------------------------- deep history (Settings::uiHistory)
+#ifndef UITEST_NO_UI
+// 24 real frames observed into a ring of 24 views, then ONE pair 10 frames behind the newest (13, 14) is estimated and
+// synthesised -- what a lag-spike buffer's pacer does. With uiHistory >= 14 the pair still has its clean copies and
+// is protected; with the default 3 (or 10: frame 13 just evicted) it runs unprotected, bit-identical to Off.
+// Afterwards: lower to 3 + releaseUnusedUi(), the newest pair must still be protected, and a raise works again.
+static int deepHistory(int W, int H) {
+    const int NF = 24, A = 13, B = 14;
+    Scene sc(W, H, NF, 0, 0);
+    auto realB = sc.frame(B);
+    printf("deep history %dx%d: pair (%d, %d): its older frame is %d frames behind the newest (%d)\n", W, H, A, B, NF - 1 - A, NF - 1);
+    auto run = [&](const char* name, Settings s, bool tail, bool* tailOk) {
+        Interpolator fg;
+        if (!makeInterp(fg, W, H, s)) { fprintf(stderr, "init failed\n"); exit(1); }
+        std::vector<Img> ring(NF);
+        for (auto& r : ring) r = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        Img out = makeImage(W, H, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        begin();
+        for (auto& r : ring) imgBarrier(r.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+        imgBarrier(out.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+        submit();
+        for (int f = 0; f < NF; f++) {
+            upload(sc.frame(f), ring[f], W, H);
+            begin();
+            fg.beginFrame();
+            if (!fg.recordObserve(cb, ring[f].view)) { fprintf(stderr, "observe failed\n"); exit(1); }
+            submit();
+        }
+        begin();
+        fg.beginFrame();
+        if (!fg.recordEstimate(cb, ring[A].view, ring[B].view) || !fg.recordSynth(cb, ring[A].view, ring[B].view, out.view, 0.5f)) { fprintf(stderr, "deep synth failed\n"); exit(1); }
+        submit();
+        std::vector<uint8_t> res = download(out, W, H);
+        if (tail) {
+            // lower to the default: the pair is evicted; release the memory (everything retired: waited above)
+            Settings lo = s; lo.uiHistory = 3;
+            if (!fg.setSettings(lo)) { printf("setSettings(lower) failed\n"); exit(1); }
+            vkDeviceWaitIdle(dev);
+            fg.releaseUnusedUi();
+            // the newest pair is still protected
+            begin();
+            fg.beginFrame();
+            if (!fg.recordEstimate(cb, ring[NF - 2].view, ring[NF - 1].view) || !fg.recordSynth(cb, ring[NF - 2].view, ring[NF - 1].view, out.view, 0.5f)) { fprintf(stderr, "tail synth failed\n"); exit(1); }
+            submit();
+            auto r2 = download(out, W, H);
+            Metrics m = measure(sc, r2, sc.frame(NF - 1), nullptr);
+            *tailOk = m.xhBad == 0;
+            // and a raise allocates again (the settings call must succeed)
+            if (!fg.setSettings(s)) { printf("setSettings(raise) failed\n"); exit(1); }
+        }
+        vkDeviceWaitIdle(dev);
+        fg.destroy();
+        for (auto& r : ring) { vkDestroyImageView(dev, r.view, nullptr); vkDestroyImage(dev, r.img, nullptr); vkFreeMemory(dev, r.mem, nullptr); }
+        vkDestroyImageView(dev, out.view, nullptr); vkDestroyImage(dev, out.img, nullptr); vkFreeMemory(dev, out.mem, nullptr);
+        Metrics m = measure(sc, res, realB, nullptr);
+        printf(" %-22s crosshair wrong %zu/%zu, hud wrong %zu/%zu\n", name, m.xhBad, m.xhN, m.hudBad, m.hudN);
+        return res;
+    };
+    for (UiProtection mode : {UiProtection::Crosshair, UiProtection::WholeScreen}) {
+        const char* nm = mode == UiProtection::Crosshair ? "Crosshair" : "WholeScreen";
+        Settings off, s3, s10, s14;
+        s3.uiProtection = s10.uiProtection = s14.uiProtection = mode;
+        s10.uiHistory = 10; s14.uiHistory = 14;
+        printf("%s:\n", nm);
+        auto rOff = run("Off", off, false, nullptr);
+        auto r3 = run("uiHistory 3 (default)", s3, false, nullptr);
+        auto r10 = run("uiHistory 10", s10, false, nullptr);
+        bool tailOk = false;
+        auto r14 = run("uiHistory 14", s14, true, &tailOk);
+        Metrics m14 = measure(sc, r14, realB, nullptr);
+        expect(r3 == rOff, "default history: a pair 10 frames back is unprotected (frame evicted), identical to Off");
+        expect(r10 == rOff, "uiHistory 10: frame 13 is just evicted, unprotected, identical to Off");
+        expect(r14 != rOff, "uiHistory 14: the pair 10 frames back still has its clean copies (output differs from Off)");
+        expect(m14.xhBad == 0, "uiHistory 14: crosshair exact in a synth from the pair 10 frames back");
+        if (mode == UiProtection::WholeScreen) expect(m14.hudBad == 0, "uiHistory 14: HUD box exact in a synth from the pair 10 frames back");
+        expect(tailOk, "lowered to 3 and released: the newest pair is still protected; raising again works");
+    }
+    Settings bad; bad.uiHistory = 2; expect(!Interpolator::validate(bad), "validate rejects uiHistory 2");
+    bad.uiHistory = Interpolator::kUiFramesMax + 1; expect(!Interpolator::validate(bad), "validate rejects uiHistory above kUiFramesMax");
+    bad.uiHistory = Interpolator::kUiFramesMax; expect(Interpolator::validate(bad), "validate accepts uiHistory = kUiFramesMax");
+    return fails ? 1 : 0;
+}
+#endif
+
 // ---------------------------------------------------------------- bench
 #ifndef UITEST_NO_UI
 static void bench(int W, int H) {
@@ -517,7 +602,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: uitest check|bench [--bgra] [--hash] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep")) { fprintf(stderr, "usage: uitest check|bench|deep [--bgra] [--hash] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -555,7 +640,17 @@ int main(int argc, char** argv) {
     CK(vkCreateFence(dev, &fci, nullptr, &fence));
 
     int rc = 0;
-    if (pos[0] == "check") {
+    if (pos[0] == "deep") {
+#ifdef UITEST_NO_UI
+        fprintf(stderr, "deep needs the UI API\n");
+        return 2;
+#else
+        int W = pos.size() >= 3 ? atoi(pos[1].c_str()) : 640, H = pos.size() >= 3 ? atoi(pos[2].c_str()) : 360;
+        initStaging((size_t)W * H * 4);
+        rc = deepHistory(W, H);
+        printf(rc ? "RESULT: FAIL (%d)\n" : "RESULT: PASS\n", fails);
+#endif
+    } else if (pos[0] == "check") {
         int W = pos.size() >= 3 ? atoi(pos[1].c_str()) : 1280, H = pos.size() >= 3 ? atoi(pos[2].c_str()) : 720;
         initStaging((size_t)W * H * 4);
         rc = check(W, H, hash);
