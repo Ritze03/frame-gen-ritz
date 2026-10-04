@@ -1,2 +1,0 @@
-effort: medium
-opus: always

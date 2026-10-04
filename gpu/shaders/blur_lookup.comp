@@ -1,0 +1,32 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Motion blur, pass 1 (flow res): resolve.comp's pass 9a (lookup.comp) for every interior sample k of the output in one
+// dispatch (z = sample): the field at time t_k, g(q) = h(q - (2t - 1) g(q)), 2 bilinear fixed-point steps from h(q).
+// Reads the estimate's pixel field, writes bf[k].
+#include "blur_common.glsl"
+
+vec2 F(int x, int y) { return field[pc.pf + clamp(y, 0, pc.fh - 1) * pc.fw + clamp(x, 0, pc.fw - 1)]; }
+vec2 sampleF(vec2 p) {   // == common.glsl sampleF
+    ivec2 X = ivec2(roundEven(p * 32.0));
+    ivec2 i = X >> 5;
+    vec2 f = vec2(X & 31) * (1.0 / 32.0);
+    vec2 p00 = F(i.x, i.y), p01 = F(i.x + 1, i.y);
+    vec2 p10 = F(i.x, i.y + 1), p11 = F(i.x + 1, i.y + 1);
+    return p00 * ((1.0 - f.y) * (1.0 - f.x)) + p01 * ((1.0 - f.y) * f.x)
+         + p10 * (f.y * (1.0 - f.x)) + p11 * (f.y * f.x);
+}
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    int k = pc.k0 + int(gl_WorkGroupID.z);
+    if (q.x >= pc.fw || q.y >= pc.fh) return;
+    float s = 2.0 * pc.t[k] - 1.0;   // exact in float32, like the library's double computation rounded
+    vec2 g = field[pc.pf + q.y * pc.fw + q.x];
+    for (int i = 0; i < 2; i++) {   // LOOKUP_ITERS
+        precise vec2 pos = vec2(q) - s * g;
+        g = sampleF(pos);
+    }
+    bf[k * pc.fw * pc.fh + q.y * pc.fw + q.x] = g;
+}

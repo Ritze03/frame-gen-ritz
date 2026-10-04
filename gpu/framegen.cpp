@@ -23,6 +23,9 @@
 #include "ui_mask_spv.h"
 #include "ui_inpaint_spv.h"
 #include "ui_patch_spv.h"
+#include "blur_lookup_spv.h"
+#include "blur_error_spv.h"
+#include "blur_resolve_spv.h"
 
 namespace framegen {
 
@@ -59,6 +62,16 @@ static const int kUiCell = 2;    // whole-screen detection resolution: 1/kUiCell
 static const int kUiTile = 32;   // == TILE in ui_common.glsl
 static const int kUiInpTile = 16;   // == T in ui_inpaint.comp
 
+// Must match the push-constant block in shaders/blur_common.glsl.
+struct BlurPC {
+    int32_t W, H, fw, fh, fscale, n, bw, bh, k0, pf, gauss, fix;
+    float cutSad, trust0, trustScale, globalFrac;
+    float t[16];
+};
+static_assert(sizeof(BlurPC) <= 128, "push constants beyond the guaranteed minimum");
+enum BlurPipe { B_LOOKUP, B_ERROR, B_RESOLVE, B_COUNT_ };
+static const int kBlurCnt0 = 32;   // == CNT0 in blur_common.glsl: u[] words 32.. hold the per-sample untrusted counts
+
 struct UiBuf { VkBuffer b = VK_NULL_HANDLE; VkDeviceMemory m = VK_NULL_HANDLE; VkDeviceSize size = 0; };
 struct UiBox { int x, y, w, h; bool operator==(const UiBox& o) const { return x == o.x && y == o.y && w == o.w && h == o.h; } };
 // One observed real frame: the clean copy, the mask of the box (full res) and, whole screen, of the whole frame.
@@ -88,6 +101,13 @@ struct Interpolator::Impl {
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipes[P_COUNT]{};
+    // motion blur (recordSynthBlur): own push-constant layout over the same set layout, 4 pipelines, and a scratch
+    // that is created by the first blur record and only ever grows (the old buffer waits in the graveyard)
+    VkPipelineLayout blurLayout = VK_NULL_HANDLE;
+    VkPipeline blurPipes[B_COUNT_]{};
+    UiBuf blurField, blurErr;
+    std::vector<UiBuf> blurGrave;
+    bool growBlur(UiBuf& b, VkDeviceSize bytes);
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // Two rings: synth sets (all 6 bindings) and estimate sets (binding 5, out, never written: no estimate
     // pass uses it, and no stale view of an earlier synth can linger in it).
@@ -156,7 +176,7 @@ struct Interpolator::Impl {
     std::vector<const char*> qnames;
     uint32_t qcount = 0;
 
-    VkDescriptorSet takeSet(int ring, VkImageView prev, VkImageView curr, VkImageView out);
+    VkDescriptorSet takeSet(int ring, VkImageView prev, VkImageView curr, VkImageView out, bool blur = false);
     bool createSizeDependent();
     bool rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force);
     void destroySizeDependent();
@@ -229,6 +249,10 @@ void Interpolator::Impl::destroySizeDependent() {
         buf[i] = VK_NULL_HANDLE; mem[i] = VK_NULL_HANDLE;
     }
     uiDestroy();
+    freeBuf(blurField);
+    freeBuf(blurErr);
+    for (UiBuf& b : blurGrave) freeBuf(b);
+    blurGrave.clear();
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -289,6 +313,16 @@ bool Interpolator::Impl::growBuf(UiBuf& b, VkDeviceSize bytes) {
     UiBuf nb;
     if (!allocBuf(nb, bytes + bytes / 4)) return false;
     if (b.b) uiGrave.push_back(b);
+    b = nb;
+    return true;
+}
+
+// growBuf for the motion-blur scratch: same rules, own graveyard (emptied by resize/reconfigure/destroy).
+bool Interpolator::Impl::growBlur(UiBuf& b, VkDeviceSize bytes) {
+    if (b.b && b.size >= bytes) return true;
+    UiBuf nb;
+    if (!allocBuf(nb, bytes)) return false;
+    if (b.b) blurGrave.push_back(b);
     b = nb;
     return true;
 }
@@ -438,11 +472,13 @@ bool Interpolator::init(const InitInfo& ii) {
     sci.maxLod = 0.0f;
     if (m->CreateSampler(d, &sci, nullptr, &m->sampler) != VK_SUCCESS) { destroy(); return false; }
 
-    VkDescriptorSetLayoutBinding b[6]{};
-    VkDescriptorType types[6] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+    // bindings 0-2 buffers, 3-4 prev/curr, 5 out; 6-7: motion-blur scratch (only the blur passes use them)
+    VkDescriptorSetLayoutBinding b[8]{};
+    VkDescriptorType types[8] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
-    for (int i = 0; i < 6; i++) {
+                                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    for (int i = 0; i < 8; i++) {
         b[i].binding = i;
         b[i].descriptorType = types[i];
         b[i].descriptorCount = 1;
@@ -450,7 +486,7 @@ bool Interpolator::init(const InitInfo& ii) {
         if (i == 3 || i == 4) b[i].pImmutableSamplers = &m->sampler;
     }
     VkDescriptorSetLayoutCreateInfo dci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dci.bindingCount = 6;
+    dci.bindingCount = 8;
     dci.pBindings = b;
     if (m->CreateDescriptorSetLayout(d, &dci, nullptr, &m->dsl) != VK_SUCCESS) { destroy(); return false; }
 
@@ -481,7 +517,34 @@ bool Interpolator::init(const InitInfo& ii) {
         if (r != VK_SUCCESS) { destroy(); return false; }
     }
 
-    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * 2 * kSetRing},
+    // motion-blur passes: the same set layout, their own (larger) push-constant block
+    {
+        VkPushConstantRange bpcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC)};
+        VkPipelineLayoutCreateInfo bplci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        bplci.setLayoutCount = 1;
+        bplci.pSetLayouts = &m->dsl;
+        bplci.pushConstantRangeCount = 1;
+        bplci.pPushConstantRanges = &bpcr;
+        if (m->CreatePipelineLayout(d, &bplci, nullptr, &m->blurLayout) != VK_SUCCESS) { destroy(); return false; }
+        struct { const uint32_t* code; size_t size; } bspv[B_COUNT_] = {
+            {blur_lookup_spv, sizeof(blur_lookup_spv)}, {blur_error_spv, sizeof(blur_error_spv)},
+            {blur_resolve_spv, sizeof(blur_resolve_spv)}};
+        for (int i = 0; i < B_COUNT_; i++) {
+            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            smci.codeSize = bspv[i].size;
+            smci.pCode = bspv[i].code;
+            VkShaderModule sm;
+            if (m->CreateShaderModule(d, &smci, nullptr, &sm) != VK_SUCCESS) { destroy(); return false; }
+            VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", nullptr};
+            cpci.layout = m->blurLayout;
+            VkResult r = m->CreateComputePipelines(d, ii.pipelineCache, 1, &cpci, nullptr, &m->blurPipes[i]);
+            m->DestroyShaderModule(d, sm, nullptr);
+            if (r != VK_SUCCESS) { destroy(); return false; }
+        }
+    }
+
+    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * 2 * kSetRing},
                                   {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 2 * kSetRing},
                                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kSetRing}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -591,6 +654,7 @@ bool Interpolator::validate(const Settings& s) {
            in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::WholeScreen &&
+           s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
            s.uiBoxWidth <= 16384 && s.uiBoxHeight <= 16384 &&
            s.uiBoxOffsetX >= -16384 && s.uiBoxOffsetX <= 16384 && s.uiBoxOffsetY >= -16384 && s.uiBoxOffsetY <= 16384 &&
@@ -634,6 +698,8 @@ void Interpolator::destroy() {
     if (m->pool) m->DestroyDescriptorPool(d, m->pool, nullptr);
     for (auto p : m->pipes) if (p) m->DestroyPipeline(d, p, nullptr);
     for (auto p : m->uiPipes) if (p) m->DestroyPipeline(d, p, nullptr);
+    for (auto p : m->blurPipes) if (p) m->DestroyPipeline(d, p, nullptr);
+    if (m->blurLayout) m->DestroyPipelineLayout(d, m->blurLayout, nullptr);
     if (m->uiPool) m->DestroyDescriptorPool(d, m->uiPool, nullptr);
     if (m->uiLayout) m->DestroyPipelineLayout(d, m->uiLayout, nullptr);
     if (m->uiDsl) m->DestroyDescriptorSetLayout(d, m->uiDsl, nullptr);
@@ -676,15 +742,15 @@ bool Interpolator::readTimings(std::vector<const char*>& names, std::vector<uint
     return true;
 }
 
-VkDescriptorSet Interpolator::Impl::takeSet(int ring, VkImageView prev, VkImageView curr, VkImageView out) {
+VkDescriptorSet Interpolator::Impl::takeSet(int ring, VkImageView prev, VkImageView curr, VkImageView out, bool blur) {
     VkDescriptorSet set = sets[ring][setIdx[ring]];
     setIdx[ring] = (setIdx[ring] + 1) % kSetRing;
     frameSets[ring]++;
-    VkDescriptorBufferInfo bi[3];
+    VkDescriptorBufferInfo bi[3], bb[2] = {{blurField.b, 0, VK_WHOLE_SIZE}, {blurErr.b, 0, VK_WHOLE_SIZE}};
     VkDescriptorImageInfo ii[3] = {{VK_NULL_HANDLE, prev, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, curr, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet wr[6]{};
+    VkWriteDescriptorSet wr[8]{};
     uint32_t n = ring == R_SYNTH ? 6 : 5;   // estimate sets never get binding 5 (out)
     for (uint32_t i = 0; i < n; i++) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -699,6 +765,17 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, VkImageView prev, VkImageV
             wr[i].descriptorType = i == 5 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             wr[i].pImageInfo = &ii[i - 3];
         }
+    }
+    if (blur) {   // the motion-blur scratch (the caller has made sure it exists)
+        for (uint32_t i = 6; i < 8; i++) {
+            wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wr[i].dstSet = set;
+            wr[i].dstBinding = i;
+            wr[i].descriptorCount = 1;
+            wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            wr[i].pBufferInfo = &bb[i - 6];
+        }
+        n = 8;
     }
     UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
     return set;
@@ -1067,6 +1144,86 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView
     }
     r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
     r.stamp("fallback");
+    return true;
+}
+
+bool Interpolator::recordSynthBlur(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t0, float t1) {
+    if (!m || !m->W || !(t0 >= 0.0f && t1 <= 1.0f && t0 <= t1)) return false;   // (also false for NaN)
+    Impl& I = *m;
+    const uint32_t N = I.set.blurSamples;
+    const bool blur = N >= 2 && t0 < t1;
+    if (!blur && t1 > 0.0f && t1 < 1.0f) return recordSynth(cb, prev, curr, out, t1);   // one interior instant
+    if (!I.haveEst || prev != I.estPrev || curr != I.estCurr) return false;
+    assert(I.frameSets[Impl::R_SYNTH] < kSetRing && "framegen: more than kSetRing recordSynth()/recordSynthBlur() since beginFrame()");
+    if (I.frameSets[Impl::R_SYNTH] >= kSetRing) return false;
+    VkImageView srcP = prev, srcC = curr;
+    if (I.estUi) {
+        const UiEntry &ep = I.uiE[I.estEnt[0]], &ec = I.uiE[I.estEnt[1]];
+        if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || !ep.view || !ec.view) return false;
+        if (I.uiFrameSets + 2 > kUiSets) return false;
+        srcP = ep.view; srcC = ec.view;
+    }
+
+    // the samples: evenly spaced over [t0, t1] (both ends), the ends exactly t0 / t1
+    const int n = blur ? (int)N : 1;
+    BlurPC bp{};
+    for (int k = 0; k < n; k++) {
+        double t = blur ? t0 + ((double)t1 - (double)t0) * k / (n - 1) : (double)t1;
+        bp.t[k] = std::min(std::max((float)t, t0), t1);
+    }
+    if (blur) bp.t[n - 1] = t1;
+    int lo = n, hi = -1;   // the interior samples (0 < t < 1) are contiguous: only they need a synthesis
+    for (int k = 0; k < n; k++)
+        if (bp.t[k] > 0.0f && bp.t[k] < 1.0f) { lo = std::min(lo, k); hi = k; }
+    const int nInt = hi - lo + 1;
+
+    // scratch: n slots of the field at t (flow res) and of the packed mismatch (full res)
+    const VkDeviceSize errWords = (VkDeviceSize)((I.W + 3) / 4) * I.H;
+    if (!I.growBlur(I.blurField, (VkDeviceSize)n * I.fw * I.fh * 8) || !I.growBlur(I.blurErr, (VkDeviceSize)n * errWords * 4)) return false;
+    VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out, true);
+
+    Rec r(I, cb);
+    // serialises this record after everything before it (shared scratch), then zeroes the per-sample counters
+    r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    I.CmdFillBuffer(cb, I.buf[2], kBlurCnt0 * 4, 16 * 4, 0);
+    r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
+    I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.blurLayout, 0, 1, &set, 0, nullptr);
+
+    const Settings& st = I.set;
+    bp.W = (int)I.W; bp.H = (int)I.H; bp.fw = I.fw; bp.fh = I.fh; bp.fscale = (int)st.flowScale;
+    bp.n = n; bp.bw = I.lv[0].bw; bp.bh = I.lv[0].bh; bp.k0 = lo; bp.pf = I.fieldPF;
+    bp.gauss = st.blurWeights == BlurWeights::Gaussian;
+    bp.cutSad = st.sceneCutSad; bp.trust0 = st.trustLow; bp.trustScale = 1.0f / (st.trustHigh - st.trustLow);
+    bp.globalFrac = st.globalFallback;
+    auto run = [&](BlurPipe p, uint32_t gx, uint32_t gy, uint32_t gz) {
+        I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.blurPipes[p]);
+        I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC), &bp);
+        I.CmdDispatch(cb, gx, gy, gz);
+    };
+    if (nInt > 0) {
+        run(B_LOOKUP, divUp(I.fw, 8), divUp(I.fh, 8), (uint32_t)nInt);
+        r.cbar();
+        r.stamp("blur lookup");
+        run(B_ERROR, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8), (uint32_t)nInt);
+        r.cbar();
+        r.stamp("blur mismatch");
+    }
+    bp.fix = 0;
+    run(B_RESOLVE, divUp((int)I.W, 16), divUp((int)I.H, 16), 1);
+    r.cbar();
+    r.stamp("blur resolve");
+    bp.fix = 1;   // exits at once unless a sample turned out to have too many untrusted pixels
+    run(B_RESOLVE, divUp((int)I.W, 64), divUp((int)I.H, 64), 1);
+    if (I.estUi) {
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
+        r.stamp("blur fixup");
+        I.uiRecordPatch(cb, curr, out, I.uiE[I.estEnt[1]]);   // the real UI pixels back over the blurred frame
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);
+        r.stamp("ui_patch");
+        return true;
+    }
+    r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);
+    r.stamp("blur fixup");
     return true;
 }
 

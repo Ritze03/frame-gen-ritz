@@ -1,0 +1,102 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Motion blur, pass 3 (+ 4): out = round(sum_k w_k * frame_k), where frame_k is the 8-bit result recordSynth(t_k) would
+// have produced (resolve.comp: 7x7 mean of e, trust ramp, warps, mix with the nearer real frame; the whole-frame
+// fallbacks of fallback.comp: scene cut or more than globalFrac untrusted -> the nearer real frame) and a sample
+// with t <= 0 / t >= 1 is the real frame prev / curr. Everything is accumulated in registers, one dispatch for all
+// samples: no sub-frame is ever written to memory. Weights: even, or Gaussian with the window ends at +-2 sigma.
+// alpha: weighted like the colour (from the nearer real frame of each sample).
+//
+// The "more than globalFrac untrusted" decision of a sample needs the count over the WHOLE frame, which only exists
+// once every workgroup has run. So the main pass (fix = 0) assumes no sample is flicked (the scene cut IS known up
+// front) and counts each sample's untrusted pixels as resolve.comp does; the fix-up pass (fix = 1, one workgroup per
+// 64x64 tile like fallback.comp) exits at once unless some sample turned out flicked (rare: fast flicks, chaos) and
+// then redoes the output with the final counts. Same result as deciding first, without a counting pass per sample.
+#include "blur_common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+shared float wk[16];
+shared uint cnt[16];
+
+// One 16x16 tile: all threads of the workgroup. counting: add this tile's untrusted counts to u[CNT0 + k].
+void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 p = tile * TS + ivec2(gl_LocalInvocationID.xy);
+    bool inside = p.x < pc.W && p.y < pc.H;
+    vec3 acc = vec3(0.0);
+    float accA = 0.0;
+    float untrustedLimit = pc.globalFrac * float(pc.W) * float(pc.H);
+    for (int k = 0; k < pc.n; k++) {
+        float t = pc.t[k];
+        vec3 v = vec3(0.0);
+        float a = 0.0;
+        if (t <= 0.0 || t >= 1.0) {   // a real frame
+            if (inside) {
+                vec4 r = t >= 1.0 ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
+                v = floor(r.rgb * 255.0 + 0.5);
+                a = r.a;
+            }
+        } else {
+            bool nearC = t > 0.5;
+            bool fb = cut || (!counting && float(u[CNT0 + k]) > untrustedLimit);   // uniform across the workgroup
+            if (fb) {   // no box needed
+                if (inside) {
+                    vec4 r = nearC ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
+                    v = floor(r.rgb * 255.0 + 0.5);
+                    a = r.a;
+                }
+            } else {
+                float e = boxMean(k, tile);
+                if (inside) {
+                    float tr = clamp((e - pc.trust0) * pc.trustScale, 0.0, 1.0);
+                    if (counting && tr > 0.5) atomicAdd(cnt[k], 1u);
+                    vec3 wa, wc;
+                    mismatch(k, t, p, wa, wc);
+                    vec4 r = nearC ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
+                    vec3 a8 = floor(r.rgb * 255.0 + 0.5);
+                    precise vec3 mt = (1.0 - t) * wa + t * wc;
+                    vec3 o = mt * (1.0 - tr) + a8 * tr;
+                    v = clamp(floor(o + 0.5), 0.0, 255.0);
+                    a = r.a;
+                }
+            }
+        }
+        acc += wk[k] * v;
+        accA += wk[k] * a;
+    }
+    if (inside) imageStore(outImg, p, vec4(clamp(floor(acc / wsum + 0.5), 0.0, 255.0) * (1.0 / 255.0), accA / wsum));
+    if (counting) {
+        barrier();
+        if (lid < pc.n && cnt[lid] > 0u) atomicAdd(u[CNT0 + lid], cnt[lid]);
+    }
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    if (lid < pc.n) {
+        float x = pc.n > 1 ? (2.0 * float(lid) - float(pc.n - 1)) / float(pc.n - 1) : 0.0;
+        wk[lid] = pc.gauss != 0 ? exp(-2.0 * x * x) : 1.0;
+    }
+    if (lid < 16) cnt[lid] = 0u;
+    barrier();
+    float wsum = 0.0;
+    for (int k = 0; k < pc.n; k++) wsum += wk[k];
+    float meanSad = float(u[1]) * (1.0 / 256.0) / float(pc.bw * pc.bh);   // U_SADSUM
+    bool cut = meanSad > pc.cutSad;
+
+    if (pc.fix == 0) {
+        tileOut(ivec2(gl_WorkGroupID.xy), true, cut, wsum);
+        return;
+    }
+    // fix-up: only if some interpolated sample is flicked (and not already presented as the nearer real frame by a cut)
+    if (cut) return;
+    bool flicked = false;
+    float untrustedLimit = pc.globalFrac * float(pc.W) * float(pc.H);
+    for (int k = 0; k < pc.n; k++)
+        if (pc.t[k] > 0.0 && pc.t[k] < 1.0 && float(u[CNT0 + k]) > untrustedLimit) flicked = true;
+    if (!flicked) return;
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++) {
+            ivec2 tile = ivec2(gl_WorkGroupID.xy) * 4 + ivec2(i, j);
+            if (tile.x * TS < pc.W && tile.y * TS < pc.H) tileOut(tile, false, false, wsum);
+        }
+}

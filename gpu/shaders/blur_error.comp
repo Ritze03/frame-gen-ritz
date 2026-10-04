@@ -1,0 +1,22 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Motion blur, pass 2 (full res): error.comp for every interior sample k in one dispatch (z = sample):
+// e = max-channel |wa - wc| of the two warps, 4 pixels per thread packed as bytes into be[k].
+#include "blur_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    int k = pc.k0 + int(gl_WorkGroupID.z);
+    if (g.x >= eStride() || g.y >= pc.H) return;
+    float t = pc.t[k];
+    uint packed = 0u;
+    for (int i = 0; i < 4; i++) {
+        ivec2 p = ivec2(g.x * 4 + i, g.y);
+        if (p.x < pc.W) {
+            vec3 wa, wc;
+            packed |= mismatch(k, t, p, wa, wc) << (8 * i);
+        }
+    }
+    be[k * eWords() + g.y * eStride() + g.x] = packed;
+}
