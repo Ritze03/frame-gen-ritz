@@ -1211,7 +1211,19 @@ namespace framegen::pacing
 			// A stall must not reset the pipeline before a spike the buffer is sized for.
 			m_ulGapNs = lb.enabled ? std::max( kGapResetNs, Ns( m_flLagMaxMs * 1e6 ) + 50 * kNsPerMs ) : kGapResetNs;
 
-			const double flInterval = m_Est.IntervalMs() > 0.0 ? m_Est.IntervalMs() : 16.7;
+			// No measured game interval yet (a cold start, or just after a stream change): the
+			// cap (kHistoryMax frames at this rate), the history depth and the content timing
+			// all need one, so hold the buffer where it is instead of sizing it from a guess.
+			// Why: a ForceMax buffer was sized against the 4 ms interval clamp and asked for
+			// ~27 frames for the first paints (the depth then took two shrink dwells to settle).
+			if ( !m_Est.Valid() )
+			{
+				m_flTargetMs = m_flBufMs;
+				m_flLowMs = 0.0;
+				m_ulExtraNs = in.extraDelayNs + Ns( m_flBufMs * 1e6 );
+				return;
+			}
+			const double flInterval = m_Est.IntervalMs();
 			m_flTargetMs = lb.enabled ? LagTargetMs( in, flInterval, in.now ) : 0.0;
 
 			const double flStep = kLagRampEps * flDtMs;
@@ -1254,6 +1266,10 @@ namespace framegen::pacing
 		// after kDepthShrinkDwellMs and only past frames the content time has left.
 		void UpdateDepth( const Inputs &in )
 		{
+			// Never size the depth from the buffer delay before the interval is measured
+			// (dividing by the 4 ms clamp balloons it); keep what it is (kHistory at start).
+			if ( !m_Est.Valid() )
+				return;
 			const double flInterval = std::max( m_Est.IntervalMs(), kMinIntervalMs );
 			const double flExtraMs = double( in.extraDelayNs ) / 1e6 + std::max( m_flBufMs, m_flTargetMs );
 			int nWant = kHistory;
@@ -1568,7 +1584,7 @@ namespace framegen::pacing
 
 			if ( m_Plan.realRate )
 			{
-				PaintRealRate( in, d, bFresh, bPresentTick );
+				PaintRealRate( in, d, bFresh, bPresentTick, bSkippable );
 				return;
 			}
 
@@ -1766,7 +1782,9 @@ namespace framegen::pacing
 			{
 				if ( bHaveLast && m_Last.prevId == 0 && m_Last.t0 == 1.0f && m_Last.showId == m_Hist[ jReal ].id && !BlurActive( in ) )
 				{
-					RepeatLast( false );    // the same real frame again: nothing new to present
+					// the same real frame again: nothing new to present, and skippable when the
+					// ring has nothing new to copy either (the newest announced frame is unchanged)
+					RepeatLast( bSkippable && d.newestId == m_Last.newestId );
 					return;
 				}
 				d.newOutput = true;
@@ -1866,7 +1884,7 @@ namespace framegen::pacing
 		// exists), so the result is exactly one real frame per real frame. A real frame
 		// that arrives within the snap tolerance max(2 ms, 15%) after a planned fill
 		// instant is waited for (shown as itself) instead of being filled before.
-		void PaintRealRate( const Inputs &in, Decision &d, bool bFresh, bool bPresentTick )
+		void PaintRealRate( const Inputs &in, Decision &d, bool bFresh, bool bPresentTick, bool bSkippable )
 		{
 			if ( !bPresentTick && !bFresh )
 			{
@@ -1938,6 +1956,10 @@ namespace framegen::pacing
 			{
 				Repeat( d, m_Last, bPending );
 				m_bExpectPaint = bPending;
+				// Nothing new to show and no new real frame to ingest (its ring copy is
+				// the paint a fresh frame needs even when it is not shown yet): a
+				// present tick with nothing but a held frame is not worth compositing.
+				d.skip = bSkippable && bPresentTick && !bFresh && !d.reset && m_Last.outId != 0;
 				return;
 			}
 

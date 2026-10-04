@@ -2728,12 +2728,14 @@ namespace
 			}
 		}
 
+		bool skippable = false;        // the host lets a tick with nothing new be dropped
+
 		Pacer::Decision Tick()
 		{
 			const int64_t V = TickNs( tick );
 			const int64_t tau = int64_t( std::llround( double( V - offsetNs ) * rate ) );
 			Announce( tau );
-			const Pacer::Decision d = pacer.OnPaint( Inputs( V ), nextFrame ? uint64_t( nextFrame ) : 0, true );
+			const Pacer::Decision d = pacer.OnPaint( Inputs( V ), nextFrame ? uint64_t( nextFrame ) : 0, true, skippable );
 			log.push_back( { V, tau, d } );
 			tick++;
 			return d;
@@ -3058,4 +3060,170 @@ TEST_CASE( "video: arrival and timestamp sources do not mix silently", "[video]"
 	p.OnArrival( 2, 20 * MS, 1, f );
 	CHECK_FALSE( p.Timestamps() );
 	CHECK( p.PendingFrames() == 0 );
+}
+
+// ---- real-rate skips and the cold-start history depth ----
+
+namespace
+{
+	struct OutKey
+	{
+		Ns t; uint64_t show, prev, curr; float t0, t1; int64_t tau;
+		bool operator==( const OutKey &o ) const
+		{
+			return t == o.t && show == o.show && prev == o.prev && curr == o.curr && t0 == o.t0 && t1 == o.t1 && tau == o.tau;
+		}
+	};
+
+	std::vector<OutKey> OutputsOf( const Driver &drv )
+	{
+		std::vector<OutKey> v;
+		for ( const Painted &p : drv.log )
+			if ( p.d.newOutput )
+				v.push_back( { p.t, p.d.showId, p.d.prevId, p.d.currId, p.d.t0, p.d.t1, p.tau } );
+		return v;
+	}
+
+	int PaintsOf( const Driver &drv, Ns t0, Ns t1 )
+	{
+		int n = 0;
+		for ( const Painted &p : drv.log )
+			if ( p.t >= t0 && p.t < t1 && !p.d.skip )
+				n++;
+		return n;
+	}
+
+	// A 30 fps game on a 120 Hz tick, FG off, with a delay and/or blur.
+	Driver RealRateDriver( bool bSkip, double flBufMs, bool bBlur )
+	{
+		Driver drv;
+		drv.refreshHz = 120.0;
+		drv.frameGen = false;
+		drv.skipVblanks = bSkip;
+		drv.blur = bBlur;
+		if ( flBufMs > 0.0 )
+		{
+			drv.lag.enabled = true;
+			drv.lag.maxBufferMs = flBufMs;
+			drv.lag.testMode = LagTestMode::ForceMax;
+		}
+		return drv;
+	}
+}
+
+TEST_CASE( "real-rate: ticks with nothing new are skippable, outputs unchanged", "[realrate][skip]" )
+{
+	const double flI = 1000.0 / 30.0;
+	Driver a = RealRateDriver( false, 50.0, false );
+	Driver b = RealRateDriver( true, 50.0, false );
+	a.Run( 20 * 1000 * MS, flI );
+	b.Run( 20 * 1000 * MS, flI );
+	REQUIRE( b.pacer.BufferMs() == 50.0 );
+	// identical output sequence (what is shown, when, and its content time)
+	CHECK( OutputsOf( a ) == OutputsOf( b ) );
+	CHECK( OutputsOf( a ).size() > 500 );
+	// settled: a paint for each new frame (its ring copy) plus one for each output, so
+	// at most ~2 x 30 a second; it used to be one per 120 Hz tick
+	const Ns t0 = 10 * 1000 * MS, t1 = 20 * 1000 * MS;
+	const int nOld = PaintsOf( a, t0, t1 );
+	const int nNew = PaintsOf( b, t0, t1 );
+	int nArrivals = 0;
+	for ( const Painted &p : b.log )
+		if ( p.t >= t0 && p.t < t1 && p.d.newestId != 0 && !p.d.skip && p.d.newOutput == false )
+			nArrivals++;
+	INFO( "paints old " << nOld << " new " << nNew );
+	CHECK( nOld >= 10 * 120 - 2 );
+	CHECK( nNew >= 10 * 30 );
+	CHECK( nNew <= b.CountOutputs( t0, t1 ) + 10 * 31 + 2 );
+	CHECK( nNew <= 10 * 2 * 31 + 2 );
+	CHECK( nArrivals <= 10 * 31 + 2 );                // non-output paints: only the ring copies
+	CHECK( b.CountOutputs( 10 * 1000 * MS, 20 * 1000 * MS ) == a.CountOutputs( 10 * 1000 * MS, 20 * 1000 * MS ) );
+	// a skip never carries a reset or a new output
+	for ( const Painted &p : b.log )
+		if ( p.d.skip )
+			CHECK( ( !p.d.newOutput && !p.d.reset ) );
+}
+
+TEST_CASE( "real-rate: without a skippable host nothing is ever skipped", "[realrate][skip]" )
+{
+	Driver a = RealRateDriver( false, 50.0, false );
+	a.Run( 5 * 1000 * MS, 1000.0 / 30.0 );
+	for ( const Painted &p : a.log )
+		CHECK_FALSE( p.d.skip );
+}
+
+TEST_CASE( "real-rate: blur only skips the same way and loses no output", "[realrate][skip][blur]" )
+{
+	const double flI = 1000.0 / 30.0;
+	Driver a = RealRateDriver( false, 0.0, true );
+	Driver b = RealRateDriver( true, 0.0, true );
+	a.Run( 10 * 1000 * MS, flI );
+	b.Run( 10 * 1000 * MS, flI );
+	CHECK( OutputsOf( a ) == OutputsOf( b ) );
+	CHECK( OutputsOf( b ).size() > 250 );
+	CHECK( PaintsOf( b, 5 * 1000 * MS, 10 * 1000 * MS ) <= 5 * 31 + 2 );
+}
+
+TEST_CASE( "real-rate: a late frame after a gap still gets its output when skipping", "[realrate][skip]" )
+{
+	const double flI = 1000.0 / 30.0;
+	Driver a = RealRateDriver( false, 50.0, false );
+	Driver b = RealRateDriver( true, 50.0, false );
+	std::vector<Ns> arr = Driver::Periodic( 3 * MS, flI, 6 * 1000 * MS );
+	std::vector<Ns> kept;
+	for ( Ns t : arr )
+		if ( t < 3000 * MS || t > 3120 * MS )
+			kept.push_back( t );               // a 120 ms hole: a lag spike
+	a.RunArrivals( kept, 6 * 1000 * MS );
+	b.RunArrivals( kept, 6 * 1000 * MS );
+	CHECK( OutputsOf( a ) == OutputsOf( b ) );
+}
+
+TEST_CASE( "video: a repeated real frame is skippable, outputs unchanged", "[video][skip]" )
+{
+	VideoDriver a, b;
+	a.fps = b.fps = 24.0;
+	a.frameGen = b.frameGen = false;
+	b.skippable = true;
+	a.RunTo( a.offsetNs + 3'000'000'000 );
+	b.RunTo( b.offsetNs + 3'000'000'000 );
+	REQUIRE( a.log.size() == b.log.size() );
+	int nSkip = 0, nOutA = 0, nOutB = 0;
+	for ( size_t i = 0; i < a.log.size(); i++ )
+	{
+		nOutA += a.log[ i ].d.newOutput;
+		nOutB += b.log[ i ].d.newOutput;
+		nSkip += b.log[ i ].d.skip;
+		CHECK( a.log[ i ].d.newOutput == b.log[ i ].d.newOutput );
+		if ( a.log[ i ].d.newOutput )
+		{
+			CHECK( a.log[ i ].d.showId == b.log[ i ].d.showId );
+			CHECK( a.log[ i ].d.t == b.log[ i ].d.t );
+		}
+		CHECK_FALSE( ( b.log[ i ].d.skip && b.log[ i ].d.newOutput ) );
+	}
+	CHECK( nOutA == nOutB );
+	CHECK( nSkip > 100 );     // 144 Hz ticks of a 24 fps file
+}
+
+TEST_CASE( "lag buffer: a forced max buffer does not balloon the history before the interval is known", "[lagbuffer][depth]" )
+{
+	for ( double flFps : { 30.0, 60.0, 120.0 } )
+	{
+		const double flI = 1000.0 / flFps;
+		Driver drv = LagDriver( 100.0 );
+		drv.lag.testMode = LagTestMode::ForceMax;
+		drv.Run( 10 * 1000 * MS, flI );
+		const int nCeil = int( std::ceil( 100.0 / flI ) ) + kHistoryMargin + 2;
+		int nMax = 0;
+		for ( const Painted &p : drv.log )
+			nMax = std::max( nMax, p.depth );
+		INFO( "fps " << flFps << " peak depth " << nMax << " limit " << nCeil );
+		CHECK( nMax <= nCeil );
+		if ( flFps == 30.0 )
+			CHECK( nMax <= 9 );
+		// the first paints are at the default depth, and the target is not sized from a guess
+		CHECK( drv.log.front().depth == kHistory );
+		CHECK( drv.log.front().bufMs == 0.0 );
+	}
 }
