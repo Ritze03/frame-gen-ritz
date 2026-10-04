@@ -162,6 +162,8 @@
 //     of real time, i.e. content time plays at 0.97x while it grows and 1.03x while it
 //     shrinks (tau stays monotonic). Shrinking starts only after the target has been
 //     more than 3 ms below D_buf for 2 s (the look-back decay, not a flicker).
+//     EXCEPTION: switching the buffer OFF (LagBufferSettings::enabled false) drops it to 0
+//     on the very next paint: one forward step of tau, which stays monotonic.
 //   * TEST MODE: ForceMin pins the target at 0, ForceMax at maxBufferMs (through the same
 //     ramp, no band, no wait).
 //   * HISTORY: HistoryDepth() = ceil((base delay + max(D_buf, target) + manual delay) /
@@ -1193,8 +1195,15 @@ namespace framegen::pacing
 			m_flDtMs = flDtMs;
 
 			const LagBufferSettings &lb = in.lagBuffer;
-			if ( !lb.enabled && m_flBufMs <= 0.0 )
+			// Switched off: drop the buffer at once (one forward step of tau; tau stays
+			// monotonic). Why: the user: "turning it off should immediately remove the buffer".
+			if ( !lb.enabled )
 			{
+				// A paint that repeats the last output (cadence) does not recompute D, so
+				// take the buffer off the reported delay now too.
+				m_flDelayMs = std::max( 0.0, m_flDelayMs - m_flBufMs );
+				m_flBufMs = 0.0;
+				m_flLowMs = 0.0;
 				m_flTargetMs = 0.0;
 				m_ulGapNs = kGapResetNs;
 				m_ulExtraNs = in.extraDelayNs;
