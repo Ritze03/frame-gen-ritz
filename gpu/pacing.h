@@ -201,10 +201,10 @@ namespace framegen::pacing
 	constexpr Ns kNsPerMs = 1'000'000ull;
 
 	// The game's frame interval = median of the last kIntervalWindow arrival
-	// intervals, clamped to [4, 50] ms (250 .. 20 fps).
+	// intervals, clamped to [1, 50] ms (1000 .. 20 fps).
 	constexpr int    kIntervalWindow  = 8;
 	constexpr int    kMinSamples      = 4;      // intervals needed before the estimate is trusted
-	constexpr double kMinIntervalMs   = 4.0;
+	constexpr double kMinIntervalMs   = 1.0;
 	constexpr double kMaxIntervalMs   = 50.0;
 	// A gap longer than this between real frames drops the previous frame.
 	constexpr Ns     kGapResetNs      = 100 * kNsPerMs;
@@ -218,7 +218,7 @@ namespace framegen::pacing
 	// than 2% longer (the same 2% the cadence in PaintGenerated() uses).
 	constexpr double kExtraEnter      = 0.98;
 	constexpr double kExtraLeave      = 1.02;
-	// No output interval is shorter than this: a fixed 8x of a 250 fps game.
+	// No output interval is shorter than this (2000 fps): a fixed 2x of a 1000 fps game, or any 4x+ of a 500+ fps one.
 	constexpr double kMinOutputMs     = 0.5;
 	// Generation (estimate + synths) may use at most this share of a game
 	// interval.
@@ -254,9 +254,11 @@ namespace framegen::pacing
 	// With a delay (the lag-spike buffer, Inputs::extraDelayNs) the number of real frames kept
 	// FOLLOWS the delay: ceil((base delay + buffer) / game interval) + kHistoryMargin
 	// (HistoryDepth(), Report::historyFrames), never fewer than kHistory, never more than
-	// kHistoryMax. The ceiling is ceil(250 ms / kMinIntervalMs) + kHistoryMargin = 63 + 2: it
-	// covers the largest buffer (kLagMaxBufferMs) at the fastest game rate the pacer supports
-	// (250 fps). Each frame the host keeps costs it one frame of memory (see INTEGRATION.md).
+	// kHistoryMax. The ceiling is NOT derived from kMinIntervalMs: 65 covers the largest buffer
+	// (kLagMaxBufferMs, 250 ms) up to 250 fps (ceil(250/4) + 2); above that the buffer's cap
+	// (LagTargetMs: (kHistoryMax - kHistory - kHistoryMargin) x interval) shrinks with the
+	// interval instead (150 ms at 400 fps, 60 ms at 1000 fps), because each frame
+	// the host keeps costs it one frame of memory (see INTEGRATION.md).
 	constexpr int    kHistoryMargin   = 2;
 	constexpr int    kHistoryMax      = 65;
 	// Depth shrinks only after the wanted depth has stayed lower for this long (no allocating
@@ -1218,7 +1220,7 @@ namespace framegen::pacing
 			// No measured game interval yet (a cold start, or just after a stream change): the
 			// cap (kHistoryMax frames at this rate), the history depth and the content timing
 			// all need one, so hold the buffer where it is instead of sizing it from a guess.
-			// Why: a ForceMax buffer was sized against the 4 ms interval clamp and asked for
+			// Why: a ForceMax buffer was sized against the (then) 4 ms interval clamp and asked for
 			// ~27 frames for the first paints (the depth then took two shrink dwells to settle).
 			if ( !m_Est.Valid() )
 			{
@@ -1271,7 +1273,7 @@ namespace framegen::pacing
 		void UpdateDepth( const Inputs &in )
 		{
 			// Never size the depth from the buffer delay before the interval is measured
-			// (dividing by the 4 ms clamp balloons it); keep what it is (kHistory at start).
+			// (dividing by the interval clamp balloons it); keep what it is (kHistory at start).
 			if ( !m_Est.Valid() )
 				return;
 			const double flInterval = std::max( m_Est.IntervalMs(), kMinIntervalMs );
