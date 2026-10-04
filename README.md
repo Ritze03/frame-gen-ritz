@@ -283,6 +283,10 @@ Some games, especially on Linux, hitch: a frame arrives one, two or three interv
 
 `INTEGRATION.md` has the full host contract, every field, a minimal loop and the reasoning behind each rule. `meson test -C <build> pacing` runs the CPU-only tests (`gpu/pacingtest.cpp`).
 
+### Video / timestamps
+
+For video, `Pacer::OnFrame(id, ptsNs, streamKey, format)` replaces `OnArrival`: the frames carry presentation timestamps and the decoder has the next ones ready, so every tick's output is generated at its **exact content time** `t = (tau - pts_k) / (pts_k+1 - pts_k)` with `tau = (V - Inputs::mediaOffsetNs) * Inputs::playbackRate`. 24 fps film on a 144 Hz display becomes six outputs per frame at `t = 0, 1/6 ... 5/6`, with no 3:2 judder; 23.976 fps follows the media clock without drift. Host contract: PTS in order, the media clock (`mediaOffsetNs`, `playbackRate`), keep the next frame announced (a late decoder holds the last frame at `t = 1` and reports `Reason::WaitingForDecoder`), `Discontinuity()` on seek. The lag-spike buffer, `extraDelayNs` and the delay priorities are inert (no arrival spikes, `D = 0`); frame generation's cadence, blur and the cost guard work as usual, and the pacer is never inert in this mode (it schedules the due frame). Details in INTEGRATION.md's "Video / timestamps". The default is unchanged arrival timing.
+
 ## Limitations
 
 - 8-bit UNORM RGBA/BGRA only. There is no HDR or 10-bit support, so the caller must skip frame generation or convert first.
