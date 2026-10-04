@@ -10,3 +10,4 @@ __pycache__/
 *.mkv
 *.rgba
 *.png
+.local-work/
