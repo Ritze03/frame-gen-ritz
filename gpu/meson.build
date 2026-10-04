@@ -29,3 +29,7 @@ executable('uitest', 'uitest.cpp', dependencies : [framegen_dep, vulkan])
 
 blend_bench = shader_gen.process('blendbench.comp')   # test only: the naive blend the benchmark compares against
 executable('blurtest', 'blurtest.cpp', blend_bench, dependencies : [framegen_dep, vulkan])
+
+# CPU-only: frame-generation pacing (pacing.h) and the motion-blur window. No GPU, no Vulkan.
+pacingtest = executable('pacingtest', 'pacingtest.cpp')
+test('pacing', pacingtest)

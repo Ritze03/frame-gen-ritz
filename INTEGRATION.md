@@ -276,3 +276,136 @@ Per 280 Hz output that is 0.16 ms (1280x960) to 0.45 ms (1440p) of a 3.57 ms bud
 
 ### Limits
 Blur averages interpolation errors, it does not hide them: an artefact in a sub-frame (a ghost, a held region, a smeared occlusion) is spread over the window, softer but wider. It reduces clarity by design (the blur *is* a loss of sharpness in motion, so competitive players will often want it off, or a short shutter), and the library's usual limits apply per sub-frame (very fast motion, repetitive structures, scene cuts and flicks present the nearer real frame, so a blurred output of such a pair is an average of real frames).
+
+## Pacing (`gpu/pacing.h`, namespace `framegen::pacing`)
+Which frame to show at which moment, and whether to generate at all, lives in the library, so every host paces the same way and the host keeps only its UI and platform glue. Header-only C++17, no Vulkan, no OS calls, no clock: every time is passed in as nanoseconds on any monotonic base. It decides; `Interpolator` renders. The host never needs to choose a multiplier `N` per frame, detect "the game is already fast enough", or implement an automatic turn-off: all of that is the `Pacer`. Reference host: gamescope-ritz (`steamcompmgr.cpp` is the thin glue that feeds it and applies its decisions). `gpu/pacingtest.cpp` drives it with a fake clock (`meson test -C <build> pacing`, CPU only, milliseconds).
+
+Vocabulary: a **present tick** is one display refresh (a vblank, a frame callback, a timer standing in for either); its time `V` is when that paint's image is shown. A **frame id** is any host-chosen identity of a real frame (a commit counter, a buffer sequence); the same id is the same image, 0 is none.
+
+### What the host feeds
+| Call | When | Arguments |
+|---|---|---|
+| `OnArrival(frameId, arrivalNs, streamKey, format)` | a real frame became usable | `arrivalNs` = the earliest instant it could be shown (its acquire fence signalled), **not** when the loop noticed it and **not** the tick that latches it. `streamKey` identifies the source (window/game); `format` = `FrameFormat{width, height, format}` (any pixel-format encoding). A new key or format is a reset. |
+| `OnPaint(inputs, newestId, bPresentTick, bSkippable)` | before every paint | `newestId` = the real frame the host would show unprocessed. `bPresentTick`: this paint was triggered by a present tick (false for a UI/cursor repaint). `bSkippable`: nothing but frame generation asked for it, so a tick that is not due may be dropped. |
+| `Discontinuity()` | the real frames cannot take part now (a fade, a menu on top, no frame) | the next frame starts a fresh sequence |
+| `Reset()` | frame generation switched off/on, new session | forget everything |
+| `StatusDue(now)` / `TakeStatus(inputs, now)` | for a HUD / log, every `kStatusPeriodNs` (250 ms) | returns `Report` |
+
+`Pacer::Inputs`, read fresh at each paint (frame generation, the buffer and blur each have their own fields, see "How the features combine"): `now`, `presentNs` (V; 0 = now; a predicted present time, or an output timer's target), `mode` (`Off`/`Fixed`/`Target`), `multiplier` (2..`kMaxN` = 8), `targetFps` (0 = the display's refresh), `priority` (`LowLatency`/`Smoothness`), `refreshHz`, `pauseAtRefresh`, `canExceedRefresh`, `costGuard`, `estimateMs`/`synthMs`/`costSeq` (the renderer's last GPU timings and a counter that changes with every new measurement; < 0 = none), `rendererOk` (false when the host cannot run the renderer: HDR, 10-bit, ...); `frameGen` (frame generation on; default true), `extraDelayNs` (the lag-spike buffer's delay, default 0), `blur` / `blurSamples` / `blurAmount` / `blurRelative` (motion blur; active when `blur && blurAmount > 0 && blurSamples >= 2`).
+
+### What the host applies (`Pacer::Decision`)
+| Field | Meaning |
+|---|---|
+| `skip` | a cadence-skip tick: paint and commit nothing, the display keeps the last buffer, ask for the next tick. Only set when the paint was `bSkippable`; nothing was consumed. |
+| `reset` | reset the renderer (forget its previous real frames) **before** this paint |
+| `inert` | pass-through: show the real frame, the renderer does nothing at all |
+| `prevId`, `currId`, `t0`, `t1` | **the one renderer call**: if `prevId != 0`, `recordSynthBlur(prev, curr, out, t0, t1)` on that pair. `t0 == t1` (blur off) is a plain `recordSynth(t1)`; a window ending at 1 is the real frame `curr` as its last sample. `prevId == 0`: no renderer work, show the real frame `showId`. |
+| `t` | the output's content instant in the pair: `1` a real frame, in (0,1) a point between the frames. `t1 == t` except the film look near the start of a pair. |
+| `showId` | the real frame to show when `prevId == 0`: the newest, unless the buffer is delaying (then an older frame the host must still hold; `Pacer::HistoryDepth()` says how many) |
+| `newestId` | the newest real frame (the renderer copies it into its ring on first sight) |
+| `outId` | the output frame's identity: the same `outId` is the same image (reuse the cached output instead of rendering again) |
+| `newOutput` | this paint presents a new output frame (count it for presented fps) |
+| `repaintNext` | another output is due: paint again at the next tick (or the next `ExtraTimer()` tick) |
+
+`Pacer::ExtraTimer()`: the output interval is shorter than a tick and the display path can show it (`pauseAtRefresh` false and `canExceedRefresh` true), so the host arms its own timer for each output frame and paints on it with `presentNs` = that timer's target (`NextExtraTargetNs(lastTarget, now, OutputMs())`). `PaintTick(...)` is the optional main-loop rule that lets only the right ticks paint while the pacer is planning (pass `Pacer::Planning()` as `bGenerating`: it is also true for real-rate planning; `Generating()` is frame generation alone). Under VRR a loop would otherwise paint at arrival times and bunch the outputs.
+
+Minimal host loop:
+
+```cpp
+#include "pacing.h"
+using namespace framegen;
+
+pacing::Pacer pacer;
+
+// a real frame is ready (its fence signalled at fenceNs):
+pacer.OnArrival(frame.id, fenceNs, window.id, {w, h, fmt});
+
+// every present tick, and on any other repaint request:
+pacing::Pacer::Inputs in;
+in.now = nowNs;  in.presentNs = predictedPresentNs;       // V
+in.frameGen = cfg.fgOn;                                    // frame generation
+in.mode = pacing::Mode::Fixed;  in.multiplier = 3;
+in.priority = pacing::Priority::LowLatency;  in.refreshHz = 144.0;
+in.pauseAtRefresh = true;  in.canExceedRefresh = false;    // host capability
+in.extraDelayNs = buffer.delayNs();                        // lag-spike buffer (0 = none)
+in.blur = cfg.blurOn;  in.blurSamples = 4;                 // motion blur
+in.blurAmount = 0.5;   in.blurRelative = pacing::BlurRelative::ShownFrame;
+in.costGuard = false;
+in.estimateMs = fgTimings.estimateMs;  in.synthMs = fgTimings.synthMs;  in.costSeq = fgTimings.seq;
+in.rendererOk = fg.initialised();
+
+const pacing::Pacer::Decision d = pacer.OnPaint(in, newestFrame.id, isPresentTick, !uiAskedForThisPaint);
+if (d.skip) { requestNextTick(); return; }
+if (d.reset) host.resetRenderer();                         // forget previous real frames
+if (d.prevId == 0) present(frameById(d.showId));           // a real frame as it is (inert or not)
+else {
+    if (pairChanged(d.prevId, d.currId)) fg.recordEstimate(cb, view(d.prevId), view(d.currId));   // once per pair
+    if (!cached(d.outId)) fg.recordSynthBlur(cb, view(d.prevId), view(d.currId), out, d.t0, d.t1); // the one call
+    present(out);
+}
+if (d.repaintNext) requestNextTick();
+if (pacer.StatusDue(nowNs)) show(pacer.TakeStatus(in, nowNs));
+```
+
+### Model: per-tick fractional pacing
+No `N` is held anywhere. Every output frame is generated for its own moment between two real frames: a real frame carries its arrival time `A`; the output for the tick at `V` shows the **content time** `tau = V - D` (`D` = the delay, per priority), `t = (tau - A0) / (A1 - A0)`; `t >= 1` (or `>= 0.98` of the newest pair) shows the real frame itself, otherwise a synth at `t`, clamped to 0.02..0.98. `tau` is monotonic. "How many generated frames per real frame" falls out of `t` from the latest arrivals, so a game dropping 120 -> 100 fps against a 240 target gets about 2.4 outputs per real frame on the very next pair, which is per-frame accuracy without a hold or a step. `Why` arrival and not latch time: latch times are quantised to the refresh (about +-7 ms for 60 fps on 144 Hz), which wrecks the interval estimate.
+
+**Output interval `o`.** Fixed N: `max(interval / N, 1 / refresh)`. Target: `1 / min(target, refresh)` (0 = the refresh). When `o` is longer than a tick only the ticks where a phase accumulator crosses `o` get a new image (Bresenham), so the average rate is exact and a fixed N simply saturates at the refresh instead of stepping down. `interval` = median of the last 8 arrival intervals, clamped to 4..50 ms, trusted after 4 (warm-up; real frames are copied meanwhile so the first pair has its previous frame).
+
+**Priority.**
+- `LowLatency` (default): `D = (smoothed interval - o) + margin`, floored at 0 (and at one `o` while the ratio is >= 1.1). A genuinely early or late real frame (more than `max(2 ms, 15%)` off the smoothed interval) snaps the content time to the new pair. `margin` = the largest ordinary arrival jitter (at most 4 ms) plus the lead by which the paint wakes before its tick (`presentNs - now`, at most 4 ms): 0 for a perfectly steady game. `Why` the smoothed interval and the margin: with `D` from the latest interval alone, ordinary jitter moved `D` from pair to pair, and the real frame of a pair sits exactly where the next one is expected, so any late arrival left a tick with nothing new and lost an output (a 30 fps game on a 120 Hz window presented about 105/s instead of 120). `Why` the floor of one `o` at ratio >= 1.1: a game just under the output rate (212 fps on a 280 Hz panel) has `interval - o` below one `o`, no generated frame fitted between two real ones and the output had fewer frames than the game.
+- `Smoothness`: `D = median interval + max(2 ms, spread)` (spread = second-largest minus median, so one hitch is ignored), at most half an interval. The content time advances evenly, the pair played may be one **older** than the newest (about one game frame queued), a late real frame holds at `t = 1` instead of hitching. `Why` the renderer keeps `kHistory` = 3 real frames: with `D >= one interval` the newest frame has usually already arrived while `tau` is inside the pair before it.
+
+### Modes and switches
+- **Fixed N / Target fps**: `Inputs::mode`, `multiplier` 2..8, `targetFps` (0 = refresh). `Inputs::frameGen` false is frame generation off: the cadence becomes one output per real frame (see "How the features combine"); `mode`, `multiplier`, `targetFps`, `priority` and `pauseAtRefresh` are then unused.
+- **Pause at refresh rate** (`pauseAtRefresh`, default true): capped at the refresh, generation stops once the game alone reaches it. False: the cap is gone (Fixed `o = interval / N`, floor 0.5 ms; Target not clamped; pass-through only when the game itself reaches the output rate), and `ExtraTimer()` asks the host to paint on its own timer when `o` is under 98% of a tick (back to the tick timer above 102%). `Why` a switch: whether 800 frames a second is wanted depends on the display path and the GPU budget, which the pacer cannot know; the user can.
+- **`canExceedRefresh`** is a **host-provided capability**: true only where a present between ticks is shown or discarded without blocking (a nested Wayland window, a tearing flip). Where it is false "off" behaves exactly as "on" (a plain display cannot show more than its refresh and a second flip while one is pending fails).
+- **GPU limit** (`costGuard`, "Limit to GPU speed"): the renderer's estimate plus the synths for one pair may use at most 25% of the game interval; otherwise `o` is raised to `interval / (g_max + 1)`, and if not even one generated frame fits it passes through (`Reason::CostGuard`). A probe retries every 10 s with one generated frame per pair, judged on the next measurement (`costSeq` changes), given up after 3 s. No timings, no guard. False: costs are still read, but the guard never caps, never passes through and never probes, and a cap lifts at once. `Why` it is a switch: the guard trades the chosen output rate for the game's own frame rate, and a steady generated output looks better to some users than switching generation on and off.
+
+### Pass-through rules
+Real frame at once, renderer inert, **only** when: frame generation is off and neither blur nor the buffer is on (`Reason::Off`), the game's rate reaches the output rate (interval / `o` below 1.02; generating again above 1.10: a ratio band, not a time hold), the renderer is unavailable (`rendererOk` false; the host keeps driving it so it can re-check), or the cost guard trips. With blur or the buffer on, a game that reaches the output rate is not passed through but planned real-rate (below). VRR and tearing are **not** a pass-through reason. `Why` the old "frame rate times N above the refresh" step-down is gone: it passed through a 144 Hz game at 86 fps with 2x. `Report::reason` (`Reason`) names the cause: `Normal`, `Off`, `WarmingUp`, `CostGuard`, `GameTooFast`, `GameStalled`, `RendererUnavailable`.
+
+### Resets
+Frames are keyed by id, never by texture pointer or object address (a host may reuse one buffer for several frames: pointer equality misses re-commits, and without a reset two unrelated images would be blended). The pacer forgets the previous real frames and the interval history and sets `Decision::reset` on: a new `streamKey`, a new `FrameFormat`, a gap over 100 ms between arrivals, a paint whose `newestId` no announced arrival explains, and `Discontinuity()`. A new stream also forgets the cost-guard state, because another game's cost and rate are unrelated. A changed mode, multiplier, target, priority or cap adopts the new target at once.
+
+### How the features combine
+Frame generation, motion blur and the lag-spike buffer are separate and can all be on at once; each owns **one dimension of the same content timeline**, so every combination falls out of one planner instead of special cases:
+
+| Feature | Owns | Input | Effect |
+|---|---|---|---|
+| Lag-spike buffer | how far behind real time we show | `extraDelayNs` | added to the base delay `D` (`tau = V - D`); gaps between real frames are filled by synthesising between the pair that brackets `tau`; more real frames are kept (`HistoryDepth()`) |
+| Frame generation | which instants get an output (the cadence) | `frameGen`, `mode`, `multiplier`, `targetFps`, `priority`, `pauseAtRefresh`, `canExceedRefresh` | fixed N / target / pause at refresh as above; **off: one output per real frame, at its own time** |
+| Motion blur | what each output shows over time | `blur`, `blurSamples`, `blurAmount`, `blurRelative` | the window `[t0, t1]` ending at the output's instant, clamped into the pair that brackets it (`BlurWindow`); off: `t0 == t1` |
+
+Every `Decision` carries the pair, `t0`, `t1`, so the host makes **one** renderer call, `recordSynthBlur(prev, curr, out, t0, t1)`, which is a plain synth when `t0 == t1` and the real frame when the window ends at 1.
+
+| Frame gen | Blur | Buffer | What you get |
+|---|---|---|---|
+| off | off | off | pass-through, renderer inert (`Reason::Off`) |
+| on | off | off | generated frames as above (`prevId`/`currId`, `t0 == t1 == t`) |
+| off | on | off | one output per real frame, blurred over `[1 - s, 1]`; no delay |
+| off | off | on | real frames at their own time plus `D`; a lag spike inside the buffer is filled with synths |
+| on | on | off | every output blurred over its own window (they tile at `s = 1` when the output instants sit on the `m/M` grid) |
+| on | off | on | delayed, so a gap is interpolated rather than held |
+| off | on | on | real-rate output, blurred, gaps filled |
+| on | on | on | all of the above on one timeline |
+
+Shared rules:
+- **One estimate per real pair**, shared by every output and every blur sample (the host calls `recordEstimate` when the pair changes).
+- **Cost guard** (`costGuard`, off by default): the budget is the estimate plus every synth, so each blurred output costs `blurSamples` synths (a conservative count: a window ending at the real frame is one sample cheaper). Over budget: the output rate is lowered (frame generation), then pass-through (`Reason::CostGuard`), with the same probe.
+- **Pause at refresh** is frame generation's cadence only. When the game already reaches the output rate, blur and the buffer still work: the planner runs **real-rate** (`Pacer::RealRate()`, `Reason::GameTooFast` while frame generation is on), one output per real frame.
+- **Resets** (new stream, format change, a gap over 100 ms, `Discontinuity()`) reset all three together: the history, the interval estimate, the content time.
+- **`Report`** exposes each part for its own settings line: frame generation (`fgActive`, `activeN`, `effectiveMultiplier`, `presentedFps`, `targetFps`), blur (`blurActive`, `blurWindowMs`, `blurSamples`), the buffer (`bufferDelayMs`; `delayMs` is the total `D`).
+
+**Real-rate planning** (frame generation off, or the game reaches the output rate and blur / the buffer is on). The output is the real frame whose time has come (the newest with `arrival <= tau = V - D`), at its own time; with `D = extraDelayNs` alone (the base delay is 0 without generation: priority is a cadence concern). When `tau` passes the planned instant of the next output (the last output plus one smoothed game interval) and no real frame is due, but a later real frame is already known, the planner fills with a synth at that instant, between the pair that brackets it. A real frame that arrives within `max(2 ms, 15%)` after a planned instant is waited for instead of being filled before, so a steady game gets no spurious extra outputs. Without a delay nothing is ever bracketed (every real frame is due the moment it exists): exactly one real output per real frame, no added latency. `Why` this is the same planner and not a second path: the buffer and blur must keep working when frame generation is off or paused, and the content-time rules (`tau` monotonic, one pair per output, resets) are the same.
+
+`Why` the buffer deepens the history: with `D` of 50 ms and 16 ms frames `tau` lies about three frames behind the newest, so the pair that brackets it is older than the last two frames; `HistoryDepth()` grows with `extraDelayNs` (at most `kHistoryMax` = 16) and the host must keep that many real frames addressable by id. Low latency's "play only the newest pair" rule is lifted while a delay is set, because the delay is the explicit choice to play behind.
+
+What is not here: the lag-spike **detection** (deciding `extraDelayNs` from the frame times, growing and shrinking it) is a later change. This header has the hook it will drive; a host can already set `extraDelayNs` by hand. A change of `extraDelayNs` is followed smoothly (the content time never goes backwards, a larger delay holds the last output until `tau` catches up). At the very start, before the first delayed frame is due, the host shows the newest real frame.
+
+### Motion-blur window (`BlurWindow`)
+`BlurWindow(t, outputIntervalNs, gameIntervalNs, amount, BlurRelative) -> BlurSpan{t0, t1}` is the arithmetic of the host's motion-blur logic: where inside the current real pair the blur averages. Feed it to `recordSynthBlur(cb, prev, curr, out, t0, t1)` (the interpolation-based motion-blur pass; `pacing.h` does not depend on it). `prev`/`curr` is `Decision::prevId`/`currId` (for a real-frame output with blur: the previous real frame and that frame). The window **always ends at the instant the output shows** (trailing shutter). `Why`: it needs no future frame and so adds no delay; a centred window would need the next pair for the output that is the real frame itself (`t = 1`). It never leaves [0, 1]. `amount` is the shutter, 0..1:
+- `ShownFrame`: measured in **output** intervals, window `[t - s * o / g, t]` (`o` the output interval, `g` the game interval). For output `m` of `M` per real pair (`t = m/M`) that is `[(m - s)/M, m/M]`; `s = 1` tiles the pair, `s = 0.5` is a 180 degree shutter. Blur only (no interpolation, `o = g`, `t = 1`): `[1 - s, 1]`. A `t` that is not on `m/M` (a fractional cadence) is cut at 0, never moved.
+- `GameFrame`: measured in **real-frame** intervals (the film look), `L = amount`: `[a, a + L]` with `a = clamp(t - L, 0, 1 - L)`, the length kept and the window slid into the pair (neighbouring outputs' windows overlap; the intervals are not used).
+
+`amount <= 0` (or an unusable interval for `ShownFrame`) is a point, `t0 == t1`. The planner calls it for every output (the game interval is the real span of the pair that brackets the output, the output interval is `OutputMs()`, or the game interval in real-rate), so a host normally just reads `Decision::t0`/`t1`; the function is public for hosts that blur on their own.
