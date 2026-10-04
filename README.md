@@ -4,7 +4,7 @@ frame-gen-ritz is an image-only frame interpolation library, similar in kind to 
 
 It was written for gamescope-ritz, a gamescope fork. There it is meant to run as a compute pass on the game's layer-0 image, before scaling and before the overlay layers (Steam overlay, cursor, performance HUD) are composited on top, so those are never interpolated. This repository contains only the library. The pacing decisions (which frame to show when, when to turn generation off) live here too, in `gpu/pacing.h`. The gamescope side is only the glue that feeds the pacer and presents what it decides. `INTEGRATION.md` is the spec for that integration.
 
-frame-gen-ritz is original code. It is not derived from LSFG, lsfg-vk or FidelityFX source. `FRAMEGEN_RESEARCH.md` holds background research on how such tools work.
+frame-gen-ritz is original code. It is not derived from LSFG, lsfg-vk or FidelityFX source.
 
 ## Design goal
 
@@ -50,7 +50,6 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 | `gpu/blurtest.cpp`, `gpu/blendbench.comp` | Validation and benchmark of the motion blur on a synthetic scene (the shader is the naive blend the benchmark compares against) |
 | `gpu/compare.py` | GPU vs Python reference checks, and the benchmark runs |
 | `INTEGRATION.md` | Integration spec for gamescope-ritz, full API contract, settings, costs |
-| `FRAMEGEN_RESEARCH.md` | Background research on image-based frame generation |
 
 ## Results
 
