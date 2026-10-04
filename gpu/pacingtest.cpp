@@ -3345,3 +3345,85 @@ TEST_CASE( "lag buffer: a forced max buffer does not balloon the history before 
 		CHECK( drv.log.front().bufMs == 0.0 );
 	}
 }
+
+TEST_CASE( "lag buffer: switching it off drops the buffer at once", "[lagbuffer][instantoff]" )
+{
+	for ( bool bFG : { false, true } )
+	{
+		Driver drv = LagDriver();
+		drv.frameGen = bFG;
+		drv.lag.testMode = LagTestMode::ForceMax;
+		drv.Run( 10 * 1000 * MS, 1000.0 / 60.0 );
+		REQUIRE( drv.pacer.BufferMs() > 49.0 );
+		REQUIRE( drv.Status().bufferDelayMs > 49.0f );
+
+		// what the base delay settles to with the buffer off
+		Driver ref = LagDriver();
+		ref.frameGen = bFG;
+		ref.lag.enabled = false;
+		ref.Run( 10 * 1000 * MS, 1000.0 / 60.0 );
+		const double flBase = ref.pacer.DelayMs();
+
+		drv.lag.enabled = false;
+		const size_t n0 = drv.log.size();
+		drv.Run( 2 * 1000 * MS, 1000.0 / 60.0 );
+		REQUIRE( drv.log.size() > n0 + 10 );
+
+		// the very next paint: buffer gone, delay is the base delay
+		const Painted &p = drv.log[ n0 ];
+		CHECK( p.bufMs == 0.0 );
+		CHECK( Near( p.delayMs, flBase ) );
+		CHECK( drv.Status().bufferDelayMs == 0.0f );
+		CHECK( drv.Status().bufferTargetMs == 0.0f );
+
+		// tau and the shown frame never go backwards, across the switch or after it
+		int64_t tauPrev = n0 > 0 ? drv.log[ n0 - 1 ].tau : 0;
+		uint64_t idPrev = 0;
+		for ( size_t i = n0 > 0 ? n0 - 1 : 0; i < drv.log.size(); i++ )
+		{
+			const Painted &q = drv.log[ i ];
+			if ( q.tau != 0 )          // 0: an inert pass-through shows the newest frame, no content time
+			{
+				CHECK( q.tau >= tauPrev );
+				tauPrev = q.tau;
+			}
+			if ( q.d.newOutput )
+			{
+				CHECK( q.d.showId >= idPrev );
+				idPrev = q.d.showId;
+			}
+			if ( i >= n0 )
+				CHECK( q.bufMs == 0.0 );
+		}
+	}
+}
+
+TEST_CASE( "lag buffer: re-enabling after an instant off starts from zero and grows normally", "[lagbuffer][instantoff]" )
+{
+	Driver drv = LagDriver();
+	drv.lag.testMode = LagTestMode::ForceMax;
+	drv.Run( 10 * 1000 * MS, 1000.0 / 60.0 );
+	REQUIRE( drv.pacer.BufferMs() > 49.0 );
+	drv.lag.enabled = false;
+	drv.Run( 500 * MS, 1000.0 / 60.0 );
+	REQUIRE( drv.pacer.BufferMs() == 0.0 );
+	drv.lag.enabled = true;
+	drv.Run( 200 * MS, 1000.0 / 60.0 );
+	// the ramp (3 %): ~6 ms after 200 ms, nowhere near an instant jump
+	CHECK( drv.pacer.BufferMs() > 1.0 );
+	CHECK( drv.pacer.BufferMs() < 10.0 );
+	drv.Run( 5 * 1000 * MS, 1000.0 / 60.0 );
+	CHECK( Near( drv.pacer.BufferMs(), 50.0 ) );
+}
+
+TEST_CASE( "lag buffer: with the buffer enabled the target falling to zero still shrinks by the ramp", "[lagbuffer][instantoff]" )
+{
+	Driver drv = LagDriver();
+	drv.lag.testMode = LagTestMode::ForceMax;
+	drv.Run( 10 * 1000 * MS, 1000.0 / 60.0 );
+	drv.lag.testMode = LagTestMode::ForceMin;
+	drv.Run( 100 * MS, 1000.0 / 60.0 );
+	CHECK( drv.pacer.BufferMs() > 40.0 );   // 3 % of 100 ms = 3 ms, not a jump
+	drv.Run( 3 * 1000 * MS, 1000.0 / 60.0 );
+	CHECK( drv.pacer.BufferMs() == 0.0 );
+}
