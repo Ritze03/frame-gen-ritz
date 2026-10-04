@@ -18,6 +18,7 @@ void main() {
         uint a = (word >> uint(8 * k)) & 255u;
         ivec2 rel = ivec2(g.x * 4 + k, g.y);
         if (a == 0u || rel.x >= pc.maskW) continue;
+        if (pc.binary != 0 && a != 255u) continue;   // CrosshairV2: only the pixels that did not change in this pair
         ivec2 p = ivec2(pc.maskX, pc.maskY) + rel;
         vec4 o = imageLoad(img, p);
         vec3 real = texelFetch(src, p, 0).rgb;

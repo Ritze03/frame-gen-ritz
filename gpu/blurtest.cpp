@@ -22,6 +22,21 @@
 #include <string>
 #include <vector>
 
+// protection modes of the tests: 0 Off, 1 Crosshair, 2 WholeScreen, 3 CrosshairV2 (compile with -DBLURTEST_NO_V2 against a library without it)
+#ifdef BLURTEST_NO_V2
+#define BT_NMODES 3
+#else
+#define BT_NMODES 4
+#endif
+static framegen::UiProtection btMode(int m) {
+    using framegen::UiProtection;
+#ifndef BLURTEST_NO_V2
+    if (m == 3) return UiProtection::CrosshairV2;
+#endif
+    return m == 0 ? UiProtection::Off : m == 1 ? UiProtection::Crosshair : UiProtection::WholeScreen;
+}
+static const char* btModeName(int m) { return m == 0 ? "Off" : m == 1 ? "Crosshair" : m == 2 ? "WholeScreen" : "CrosshairV2"; }
+
 #define CK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { fprintf(stderr, "%s failed: %d\n", #x, r_); exit(1); } } while (0)
 
 static VkDevice dev;
@@ -645,8 +660,8 @@ static int check(int W, int H) {
     // ---- 1. blur off: byte identical (FNV of generated frames; compare against a build of the library before blur)
     {
         printf("[hashes: protection Off / Crosshair / WholeScreen, t = 0.2 0.5 0.75 of the last pair]\n");
-        UiProtection modes[3] = {UiProtection::Off, UiProtection::Crosshair, UiProtection::WholeScreen};
-        for (UiProtection mode : modes) {
+        for (int mi = 0; mi < BT_NMODES; mi++) {
+            const UiProtection mode = btMode(mi);
             Settings s;
             s.uiProtection = mode; s.uiBoxWidth = s.uiBoxHeight = 64;   // fits the 35 px test crosshair
             Ctx c(W, H, s);
@@ -768,9 +783,9 @@ static int check(int W, int H) {
         expect(diff > 0, "the whole-frame flick fallback is applied by the fix-up pass");
     }
     // ---- 4. the edge of a moving object smears over speed x (t1 - t0); the crosshair stays pixel-exact
-    for (int mode = 0; mode < 3; mode++) {
-        UiProtection pm = mode == 0 ? UiProtection::Off : mode == 1 ? UiProtection::Crosshair : UiProtection::WholeScreen;
-        printf("[edge smear, protection %s]\n", mode == 0 ? "Off" : mode == 1 ? "Crosshair" : "WholeScreen");
+    for (int mode = 0; mode < BT_NMODES; mode++) {
+        UiProtection pm = btMode(mode);
+        printf("[edge smear, protection %s]\n", btModeName(mode));
         Settings s;
         s.uiProtection = pm; s.uiBoxWidth = s.uiBoxHeight = 64;
         Ctx c(W, H, s);
@@ -872,9 +887,9 @@ static int check(int W, int H) {
     // ---- 5. rings: 8 outputs x 8 samples in one pair; mixed N in one submission; 32 outputs; the 33rd is refused
     {
         printf("[descriptor rings]\n");
-        for (int mode = 0; mode < 3; mode++) {
+        for (int mode = 0; mode < BT_NMODES; mode++) {
             Settings s;
-            s.uiProtection = mode == 0 ? UiProtection::Off : mode == 1 ? UiProtection::Crosshair : UiProtection::WholeScreen;
+            s.uiProtection = btMode(mode);
             s.uiBoxWidth = s.uiBoxHeight = 64;
             s.blurSamples = 8;
             Ctx c(W, H, s);
@@ -883,7 +898,7 @@ static int check(int W, int H) {
             bool ok = true;
             for (int i = 0; i < 8; i++) ok = ok && c.fg.recordSynthBlur(cb, c.prv->view, c.cur->view, c.outs[i].view, i / 8.0f, std::min(1.0f, (i + 1) / 8.0f + 0.25f));
             submit();
-            expect(ok, mode == 0 ? "8 outputs x 8 samples in one pair, one submission (Off)" : mode == 1 ? "8 outputs x 8 samples in one pair (Crosshair)" : "8 outputs x 8 samples in one pair (WholeScreen)");
+            expect(ok, (std::string("8 outputs x 8 samples in one pair, one submission (") + btModeName(mode) + ")").c_str());
             if (mode == 0) {   // mixed N in one submission (the scratch grows between records): each equals its own single record
                 Settings s2 = s;
                 s2.blurSamples = 2;

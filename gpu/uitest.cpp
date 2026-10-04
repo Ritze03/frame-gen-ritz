@@ -4,6 +4,8 @@
 //   uitest track [W H]                       recordTrack: UI protection kept warm while the host does not generate (default 640x360)
 //   uitest trackbench [W H]                  GPU cost of recordTrack vs recordObserve (default 1920x1080 and 2560x1440)
 //   uitest bench [W H]                       per-pass GPU times, moving and still scene (default 1920x1080 and 2560x1440)
+// check also covers CrosshairV2 (the V2 block at its end): pixel-exact crosshair, the shrinking / growing mask control against V1,
+// hysteresis, fast re-entry, the pair gate, mode switching, validation. deep and track run it too.
 // check: a synthetic sequence of 12 frames: a textured background panning 14 px right / 6 px down per frame with 16 independently moving objects (some crossing the crosshair and the HUD), a static opaque crosshair
 // (plus-shaped arms, centre dot, 1 px black outline) and a static opaque HUD box in a corner. The last pair
 // (frames 10, 11) is interpolated at t = 0.5 and 0.25 with protection Off / Crosshair / WholeScreen (explicit
@@ -22,6 +24,19 @@
 #include <functional>
 #include <string>
 #include <vector>
+
+#ifdef UITEST_NO_UI
+#define UITEST_NO_V2   // a library without the feature has no CrosshairV2 either
+#endif
+// the modes the shared tests (deep, track, trackbench, bench) loop over besides Crosshair and WholeScreen
+#ifdef UITEST_NO_V2
+#define UT_V2_MODE
+#define UT_V2_ENUM (UiProtection)0
+#else
+#define UT_V2_MODE , UiProtection::CrosshairV2
+#define UT_V2_ENUM UiProtection::CrosshairV2
+#endif
+static const char* modeName(int m) { return m == 1 ? "Crosshair" : m == 2 ? "WholeScreen" : m == 3 ? "CrosshairV2" : "Off"; }
 
 #define CK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { fprintf(stderr, "%s failed: %d\n", #x, r_); exit(1); } } while (0)
 
@@ -146,7 +161,10 @@ struct Scene {
     std::vector<uint8_t> uiCol;   // overlay RGB(A)
     int cx, cy;                   // crosshair centre
     int hx0, hy0, hx1, hy1;       // hud box
-    Scene(int w, int h, int nf, int cxOff, int cyOff, int arm = 16) : W(w), H(h), NF(nf) {
+    // uiHook (tests): called for every UI pixel of an INTEGER frame f with the UI colour in px (RGBA, may be rewritten: erase
+    // it by copying `under`, the pixel without UI) so a test can make the crosshair change, shrink or flash.
+    std::function<void(int f, int x, int y, uint8_t* px, const uint8_t* under)> uiHook;
+    Scene(int w, int h, int nf, int cxOff, int cyOff, int arm = 16, int nObj = 16) : W(w), H(h), NF(nf) {
         bgW = W + kPanX * (NF + 1);
         bgH = H + kPanY * (NF + 1);
         bg.resize((size_t)bgW * bgH * 4);
@@ -159,7 +177,7 @@ struct Scene {
                 }
         for (size_t i = 3; i < bg.size(); i += 4) bg[i] = 255;
         // moving objects: some pass over the crosshair and the HUD box on the last pair
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < nObj; i++) {
             Obj o;
             o.w = 30 + (int)(hash2(i, 1, 77) % 60); o.h = 30 + (int)(hash2(i, 2, 77) % 60);
             o.vx = 2 * ((int)(hash2(i, 3, 77) % 21) - 10); o.vy = 2 * ((int)(hash2(i, 4, 77) % 11) - 5);
@@ -201,7 +219,7 @@ struct Scene {
             }
     }
     // the frame at time t (in frames; t * 2 is an integer): panned background, moving objects, static UI on top
-    std::vector<uint8_t> frame(double t) const {
+    std::vector<uint8_t> frame(double t, bool withUi = true) const {
         std::vector<uint8_t> f((size_t)W * H * 4);
         int ox = (int)std::lround(t * kPanX), oy = (int)std::lround(t * kPanY);
         for (int y = 0; y < H; y++) memcpy(&f[(size_t)y * W * 4], &bg[((size_t)(y + oy) * bgW + ox) * 4], (size_t)W * 4);
@@ -214,8 +232,14 @@ struct Scene {
                     d[0] = chk ? o.r : o.r / 2; d[1] = chk ? o.g : o.g / 2; d[2] = chk ? o.b : o.b / 2; d[3] = 255;
                 }
         }
-        for (size_t i = 0; i < (size_t)W * H; i++)
-            if (ui[i]) memcpy(&f[i * 4], &uiCol[i * 4], 4);
+        if (withUi)
+            for (size_t i = 0; i < (size_t)W * H; i++)
+                if (ui[i]) {
+                    uint8_t under[4];
+                    memcpy(under, &f[i * 4], 4);
+                    memcpy(&f[i * 4], &uiCol[i * 4], 4);
+                    if (uiHook && t == std::floor(t)) uiHook((int)t, (int)(i % W), (int)(i / W), &f[i * 4], under);
+                }
         return f;
     }
 };
@@ -238,7 +262,7 @@ static bool makeInterp(Interpolator& fg, int W, int H, const Settings& s) {
 
 // Runs the 12-frame sequence through a ring of 4 views; observes explicitly or implicitly. hashes (Off check).
 static Result runSequence(const Scene& sc, const Settings& s, bool explicitObserve, std::vector<uint64_t>* hashes,
-                          const std::function<void(Interpolator&, int)>& hook = nullptr) {
+                          const std::function<void(Interpolator&, int)>& hook = nullptr, bool blur2 = false) {
     Interpolator fg;
     if (!makeInterp(fg, sc.W, sc.H, s)) { fprintf(stderr, "init failed\n"); exit(1); }
     Img ring[4];
@@ -264,7 +288,8 @@ static Result runSequence(const Scene& sc, const Settings& s, bool explicitObser
             bool last = f == sc.NF - 1;
             if (!fg.recordEstimate(cb, prv.view, cur.view)) { fprintf(stderr, "estimate failed\n"); exit(1); }
             if (!fg.recordSynth(cb, prv.view, cur.view, outs[0].view, 0.5f)) { fprintf(stderr, "synth failed\n"); exit(1); }
-            if (last && !fg.recordSynth(cb, prv.view, cur.view, outs[1].view, 0.25f)) { fprintf(stderr, "synth failed\n"); exit(1); }
+            // blur2: the second output is a motion-blurred one (window [0.25, 0.75], blurSamples of the settings) instead of t = 0.25
+            if (last && !(blur2 ? fg.recordSynthBlur(cb, prv.view, cur.view, outs[1].view, 0.25f, 0.75f) : fg.recordSynth(cb, prv.view, cur.view, outs[1].view, 0.25f))) { fprintf(stderr, "synth failed\n"); exit(1); }
         }
         submit();
         if (f > 0) {
@@ -324,6 +349,9 @@ static void expect(bool ok, const char* what) {
     if (!ok) fails++;
 }
 
+#ifndef UITEST_NO_V2
+static int v2Check(int W, int H);
+#endif
 static int check(int W, int H, bool hash) {
     Scene sc(W, H, 12, 0, 0);
     auto real11 = sc.frame(11);
@@ -356,6 +384,16 @@ static int check(int W, int H, bool hash) {
     const float kFitFrac = 43.0f / H;   // 43 px: the crosshair plus 4 px of room per side
     Settings c1; c1.uiProtection = UiProtection::Crosshair; c1.uiBoxHeightFrac = kFitFrac;
     Settings w1; w1.uiProtection = UiProtection::WholeScreen; w1.uiBoxHeightFrac = kFitFrac;
+    if (hash) {   // the same for the two older modes: compare against a build of the library before CrosshairV2 (-DUITEST_NO_V2)
+        const std::pair<const char*, Settings> modes[2] = {{"CROSSHAIR", c1}, {"WHOLESCREEN", w1}};
+        for (const auto& md : modes) {
+            std::vector<uint64_t> h;
+            runSequence(sc, md.second, true, &h);
+            printf("HASHES-%s", md.first);
+            for (uint64_t x : h) printf(" %016llx", (unsigned long long)x);
+            printf("\n");
+        }
+    }
     Result rc = run("Crosshair", c1, true, true, false);
     Result rw = run("WholeScreen", w1, true, true, true);
     Result rci = run("Crosshair(i)", c1, false, true, false);
@@ -448,12 +486,354 @@ static int check(int W, int H, bool hash) {
         bad = Settings{}; bad.uiCrosshairArea = 0.0f; expect(!Interpolator::validate(bad), "validate rejects uiCrosshairArea 0");
         bad = Settings{}; bad.uiInpaintReach = 17; expect(!Interpolator::validate(bad), "validate rejects uiInpaintReach 17");
         bad = Settings{}; bad.uiStillFrames = 0; expect(!Interpolator::validate(bad), "validate rejects uiStillFrames 0");
-        bad = Settings{}; bad.uiProtection = (UiProtection)3; expect(!Interpolator::validate(bad), "validate rejects an unknown mode");
+        bad = Settings{}; bad.uiProtection = (UiProtection)4; expect(!Interpolator::validate(bad), "validate rejects an unknown mode");
         expect(Interpolator::validate(Settings{}), "defaults valid");
     }
+#ifndef UITEST_NO_V2
+    return v2Check(W, H);
+#else
     return fails ? 1 : 0;
 #endif
+#endif
 }
+
+
+// ---------------------------------------------------------------- CrosshairV2
+#ifndef UITEST_NO_V2
+// The scenes of these tests have NO moving objects (the background pans 14, 6 px per frame, the crosshair is static), so the
+// interpolation of everything that is not UI is near perfect and a protection artifact stands out. `Scene::uiHook` makes the
+// crosshair change: a "tip" or a "right arm" subset changes colour, disappears or comes back at chosen frames.
+struct V2Case {
+    Settings s;
+    bool explicitObserve = true;
+};
+static Settings v2Settings(int H) {
+    Settings s;
+    s.uiProtection = UiProtection::CrosshairV2;
+    s.uiBoxHeightFrac = 43.0f / H;   // the fitted box of the other tests
+    return s;
+}
+static bool subsetPx(const Scene& sc, int x, int) { return x - sc.cx >= 8; }   // the right arm (and its outline) beyond the centre block
+static bool tipPx(const Scene& sc, int x, int y) { return std::max(std::abs(x - sc.cx), std::abs(y - sc.cy)) > 10; }   // the outer arm ends
+static void setRgb(uint8_t* p, int r, int g, int b) { p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)b; p[3] = 255; }
+// pixels of `sc.ui == 1` for which pick(x, y) holds that differ from `ref` by more than `tol` levels in `img`
+static size_t uiDiffers(const Scene& sc, const std::vector<uint8_t>& img, const std::vector<uint8_t>& ref, int tol, const std::function<bool(int, int)>& pick, size_t* total = nullptr) {
+    size_t bad = 0, n = 0;
+    for (int y = 0; y < sc.H; y++)
+        for (int x = 0; x < sc.W; x++) {
+            size_t i = (size_t)y * sc.W + x;
+            if (sc.ui[i] != 1 || !pick(x, y)) continue;
+            int d = 0;
+            for (int c = 0; c < 3; c++) d = std::max(d, std::abs((int)img[i * 4 + c] - (int)ref[i * 4 + c]));
+            bad += d > tol;
+            n++;
+        }
+    if (total) *total = n;
+    return bad;
+}
+
+// A hard-edged background (random 3x3 blocks of 20 / 235 per channel) around and under the crosshair: a smooth fill of
+// a removed or hidden crosshair pixel is then far from the truth, which is what makes the artifacts of a clean copy visible.
+static void harshBackground(Scene& sc) {
+    for (int y = 0; y < sc.bgH; y++)
+        for (int x = 0; x < sc.bgW; x++)
+            for (int c = 0; c < 3; c++) sc.bg[((size_t)y * sc.bgW + x) * 4 + c] = (hash2(x / 3, y / 3, 91 + c) & 1) ? 235 : 20;
+}
+static int v2Check(int W, int H) {
+    printf("\nCrosshairV2:\n");
+    const Settings v2 = v2Settings(H);
+    auto all = [](int, int) { return true; };
+
+    // 1. the crosshair of the check scene (objects cross it, background pans) is pixel-exact; implicit observe is bit-identical
+    {
+        Scene sc(W, H, 12, 0, 0);
+        auto real11 = sc.frame(11);
+        Result r = runSequence(sc, v2, true, nullptr);
+        Result ri = runSequence(sc, v2, false, nullptr);
+        size_t n;
+        size_t bad = uiDiffers(sc, r.out[0], real11, 1, all, &n), bad2 = uiDiffers(sc, r.out[1], real11, 1, all);
+        printf(" check scene: crosshair wrong %zu/%zu (t=0.5), %zu (t=0.25)\n", bad, n, bad2);
+        expect(bad == 0 && bad2 == 0, "V2: crosshair pixels equal the real ones (<= 1 level), t = 0.5 and 0.25");
+        expect(r.out[0] == ri.out[0] && r.out[1] == ri.out[1], "V2: implicit observe == explicit observe (bit-exact)");
+        Settings off;
+        Result ro = runSequence(sc, off, true, nullptr);
+        auto truth = sc.frame(10.5);
+        Metrics mo = measure(sc, ro.out[0], real11, &truth), mv = measure(sc, r.out[0], real11, &truth);
+        printf(" background PSNR (away from the UI): Off %.2f dB, V2 %.2f dB\n", mo.psnrBg, mv.psnrBg);
+        expect(mv.psnrBg >= mo.psnrBg - 0.3, "V2: background PSNR within 0.3 dB of Off (or better)");
+        // the default box (small) around a small crosshair, and an offset box on an off-centre crosshair
+        Scene sm(W, H, 12, 0, 0, 7);
+        Settings cd; cd.uiProtection = UiProtection::CrosshairV2;
+        Result rs = runSequence(sm, cd, true, nullptr);
+        expect(uiDiffers(sm, rs.out[0], sm.frame(11), 1, all) == 0, "V2: default-fraction box around a small crosshair is pixel-exact");
+        Scene so(W, H, 12, 37, -23);
+        Settings co = v2; co.uiBoxWidth = 120; co.uiBoxHeight = 120; co.uiBoxOffsetX = 37; co.uiBoxOffsetY = -23;
+        Result ro2 = runSequence(so, co, true, nullptr);
+        expect(uiDiffers(so, ro2.out[0], so.frame(11), 1, all) == 0, "V2: offset box protects the off-centre crosshair exactly");
+        // contrast gate: a gate above the crosshair's contrast leaves it unprotected (the gate has teeth); 0 disables the gate
+        Settings hi = v2; hi.uiContrastThreshold = 255.0f;
+        Result rh = runSequence(sc, hi, true, nullptr);
+        size_t badHi = uiDiffers(sc, rh.out[0], real11, 1, all);
+        Settings lo = v2; lo.uiContrastThreshold = 0.0f;
+        Result rl = runSequence(sc, lo, true, nullptr);
+        size_t badLo = uiDiffers(sc, rl.out[0], real11, 1, all);
+        printf(" contrast gate 255: crosshair wrong %zu; gate 0: %zu\n", badHi, badLo);
+        expect(badHi > 0, "V2: uiContrastThreshold 255 admits nothing: the crosshair is not protected");
+        expect(badLo == 0, "V2: uiContrastThreshold 0 (no gate): crosshair pixel-exact");
+    }
+
+    // 1b. V2 without the estimate fill (the default) runs the estimate and the synthesis on the host's frames exactly as Off does:
+    //     the generated frame is bit-identical to Off everywhere outside the box (only pasted pixels differ); with the fill on
+    //     (uiEstimateFill) the crosshair stays exact and the error near a thick crosshair on a hard-edged moving background does
+    //     not grow (it falls: the crosshair no longer casts a zero-vector vote in the blocks around it).
+    {
+        Scene sc(W, H, 12, 0, 0);
+        Settings off;
+        Result ro = runSequence(sc, off, true, nullptr), rv = runSequence(sc, v2, true, nullptr);
+        uint32_t bw, bh;
+        Interpolator::boxSize(v2, W, H, &bw, &bh);
+        const int bx0 = ((int)W - (int)bw) / 2, by0 = ((int)H - (int)bh) / 2;
+        size_t outside = 0, inside = 0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                size_t i = (size_t)y * W + x;
+                bool differs = memcmp(&ro.out[0][i * 4], &rv.out[0][i * 4], 3) != 0 || memcmp(&ro.out[1][i * 4], &rv.out[1][i * 4], 3) != 0;
+                if (!differs) continue;
+                if (x >= bx0 && x < bx0 + (int)bw && y >= by0 && y < by0 + (int)bh) inside++; else outside++;
+            }
+        printf(" V2 vs Off (t = 0.5 and 0.25): %zu pixels differ inside the %ux%u box, %zu outside it\n", inside, bw, bh, outside);
+        expect(inside > 0 && outside == 0, "V2 (no estimate fill): the generated frames are bit-identical to Off everywhere outside the box");
+        for (int arm : {7, 16}) {
+            Scene sh(W, H, 12, 0, 0, arm, 0);
+            harshBackground(sh);
+            auto truth = sh.frame(10.5, false), real = sh.frame(11);
+            Result a = runSequence(sh, off, true, nullptr);
+            Settings vf = v2; vf.uiEstimateFill = true;
+            Result b = runSequence(sh, vf, true, nullptr);
+            auto meanErr = [&](const std::vector<uint8_t>& out) {
+                double se = 0; size_t n = 0;
+                for (int y = std::max(sh.cy - 24, 0); y <= std::min(sh.cy + 24, H - 1); y++)
+                    for (int x = std::max(sh.cx - 24, 0); x <= std::min(sh.cx + 24, W - 1); x++) {
+                        size_t i = (size_t)y * W + x;
+                        if (sh.ui[i]) continue;
+                        int e = 0;
+                        for (int c = 0; c < 3; c++) e = std::max(e, std::abs((int)out[i * 4 + c] - (int)truth[i * 4 + c]));
+                        se += e; n++;
+                    }
+                return se / n;
+            };
+            double eo = meanErr(a.out[0]), ef = meanErr(b.out[0]);
+            printf(" estimate fill, hard-edged moving background, arm %d: mean error within 24 px of the crosshair: Off %.2f, V2 + fill %.2f\n", arm, eo, ef);
+            expect(uiDiffers(sh, b.out[0], real, 1, all) == 0, "V2 + estimate fill: crosshair pixels equal the real ones");
+            expect(ef <= eo + 0.5, "V2 + estimate fill: the background near the crosshair is not worse than Off");
+        }
+    }
+
+    // 2. the shrinking / growing mask: V1's known artifacts (inpainted clean copy read by the warp, paste onto changed pixels)
+    //    against V2's. Pair (10, 11): the outer arm ends vanish (or appear) at frame 11. Artifact = a pixel that is wrong
+    //    by > 32 levels against the true mid frame AND > 24 levels worse than with protection Off, in the 43x43 px around the
+    //    crosshair, excluding the crosshair itself and the arm ends (whose true mid frame is ambiguous).
+    for (int grow = 0; grow < 2; grow++) {
+        Scene sc(W, H, 12, 0, 0, 16, 0);
+        harshBackground(sc);
+        sc.uiHook = [&](int f, int x, int y, uint8_t* px, const uint8_t* under) {
+            if (tipPx(sc, x, y) && (grow ? f < 11 : f >= 11)) memcpy(px, under, 4);
+        };
+        auto real11 = sc.frame(11);
+        auto truth = sc.frame(10.5, false);   // the pan at 10.5, no UI: valid wherever the UI is absent at both frames
+        auto changed = [&](int x, int y) { return tipPx(sc, x, y); };
+        std::vector<uint8_t> skip((size_t)W * H, 0);   // the crosshair itself, and the arm ends with 2 px around them
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                if (sc.ui[(size_t)y * W + x]) {
+                    skip[(size_t)y * W + x] = 1;
+                    if (tipPx(sc, x, y))
+                        for (int dy = -2; dy <= 2; dy++)
+                            for (int dx = -2; dx <= 2; dx++) {
+                                int X = x + dx, Y = y + dy;
+                                if (X >= 0 && Y >= 0 && X < W && Y < H) skip[(size_t)Y * W + X] = 1;
+                            }
+                }
+        (void)changed;
+        Settings off;
+        Result ro = runSequence(sc, off, true, nullptr);
+        Settings c1 = v2; c1.uiProtection = UiProtection::Crosshair;
+        Result r1 = runSequence(sc, c1, true, nullptr);
+        Result r2 = runSequence(sc, v2, true, nullptr);
+        auto artifacts = [&](const std::vector<uint8_t>& out) {
+            size_t art = 0;
+            for (int y = std::max(sc.cy - 21, 0); y <= std::min(sc.cy + 21, H - 1); y++)
+                for (int x = std::max(sc.cx - 21, 0); x <= std::min(sc.cx + 21, W - 1); x++) {
+                    size_t i = (size_t)y * W + x;
+                    if (skip[i]) continue;
+                    int eo = 0, ec = 0;
+                    for (int c = 0; c < 3; c++) {
+                        eo = std::max(eo, std::abs((int)ro.out[0][i * 4 + c] - (int)truth[i * 4 + c]));
+                        ec = std::max(ec, std::abs((int)out[i * 4 + c] - (int)truth[i * 4 + c]));
+                    }
+                    art += ec - eo > 24 && ec > 32;
+                }
+            return art;
+        };
+        size_t a1 = artifacts(r1.out[0]), a2 = artifacts(r2.out[0]);
+        size_t x1 = uiDiffers(sc, r1.out[0], real11, 1, [&](int x, int y) { return !tipPx(sc, x, y); });
+        size_t x2 = uiDiffers(sc, r2.out[0], real11, 1, [&](int x, int y) { return !tipPx(sc, x, y); });
+        printf(" arm ends %s at frame 11: artifact px  V1 %zu   V2 %zu   (crosshair body wrong: V1 %zu, V2 %zu)\n", grow ? "appear" : "vanish", a1, a2, x1, x2);
+        expect(a2 == 0, grow ? "V2: no artifact pixel when the arm ends appear" : "V2: no artifact pixel when the arm ends vanish");
+        expect(a1 > 0, "control: V1 shows artifact pixels in the same pair (the test has teeth)");
+        expect(x2 == 0, "V2: the unchanged part of the crosshair stays pixel-exact");
+    }
+
+    // 3. hysteresis: the right arm is disturbed for 2 frames (colours cycle: every frame is a change) and comes back; it
+    //    must still be protected the very first pair after it is back. leave 4 stays (3 changed frames in a row), leave 1 does not.
+    {
+        const int NF = 18;   // last pair (16, 17): the arm is back at frame 16
+        Scene sc(W, H, NF, 0, 0, 16, 0);
+        sc.uiHook = [&](int f, int x, int y, uint8_t* px, const uint8_t*) {
+            if (!subsetPx(sc, x, y)) return;
+            if (f == 14) setRgb(px, 10, 200, 10);
+            else if (f == 15) setRgb(px, 220, 220, 10);
+        };
+        auto real = sc.frame(NF - 1);
+        Settings h4 = v2; h4.uiReentryFrames = 0;   // isolate the hysteresis from fast re-entry
+        Settings h1 = h4; h1.uiLeaveFrames = 1;
+        Result r4 = runSequence(sc, h4, true, nullptr), r1 = runSequence(sc, h1, true, nullptr);
+        size_t n, b4 = uiDiffers(sc, r4.out[0], real, 1, all, &n), b1 = uiDiffers(sc, r1.out[0], real, 1, all);
+        Settings c1 = v2; c1.uiProtection = UiProtection::Crosshair;
+        Result rv1 = runSequence(sc, c1, true, nullptr);
+        size_t bv1 = uiDiffers(sc, rv1.out[0], real, 1, all);
+        printf(" hysteresis (2 changed frames, back at 16, pair 16-17): wrong px  leave 4: %zu   leave 1: %zu   V1: %zu   (of %zu)\n", b4, b1, bv1, n);
+        expect(b4 == 0, "hysteresis: leave 4 keeps the arm masked through a 2-frame disturbance, exact on the first pair after it");
+        expect(b1 > 0, "control: leave 1 loses the arm at the first change and has not got it back");
+        expect(bv1 > 0, "control: V1 loses the arm (needs 8 still frames again)");
+    }
+
+    // 4. fast re-entry: the right arm cycles colours for 5 frames (14..18: it LEAVES the mask after 4 changed frames), is back
+    //    at frame 19 and stays. With re-entry 2 it is protected again two frames later: pair (19, 20); without it only after
+    //    uiStillFrames = 8 still frames: pair (26, 27).
+    {
+        auto runAt = [&](int nf, const Settings& s) {
+            Scene sc(W, H, nf, 0, 0, 16, 0);
+            sc.uiHook = [&](int f, int x, int y, uint8_t* px, const uint8_t*) {
+                if (!subsetPx(sc, x, y)) return;
+                static const int pal[5][3] = {{10, 200, 10}, {220, 220, 10}, {10, 10, 220}, {220, 10, 10}, {10, 220, 220}};
+                if (f >= 14 && f <= 18) setRgb(px, pal[f - 14][0], pal[f - 14][1], pal[f - 14][2]);
+            };
+            Result r = runSequence(sc, s, true, nullptr);
+            return uiDiffers(sc, r.out[0], sc.frame(nf - 1), 1, [&](int x, int y) { return subsetPx(sc, x, y); });
+        };
+        Settings re2 = v2, re0 = v2; re0.uiReentryFrames = 0;
+        size_t a = runAt(21, re2), b = runAt(20, re2), c = runAt(21, re0), d = runAt(27, re0), e = runAt(28, re0);
+        printf(" fast re-entry (arm leaves at 17, back at 19): wrong arm px  re-entry 2: pair(19,20) %zu, pair(18,19) %zu | re-entry 0: pair(19,20) %zu, pair(25,26) %zu, pair(26,27) %zu\n", a, b, c, d, e);
+        expect(a == 0, "fast re-entry 2: the arm is protected again on the pair 2 frames after it came back");
+        expect(b > 0, "(the pair before it is not: one matching frame is not enough)");
+        expect(c > 0, "control: without re-entry the arm is still unprotected there");
+        expect(d > 0 && e == 0, "without re-entry the arm needs uiStillFrames = 8 still frames after it came back: protected from pair (26, 27)");
+    }
+
+    // 5. the pair gate: the right arm changes colour in the LAST pair only. V2 never pastes a pixel that changed in the pair
+    //    (the generated frame shows the previous frame's colour there, not curr's); the rest of the crosshair is exact.
+    //    V1's hard grow / half-alpha ring pastes curr onto the changed pixels next to still ones.
+    {
+        const int NF = 12;
+        Scene sc(W, H, NF, 0, 0, 16, 0);
+        sc.uiHook = [&](int f, int x, int y, uint8_t* px, const uint8_t*) { if (f == NF - 1 && subsetPx(sc, x, y)) setRgb(px, 10, 200, 10); };
+        auto real = sc.frame(NF - 1), prev = sc.frame(NF - 2);
+        Result r2 = runSequence(sc, v2, true, nullptr);
+        Settings c1 = v2; c1.uiProtection = UiProtection::Crosshair;
+        Result r1 = runSequence(sc, c1, true, nullptr);
+        Settings vb = v2; vb.blurSamples = 4;
+        Result rb = runSequence(sc, vb, true, nullptr, nullptr, true);   // out[1] = the blurred output
+        size_t nsub;
+        auto subset = [&](int x, int y) { return subsetPx(sc, x, y); };
+        auto rest = [&](int x, int y) { return !subsetPx(sc, x, y); };
+        // changed pixels equal to curr in the output = pasted
+        size_t sameCurr2 = nsub = 0, pasted1 = 0, pasted2 = 0;
+        size_t nChanged = 0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                size_t i = (size_t)y * W + x;
+                if (sc.ui[i] != 1 || !subset(x, y)) continue;
+                int dp = 0, o1 = 0, o2 = 0;
+                for (int c = 0; c < 3; c++) {
+                    dp = std::max(dp, std::abs((int)real[i * 4 + c] - (int)prev[i * 4 + c]));
+                    o1 = std::max(o1, std::abs((int)r1.out[0][i * 4 + c] - (int)real[i * 4 + c]));
+                    o2 = std::max(o2, std::abs((int)r2.out[0][i * 4 + c] - (int)real[i * 4 + c]));
+                }
+                if (dp <= 3) continue;   // (colours that happen to be close: not a change)
+                nChanged++;
+                pasted1 += o1 <= 1;
+                pasted2 += o2 <= 1;
+            }
+        (void)sameCurr2;
+        size_t restBad = uiDiffers(sc, r2.out[0], real, 1, rest);
+        printf(" pair gate: %zu crosshair pixels change in the last pair; pasted (== curr) V1 %zu, V2 %zu; unchanged crosshair wrong V2 %zu\n", nChanged, pasted1, pasted2, restBad);
+        expect(nChanged > 0 && pasted2 == 0, "V2: no pixel that changed in the pair is pasted (t = 0.5)");
+        expect(restBad == 0, "V2: the unchanged part of the crosshair stays pixel-exact in the same pair");
+        {   // recordSynthBlur: the patch after the blend has the same gate
+            size_t pastedB = 0, nB = 0;
+            for (size_t i = 0; i < (size_t)W * H; i++) {
+                if (sc.ui[i] != 1 || !subsetPx(sc, (int)(i % W), 0)) continue;
+                int dp = 0, ob = 0;
+                for (int c = 0; c < 3; c++) {
+                    dp = std::max(dp, std::abs((int)real[i * 4 + c] - (int)prev[i * 4 + c]));
+                    ob = std::max(ob, std::abs((int)rb.out[1][i * 4 + c] - (int)real[i * 4 + c]));
+                }
+                if (dp <= 3) continue;
+                nB++;
+                pastedB += ob <= 1;
+            }
+            size_t restBadB = uiDiffers(sc, rb.out[1], real, 1, rest);
+            printf(" pair gate, motion blur [0.25, 0.75] x 4: changed pixels pasted %zu/%zu; unchanged crosshair wrong %zu\n", pastedB, nB, restBadB);
+            expect(nB > 0 && pastedB == 0, "V2 + motion blur: no pixel that changed in the pair is pasted");
+            expect(restBadB == 0, "V2 + motion blur: the unchanged part of the crosshair is pixel-exact");
+        }
+        expect(pasted1 > 0, "control: V1 pastes curr onto changed pixels (hard grow / half-alpha ring)");
+    }
+
+    // 6. runtime switching between the modes (the state layout and the mask format differ) and to Off
+    {
+        Scene sc(W, H, 12, 0, 0);
+        auto real11 = sc.frame(11);
+        Settings off;
+        Result rOff = runSequence(sc, off, true, nullptr);
+        auto sw = [&](const Settings& start, const std::vector<std::pair<int, UiProtection>>& steps) {
+            return runSequence(sc, start, true, nullptr, [&](Interpolator& fg, int f) {
+                for (auto& st : steps)
+                    if (st.first == f) {
+                        Settings x = fg.settings();
+                        x.uiProtection = st.second;
+                        x.uiBoxHeightFrac = 43.0f / H;
+                        if (!fg.setSettings(x)) { printf("setSettings failed\n"); exit(1); }
+                    }
+            });
+        };
+        Result a = sw(off, {{1, UiProtection::CrosshairV2}});
+        expect(uiDiffers(sc, a.out[0], real11, 1, all) == 0, "runtime switch Off -> V2 mid-stream protects the crosshair");
+        Result b = sw(v2, {{2, UiProtection::Crosshair}});
+        expect(uiDiffers(sc, b.out[0], real11, 1, all) == 0, "runtime switch V2 -> Crosshair (V1): the clean copies are allocated then, the crosshair is exact");
+        Result c = sw(v2, {{1, UiProtection::WholeScreen}, {3, UiProtection::CrosshairV2}});
+        expect(uiDiffers(sc, c.out[0], real11, 1, all) == 0, "runtime switch V2 -> WholeScreen -> V2: exact");
+        Result d = sw(v2, {{9, UiProtection::Off}});
+        expect(d.out[0] == rOff.out[0] && d.out[1] == rOff.out[1], "runtime switch V2 -> Off: later output bit-identical to an Off run");
+    }
+
+    // 7. validation of the new settings
+    {
+        Settings bad;
+        bad.uiContrastThreshold = -1.0f; expect(!Interpolator::validate(bad), "validate rejects uiContrastThreshold < 0");
+        bad = Settings{}; bad.uiContrastThreshold = 256.0f; expect(!Interpolator::validate(bad), "validate rejects uiContrastThreshold > 255");
+        bad = Settings{}; bad.uiContrastThreshold = std::nanf(""); expect(!Interpolator::validate(bad), "validate rejects uiContrastThreshold NaN");
+        bad = Settings{}; bad.uiLeaveFrames = 0; expect(!Interpolator::validate(bad), "validate rejects uiLeaveFrames 0");
+        bad = Settings{}; bad.uiLeaveFrames = 256; expect(!Interpolator::validate(bad), "validate rejects uiLeaveFrames 256");
+        bad = Settings{}; bad.uiReentryFrames = 256; expect(!Interpolator::validate(bad), "validate rejects uiReentryFrames 256");
+        bad = Settings{}; bad.uiReentryFrames = 0; bad.uiContrastThreshold = 0.0f; expect(Interpolator::validate(bad), "validate accepts uiReentryFrames 0 and uiContrastThreshold 0");
+        bad = Settings{}; bad.uiProtection = UiProtection::CrosshairV2; expect(Interpolator::validate(bad), "validate accepts CrosshairV2");
+        bad.uiProtection = (UiProtection)4; expect(!Interpolator::validate(bad), "validate rejects mode 4");
+    }
+    return fails ? 1 : 0;
+}
+#endif
 
 // ---------------------------------------------------------------- deep history (Settings::uiHistory)
 #ifndef UITEST_NO_UI
@@ -513,10 +893,11 @@ static int deepHistory(int W, int H) {
         printf(" %-22s crosshair wrong %zu/%zu, hud wrong %zu/%zu\n", name, m.xhBad, m.xhN, m.hudBad, m.hudN);
         return res;
     };
-    for (UiProtection mode : {UiProtection::Crosshair, UiProtection::WholeScreen}) {
-        const char* nm = mode == UiProtection::Crosshair ? "Crosshair" : "WholeScreen";
+    for (UiProtection mode : {UiProtection::Crosshair, UiProtection::WholeScreen UT_V2_MODE}) {
+        const char* nm = modeName((int)mode);
         Settings off, s3, s10, s14;
         s3.uiProtection = s10.uiProtection = s14.uiProtection = mode;
+        s3.uiBoxHeightFrac = s10.uiBoxHeightFrac = s14.uiBoxHeightFrac = 43.0f / H;   // fitted to the 35 px test crosshair (the default 0.025 is only 9 px at 360 high)
         s10.uiHistory = 10; s14.uiHistory = 14;
         printf("%s:\n", nm);
         auto rOff = run("Off", off, false, nullptr);
@@ -600,10 +981,14 @@ static int trackCheck(int W, int H) {
     Scene sc(W, H, 44, 0, 0);
     printf("track %dx%d: crosshair %zu px, hud box %zu px\n", W, H, (size_t)std::count(sc.ui.begin(), sc.ui.end(), 1), (size_t)std::count(sc.ui.begin(), sc.ui.end(), 2));
     const int PRE = 14, GAP = 20;
-    for (UiProtection mode : {UiProtection::Crosshair, UiProtection::WholeScreen}) {
+    for (UiProtection mode : {UiProtection::Crosshair, UiProtection::WholeScreen UT_V2_MODE}) {
         const bool ws = mode == UiProtection::WholeScreen;
+        // V2 keeps a masked pixel through a gap (hysteresis): a recoloured crosshair is protected on the first pair after the gap
+        // even without tracking, so the V1 "control" expectations and the exact-count thresholds do not apply to it
+        const bool v2 = (int)mode == 3;
         Settings s; s.uiProtection = mode;
-        printf("%s:\n", ws ? "WholeScreen" : "Crosshair");
+        s.uiBoxHeightFrac = 43.0f / H;   // the 35 px test crosshair needs a fitted box (the default 0.025 is 9 px at 360 high)
+        printf("%s:\n", modeName((int)mode));
         auto bad = [&](const TrackRun& r) { return measure(sc, r.out, r.real, nullptr); };
         TrackRun ctl = trackRun(sc, s, PRE, GAP, 0);
         TrackRun trk = trackRun(sc, s, PRE, GAP, 1);
@@ -622,7 +1007,7 @@ static int trackCheck(int W, int H) {
             printf(" UI unchanged in the gap: no tracking crosshair wrong %zu, hud wrong %zu | tracking crosshair wrong %zu, hud wrong %zu\n", mu.xhBad, mu.hudBad, mut.xhBad, mut.hudBad);
         }
         expect(trk.trackOk && st.trackOk, "recordTrack returns true");
-        expect(mc.xhBad > 0, "control: without tracking the first synth after the gap has wrong crosshair pixels (test has teeth)");
+        if (!v2) expect(mc.xhBad > 0, "control: without tracking the first synth after the gap has wrong crosshair pixels (test has teeth)");
         if (ws) expect(mc.hudBad > 0, "control: without tracking the first synth after the gap has wrong HUD pixels");
         expect(mt.xhBad == 0, "recordTrack x20: crosshair pixel-exact (<= 1 level) on the very first synth after the resume");
         if (ws) expect(mt.hudBad == 0, "recordTrack x20: HUD box pixel-exact on the very first synth after the resume");
@@ -636,8 +1021,14 @@ static int trackCheck(int W, int H) {
             Metrics ma = bad(a);
             printf(" gap %d: tracked crosshair wrong %zu/%zu\n", g, ma.xhBad, ma.xhN);
             expect(a.out == b.out, g == 6 ? "equivalence at the threshold, 6 tracked frames == 6 observed (not yet protected)" : "equivalence at the threshold, 7 tracked frames == 7 observed (protected)");
+            if (v2) continue;
             if (g == 6) expect(ma.xhBad > 0, "6 tracked frames: counters at 7 of 8, crosshair not yet protected (counts exactly)");
             else expect(ma.xhBad == 0, "7 tracked frames: counters at 8 of 8, crosshair protected (counts exactly)");
+        }
+        if (v2) {   // tracked from the start (no observe before): the state machine counts the tracked frames like observed ones
+            TrackRun a = trackRun(sc, s, 0, 6, 1), b = trackRun(sc, s, 0, 6, 2), c = trackRun(sc, s, 0, 7, 1), d = trackRun(sc, s, 0, 7, 2);
+            expect(a.out == b.out && c.out == d.out, "equivalence from the first frame: 6 / 7 tracked frames == 6 / 7 observed");
+            expect(bad(a).xhBad > 0 && bad(c).xhBad == 0, "from a cold start the crosshair needs uiStillFrames = 8 frames counted: tracking counts them exactly");
         }
     }
     // Off: recordTrack is a no-op returning true; the output is byte-identical to a run that never calls it
@@ -661,7 +1052,7 @@ static void trackBench(int W, int H) {
     for (auto& r : ring) imgBarrier(r.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
     submit();
     for (int i = 0; i < NIMG; i++) upload(sc.frame(i), ring[i], W, H);
-    for (UiProtection mode : {UiProtection::Crosshair, UiProtection::WholeScreen}) {
+    for (UiProtection mode : {UiProtection::Crosshair, UiProtection::WholeScreen UT_V2_MODE}) {
         Settings s; s.uiProtection = mode;
         double ms[2] = {0, 0};
         for (int track = 0; track < 2; track++) {
@@ -693,7 +1084,7 @@ static void trackBench(int W, int H) {
             vkDeviceWaitIdle(dev);
             fg.destroy();
         }
-        printf("  %-12s recordObserve %.4f ms   recordTrack %.4f ms   (%.0f %% of an observe)\n", mode == UiProtection::Crosshair ? "Crosshair" : "WholeScreen", ms[0], ms[1], 100.0 * ms[1] / ms[0]);
+        printf("  %-12s recordObserve %.4f ms   recordTrack %.4f ms   (%.0f %% of an observe)\n", modeName((int)mode), ms[0], ms[1], 100.0 * ms[1] / ms[0]);
     }
     for (auto& r : ring) { vkDestroyImageView(dev, r.view, nullptr); vkDestroyImage(dev, r.img, nullptr); vkFreeMemory(dev, r.mem, nullptr); }
 }
@@ -706,12 +1097,17 @@ static void bench(int W, int H) {
     Scene sc(W, H, NIMG, 0, 0);
     printf("\n== %dx%d ==\n", W, H);
     struct Mode { const char* name; Settings s; };
-    Settings sOff, sC, sW, sWn;
+    Settings sOff, sC, sW, sWn, sV, sVf;
     sC.uiProtection = UiProtection::Crosshair;
+    sV.uiProtection = UT_V2_ENUM;
     sW.uiProtection = UiProtection::WholeScreen;
-    sC.uiBoxHeightFrac = sW.uiBoxHeightFrac = 43.0f / H;   // box fitted to the 35 px test crosshair
+    sC.uiBoxHeightFrac = sW.uiBoxHeightFrac = sV.uiBoxHeightFrac = 43.0f / H;   // box fitted to the 35 px test crosshair
+    sVf = sV;
+#ifndef UITEST_NO_V2
+    sVf.uiEstimateFill = true;
+#endif
     sWn = sW; sWn.uiMaxStillFraction = 1.0f;
-    Mode modes[] = {{"Off", sOff}, {"Crosshair", sC}, {"WholeScreen", sW}, {"WholeScreen, no still-skip", sWn}};
+    Mode modes[] = {{"Off", sOff}, {"Crosshair", sC}, {"CrosshairV2", sV}, {"CrosshairV2 + fill", sVf}, {"WholeScreen", sW}, {"WholeScreen, no still-skip", sWn}};
     Img ring[NIMG];
     for (auto& r : ring) r = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     Img out = makeImage(W, H, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -731,6 +1127,7 @@ static void bench(int W, int H) {
         printf("-- %s scene (%s; static crosshair + HUD box)\n", scene == 0 ? "moving" : scene == 1 ? "still" : "70% still", scene == 0 ? "background pans 14,6 px/frame + 16 moving objects" : scene == 1 ? "every frame identical" : "left 70% of every frame identical, right 30% as the moving scene");
         for (auto& md : modes) {
             if (scene == 1 && md.s.uiProtection == UiProtection::Off) continue;
+            if (!strncmp(md.name, "CrosshairV2", 11) && md.s.uiProtection == UiProtection::Off) continue;   // (built without V2)
             Interpolator fg;
             if (!makeInterp(fg, W, H, md.s)) { fprintf(stderr, "init failed\n"); exit(1); }
             int pair = 0;

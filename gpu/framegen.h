@@ -16,6 +16,10 @@ enum class UiProtection : uint32_t {
     Off = 0,          // nothing is recorded or allocated: output byte-identical to a library without it
     Crosshair = 1,    // full-resolution protection of one box (default: the centre): crosshair, reticle, hit marker
     WholeScreen = 2,  // the box at full resolution, plus every solid static HUD element elsewhere (reduced-res detection)
+    CrosshairV2 = 3,  // the crosshair box only, without inpaint or clean copy: contrast-gated detection with hysteresis and fast
+                      // re-entry, and a pixel is pasted back only if it did not change in the pair being synthesised (optionally
+                      // the UI is also hidden from the motion estimate: uiEstimateFill). Next to Crosshair (V1, unchanged).
+                      // See "CrosshairV2" below.
 };
 
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
@@ -98,6 +102,9 @@ struct Settings {
     // wait (it only ever ALLOCATES, never frees; setSettings returns false if that allocation fails). Off =
     // byte-identical to a library without it.
     // recordTrack() keeps the counters current while the host passes frames through (see there).
+    // CrosshairV2 differs: no clean copy, no inpaint; see "CrosshairV2" below for what it does instead, its settings
+    // (uiContrastThreshold, uiLeaveFrames, uiReentryFrames, uiEstimateFill) and its limits. Cost (RX 7900 XTX, 1080p and
+    // 1440p, GPU time per real frame): observe 0.020 ms + patch 0.002 ms; recordTrack 0.020 ms (it is the whole detect pass).
     // Cost (RX 7900 XTX, 2560x1440, GPU time per real frame): Crosshair ~0.07 ms, WholeScreen ~0.09 ms typical
     // and <= ~0.25 ms in the worst case below the uiMaxStillFraction skip (about half of it is the full-frame copy
     // into the clean image). Memory: uiHistory (default kUiFrames = 3) clean copies of the frame (Rgba8 and Rgb10 4 bytes/px each: 44 MB
@@ -146,6 +153,33 @@ struct Settings {
     // that frame's whole-screen mask/inpaint/patch passes are skipped on the GPU. A (nearly) static screen needs
     // no generated frame to differ from the real one, and this bounds the worst case of a paused/menu picture.
     float uiMaxStillFraction = 0.75f;
+    // CrosshairV2 only (ignored by every other mode); the box, uiStillFrames and uiStillThreshold apply to it as to Crosshair,
+    // uiHistory still sizes the kept-frame set (no clean copies are allocated for V2: one small mask per kept frame).
+    //   uiContrastThreshold: a pixel can only ENTER the mask if its local contrast c = max channel |I - median7x7(I)| is at
+    //   least this ([0, 255], 8-bit-equivalent levels in every format like uiStillThreshold; 0 = no contrast gate). A
+    //   crosshair has an edge against its surroundings, a still flat piece of background (sky, a wall, a menu) does not: on
+    //   the user's CS2 footage 88-90 % of the still crosshair pixels pass 16 and 77-83 % pass 24 while 0.03-0.08 % (16) / less
+    //   (24) of the still background does. Higher = fewer false positives, thin or low-contrast crosshairs are missed.
+    float uiContrastThreshold = 20.0f;
+    //   uiLeaveFrames: a masked pixel leaves the mask only after this many CONSECUTIVE frames in which it changed more than
+    //   uiStillThreshold ([1, 255]). Hysteresis: the mask no longer flickers when the background behind a thin crosshair
+    //   shimmers for a frame. 4 default; 1 = leaves at the first change (like V1's mask without the delay).
+    uint32_t uiLeaveFrames = 4;
+    //   uiReentryFrames: fast re-entry. The colour a pixel had when it was last confirmed is kept; a pixel that left the mask and
+    //   shows that colour again (within uiStillThreshold, and contrasty) for this many consecutive frames re-enters at once
+    //   instead of after uiStillFrames more still frames: the crosshair is back after a disruption (a flash, a muzzle effect, a
+    //   scope) within [0 = off, 255] frames. 2 default.
+    uint32_t uiReentryFrames = 2;
+    //   uiEstimateFill: also hide the UI from the MOTION ESTIMATE. Off (default): the estimate and the whole synthesis run on the
+    //   host's frames exactly as with protection Off, so the generated frame is bit-identical to Off everywhere except on the
+    //   pasted UI pixels (never worse than Off elsewhere). On: the flow-resolution luma of every cell that holds a UI pixel is
+    //   re-averaged over the cell's non-UI pixels (a wider window where all are UI), so a static crosshair casts no vote for the
+    //   zero vector in the blocks around it. The fill exists only in the estimate's luma buffer, never in a colour pass, so it
+    //   cannot reach an output pixel. Measured on the user's CS2 footage it is a wash (see INTEGRATION.md): it lowers the
+    //   error near a THICK crosshair on a hard-edged moving background (synthetic scene: 125 -> 110) but re-rolls the vectors of
+    //   neighbouring blocks, which on the thin real crosshair worsens as many pixels as it improves (+2.3 px/frame worse than Off,
+    //   +2.0 better) and shows as sporadic artifacts away from the crosshair. Costs ~0.03 ms per pair at 1440p (RX 7900 XTX) and 2 sets of the kUiSets ring per estimate.
+    bool uiEstimateFill = false;
 
     // Interpolation-based motion blur (recordSynthBlur()): one output = the weighted average of blurSamples
     // interpolated sub-frames spread evenly over a window [t0, t1] of the current real pair, a longer, smoother
@@ -324,6 +358,41 @@ public:
     // observe implicitly: a pair of which a view has not been observed (protection was just switched on, an
     // observe was skipped, the entry was evicted) is simply interpolated unprotected, as with Off.
     bool recordObserve(VkCommandBuffer cb, Frame frame);
+
+    // ---- CrosshairV2 (Settings::uiProtection = CrosshairV2) ----
+    // The crosshair box only (no WholeScreen variant), same API and host contract as Crosshair (explicit / implicit observe, recordTrack,
+    // uiHistory, the box settings), a different algorithm. V1 stays unchanged next to it. Built from what V1 gets wrong on the user's CS2
+    // recordings (white specks and patterns that move with the picture inside the protected area; measurements in INTEGRATION.md):
+    //   1. it READS THE INPAINTED CLEAN COPY IN THE COLOUR WARP (~61 % of V1's artifact pixels): a pixel inpainted in prev's copy but real
+    //      in curr (a mask that shrinks) is warped as 8-direction streaks. V2 has no inpaint and no clean copy: the estimate and every
+    //      colour pass read the host's own frames, so the generated frame is bit-identical to Off everywhere but the pasted pixels.
+    //   2. it PASTES curr'S PIXELS ONTO PIXELS THAT CHANGED IN THE PAIR (~37 %): the half-alpha ring and the hard grow. V2 pastes a pixel
+    //      only if max channel |curr - prev| <= uiStillThreshold for the pair being synthesised (the pair gate), at full strength.
+    //   3. its MASK FLICKERS (879-3378 px flip per frame with a 249 px box, ~20 with 27 px): a pixel that was masked for 8 frames drops
+    //      out on one noisy frame. V2 enters a pixel after uiStillFrames still AND contrasty frames, but leaves it only after
+    //      uiLeaveFrames consecutive changed frames, and re-enters at once (uiReentryFrames) when it shows its confirmed colour again.
+    // Per observed frame, per box pixel (full resolution, one state machine, 4 state words per pixel, no per-frame mask history):
+    //   still      = max channel |new - previous original| <= uiStillThreshold            (the V1 test, in the format's 8-bit-equivalent levels)
+    //   contrasty  = max channel |I - median7x7(I)| >= uiContrastThreshold                (a crosshair has an edge, a flat background does not)
+    //   out of the mask: counts consecutive still-and-contrasty frames, enters at uiStillFrames; or enters at once after
+    //                    uiReentryFrames consecutive (contrasty) frames in the colour it was last confirmed in
+    //   in the mask:     counts consecutive changed frames, leaves at uiLeaveFrames; while still it refreshes the confirmed colour
+    //   mask = the pixels in the mask plus a hard 1 px grow (8-neighbourhood, binary). Each mask pixel is PASTED (out = real curr pixel)
+    //   only if it is unchanged in this pair, else it is left to the interpolation (and still counts as UI for the optional fill).
+    // The previous original is the frame observed (or tracked) just before, so the pair gate compares each frame with its predecessor in
+    // observe order: call recordObserve / recordTrack for every real frame, as always. recordSynthBlur pastes after the average with the
+    // same gate. recordTrack runs the very same state-machine pass and nothing else: the state after N tracked frames is the state after N
+    // observed ones, hysteresis counters and confirmed colours included. Works for every Format: the thresholds are 8-bit-equivalent levels
+    // (YUV: the contrast difference is converted to R'G'B' levels like the mismatch metric; stillness is on the Y/Cb/Cr codes as in V1).
+    // Memory: no clean copy (V1: 4 B/px per kept frame); one mask per kept frame (1 B per box pixel) and 16 B per box pixel of shared state.
+    // Cost: observe = one pass over the box (a 7x7 median per candidate pixel, only where it can matter) + the mask pass; no inpaint, no
+    // whole-frame copy. With uiEstimateFill: two more tiny passes in recordEstimate.
+    // Limits: the crosshair must be opaque and static. A semi-transparent crosshair (its pixels change with the background behind it) and a
+    // crosshair that changes shape every frame (a spread that follows movement or recoil) stay unprotected while it changes: its changed
+    // pixels are never pasted, by design, and it re-enters uiReentryFrames / uiStillFrames frames after it settles. In 4:2:0 formats
+    // (Nv12, P010) the chroma of an edge pixel is shared with the moving background, so a few edge pixels count as changed. No clean copy
+    // also means nothing hides the crosshair from the optical-flow vote of the blocks around it unless uiEstimateFill is on.
+    // Host: add the enum value, set the settings you expose (the defaults are the tuned ones), keep calling recordObserve / recordTrack.
 
     // recordTrack(cb, frame): the cheap sibling of recordObserve for a real frame the host passes THROUGH without
     // generating (pacer reason GameTooFast / Off / CostGuard ...). It advances ONLY the stillness state (the box's
