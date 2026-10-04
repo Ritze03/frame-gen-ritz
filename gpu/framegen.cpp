@@ -1493,14 +1493,15 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
         srcP = ep.frame(); srcC = ec.frame();
     }
 
-    // the samples: evenly spaced over [t0, t1] (both ends), the ends exactly t0 / t1
+    // the samples: the MIDPOINTS of N equal slices of [t0, t1], t_k = t0 + (t1 - t0)(k + 0.5)/N (a box-filter shutter).
+    // Why: with both ends sampled, windows that tile (100 % blur) counted the real frame at the shared end in BOTH
+    // neighbours. A non-blur output (blur off, or t0 == t1) is the single instant t1 as before.
     const int n = blur ? (int)N : 1;
     BlurPC bp{};
     for (int k = 0; k < n; k++) {
-        double t = blur ? t0 + ((double)t1 - (double)t0) * k / (n - 1) : (double)t1;
+        double t = blur ? t0 + ((double)t1 - (double)t0) * (k + 0.5) / n : (double)t1;
         bp.t[k] = std::min(std::max((float)t, t0), t1);
     }
-    if (blur) bp.t[n - 1] = t1;
     int lo = n, hi = -1;   // the interior samples (0 < t < 1) are contiguous: only they need a synthesis
     for (int k = 0; k < n; k++)
         if (bp.t[k] > 0.0f && bp.t[k] < 1.0f) { lo = std::min(lo, k); hi = k; }
