@@ -191,6 +191,8 @@ gpu/build/uitest check [--bgra] [W H]    # default 1280x720: asserts the exact c
 gpu/build/uitest check --hash            # also prints a hash per generated frame of the Off run (compare against the
                                          # library before the feature to prove byte-identical output)
 gpu/build/uitest deep [W H]              # Settings::uiHistory: a synth from a pair 10 frames behind the newest is still protected (default 640x360)
+gpu/build/uitest track [W H]             # recordTrack: UI protection kept warm during pass-through; first synth after the resume is exact (default 640x360)
+gpu/build/uitest trackbench [W H]        # GPU cost of recordTrack vs recordObserve
 gpu/build/uitest bench [W H]             # per-pass GPU times: moving / still / 70% still scenes, all modes
 ```
 

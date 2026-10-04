@@ -170,7 +170,7 @@ static const int kEOff = 64;   // == E_OFF in common.glsl
 struct UiPC {
     int32_t W, H, boxX, boxY, boxW, boxH, cell, cw, ch, wholeScreen, still;
     float thr;
-    int32_t reach, reset, tilesX, tilesY, stillLimit, maskX, maskY, maskW, maskH, maskStride, maskOff, gate;
+    int32_t reach, reset, tilesX, tilesY, stillLimit, maskX, maskY, maskW, maskH, maskStride, maskOff, gate, track;
 };
 static_assert(sizeof(UiPC) <= 128, "push constants beyond the guaranteed minimum");
 enum UiPipe { U_DETECT, U_BOX_UPDATE, U_BOX_MASK, U_MASK, U_INPAINT, U_PATCH, U_COUNT, U_INPAINT_C = U_COUNT, U_PATCH_C, U_COUNT_ALL };   // _C: the CbCr plane (YUV only)
@@ -293,6 +293,8 @@ struct Interpolator::Impl {
     int uiPick(VkImageView v) const;
     VkDescriptorSet takeUiSet(Frame src, Frame img, const UiBuf& s, const UiBuf& m);
     bool uiObserveRecord(VkCommandBuffer cb, Frame view);
+    bool uiTrackRecord(VkCommandBuffer cb, Frame view);
+    void uiFlushPendingInit(VkCommandBuffer cb);
     void uiRecordPatch(VkCommandBuffer cb, Frame curr, Frame out, const UiEntry& e);
 
     // profiling
@@ -1099,22 +1101,8 @@ void uiDispatch(Interpolator::Impl& I, VkCommandBuffer cb, UiPipe p, VkDescripto
 }
 }  // namespace
 
-// Records the observe of one real frame into the entry it picks: clean copy, stillness, masks, inpaint.
-// The caller has checked uiActive() and the set ring (uiObserveSets()).
-bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
-    const bool ws = set.uiProtection == UiProtection::WholeScreen;
-    const UiBox bx = computeBox();
-    const int e = uiPick(view.view);
-    UiEntry& E = uiE[e];
-    // buffers first (they may fail and must not leave a half-observed entry): the box mask of this entry, and the
-    // box state; growing the state buffer or moving the box restarts the box counters
-    const VkDeviceSize maskWords = 4 + (VkDeviceSize)((bx.w + 3) / 4) * bx.h;
-    const VkBuffer oldState = uiBoxState.b;
-    if (!growBuf(E.box, maskWords * 4) || !growBuf(uiBoxState, (VkDeviceSize)bx.w * bx.h * 4)) return false;
-    if (uiBoxState.b != oldState || !(bx == uiPrevBox)) uiBoxHist = false;
-    uiPrevBox = bx;
-
-    // flush the layout transition of freshly created images
+// Moves freshly created clean images UNDEFINED -> GENERAL (one barrier for all of them).
+void Interpolator::Impl::uiFlushPendingInit(VkCommandBuffer cb) {
     if (!uiPendingInit.empty()) {
         std::vector<VkImageMemoryBarrier> bars;
         for (VkImage im : uiPendingInit) {
@@ -1131,6 +1119,24 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
         CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, CS, 0, 0, nullptr, 0, nullptr, (uint32_t)bars.size(), bars.data());
         uiPendingInit.clear();
     }
+}
+
+// Records the observe of one real frame into the entry it picks: clean copy, stillness, masks, inpaint.
+// The caller has checked uiActive() and the set ring (uiObserveSets()).
+bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
+    const bool ws = set.uiProtection == UiProtection::WholeScreen;
+    const UiBox bx = computeBox();
+    const int e = uiPick(view.view);
+    UiEntry& E = uiE[e];
+    // buffers first (they may fail and must not leave a half-observed entry): the box mask of this entry, and the
+    // box state; growing the state buffer or moving the box restarts the box counters
+    const VkDeviceSize maskWords = 4 + (VkDeviceSize)((bx.w + 3) / 4) * bx.h;
+    const VkBuffer oldState = uiBoxState.b;
+    if (!growBuf(E.box, maskWords * 4) || !growBuf(uiBoxState, (VkDeviceSize)bx.w * bx.h * 4)) return false;
+    if (uiBoxState.b != oldState || !(bx == uiPrevBox)) uiBoxHist = false;
+    uiPrevBox = bx;
+
+    uiFlushPendingInit(cb);
 
     E.key = view.view;
     E.seq = ++uiSeq;
@@ -1196,6 +1202,50 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
     return true;
 }
 
+// Records the track of one real frame (recordTrack): ONLY the stillness state is advanced. The same two passes as an
+// observe runs for it, on the same state buffers with the same `reset` handling: ui_box_update (box counters) and, for
+// WholeScreen, ui_detect with pc.track = 1 (cell counters; no clean copy, no tile flags, no mask). Nothing else of an
+// observe runs (mask, inpaint, the copy), no entry is picked and no LRU slot is touched. The shaders still declare the
+// observe's bindings, so the set gets harmless placeholders: the first active entry's clean image (never written with
+// track = 1) and the box state as the "mask" (never touched with track = 1).
+bool Interpolator::Impl::uiTrackRecord(VkCommandBuffer cb, Frame view) {
+    const bool ws = set.uiProtection == UiProtection::WholeScreen;
+    const UiBox bx = computeBox();
+    const UiEntry* ph = nullptr;
+    for (const UiEntry& e : uiE) if (e.active && e.img) { ph = &e; break; }
+    if (!ph) return false;
+    const VkBuffer oldState = uiBoxState.b;
+    if (!growBuf(uiBoxState, (VkDeviceSize)bx.w * bx.h * 4)) return false;
+    if (uiBoxState.b != oldState || !(bx == uiPrevBox)) uiBoxHist = false;
+    uiPrevBox = bx;
+    uiFlushPendingInit(cb);
+
+    Rec r(*this, cb);
+    r.cbar();   // earlier records read/wrote the state buffers (mask build, observe, ...)
+    UiPC pc{};
+    pc.W = (int)W; pc.H = (int)H;
+    pc.boxX = bx.x; pc.boxY = bx.y; pc.boxW = bx.w; pc.boxH = bx.h;
+    pc.cell = kUiCell; pc.cw = cw; pc.ch = ch;
+    pc.still = (int)set.uiStillFrames;
+    pc.thr = set.uiStillThreshold;
+    pc.tilesX = tilesX; pc.tilesY = tilesY;
+    pc.track = 1;
+    if (ws) {
+        VkDescriptorSet wsSet = takeUiSet(view, ph->frame(), uiCellState, uiBoxState);
+        pc.wholeScreen = 1;
+        pc.reset = !uiCellHist;
+        uiDispatch(*this, cb, U_DETECT, wsSet, pc, divUp(cw, 8), divUp(ch, 8));
+    }
+    VkDescriptorSet boxSet = takeUiSet(view, ph->frame(), uiBoxState, uiBoxState);
+    pc.wholeScreen = 0;
+    pc.reset = !uiBoxHist;
+    uiDispatch(*this, cb, U_BOX_UPDATE, boxSet, pc, divUp(bx.w, 8), divUp(bx.h, 8));
+    r.cbar();
+    uiBoxHist = true;
+    uiCellHist = ws;
+    return true;
+}
+
 // After a generated frame is complete: paste the real pixels of the frame the synth leads up to (curr) over it.
 void Interpolator::Impl::uiRecordPatch(VkCommandBuffer cb, Frame curr, Frame out, const UiEntry& E) {
     Rec r(*this, cb);
@@ -1236,6 +1286,16 @@ bool Interpolator::recordObserve(VkCommandBuffer cb, Frame frame) {
     }
     I.profPending = I.profiling && I.qpool;
     return I.uiObserveRecord(cb, frame);
+}
+
+bool Interpolator::recordTrack(VkCommandBuffer cb, Frame frame) {
+    if (!m || !m->W) return false;
+    Impl& I = *m;
+    if (!I.framesOk(frame)) return false;
+    if (I.set.uiProtection == UiProtection::Off) return true;
+    if (!I.uiActive()) return false;
+    if (I.uiFrameSets + I.uiObserveSets() > kUiSets) return false;
+    return I.uiTrackRecord(cb, frame);
 }
 
 bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {

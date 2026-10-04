@@ -97,6 +97,7 @@ struct Settings {
     // (or the implicit observe, see there). Runtime: setSettings() switches it on/off/between modes with no GPU
     // wait (it only ever ALLOCATES, never frees; setSettings returns false if that allocation fails). Off =
     // byte-identical to a library without it.
+    // recordTrack() keeps the counters current while the host passes frames through (see there).
     // Cost (RX 7900 XTX, 2560x1440, GPU time per real frame): Crosshair ~0.07 ms, WholeScreen ~0.09 ms typical
     // and <= ~0.25 ms in the worst case below the uiMaxStillFraction skip (about half of it is the full-frame copy
     // into the clean image). Memory: uiHistory (default kUiFrames = 3) clean copies of the frame (Rgba8 and Rgb10 4 bytes/px each: 44 MB
@@ -311,6 +312,33 @@ public:
     // observe implicitly: a pair of which a view has not been observed (protection was just switched on, an
     // observe was skipped, the entry was evicted) is simply interpolated unprotected, as with Off.
     bool recordObserve(VkCommandBuffer cb, Frame frame);
+
+    // recordTrack(cb, frame): the cheap sibling of recordObserve for a real frame the host passes THROUGH without
+    // generating (pacer reason GameTooFast / Off / CostGuard ...). It advances ONLY the stillness state (the box's
+    // per-pixel counters and, in WholeScreen, the 1/2-res cell counters, with their "previous original" values) with
+    // the very same shaders and thresholds an observe uses, and nothing else: no clean copy, no mask, no inpaint, no
+    // entry in the kept-frame set (so nothing is evicted and nothing is allocated). The state after N tracked frames
+    // is exactly the state after N observed ones.
+    // Why: a host that is idle for a while (the game is fast enough, the guard paused generation) and then starts
+    // generating again must not find a crosshair or HUD that "has not been still for uiStillFrames frames yet": the
+    // user's words were "make sure that it still keeps track of like static UI elements, like the crosshair, even when
+    // it's temporarily deactivated because the FPS is high enough. Then it should still keep track of the crosshair so
+    // it doesn't start shifting around once it starts generating frames again." Without it a UI element that changed
+    // during the idle stretch (or a library that was reset) needs uiStillFrames new real frames after the restart
+    // before it is masked again, and until then it can shift.
+    // Call it ONCE per new real frame instead of recordObserve while not generating (a frame is tracked OR observed,
+    // never both: a second pass over the same pixels would count them twice). Then, when generation resumes, call
+    // recordObserve on the next real frames as usual: the counters are warm, so the first pair that is synthesised
+    // (both frames observed) already has the full mask. The frame that was only tracked has no clean copy and cannot be
+    // a member of a pair; a host that wants to interpolate its very next frame against it observes that one instead.
+    // Same contract as recordObserve otherwise: protection Off -> returns true and records nothing; false (and nothing
+    // recorded) if not initialised, a descriptor ring is full (it takes the same 1 / 2 sets of the kUiSets ring) or the
+    // first-use allocation failed. `frame` is only SAMPLED (the host's own image, GENERAL layout, final pixels); it
+    // needs no storage usage and the library keeps no reference to it. A change of frame size / format (resize) or of
+    // the box restarts the counters, as for an observe. Works for every Format. Cost, 2560x1440 (RX 7900 XTX, GPU): Crosshair ~0.004 ms, WholeScreen ~0.027 ms (about 3 % / 20 % of recordObserve).
+    // Not for hosts that rely on the implicit observe (never call recordObserve): recordEstimate would count a tracked
+    // frame a second time.
+    bool recordTrack(VkCommandBuffer cb, Frame frame);
 
     // Frees the clean copies that Settings::uiHistory no longer keeps (they stay allocated, unused, when it is
     // lowered, so a later raise costs nothing). Retire rule of resize()/destroy(): every earlier record must have
