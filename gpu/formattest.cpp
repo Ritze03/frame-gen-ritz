@@ -622,7 +622,7 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     uiWrong(sc, o05, real, tol, xh, hud, xhN, hudN);
     printf("    UI Off:         crosshair wrong %zu/%zu, hud wrong %zu/%zu\n", xh, xhN, hud, hudN);
     size_t xhOff = xh, hudOff = hud;
-    Settings w; w.uiProtection = UiProtection::WholeScreen;
+    Settings w; w.uiProtection = UiProtection::WholeScreen; w.uiBoxWidth = w.uiBoxHeight = 64;   // fits the 35 px test crosshair (the default box is smaller)
     Result rw = runSequence(e, sc, w, false);
     if (!rw.ok) { expect(false, "WholeScreen init + sequence"); return; }
     auto w05 = decode(e, rw.out[0], W, H), w025 = decode(e, rw.out[1], W, H);
@@ -638,7 +638,7 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         expect(rt.ok && rt.out[0].p0 == rw.out[0].p0 && rt.out[0].p1 == rw.out[0].p1 && rt.out[1].p0 == rw.out[1].p0 && rt.out[1].p1 == rw.out[1].p1,
                "recordTrack (WholeScreen): frames tracked instead of observed give bit-identical output");
     }
-    Settings c; c.uiProtection = UiProtection::Crosshair;
+    Settings c; c.uiProtection = UiProtection::Crosshair; c.uiBoxWidth = c.uiBoxHeight = 64;
     Result rc = runSequence(e, sc, c, false);
     if (rc.ok) {
         auto c05 = decode(e, rc.out[0], W, H);

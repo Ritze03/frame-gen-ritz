@@ -114,14 +114,20 @@ struct Settings {
     // exactly as before.
     uint32_t uiHistory = 3;
     // The crosshair box: always protected at FULL resolution, in both modes (a crosshair is the most noticeable
-    // thing if it breaks). Size it so the whole reticle fits with room for its spread and outline: about 2-3x the
-    // crosshair's largest extent. Too small cuts the crosshair's ends off the protection, too big only costs a few
-    // more pixels of work (the box is cheap; the default is 333 px at 2560x1440).
-    //   uiBoxWidth/uiBoxHeight: the box size in pixels, [0, 16384]. 0 = take that side from uiCrosshairArea.
+    // thing if it breaks). Size it so the whole reticle fits with a little room for its spread and outline: make it
+    // slightly LARGER than the crosshair, not 2-3x. Everything inside the box is held to the real frame, so a box that
+    // is much bigger than the reticle catches background too, and moving background inside it shows up as small
+    // white speckles. A host can draw the box as a preview while the user adjusts the slider.
+    //   uiBoxHeightFrac: (0, 1], the side of the square box as a fraction of the FRAME HEIGHT: side =
+    //   round(frameHeight * uiBoxHeightFrac), clamped to [8, min(w, h)]. 0.025 = 24 px at 960, 27 at 1080, 36 at 1440,
+    //   54 at 2160. 0 = legacy: take the side from uiCrosshairArea instead (below).
+    float uiBoxHeightFrac = 0.025f;
+    //   uiBoxWidth/uiBoxHeight: the box size in pixels, [0, 16384]. 0 = take that side from uiBoxHeightFrac.
     //   An explicit size wins over the fraction; it is clamped to [4, frame size].
     uint32_t uiBoxWidth = 0, uiBoxHeight = 0;
-    //   uiCrosshairArea: (0, 1]. The area-derived box is a square of side sqrt(uiCrosshairArea * w * h), clamped to
-    //   [32, min(w, h)]: 0.03 = 333 px at 2560x1440.
+    //   uiCrosshairArea: DEPRECATED, kept for API compatibility. Used ONLY when uiBoxHeightFrac == 0: then the box is
+    //   a square of side sqrt(uiCrosshairArea * w * h), clamped to [32, min(w, h)] (0.03 = 333 px at 2560x1440).
+    //   Range (0, 1] as before. Why: that area box was 192 px on 1280x960 and caught background (see README.md).
     float uiCrosshairArea = 0.03f;
     //   uiBoxOffsetX/Y: where the box is centred, in pixels from the frame centre ([-16384, 16384]; +x right,
     //   +y down; 0 = dead centre). For a game whose reticle is not in the middle. The box is clamped into the frame.
@@ -207,6 +213,10 @@ public:
 
     // Settings (see struct Settings). validate(): true if every field is finite and in range.
     static bool validate(const Settings&);
+    // The box size (pixels) a frame of w x h gets under these settings: the explicit uiBoxWidth/uiBoxHeight, else the
+    // square from uiBoxHeightFrac (or the legacy uiCrosshairArea). The same numbers the library protects; for a host
+    // preview. Does not check validity.
+    static void boxSize(const Settings&, uint32_t w, uint32_t h, uint32_t* boxW, uint32_t* boxH);
     // Runtime change: applies the runtime fields (the UI-protection ones too) to every record*() recorded after this call (each record
     // copies them into its own push constants, so in-flight and already-recorded work keeps its values;
     // no retire needed). Returns false and changes nothing if the object is not initialised, the settings

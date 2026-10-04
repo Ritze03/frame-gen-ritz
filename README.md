@@ -119,10 +119,12 @@ Two modes (`Settings::uiProtection`, a runtime setting, `Off` by default and byt
 
 | Mode | What is protected | How |
 |---|---|---|
-| `Crosshair` | the **box** (default: a centred square of 3% of the frame area, 333 px at 1440p) | full resolution, every pixel |
+| `Crosshair` | the **box** (default: a centred square, side 2.5% of the frame height: 24 px at 960, 36 at 1440) | full resolution, every pixel |
 | `WholeScreen` | the box, plus every solid static HUD element outside it | the box as above; outside it detection at half resolution (2x2 cell means, one counter per cell), the mask is upsampled and dilated at full resolution, and work is skipped for every 32x32 tile that cannot contain a still pixel (GPU-side tile flags); inpaint and patch touch only masked pixels in flagged tiles |
 
-The box is always full resolution in both modes, because the crosshair is the most noticeable thing if it breaks. **Make sure it is big enough for your reticle:** `uiBoxWidth`/`uiBoxHeight` set it in pixels (0 = derive that side from `uiCrosshairArea`, an explicit size wins) and `uiBoxOffsetX`/`uiBoxOffsetY` move its centre from the frame centre (for a game whose reticle is not dead centre). Rule of thumb: 2-3x the crosshair's largest extent, so its spread (shooting, movement) and outline fit. Too small leaves the ends of the crosshair unprotected; too big only costs a few more pixels of work. The box is clamped into the frame.
+The box is always full resolution in both modes, because the crosshair is the most noticeable thing if it breaks. **Size it for your reticle:** `uiBoxHeightFrac` (default 0.025) sets the side of the square as a fraction of the frame height, `round(height * frac)` clamped to [8, min(w, h)]: 24 px at 960, 27 at 1080, 36 at 1440, 54 at 2160. `uiBoxWidth`/`uiBoxHeight` set it in pixels instead (0 = take that side from the fraction; an explicit size wins), and `uiBoxOffsetX`/`uiBoxOffsetY` move its centre from the frame centre (for a game whose reticle is not dead centre). Rule of thumb: make the box **slightly larger than the crosshair** including its spread and outline, not much larger; a host can draw the box as a preview while the user adjusts a slider. Too small leaves the ends of the crosshair unprotected; too big holds background to the real frame too, which shows as small white speckles. The box is clamped into the frame. `Interpolator::boxSize()` returns the size the library will use. `uiCrosshairArea` is deprecated and used only when `uiBoxHeightFrac` is 0 (the old area box).
+
+`Why:` the former default, a 3% *area* box, was 192 px on 1280x960. It caught moving background around the reticle, which the user saw as small white pixel artifacts, and its 32 px minimum made a small box impossible. The side is now a plain fraction of the height, which is easy to reason about and to put on a slider.
 
 `WholeScreen` bounds its worst case: if more than `uiMaxStillFraction` (75%) of the cells outside the box are still, that frame's whole-screen passes exit on the GPU (a nearly static picture needs no generated frame to differ from the real one). Costs, memory and measurements are in `INTEGRATION.md`. Limits: only *opaque, solid, static* UI is protected. Semi-transparent UI over moving background, UI whose shape changes every frame (a scrolling kill feed, an animated number) and UI that moves (a floating damage number) are not; they behave as before. The cell-mean detection also treats a very slowly moving gradient (under `uiStillThreshold` per frame) as still, which only means it is shown from the real frame.
 
@@ -130,7 +132,8 @@ Host sketch (details in `gpu/framegen.h`):
 
 ```cpp
 Settings s; s.uiProtection = UiProtection::WholeScreen;
-s.uiBoxWidth = 200; s.uiBoxHeight = 200;        // optional: box sized for this game's reticle
+s.uiBoxHeightFrac = 0.03f;                      // optional: box side as a fraction of the frame height
+// s.uiBoxWidth = 40; s.uiBoxHeight = 40;       // or explicit pixels (wins over the fraction)
 s.uiBoxOffsetX = 0; s.uiBoxOffsetY = -30;       // optional: reticle sits 30 px above the centre
 fg.setSettings(s);                              // or Settings::uiProtection in InitInfo
 
@@ -264,8 +267,9 @@ for (int k = 1; k < N; ++k)
 | `searchPenalty` | 0.5 | Search cost per pixel step. Higher = steadier on flat or repetitive surfaces, lower = follows small fast detail. |
 | `subpixel` | true | 1/2 + 1/4 px refinement. Off saves about 0.04-0.06 ms per pair, slightly softer on slow pans. |
 | `uiProtection` | Off | `Off`, `Crosshair` or `WholeScreen`: static-UI protection (see above). Runtime. |
-| `uiBoxWidth`, `uiBoxHeight` | 0, 0 | Size of the full-resolution box in pixels; 0 = take that side from `uiCrosshairArea`. Clamped to [4, frame]. Runtime. |
-| `uiCrosshairArea` | 0.03 | Box = square of side sqrt(area * w * h), clamped to [32, min(w, h)]. (0, 1]. |
+| `uiBoxHeightFrac` | 0.025 | Box = square of side round(frame height * frac), clamped to [8, min(w, h)]. [0, 1]; 0 = legacy area box. Runtime. |
+| `uiBoxWidth`, `uiBoxHeight` | 0, 0 | Size of the full-resolution box in pixels; 0 = take that side from `uiBoxHeightFrac`. Clamped to [4, frame]. Runtime. |
+| `uiCrosshairArea` | 0.03 | Deprecated; used only when `uiBoxHeightFrac` is 0: square of side sqrt(area * w * h), clamped to [32, min(w, h)]. (0, 1]. |
 | `uiBoxOffsetX`, `uiBoxOffsetY` | 0, 0 | Box centre offset from the frame centre, pixels (+x right, +y down). The box is clamped into the frame. |
 | `uiStillFrames`, `uiStillThreshold` | 8, 3.5 | A pixel is protected after this many consecutive real frames in which no channel moved more than this many levels. |
 | `uiInpaintReach` | 12 | Walk length (1-16 px) of the inpaint. |

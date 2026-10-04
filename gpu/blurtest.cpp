@@ -648,7 +648,7 @@ static int check(int W, int H) {
         UiProtection modes[3] = {UiProtection::Off, UiProtection::Crosshair, UiProtection::WholeScreen};
         for (UiProtection mode : modes) {
             Settings s;
-            s.uiProtection = mode;
+            s.uiProtection = mode; s.uiBoxWidth = s.uiBoxHeight = 64;   // fits the 35 px test crosshair
             Ctx c(W, H, s);
             printf("HASH mode %d:", (int)mode);
             float ts[3] = {0.2f, 0.5f, 0.75f};
@@ -662,7 +662,7 @@ static int check(int W, int H) {
     // ---- 2. blur off / single instant == recordSynth
     {
         Settings s;
-        s.uiProtection = UiProtection::Crosshair;
+        s.uiProtection = UiProtection::Crosshair; s.uiBoxWidth = s.uiBoxHeight = 64;
         s.blurSamples = 0;
         Ctx c(W, H, s);
         synthOut(c, 0, 0.3f);
@@ -772,7 +772,7 @@ static int check(int W, int H) {
         UiProtection pm = mode == 0 ? UiProtection::Off : mode == 1 ? UiProtection::Crosshair : UiProtection::WholeScreen;
         printf("[edge smear, protection %s]\n", mode == 0 ? "Off" : mode == 1 ? "Crosshair" : "WholeScreen");
         Settings s;
-        s.uiProtection = pm;
+        s.uiProtection = pm; s.uiBoxWidth = s.uiBoxHeight = 64;
         Ctx c(W, H, s);
         // a plain interpolated frame for reference
         synthOut(c, 0, 0.75f);
@@ -875,6 +875,7 @@ static int check(int W, int H) {
         for (int mode = 0; mode < 3; mode++) {
             Settings s;
             s.uiProtection = mode == 0 ? UiProtection::Off : mode == 1 ? UiProtection::Crosshair : UiProtection::WholeScreen;
+            s.uiBoxWidth = s.uiBoxHeight = 64;
             s.blurSamples = 8;
             Ctx c(W, H, s);
             begin();
