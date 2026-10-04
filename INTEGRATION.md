@@ -75,6 +75,7 @@ public:
   bool recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageView curr);            // passes 1-8, once per real pair
   bool recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t);   // frame at t in (0,1)
   bool record(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t = 0.5f); // = estimate + synth
+  bool recordSynthBlur(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t0, float t1);   // motion blur over [t0, t1] (see "Motion blur")
   static constexpr uint32_t kSetRing = 32, kUiSets = 64, kUiFrames = 3, kMinSize = 16;
 };
 }
@@ -101,6 +102,8 @@ A plain struct whose in-class defaults are the tuned values of `proto/interp.py`
 | `smoothBonus` | 0.5 | 0-255 (useful 0-2) | runtime | Bonus for the smooth (bilinear) vector field. Higher = calmer, softer motion edges; lower = sharper edges, more speckle. |
 | `searchPenalty` | 0.5 | 0-255 (useful 0.25-2) | runtime | Motion-search cost per pixel step (interp's `LAMBDA`). Higher = steadier vectors on flat/repetitive surfaces; lower = follows small fast detail more freely. |
 | `subpixel` | true | bool | runtime | 1/2 + 1/4 px refinement. Off saves ~0.04 ms (1080p) / ~0.06 ms (1440p) per real pair; ~0.5 dB lower, slightly softer/wobblier on slow pans. |
+| `blurSamples` | 0 | 0, 1 (off), 2-16 | runtime | Interpolation-based motion blur: sub-frames averaged by `recordSynthBlur()` (see "Motion blur"). Off = byte-identical. |
+| `blurWeights` | Gaussian | Even, Gaussian | runtime | Weights of the sub-frames: 1/N each, or a Gaussian with the window ends at 2 sigma. |
 | `flowScale` | 2 | 1, 2, 4 | structural | Motion estimation at 1/flowScale of the frame. 4 = performance mode (~40 % cheaper at 2×, ~30 % at 4×, see below; ~0.1 dB lower on the test clips, can miss thin/fine motion); 1 = full res, much slower (1080p 2×: 0.79 vs 0.35 ms), not better on the test clips. |
 
 - **Runtime** fields: `setSettings(s)` at any time, even between two records of one command buffer. Each record copies the values into its own push constants, so nothing in flight changes and no retire/wait is needed; every `record*()` recorded after the call uses the new values (a synth uses the values current when the synth is recorded, the estimate those current at its record). `setSettings` returns false and changes nothing if `s` is invalid or its `flowScale` differs from the active one.
@@ -214,3 +217,62 @@ Also checked: implicit observe is bit-identical to explicit observe; runtime swi
 3. Call `recordObserve(cb, frameView)` once per new real frame at the point where it currently copies a real frame into its ring slot and runs `RecordCrosshairDetect`, including frames it will not interpolate.
 4. Delete `EnsureCrosshair`/`ReleaseCrosshair`/`RecordCrosshairDetect`/`RecordCrosshairPatch`, the per-slot patch textures, `cs_fg_crosshair_detect.comp`, `cs_fg_inpaint.comp`, `cs_fg_crosshair_patch.comp`; the library now owns the clean copies, so the host's ring slots hold real, un-inpainted frames. The host must keep `curr` valid until the last synth of its pair retires (as before).
 5. Account for `kUiSets` (64) per submission in its pacing guard, like `kMaxSynthsPerPair` for the 32-set rings.
+
+## Motion blur (`Settings::blurSamples`, `recordSynthBlur`)
+Interpolation-based motion blur, the technique of video tools such as Blur and smoothie-rs: interpolate to a high rate, then average groups of sub-frames, which gives a physically plausible blur without the "smear" of a screen-space filter. The idea, in the user's words: *"interpolated motion blur, which people basically achieve by, for example, interpolating a 60 FPS video to 240, and then blending the frames together to get like really accurate motion blur."* In the library it is one primitive: **one output image = the weighted average of N synthesised sub-frames at t in [t0, t1] of the current real pair.** It works without frame generation (blur only) and together with it.
+
+```cpp
+Settings s; s.blurSamples = 4; s.blurWeights = BlurWeights::Gaussian;   // runtime; 0 or 1 = off
+fg.setSettings(s);
+fg.recordEstimate(cb, prev, curr);                          // once per real pair, as before
+fg.recordSynthBlur(cb, prev, curr, out, t0, t1);            // 0 <= t0 <= t1 <= 1, one call per output image
+```
+
+**Sub-frames and weights.** N = `blurSamples` (any value 2-16; 2-8 are the expected ones, odd counts work). Sample k sits at `t_k = t0 + (t1 - t0) k / (N - 1)`, k = 0..N-1, both window ends included. Weights `w_k` are normalised to sum 1: `Even` = 1/N; `Gaussian` = `exp(-2 x_k^2)`, `x_k = (2k - (N-1)) / (N-1)`, i.e. a Gaussian with sigma = 1/4 of the window (ends at 13.5 % of the centre's weight). Even is a box shutter (what a physical camera does, hard-edged smear); Gaussian is softer and its effective length is shorter (full width at half maximum 0.59 of the window). A sub-frame is **exactly** what `recordSynth(t_k)` produces (same field lookup, warps, trust ramp, scene-cut and `globalFallback` decisions, nearer-real-frame rule, rounded to 8 bit); `t_k <= 0` / `>= 1` is the real frame prev / curr (no synthesis, so a window ending at 1 costs one sample less). The average of the 8-bit sub-frames is rounded once. With `t0 == t1`, or blur off, the result is `recordSynth(t1)` bit for bit (`t1` = 0 / 1: a copy of prev / curr); with blur off and `t0 < t1` the window collapses to its end `t1` (a host that centres its window should call `recordSynth` itself while blur is off).
+
+**Passes (what is shared, what is per t).** *Shared by every output of the pair*: the whole `recordEstimate` (luma, pyramid, search, medians, sub-pixel, per-pixel field, scene-cut SAD sum) and, with UI protection, the observe (clean copies, masks). *Per sub-frame t_k* (nothing here can be shared, the field at t differs): the field lookup (`blur_lookup.comp`, flow res), the full-res mismatch of the two warps (`blur_error.comp`), then the 7x7 trust, the warps and blend and the fallbacks of that sample (`blur_resolve.comp`). `blur_lookup` and `blur_error` are one dispatch for all samples (z = sample); `blur_resolve` is one dispatch that loops the samples per pixel and accumulates in registers, so **no sub-frame is ever written to memory**. The whole-frame "more than `globalFallback` untrusted" decision of a sample needs a count over the whole frame, so `blur_resolve` assumes no sample is flicked and counts each sample's untrusted pixels as it goes, and a second dispatch of the same shader (`fix`) exits at once unless some sample turned out flicked (rare), in which case it redoes the output with the final counts. Result identical to deciding first, one counting pass per sample cheaper. One blurred output is therefore 4 dispatches whatever N is. Timestamps in `readTimings`: `blur lookup`, `blur mismatch`, `blur resolve`, `blur fixup`.
+
+**UI protection.** With `uiProtection != Off` the patch is applied **after** the average (`ui_patch`, once per output, real pixels from `curr`), so a static crosshair or HUD is the exact real pixels while the world around it is blurred. The estimate runs on the clean copies as always.
+
+**Rings and memory.** One synth descriptor set per call (not per sample) plus the UI patch sets, i.e. the same as `recordSynth`; 8 outputs x 8 samples in one pair take 8 sets. Scratch per sample: the field at t (8 B per flow pixel) and the mismatch (1 B per pixel) = 3 B per pixel at `flowScale` 2 (N = 8: 29 MB at 1280x960, 88 MB at 1440p), 9 B at `flowScale` 1. It is allocated by the first blurred call, only ever grows (the old buffer waits in a graveyard until `resize`/`reconfigure`/`destroy`, like the UI buffers; no GPU wait) and `recordSynthBlur` returns false if that allocation fails. Changing `blurSamples` live is free.
+
+### How a host calls it
+`s` is the **shutter** as a fraction of an interval and the window always *ends* at the instant the output shows, so it needs no future frame and adds no delay. A window that starts before the pair (negative `t0`) cannot be built from this pair; the two modes below are arranged so that it never happens.
+
+- **Blur only (no frame generation).** Each real frame is shown blurred over the last part of the interval that led to it: `recordEstimate(prev, curr)`, then `recordSynthBlur(prev, curr, out, 1 - s, 1)`, 0 < s <= 1. s = 0.5 is a 180 degree shutter (the film default: smear = half the motion between two real frames), s = 1 a 360 degree one (the whole motion). Because t = 1 is the real frame, N = 4 costs three synths. The newest sample is the real frame: the picture's front edge is sharp and the blur trails behind it.
+- **With interpolation (M outputs per real pair).** Output m = 1..M of a pair is at `t = m / M` (m = M is the real frame `curr`, which is why the windows end at t and not centre on it: a centred window would need the next pair). With the shutter `s` (<= 1) measured in **output** intervals, the window is `[t - s/M, t]`, i.e. `recordSynthBlur(prev, curr, out, (m - s) / M, m / M)`. It never leaves [0, 1], keeps the same length for every output and, for s = 1, tiles the pair exactly. Example, 60 fps to 280 Hz (M = 4.67, so the host's cadence decides each output's t; the same formula with that t): s = 1 smears each output over 3.6 ms of motion, what a 280 fps camera with a 360 degree shutter records. That is the setting that hides the stepping of interpolation yet stays sharp.
+- **Longer "film look" blur** (shutter measured in *real* frame intervals, `L = s_real` instead of `s/M`): window `[t - L, t]` slid into the pair, `a = clamp(t - L, 0, 1 - L)`, `[a, a + L]`. A window longer than the output interval overlaps its neighbours (and for `t < L` looks slightly ahead of `t`); the blur is as long as a 60 fps camera's and so heavy, and costs the same N sub-frames per output but needs a larger N for the same smoothness (the samples are further apart in pixels).
+
+How many samples: the sub-frames are `L x v / (N - 1)` pixels apart for an object moving `v` px per real frame, and the blur is smooth when that is at most about 2-3 px; fewer samples show a stack of discrete ghost copies instead of a ramp (N = 2 is two ghosts; use it only for a tiny L). Pick N from the longest smear: e.g. v = 16 px/frame and s = 0.5 real frame -> 8 px smear -> N = 4-5.
+
+### Cost
+RX 7900 XTX (RADV), back-to-back, minimum of 21 submissions per cell (`blurtest bench`; GPU shared with the desktop, so +-5 %). "1 output" = one estimate plus one blurred output with N samples over `[0.25, 0.75]` (all interpolated; a window ending on a real frame is one synth cheaper); "naive" = the same with N `recordSynth` calls into N images plus a blend pass:
+
+| ms per pair | | N=2 | N=3 | N=4 | N=5 | N=6 | N=7 | N=8 |
+|---|---|---|---|---|---|---|---|---|
+| 1280x960 Quality | 1 output | 0.26 | 0.29 | 0.32 | 0.35 | 0.38 | 0.41 | 0.44 |
+| | naive | 0.27 | 0.30 | 0.35 | 0.39 | 0.43 | 0.46 | 0.51 |
+| 1280x960 Performance | 1 output | 0.17 | 0.19 | 0.22 | 0.25 | 0.28 | 0.30 | 0.34 |
+| 1920x1080 Quality | 1 output | 0.36 | 0.42 | 0.46 | 0.52 | 0.58 | 0.62 | 0.68 |
+| | naive | 0.37 | 0.43 | 0.51 | 0.56 | 0.66 | 0.71 | 0.77 |
+| 1920x1080 Performance | 1 output | 0.22 | 0.27 | 0.31 | 0.35 | 0.41 | 0.46 | 0.50 |
+| 2560x1440 Quality | 1 output | 0.56 | 0.66 | 0.75 | 0.85 | 0.96 | 1.07 | 1.20 |
+| | naive | 0.58 | 0.69 | 0.83 | 0.94 | 1.09 | 1.22 | 1.38 |
+| 2560x1440 Performance | 1 output | 0.33 | 0.42 | 0.50 | 0.59 | 0.69 | 0.76 | 0.85 |
+
+Per extra sample (least squares over N): 0.030 ms (1280x960 Quality) / 0.028 (Performance), 0.052 / 0.048 (1080p), 0.105 / 0.087 (1440p), against 0.035 / 0.032, 0.060 / 0.052, 0.099 / 0.092 ms for a plain `recordSynth`: **a sample costs about as much as a generated frame**, only a little less (no per-frame fallback pass, no blend, no N output images or sets), at 1440p Quality about 5 % more. There is no cheaper shortcut that keeps per-t correctness: the lookup, the mismatch and the trust all depend on t. Blur only with N = 4 and a window ending on the real frame: about 0.29 ms per real frame at 1280x960 Quality (0.19 Performance), 0.65 ms at 1440p (0.41).
+
+**The target case, 60 fps game to 280 Hz (4.67 outputs per real pair, 60 pairs/s), 4 samples per output = 18.7 sub-frames per pair**, the total including the estimate and replacing the plain generated frames, measured as 1 pair in 3 with 4 outputs and 2 with 5:
+
+| | per pair | per second (60 pairs) | of one second of GPU | plain frame generation alone | blur adds |
+|---|---|---|---|---|---|
+| 1280x960 Quality | 0.76 ms | 46 ms | 4.6 % | 0.36 ms (2.2 %) | 0.40 ms = 24 ms/s (2.4 %) |
+| 1280x960 Performance | 0.64 ms | 38 ms | 3.8 % | 0.26 ms (1.5 %) | 0.38 ms = 23 ms/s (2.3 %) |
+| 1920x1080 Quality | 1.22 ms | 73 ms | 7.3 % | 0.53 ms (3.2 %) | 0.69 ms = 41 ms/s (4.1 %) |
+| 2560x1440 Quality | 2.11 ms | 127 ms | 12.7 % | 0.82 ms (4.9 %) | 1.29 ms = 77 ms/s (7.7 %) |
+| 2560x1440 Performance | 1.71 ms | 103 ms | 10.2 % | 0.58 ms (3.5 %) | 1.13 ms = 68 ms/s (6.8 %) |
+
+Per 280 Hz output that is 0.16 ms (1280x960) to 0.45 ms (1440p) of a 3.57 ms budget. N = 2 / N = 8 at the same case: 1280x960 Quality 28 / 82 ms/s, 1440p Quality 69 / 247 ms/s. A cheaper variant that is not implemented: with `s = 1` the windows of neighbouring outputs share an end sample (`M (N-1) + 1` distinct sub-frames per pair instead of `M N`, 25 % fewer at N = 4); it would need a batched call that dedupes the sample times.
+
+### Limits
+Blur averages interpolation errors, it does not hide them: an artefact in a sub-frame (a ghost, a held region, a smeared occlusion) is spread over the window, softer but wider. It reduces clarity by design (the blur *is* a loss of sharpness in motion, so competitive players will often want it off, or a short shutter), and the library's usual limits apply per sub-frame (very fast motion, repetitive structures, scene cuts and flicks present the nearer real frame, so a blurred output of such a pair is an average of real frames).

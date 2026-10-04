@@ -18,6 +18,13 @@ enum class UiProtection : uint32_t {
     WholeScreen = 2,  // the box at full resolution, plus every solid static HUD element elsewhere (reduced-res detection)
 };
 
+// Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
+enum class BlurWeights : uint32_t {
+    Even = 0,       // every sub-frame 1/N: a plain box shutter
+    Gaussian = 1,   // w_k ~ exp(-2 x_k^2), x_k = (2k - (N-1)) / (N-1) in [-1, 1]: a Gaussian whose sigma is 1/4 of the
+                    // window, so the ends of the window carry exp(-2) = 13.5 % of the centre's weight
+};
+
 // Tuning knobs. The defaults are the tuned values of proto/interp.py (the approved look); with them the
 // output is byte-identical to the library without settings. Costs and mismatches are in 8-bit luma/RGB
 // levels (0-255). Interpolator::validate() states the accepted ranges; anything else is rejected.
@@ -91,6 +98,17 @@ struct Settings {
     // that frame's whole-screen mask/inpaint/patch passes are skipped on the GPU. A (nearly) static screen needs
     // no generated frame to differ from the real one, and this bounds the worst case of a paused/menu picture.
     float uiMaxStillFraction = 0.75f;
+
+    // Interpolation-based motion blur (recordSynthBlur()): one output = the weighted average of blurSamples
+    // interpolated sub-frames spread evenly over a window [t0, t1] of the current real pair, a longer, smoother
+    // "shutter" than a single instant. 0 or 1 = off (recordSynthBlur then equals recordSynth at the window's end t1).
+    // 2..kBlurMaxSamples; any value works: the sub-frames sit at t0 + (t1 - t0) k / (N - 1), k = 0..N-1 (both window
+    // ends included), with the weights of blurWeights. Runtime: setSettings() at any time; the scratch it needs (per sample one
+    // field at t and one mismatch image: ~3 B per pixel at flowScale 2, 9 B at flowScale 1) is allocated by the first
+    // blurred record and only grows. Off = byte-identical to a library without it.
+    // Cost (RX 7900 XTX, per output, on top of the pair's estimate): see "Motion blur" in INTEGRATION.md.
+    uint32_t blurSamples = 0;
+    BlurWeights blurWeights = BlurWeights::Gaussian;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
     // Motion estimation runs at 1/flowScale of the frame size: 1, 2 or 4. 2 = quality (default);
@@ -180,6 +198,26 @@ public:
     bool recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t);
     bool record(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t = 0.5f);
 
+    // ---- Motion blur ----
+    // recordSynthBlur(cb, prev, curr, out, t0, t1): out = the weighted average of Settings::blurSamples sub-frames of
+    // the latest recordEstimate's pair, at t = t0 + (t1 - t0) k / (N - 1), k = 0..N-1, with Settings::blurWeights.
+    // 0 <= t0 <= t1 <= 1 (else false). A sub-frame is exactly what recordSynth(t) would have produced (the same
+    // fallbacks per sub-frame: per pixel trust ramp, scene cut, more than globalFallback untrusted -> the nearer real
+    // frame); t <= 0 / t >= 1 is the real frame prev / curr (no synthesis, so a window ending at 1 is cheaper). Each
+    // sub-frame is rounded to 8 bit like a recordSynth output, the average is rounded once.
+    //   t0 == t1, or blur off (blurSamples < 2): one instant, t1: the same as recordSynth(t1) (t1 = 0 / 1: a copy of
+    //   prev / curr). With blur off and t0 < t1 the window collapses to its END t1: a host that centres its window
+    //   on the output's t should call recordSynth(t) itself while blur is off.
+    // Cost: the estimate is shared by every output of the pair; the per-sample work (field lookup, mismatch) is one
+    // dispatch each for all samples, one more resolves and averages them (a sub-frame is never stored) and a last one
+    // applies the whole-frame fallback if a sample needs it: 4 dispatches whatever N is (see INTEGRATION.md).
+    // UI protection: the patch is applied AFTER the average, so a protected crosshair/HUD is the exact real pixels
+    // while the world around it is blurred.
+    // Rings: takes ONE synth set (not one per sample) and the same UI sets as recordSynth. Same preconditions and
+    // refusals as recordSynth (no estimate, prev/curr not the estimate's, ring full), plus false if the scratch
+    // cannot be allocated. Like recordSynth: out in GENERAL, written by the last pass, SHADER_WRITE -> SHADER_READ barrier.
+    bool recordSynthBlur(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t0, float t1);
+
     // ---- Static UI protection (Settings::uiProtection != Off) ----
     // The library keeps, per real frame it has "observed", its own clean copy (UI inpainted out) and the
     // mask of the still pixels. recordEstimate/recordSynth then read the clean copies, and every synth ends with
@@ -220,11 +258,13 @@ public:
     // (multiply by VkPhysicalDeviceLimits::timestampPeriod for ns). Returns false if unavailable.
     // With protection on the profile also holds "ui_detect" (stillness + masks + the clean copy) and
     // "ui_inpaint" (both recorded by recordObserve; a profile opened by an observe is continued by the next
-    // recordEstimate) and "ui_patch" (the paste-back, per recordSynth).
+    // recordEstimate) and "ui_patch" (the paste-back, per recordSynth). recordSynthBlur adds "blur lookup", "blur mismatch", "blur resolve"
+    // (the average of all samples) and "blur fixup" (the whole-frame fallback check, a no-op in the normal case), then "ui_patch".
     bool readTimings(std::vector<const char*>& names, std::vector<uint64_t>& ticks);
 
     static constexpr uint32_t kSetRing = 32;
     static constexpr uint32_t kUiSets = 64;    // descriptor sets of the UI-protection passes (see above)
+    static constexpr uint32_t kBlurMaxSamples = 16;   // Settings::blurSamples upper bound
     static constexpr uint32_t kUiFrames = 3;   // observed frames kept (clean copy + mask each)
     static constexpr uint32_t kMinSize = 16;
     struct Impl;

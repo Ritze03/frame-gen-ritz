@@ -42,9 +42,10 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 | `proto/render.py` | Renders review videos (generated frames only, or the full real + generated stream) |
 | `proto/NOTES.md` | Experiment log: what was tried, measured and kept |
 | `gpu/framegen.h`, `gpu/framegen.cpp` | The Vulkan library (`framegen::Interpolator`) |
-| `gpu/shaders/*.comp` | GLSL compute passes (`ui_*.comp`: static-UI protection) |
+| `gpu/shaders/*.comp` | GLSL compute passes (`ui_*.comp`: static-UI protection, `blur_*.comp`: motion blur) |
 | `gpu/fgtest.cpp` | Test and benchmark tool for raw RGBA frame files |
 | `gpu/uitest.cpp` | Validation and benchmark of static-UI protection on a synthetic scene |
+| `gpu/blurtest.cpp`, `gpu/blendbench.comp` | Validation and benchmark of the motion blur on a synthetic scene (the shader is the naive blend the benchmark compares against) |
 | `gpu/compare.py` | GPU vs Python reference checks, and the benchmark runs |
 | `INTEGRATION.md` | Integration spec for gamescope-ritz, full API contract, settings, costs |
 | `FRAMEGEN_RESEARCH.md` | Background research on image-based frame generation |
@@ -119,6 +120,17 @@ fg.recordEstimate(cb, prevView, currView);
 fg.recordSynth(cb, prevView, currView, outView, t);   // curr must still hold the real frame: it is the patch source
 ```
 
+## Motion blur
+
+Interpolation-based motion blur, the technique of video tools such as Blur and smoothie-rs: interpolate to a high rate and average groups of sub-frames. In the library it is one primitive, `recordSynthBlur(cb, prev, curr, out, t0, t1)`: **one output image = the weighted average of `Settings::blurSamples` (2-16, any count) synthesised sub-frames at evenly spaced t in [t0, t1] of the current real pair**, with `Even` or `Gaussian` weights (`Settings::blurWeights`). Each sub-frame is exactly what `recordSynth(t)` produces, including every fallback; `t <= 0` / `t >= 1` is the real frame. Off (`blurSamples` 0 or 1) leaves every output byte-identical.
+
+- **Blur only**, no frame generation: show each real frame blurred over the end of the interval that led to it, `recordSynthBlur(prev, curr, out, 1 - s, 1)`. The newest sample is the real frame, so it needs no future frame and adds no delay.
+- **With frame generation**, M outputs per real pair at `t = m / M`: output m is blurred over the window that *ends* at its time, `recordSynthBlur(prev, curr, out, (m - s) / M, m / M)`, with the shutter `s` (<= 1) in output intervals. Also no delay; `s = 1` is a 360 degree shutter at the output rate.
+- **Per-t work is not shared** (lookup, mismatch, trust and the fallbacks depend on t); the estimate is. The library runs all samples of one output in 4 dispatches and never stores a sub-frame, so it takes one descriptor set per output: 8 outputs x 8 samples in one pair fit the 32-set ring. A sample costs about as much as one generated frame (0.03 ms at 1280x960, 0.05 at 1080p, 0.1 at 1440p).
+- **Static UI protection applies after the average**: with `uiProtection` on, a crosshair or HUD stays pixel-exact while the world around it blurs.
+- The 60 fps to 280 Hz case with 4 samples per output costs about 0.76 ms per real frame in total at 1280x960 (46 ms of GPU time per second, 4.6 %) and 2.1 ms at 1440p (12.7 %). Tables, shutter conventions and the pass breakdown are in `INTEGRATION.md`.
+- Limits: blur spreads interpolation errors instead of hiding them, and it reduces clarity by design, so competitive players will often want it off.
+
 ## Testing and benchmarking
 
 Footage is not in the repository. The tools expect 120 fps recordings: `compare.py` reads `battlefield.mp4` and `obs2.mp4` from `footage/` at the repo root (override with `FG_FOOTAGE`). The test clips were a CS2 recording made with OBS and a Battlefield clip. Work files go to `FG_WORK` (default `/tmp/fgwork`). The `fgtest` binary is `gpu/build/fgtest` unless `FGTEST` is set.
@@ -141,6 +153,15 @@ fgtest [--bgra] [--split] [--t T1,T2,..] [--bench N [--mult M]] [--set k=v,..] [
 - `--t`: generated times (default 0.5). With several values, the k-th output goes to `out.rgba.<k>`.
 - `--bench N --mult M`: benchmark N iterations, one estimate + M-1 synths per pair.
 - `--set`: `framegen::Settings` fields by name. `--then`: a `setSettings` change applied between two records (runtime-change test).
+
+`blurtest` (needs no footage) validates and benchmarks the motion blur on a synthetic scene (panning textured background, a moving object, a static crosshair):
+
+```sh
+gpu/build/blurtest check [--bgra] [W H]  # default 1280x720: blur == recordSynth for one instant, == the CPU average of the
+                                         # recordSynth sub-frames (N = 2..8), smear of the object's edge vs the ideal model,
+                                         # crosshair pixel-exact, descriptor rings, validation; prints FNV hashes of the blur-off output
+gpu/build/blurtest bench [W H]           # GPU cost: one synth, N x recordSynth (+ blend), recordSynthBlur for N = 2..8, M outputs per pair
+```
 
 `uitest` (needs no footage) validates and benchmarks static-UI protection on a synthetic sequence:
 
@@ -215,6 +236,8 @@ for (int k = 1; k < N; ++k)
 | `uiBoxOffsetX`, `uiBoxOffsetY` | 0, 0 | Box centre offset from the frame centre, pixels (+x right, +y down). The box is clamped into the frame. |
 | `uiStillFrames`, `uiStillThreshold` | 8, 3.5 | A pixel is protected after this many consecutive real frames in which no channel moved more than this many levels. |
 | `uiInpaintReach` | 12 | Walk length (1-16 px) of the inpaint. |
+| `blurSamples` | 0 | Motion blur: sub-frames averaged by `recordSynthBlur()`. 0 or 1 = off, 2-16 on (see above). Runtime. |
+| `blurWeights` | Gaussian | `Even` (1/N each) or `Gaussian` (ends of the window at 2 sigma). Runtime. |
 | `uiMaxStillFraction` | 0.75 | WholeScreen: above this still share (of cells outside the box) the whole-screen passes are skipped for that frame. 1 = never. |
 | `flowScale` | 2 | Motion estimation at 1/flowScale resolution: 1, 2 or 4. 4 is much cheaper but can miss thin, fine motion. 1 is much slower and was not better on the test clips. (structural) |
 
