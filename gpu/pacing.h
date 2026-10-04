@@ -66,17 +66,18 @@
 //
 // DELAY D, per Priority (the user's "one for low latency and one for maximum
 // smoothness"):
-//   Low latency : D = smoothed interval - o, floored at 0, plus the largest recent
-//     arrival jitter (0 for a steady game, at most 4 ms) plus the lead by which the
-//     paint wakes before its tick (at most 4 ms). At a fixed N this is
-//     (N-1)/N of a game interval. The latest interval replaces the
-//     smoothed one only when it is genuinely early or late (more than
-//     max(2 ms, 15%) off): such a frame SNAPS the content time to the new pair
-//     (latency-first rule), so uneven motion on really jittery frame times
-//     is accepted. Why the smoothed interval and the jitter margin: with D from
-//     the latest interval alone, ordinary arrival jitter (+-1 ms on a capped
-//     game) moved D from pair to pair, and a late arrival left a tick with no
-//     new real frame to show, losing an output a steady game should have had.
+//   Low latency : D = max(0, i - o) + margin, i the smoothed interval, o the output
+//     interval; margin = the 75th percentile of the arrival jitter, at most 1 ms and
+//     20% of i (0 for a steady game). At a fixed N this is (N-1)/N of a game interval.
+//     The latest interval replaces the smoothed one only when it is genuinely early
+//     or late (more than max(2 ms, 15%) off): such a frame SNAPS the content time to
+//     the new pair (latency-first rule), so uneven motion on really jittery frame
+//     times is accepted. Minimal delay is the point: there is no floor of one o and
+//     no allowance for the paint's lead, so a frame landing a little late may leave
+//     one tick repeating its output (a few % of the ticks at +-1 ms jitter). Why not
+//     the worst-case jitter + the lead + a floor (gamescope-ritz 8e806c4): they kept
+//     every tick filled but put D at 8 ms at 120-210 fps on 280 Hz, no lower than
+//     Smoothness -- "I feel like the input latency has become worse".
 //   Smoothness  : D = median interval + margin (margin = max(2 ms, the spread
 //     of recent intervals), capped at half an interval). tau advances evenly at
 //     the output rate; the pair being played may be one OLDER than the newest
@@ -237,6 +238,9 @@ namespace framegen::pacing
 	constexpr int    kMaxN            = 8;
 	// Smoothness: margin = max(kMinMarginMs, spread), at most half an interval.
 	constexpr double kMinMarginMs     = 2.0;
+	// Low latency: margin = the P75 arrival jitter, at most 1 ms and at most 20% of an interval.
+	constexpr double kLowLatencyMarginMaxMs = 1.0;
+	constexpr double kLowLatencyMarginFrac  = 0.2;
 	// Generated frames per real pair, well under the library's 32-set ring.
 	constexpr int    kMaxSynthsPerPair = 24;
 	// A synth is never made closer than this to either real frame; a newest-pair
@@ -329,10 +333,10 @@ namespace framegen::pacing
 		return n;
 	}
 
-	// The largest ORDINARY deviation from the median in v[0..n) (0 for fewer than
-	// 3): the jitter an arrival can show, which Low latency's margin covers. A
-	// deviation past max(2 ms, 15%) is a hitch and is left out.
-	inline double MaxDevOf( const double *v, int n );
+	// The TYPICAL arrival jitter of v[0..n) (0 for fewer than 3): the 75th percentile
+	// (nearest rank) of the absolute deviation from the median. Low latency's margin;
+	// a hitch or two in the window do not move it, unlike a worst-case deviation.
+	inline double P75DevOf( const double *v, int n );
 
 	// Median of v[0..n): the middle value, or the mean of the two middle ones
 	// for an even count.
@@ -345,21 +349,18 @@ namespace framegen::pacing
 		return ( n & 1 ) ? s[ n / 2 ] : 0.5 * ( s[ n / 2 - 1 ] + s[ n / 2 ] );
 	}
 
-	inline double MaxDevOf( const double *v, int n )
+	inline double P75DevOf( const double *v, int n )
 	{
 		if ( n < 3 )
 			return 0.0;
-		const double flMed = MedianOf( v, std::min( n, kIntervalWindow ) );
-		double flMax = 0.0;
-		for ( int i = 0; i < std::min( n, kIntervalWindow ); i++ )
-		{
-			// Only ordinary jitter: a deviation past the snap threshold is a hitch
-			// (a real early/late frame), which Low latency snaps to, not pads for.
-			const double flDev = std::fabs( v[ i ] - flMed );
-			if ( flDev <= std::max( 2.0, 0.15 * flMed ) )
-				flMax = std::max( flMax, flDev );
-		}
-		return flMax;
+		n = std::min( n, kIntervalWindow );
+		const double flMed = MedianOf( v, n );
+		double d[ kIntervalWindow ] = {};
+		for ( int i = 0; i < n; i++ )
+			d[ i ] = std::fabs( v[ i ] - flMed );
+		double s[ kIntervalWindow ] = {};
+		SortedCopy( d, n, s );
+		return s[ ( 3 * n + 3 ) / 4 - 1 ];     // ceil( 0.75 n ) - 1
 	}
 
 	// A robust spread of v[0..n): second-largest minus median, so one hitch in
@@ -423,21 +424,15 @@ namespace framegen::pacing
 		return std::fabs( flLatestMs - flSmoothMs ) > std::max( 2.0, 0.15 * flSmoothMs ) ? flLatestMs : flSmoothMs;
 	}
 
-	// Low latency's jitter margin: D is the (interval - o) the content lags by, which
-	// puts the real frame of a pair exactly where the NEXT real frame is expected
-	// (a steady game: the last output of a pair is the real frame, one tick
-	// later the next pair starts). An arrival later than that by even a little
-	// leaves nothing to show for that tick and the output is lost. So D carries
-	// the measured arrival jitter (the largest deviation from the median interval in the window, no floor)
-	// on top: the latency Low latency adds is 'one interval minus o plus the jitter
-	// actually seen', so a perfectly steady game pays nothing extra.
-	// The paint also wakes BEFORE the tick it is for (a tick timer's draw-time
-	// red zone, about 4 ms in a nested window): a real frame that arrives in that
-	// lead cannot be used, however close to the tick it came, so the lead counts
-	// like jitter. flLeadMs = tick time V minus the time of the paint.
-	inline double LowLatencyMarginMs( double flJitterMs, double flLeadMs = 0.0 )
+	// Low latency's jitter margin (2026-10-04, redone): the TYPICAL arrival jitter
+	// (P75DevOf), at most 1 ms and at most 20% of the interval, so a steady game pays
+	// nothing and a jittery one at most a millisecond. There is deliberately NO paint-
+	// lead term and no floor of one output interval: Low latency means minimal delay,
+	// D = max(0, i - o) + this, and a real frame that lands late may leave one tick
+	// repeating the previous image (Smoothness is the priority that never does).
+	inline double LowLatencyMarginMs( double flJitterP75Ms, double flIntervalMs )
 	{
-		return std::min( std::max( flJitterMs, 0.0 ) + std::max( flLeadMs, 0.0 ), 8.0 );
+		return std::min( std::max( flJitterP75Ms, 0.0 ), std::min( kLowLatencyMarginMaxMs, kLowLatencyMarginFrac * std::max( flIntervalMs, 0.0 ) ) );
 	}
 
 	// Smoothness: the median interval plus the margin.
@@ -594,8 +589,8 @@ namespace framegen::pacing
 
 		// Jitter of the recent intervals (SpreadOf), in milliseconds.
 		double SpreadMs() const { return SpreadOf( m_flMs, m_nCount ); }
-		// The largest deviation from the median in the window, ms.
-		double MaxDevMs() const { return MaxDevOf( m_flMs, m_nCount ); }
+		// The 75th percentile of the absolute deviation from the median, ms.
+		double JitterP75Ms() const { return P75DevOf( m_flMs, m_nCount ); }
 
 	private:
 		double m_flMs[ kIntervalWindow ] = {};
@@ -1532,14 +1527,11 @@ namespace framegen::pacing
 			const double flInterval = m_Est.IntervalMs();
 			if ( in.priority == Priority::Smoothness )
 				return SmoothnessDelayMs( flInterval, m_Est.SpreadMs() );
-			double flBase = LowLatencyDelayMs( LowLatencyIntervalMs( flInterval, m_flLastIntervalMs ), m_Plan.oMs );
-			// At a high ratio (the game just under the output rate: 1.1 .. 2) i - o is
-			// less than one output interval and no generated frame would fit between two
-			// real ones; the floor of one o makes room for at least one.
-			if ( m_Plan.oMs > 0.0 && flInterval / m_Plan.oMs >= kStartRatio )
-				flBase = std::max( flBase, m_Plan.oMs );
-			const double flLeadMs = in.presentNs > in.now ? double( in.presentNs - in.now ) / double( kNsPerMs ) : 0.0;
-			return flBase > 0.0 ? flBase + LowLatencyMarginMs( std::min( m_Est.MaxDevMs(), 4.0 ), std::min( flLeadMs, 4.0 ) ) : 0.0;
+			const double flI = LowLatencyIntervalMs( flInterval, m_flLastIntervalMs );
+			const double flBase = LowLatencyDelayMs( flI, m_Plan.oMs );
+			// i - o plus the typical jitter. No floor of one o and no paint lead: minimal
+			// delay is the point (see LowLatencyMarginMs). Zero stays zero (game at the output rate).
+			return flBase > 0.0 ? flBase + LowLatencyMarginMs( m_Est.JitterP75Ms(), flI ) : 0.0;
 		}
 
 		void Repeat( Decision &d, const Decision &last, bool bRepaintNext ) const

@@ -1614,9 +1614,12 @@ TEST_CASE( "pacing: skipping is only for a repaint nobody else asked for", "[pac
 		CHECK_FALSE( p.d.skip );
 }
 
-TEST_CASE( "pacing: Low latency delivers every output for a steady jittered game", "[pacing]" )
+
+TEST_CASE( "pacing: Low latency keeps (nearly) every tick distinct for a steady jittered game", "[pacing]" )
 {
-	// 30 fps +-1 ms, fixed 8x on 120 Hz: o = one vblank -> 120 distinct outputs/s.
+	// 30 fps +-1 ms, fixed 8x on 120 Hz: o = one vblank -> 120 distinct outputs/s at best.
+	// Low latency pays minimal delay, so a frame that lands late may leave one tick
+	// repeating (about 5% here); Smoothness is the priority that never does.
 	Driver drv;
 	drv.refreshHz = 120.0;
 	drv.multiplier = 8;
@@ -1625,7 +1628,8 @@ TEST_CASE( "pacing: Low latency delivers every output for a steady jittered game
 	REQUIRE( drv.pacer.Generating() );
 	const int nDistinct = drv.CountDistinct( 4000 * MS, 6000 * MS );
 	INFO( "distinct outputs in 2 s: " << nDistinct );
-	CHECK( std::abs( nDistinct - 240 ) <= 4 );        // 120/s
+	CHECK( nDistinct >= 216 );                        // >= 90% of 240
+	CHECK( nDistinct <= 244 );
 
 	// The same for Target 120.
 	Driver tgt;
@@ -1636,21 +1640,43 @@ TEST_CASE( "pacing: Low latency delivers every output for a steady jittered game
 	tgt.RunArrivals( JitteredArrivals( 1000.0 / 30.0, 1.0, 8000 * MS ), 8000 * MS );
 	const int nTgt = tgt.CountDistinct( 4000 * MS, 6000 * MS );
 	INFO( "target 120 distinct outputs in 2 s: " << nTgt );
-	CHECK( std::abs( nTgt - 240 ) <= 4 );
+	CHECK( nTgt >= 216 );
+	CHECK( nTgt <= 244 );
+
+	// Smoothness, same game: every tick.
+	Driver smo;
+	smo.refreshHz = 120.0;
+	smo.multiplier = 8;
+	smo.priority = Priority::Smoothness;
+	smo.skipVblanks = true;
+	smo.RunArrivals( JitteredArrivals( 1000.0 / 30.0, 1.0, 8000 * MS ), 8000 * MS );
+	CHECK( std::abs( smo.CountDistinct( 4000 * MS, 6000 * MS ) - 240 ) <= 4 );
 }
 
-TEST_CASE( "pacing: Low latency reaches the full output rate: 60 fps on 144 Hz, target = refresh", "[pacing]" )
+TEST_CASE( "pacing: Low latency, steady game: 60 fps on 144 Hz, target = refresh, >= 95% of ticks distinct", "[pacing]" )
 {
 	Driver drv;
 	drv.refreshHz = 144.0;
 	drv.mode = Mode::Target;
 	drv.targetFps = 0;
 	drv.skipVblanks = true;
-	drv.RunArrivals( JitteredArrivals( 1000.0 / 60.0, 0.5, 8000 * MS ), 8000 * MS );
+	drv.RunArrivals( Driver::Periodic( 5 * MS, 1000.0 / 60.0, 8000 * MS ), 8000 * MS );
 	REQUIRE( drv.pacer.Generating() );
 	const int nDistinct = drv.CountDistinct( 4000 * MS, 6000 * MS );
 	INFO( "distinct outputs in 2 s: " << nDistinct );
-	CHECK( std::abs( nDistinct - 288 ) <= 6 );        // 144/s
+	CHECK( nDistinct >= 274 );                        // >= 95% of 288
+	CHECK( nDistinct <= 290 );
+
+	// With 0.5 ms of arrival jitter some ticks may repeat.
+	Driver jit;
+	jit.refreshHz = 144.0;
+	jit.mode = Mode::Target;
+	jit.targetFps = 0;
+	jit.skipVblanks = true;
+	jit.RunArrivals( JitteredArrivals( 1000.0 / 60.0, 0.5, 8000 * MS ), 8000 * MS );
+	const int nJit = jit.CountDistinct( 4000 * MS, 6000 * MS );
+	INFO( "jittered distinct outputs in 2 s: " << nJit );
+	CHECK( nJit >= 259 );                             // >= 90%
 }
 
 TEST_CASE( "pacing: Low latency still snaps on a genuinely early or late frame", "[pacing]" )
@@ -1665,26 +1691,102 @@ TEST_CASE( "pacing: Low latency still snaps on a genuinely early or late frame",
 	CHECK( LowLatencyIntervalMs( 16.0, 0.0 ) == 16.0 );    // no latest interval yet
 }
 
-TEST_CASE( "pacing: Low latency covers the paint's lead before the vblank (4 ms) and arrival jitter", "[pacing]" )
+TEST_CASE( "pacing: P75DevOf is the typical jitter, not the worst", "[pacing]" )
 {
-	// The vblank timer wakes about 4 ms ahead of the vblank it paints for: a real
-	// frame arriving in that lead is only seen by the next vblank. Fixed 8x on 120 Hz
-	// must still give one output per vblank for a 30 fps +-1 ms game.
-	Driver drv;
-	drv.refreshHz = 120.0;
-	drv.multiplier = 8;
-	drv.skipVblanks = true;
-	drv.leadNs = 4 * MS;
-	drv.RunArrivals( JitteredArrivals( 1000.0 / 30.0, 1.0, 8000 * MS ), 8000 * MS );
-	REQUIRE( drv.pacer.Generating() );
-	const int nDistinct = drv.CountDistinct( 4000 * MS, 6000 * MS );
-	INFO( "distinct outputs in 2 s: " << nDistinct );
-	CHECK( std::abs( nDistinct - 240 ) <= 4 );
+	const double steady[ 8 ] = { 10, 10, 10, 10, 10, 10, 10, 10 };
+	CHECK( P75DevOf( steady, 8 ) == 0.0 );
+	// One late frame in eight does not move it (the worst-case deviation would be 1.5).
+	const double hitch[ 8 ] = { 10, 10, 10, 10, 10, 10, 10, 11.5 };
+	CHECK( P75DevOf( hitch, 8 ) == 0.0 );
+	// A genuinely jittery game does: deviations 1,0,1,0,1,1,0,0 -> the 6th smallest is 1.
+	const double jittery[ 8 ] = { 9, 10, 11, 10, 9, 11, 10, 10 };
+	CHECK( P75DevOf( jittery, 8 ) == 1.0 );
+	CHECK( P75DevOf( jittery, 2 ) == 0.0 );                 // too few samples
+}
 
-	// The margin is bounded: a perfectly steady game with no lead pays nothing extra.
-	CHECK( LowLatencyMarginMs( 0.0, 0.0 ) == 0.0 );
-	CHECK( LowLatencyMarginMs( 1.5, 4.0 ) == 5.5 );
-	CHECK( LowLatencyMarginMs( 20.0, 20.0 ) == 8.0 );
+TEST_CASE( "pacing: Low latency's margin is the typical jitter, at most 1 ms and 20% of an interval", "[pacing]" )
+{
+	CHECK( LowLatencyMarginMs( 0.0, 16.0 ) == 0.0 );        // a steady game pays nothing
+	CHECK( LowLatencyMarginMs( 0.5, 16.0 ) == 0.5 );
+	CHECK( LowLatencyMarginMs( 3.0, 16.0 ) == 1.0 );        // capped at 1 ms
+	CHECK( std::fabs( LowLatencyMarginMs( 0.8, 3.0 ) - 0.6 ) < 1e-9 );   // capped at 20% of 3 ms
+	CHECK( LowLatencyMarginMs( -1.0, 16.0 ) == 0.0 );
+}
+
+namespace
+{
+	// The mean total delay D over the new outputs in [t0, t1).
+	double MeanDelayMs( const Driver &drv, Ns t0, Ns t1 )
+	{
+		double sum = 0.0;
+		int n = 0;
+		for ( const Painted &p : drv.log )
+			if ( p.t >= t0 && p.t < t1 && p.d.newOutput )
+			{
+				sum += p.delayMs;
+				n++;
+			}
+		return n ? sum / n : 0.0;
+	}
+
+	Driver Run280( double gameFps, double jitterMs, Priority prio, Ns leadNs = 0 )
+	{
+		Driver drv;
+		drv.refreshHz = 280.0;
+		drv.mode = Mode::Target;
+		drv.targetFps = 0;
+		drv.priority = prio;
+		drv.skipVblanks = true;
+		drv.leadNs = leadNs;
+		drv.RunArrivals( JitteredArrivals( 1000.0 / gameFps, jitterMs, 8000 * MS ), 8000 * MS );
+		return drv;
+	}
+}
+
+TEST_CASE( "pacing: Low latency adds about i - o (+ typical jitter) at 120 / 160 / 210 fps on 280 Hz, well below Smoothness", "[pacing]" )
+{
+	// The user's CS2 session ("I feel like the input latency has become worse"): Low
+	// latency measured 7.9-9.2 ms, no lower than Smoothness's 7.7-8.7.
+	for ( double fps : { 120.0, 160.0, 210.0 } )
+	{
+		const double flI = 1000.0 / fps, flO = 1000.0 / 280.0;
+		Driver low = Run280( fps, 1.0, Priority::LowLatency );
+		Driver smo = Run280( fps, 1.0, Priority::Smoothness );
+		REQUIRE( low.pacer.Generating() );
+		const double dLow = MeanDelayMs( low, 4000 * MS, 6000 * MS );
+		const double dSmo = MeanDelayMs( smo, 4000 * MS, 6000 * MS );
+		INFO( fps << " fps: i - o " << flI - flO << " ms, Low latency D " << dLow << " ms, Smoothness D " << dSmo << " ms" );
+		CHECK( dLow <= ( flI - flO ) + 1.5 );
+		CHECK( dLow >= ( flI - flO ) - 0.01 );               // no floor, but never below i - o either
+		CHECK( dLow + 3.0 <= dSmo );
+		// No floor of one output interval: at 210 fps D is below one tick (3.57 ms).
+		if ( fps >= 210.0 )
+			CHECK( dLow < flO );
+	}
+
+	// A steady 60 fps on 144 Hz: exactly i - o, no margin at all.
+	Driver s60;
+	s60.refreshHz = 144.0;
+	s60.mode = Mode::Target;
+	s60.targetFps = 0;
+	s60.skipVblanks = true;
+	s60.RunArrivals( Driver::Periodic( 5 * MS, 1000.0 / 60.0, 8000 * MS ), 8000 * MS );
+	CHECK( std::fabs( MeanDelayMs( s60, 4000 * MS, 6000 * MS ) - ( 1000.0 / 60.0 - 1000.0 / 144.0 ) ) < 0.05 );
+}
+
+TEST_CASE( "pacing: Low latency's D does not grow with the paint's lead before the vblank", "[pacing]" )
+{
+	// The lead used to be added to D (it kept every tick filled). Low latency now
+	// leaves it out on purpose: minimal delay is the priority, and a frame landing
+	// inside the lead is simply seen one tick later.
+	const double flI = 1000.0 / 160.0, flO = 1000.0 / 280.0;
+	for ( Ns lead : { Ns( 0 ), 2 * MS, 4 * MS } )
+	{
+		Driver low = Run280( 160.0, 1.0, Priority::LowLatency, lead );
+		const double d = MeanDelayMs( low, 4000 * MS, 6000 * MS );
+		INFO( "lead " << lead / MS << " ms: D " << d << " ms" );
+		CHECK( d <= ( flI - flO ) + 1.5 );
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1693,9 +1795,12 @@ TEST_CASE( "pacing: Low latency covers the paint's lead before the vblank (4 ms)
 
 namespace
 {
-	// Target = refresh at 280 Hz: the presented rate must reach (nearly) the
-	// refresh and never fall below the game's own rate, whatever the jitter.
-	void CheckHighRatio( double gameFps, Priority prio, Ns leadNs, double jitterMs, bool bGenerates )
+	// Target = refresh at 280 Hz. Smoothness: the presented rate never falls below the
+	// game's own. Low latency (minimal delay): a late frame may repeat one tick, so the
+	// output rate is only required to stay near the refresh (nMinOut) -- but with the
+	// vblank seeing every arrival (lead 0) it still never falls below the game's rate,
+	// and real frames are still shown (the renderer shows the real frame itself, t = 1).
+	void CheckHighRatio( double gameFps, Priority prio, Ns leadNs, double jitterMs, int nMinOut, double flMinGameShare = 1.0 )
 	{
 		Driver drv;
 		drv.refreshHz = 280.0;
@@ -1711,33 +1816,46 @@ namespace
 		for ( Ns a : arr )
 			nGame += ( a >= t0 && a < t1 ) ? 1 : 0;
 		const int nOut = drv.CountOutputs( t0, t1 );
-		INFO( "game " << gameFps << " fps, prio " << int( prio ) << ", lead " << leadNs / MS << " ms: arrivals " << nGame
+		INFO( "game " << gameFps << " fps, prio " << int( prio ) << ", lead " << leadNs / MS << " ms, jitter " << jitterMs << " ms: arrivals " << nGame
 			<< " / 2 s, outputs " << nOut << " / 2 s, generating " << drv.pacer.Generating() );
-		CHECK( nOut >= nGame );                         // never fewer than the game
-		if ( bGenerates )
+		CHECK( double( nOut ) >= flMinGameShare * double( nGame ) );
+		if ( nMinOut > 0 )
 		{
 			REQUIRE( drv.pacer.Generating() );
-			CHECK( nOut >= 540 );                       // >= 270/s
+			CHECK( nOut >= nMinOut );
 		}
 	}
 }
 
 TEST_CASE( "pacing: 212 fps on 280 Hz, target = refresh, Low latency never presents fewer than the game", "[pacing]" )
 {
-	CheckHighRatio( 212.0, Priority::LowLatency, 0, 1.0, true );
-	CheckHighRatio( 212.0, Priority::LowLatency, 2 * MS, 1.0, true );
-	CheckHighRatio( 212.0, Priority::LowLatency, 0, 0.0, true );
-	CheckHighRatio( 212.0, Priority::LowLatency, 0, 2.0, true );
-	CheckHighRatio( 212.0, Priority::LowLatency, 2 * MS, 2.0, true );
+	// Steady and +-1 ms: >= 97% of the 280 Hz ticks carry an output (the rest repeat).
+	CheckHighRatio( 212.0, Priority::LowLatency, 0, 0.0, 540 );
+	CheckHighRatio( 212.0, Priority::LowLatency, 0, 1.0, 540 );
+	// +-2 ms is worse than the game's own interval spread: >= 90% of the ticks.
+	CheckHighRatio( 212.0, Priority::LowLatency, 0, 2.0, 500 );
+	// A 2 ms paint lead hides frames that land in it: the count can dip a little under
+	// the game's (measured 421 / 424 and 416 / 424), never more than 3%.
+	CheckHighRatio( 212.0, Priority::LowLatency, 2 * MS, 1.0, 0, 0.97 );
+	CheckHighRatio( 212.0, Priority::LowLatency, 2 * MS, 2.0, 0, 0.97 );
 }
 
 TEST_CASE( "pacing: 234 fps on 280 Hz, target = refresh, Smoothness never presents fewer than the game", "[pacing]" )
 {
-	CheckHighRatio( 234.0, Priority::Smoothness, 0, 0.5, false );
-	CheckHighRatio( 234.0, Priority::Smoothness, 2 * MS, 0.5, false );
-	CheckHighRatio( 234.0, Priority::Smoothness, 0, 0.0, false );
-	CheckHighRatio( 234.0, Priority::Smoothness, 0, 1.5, false );
-	CheckHighRatio( 234.0, Priority::Smoothness, 2 * MS, 1.5, false );
+	CheckHighRatio( 234.0, Priority::Smoothness, 0, 0.5, 0 );
+	CheckHighRatio( 234.0, Priority::Smoothness, 2 * MS, 0.5, 0 );
+	CheckHighRatio( 234.0, Priority::Smoothness, 0, 0.0, 0 );
+	CheckHighRatio( 234.0, Priority::Smoothness, 0, 1.5, 0 );
+	CheckHighRatio( 234.0, Priority::Smoothness, 2 * MS, 1.5, 0 );
+}
+
+TEST_CASE( "pacing: Smoothness keeps the output rate and never presents fewer than the game whatever the paint's lead", "[pacing]" )
+{
+	// Smoothness's D >= one interval already clears any lead, so the paint-lead logic
+	// that Low latency used to carry is not needed there.
+	CheckHighRatio( 212.0, Priority::Smoothness, 4 * MS, 1.0, 540 );
+	CheckHighRatio( 212.0, Priority::Smoothness, 4 * MS, 2.0, 500 );      // measured 538
+	CheckHighRatio( 120.0, Priority::Smoothness, 4 * MS, 1.0, 540 );
 }
 
 // ---------------------------------------------------------------------------
