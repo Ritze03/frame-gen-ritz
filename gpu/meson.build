@@ -25,3 +25,7 @@ framegen_dep = declare_dependency(link_with : framegen_lib, include_directories 
 executable('fgtest', 'fgtest.cpp', dependencies : [framegen_dep, vulkan])
 
 executable('uitest', 'uitest.cpp', dependencies : [framegen_dep, vulkan])
+
+# CPU-only: frame-generation pacing (pacing.h) and the motion-blur window. No GPU, no Vulkan.
+pacingtest = executable('pacingtest', 'pacingtest.cpp')
+test('pacing', pacingtest)

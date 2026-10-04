@@ -2,7 +2,7 @@
 
 FrameGen is an image-only frame interpolation library, similar in kind to Lossless Scaling's LSFG or AMD AFMF. It sees only finished frames, with no motion vectors or depth from the game. From two real frames it generates the frames in between, for 2x, 3x or 4x the base frame rate. It is a set of Vulkan compute shaders behind a small C++ API, plus the Python/NumPy reference implementation it was ported from.
 
-It was written for gamescope-ritz, a gamescope fork. There it is meant to run as a compute pass on the game's layer-0 image, before scaling and before the overlay layers (Steam overlay, cursor, performance HUD) are composited on top, so those are never interpolated. This repository contains only the library. The gamescope side (when the extra frames are presented, vblank/VRR pacing) is built separately in gamescope-ritz. `INTEGRATION.md` is the spec for that integration.
+It was written for gamescope-ritz, a gamescope fork. There it is meant to run as a compute pass on the game's layer-0 image, before scaling and before the overlay layers (Steam overlay, cursor, performance HUD) are composited on top, so those are never interpolated. This repository contains only the library. The pacing decisions (which frame to show when, when to turn generation off) live here too, in `gpu/pacing.h`. The gamescope side is only the glue that feeds the pacer and presents what it decides. `INTEGRATION.md` is the spec for that integration.
 
 FrameGen is original code. It is not derived from LSFG, lsfg-vk or FidelityFX source. `FRAMEGEN_RESEARCH.md` holds background research on how such tools work.
 
@@ -42,6 +42,8 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 | `proto/render.py` | Renders review videos (generated frames only, or the full real + generated stream) |
 | `proto/NOTES.md` | Experiment log: what was tried, measured and kept |
 | `gpu/framegen.h`, `gpu/framegen.cpp` | The Vulkan library (`framegen::Interpolator`) |
+| `gpu/pacing.h` | Host-agnostic pacing: which frame to show when, pass-through, cost guard, motion-blur window (`framegen::pacing`, header-only, no Vulkan) |
+| `gpu/pacingtest.cpp`, `gpu/minitest.h` | CPU-only tests of the pacing header (`meson test`), with a tiny Catch2 stand-in |
 | `gpu/shaders/*.comp` | GLSL compute passes (`ui_*.comp`: static-UI protection) |
 | `gpu/fgtest.cpp` | Test and benchmark tool for raw RGBA frame files |
 | `gpu/uitest.cpp` | Validation and benchmark of static-UI protection on a synthetic scene |
@@ -220,6 +222,29 @@ for (int k = 1; k < N; ++k)
 
 `INTEGRATION.md` lists the accepted ranges, the measured cost of each setting, and a suggested user-facing subset.
 
+## Pacing
+
+`gpu/pacing.h` (`framegen::pacing`, header-only, no Vulkan, no OS calls, times passed in as nanoseconds) decides **which frame to show at which moment and whether to generate at all**, so a host only builds its GUI and platform glue. The host feeds it real-frame arrivals (`OnArrival`) and one paint per present tick (`OnPaint`), and applies each `Decision`: show the real frame, or synthesise at `t` between `prevId` and `currId` (`Interpolator::recordSynth`), reset the renderer, skip the tick, or paint again. gamescope-ritz is the reference host.
+
+```cpp
+pacing::Pacer pacer;
+pacer.OnArrival(frameId, fenceSignalNs, windowId, {w, h, fmt});            // a real frame is usable
+pacing::Pacer::Inputs in;  in.now = nowNs;  in.presentNs = predictedPresentNs;
+in.mode = pacing::Mode::Fixed;  in.multiplier = 3;  in.refreshHz = 144.0;  // ... see INTEGRATION.md
+const auto d = pacer.OnPaint(in, newestFrameId, /*bPresentTick*/ true);     // per present tick
+if (d.t >= 1.0f || d.inert) { /* show the real frame d.newestId */ }
+else                        { /* recordSynth(cb, prev(d.prevId), curr(d.currId), out, d.t) */ }
+```
+
+- **Per-tick fractional pacing**: every output frame is generated for its own content time `tau = V - D` between the two newest real frames. No multiplier is chosen or held; a fixed N sets only the output interval and saturates at the refresh, and a game that speeds up or slows down is followed on the very next pair.
+- **Modes**: fixed N (2x-8x) or a target fps; **Low latency** (the pair is the newest, the delay is the smoothed interval minus the output interval plus the measured jitter) or **Smoothness** (about one game frame queued, never hitches on a late frame).
+- **Pause at refresh rate**: on, the output is capped at the refresh and generation stops once the game reaches it; off, the cap is gone and `ExtraTimer()` asks the host to paint on its own timer. `Inputs::canExceedRefresh` is a host capability: where a present between ticks cannot be shown, off behaves as on.
+- **GPU limit**: generation may use at most 25% of a game interval; otherwise the output rate is lowered, then it passes through, with a probe every 10 s. A switch turns it off.
+- **Pass-through** (real frame, renderer inert) only when the game reaches the output rate (a ratio band, 1.02 / 1.10), the renderer is unavailable, or the cost guard trips. **Resets** on a new stream, a format change, a gap over 100 ms, or `Discontinuity()`.
+- **Blur window**: `BlurWindow(t, outputIntervalNs, gameIntervalNs, amount, BlurRelative, BlurAnchor)` returns the `[t0, t1]` span of the pair for the motion-blur pass (`recordSynthBlur`): trailing for blur without interpolation, centred with it, `amount` 0..1 of the output or game interval, clamped to the pair.
+
+`INTEGRATION.md` has the full host contract, every field, a minimal loop and the reasoning behind each rule. `meson test -C <build> pacing` runs the CPU-only tests (`gpu/pacingtest.cpp`).
+
 ## Limitations
 
 - 8-bit UNORM RGBA/BGRA only. There is no HDR or 10-bit support, so the caller must skip frame generation or convert first.
@@ -228,7 +253,7 @@ for (int k = 1; k < N; ++k)
 - Very fast flicks below the whole-frame fallback threshold can show seams between warped and held regions.
 - Interpolation adds latency, because a generated frame needs the next real frame.
 - At a low base frame rate (3x, 4x) motion between real frames is larger, so fallbacks are more frequent.
-- Presentation pacing is the caller's job. The library only produces the frames.
+- Presentation is the caller's job. `gpu/pacing.h` decides the schedule (which frame at which time), the caller owns the clock, the display and the actual present.
 
 ## License
 
