@@ -1145,32 +1145,33 @@ namespace framegen::pacing
 	// span [t0, t1] of the pair's own timeline (0 = the previous real frame, 1 = the
 	// newest), the arguments of the renderer's
 	//     recordSynthBlur( cb, prev, curr, out, t0, t1 )
-	// (the motion-blur pass of framegen::Interpolator; prev/curr are the pair the
-	// output is made from, i.e. Decision::prevId/currId, or, when the real frame
-	// itself is being shown (Decision::t == 1), the previous real frame and the
-	// newest one). This function only does the arithmetic, so the host's blur logic
-	// is the same in every host.
+	// (the interpolation-based motion-blur pass of framegen::Interpolator; prev/curr
+	// are the pair the output is made from, i.e. Decision::prevId/currId, or, when the
+	// real frame itself is shown (Decision::t == 1), the previous real frame and the
+	// newest one). pacing.h does not depend on that pass; this function only does the
+	// arithmetic, so every host's blur logic is the same.
 	//
-	// The blur amount is a fraction of one interval, like a camera's shutter angle:
-	//   Relative::ShownFrame -- of the OUTPUT interval o (the time one displayed
-	//                           frame is on screen; "180 degrees" = 0.5);
-	//   Relative::GameFrame  -- of the GAME interval (the time between two real
-	//                           frames). The same amount blurs the same stretch of
-	//                           game motion whatever the output rate is.
-	// and the window is that long in time, then turned into a fraction s of the pair
-	// (s = width / game interval; the pair spans one game interval):
-	//   Anchor::Trailing -- [t - s, t]: the blur looks BACK from the shown instant.
-	//                       Blur without interpolation: t = 1 (the real frame), so
-	//                       [1 - s, 1], and nothing is delayed to make room for it.
-	//   Anchor::Centered -- [t - s/2, t + s/2]: the window straddles the generated
-	//                       instant, as it does with interpolation, where the later
-	//                       half of the window already exists as the next frame.
-	// Both ends are clamped to [0, 1] (the window never leaves the pair, it shortens
-	// at an edge instead of moving: a Centered window at t = 1 is [1 - s/2, 1]).
-	// amount <= 0 (or an unusable game interval) is a point, t0 == t1 == clamp(t):
-	// no blur. t is clamped first; NaN counts as 0.
+	// The window always ENDS at the instant the output shows (t): a trailing shutter.
+	// It needs no future frame, so it adds no delay -- a centred window would need
+	// the NEXT pair for the output that is the real frame itself (t = 1). It never
+	// leaves [0, 1]. `amount` is the shutter, 0..1 (clamped), by what it is measured in:
+	//
+	//   Relative::ShownFrame -- in OUTPUT intervals (the time one displayed frame is
+	//     on screen). The window is [t - s*o/g, t] with o the output interval and g
+	//     the game interval, i.e. for output m of M per real pair (t = m/M, o/g = 1/M)
+	//     [(m - s)/M, m/M]; s = 1 tiles the pair exactly, s = 0.5 is a 180 degree
+	//     shutter. Blur only (no interpolation, o = g, t = 1): [1 - s, 1]. A host whose
+	//     t does not sit on m/M (a fractional cadence) gets the lower end clamped at 0:
+	//     the window is cut at the pair's start, never moved.
+	//   Relative::GameFrame  -- in REAL-frame intervals: the "film look", a shutter as
+	//     long as a camera at the game's own rate. Window [a, a + L], L = amount,
+	//     a = clamp(t - L, 0, 1 - L): the length is kept and the window is slid into
+	//     the pair (for t < L it looks slightly ahead of t, and neighbouring outputs'
+	//     windows overlap). The intervals are not used.
+	//
+	// amount <= 0 (or NaN), or an unusable interval for ShownFrame, is a point,
+	// t0 == t1 == clamp(t): no blur. t is clamped first; NaN counts as 0.
 	enum class BlurRelative : uint8_t { ShownFrame, GameFrame };
-	enum class BlurAnchor : uint8_t { Trailing, Centered };
 
 	struct BlurSpan
 	{
@@ -1178,23 +1179,25 @@ namespace framegen::pacing
 		float t1 = 0.0f;
 	};
 
-	inline BlurSpan BlurWindow( double t, double outputIntervalNs, double gameIntervalNs, double amount,
-		BlurRelative eRelative, BlurAnchor eAnchor )
+	inline BlurSpan BlurWindow( double t, double outputIntervalNs, double gameIntervalNs, double amount, BlurRelative eRelative )
 	{
 		auto Clamp01 = []( double v ) { return v != v ? 0.0 : std::min( std::max( v, 0.0 ), 1.0 ); };
 		const double flT = Clamp01( t );
 		BlurSpan w;
 		w.t0 = w.t1 = float( flT );
-		if ( !( amount > 0.0 ) || !( gameIntervalNs > 0.0 ) )
+		if ( !( amount > 0.0 ) )
 			return w;
-		const double flInterval = eRelative == BlurRelative::ShownFrame ? outputIntervalNs : gameIntervalNs;
-		if ( !( flInterval > 0.0 ) )
+		const double flS = std::min( amount, 1.0 );
+		if ( eRelative == BlurRelative::GameFrame )
+		{
+			const double flA = std::min( std::max( flT - flS, 0.0 ), 1.0 - flS );
+			w.t0 = float( flA );
+			w.t1 = float( flA + flS );
 			return w;
-		const double flWidth = std::min( amount, 1.0 ) * flInterval / gameIntervalNs;   // fraction of the pair
-		const double flBack = eAnchor == BlurAnchor::Trailing ? flWidth : 0.5 * flWidth;
-		const double flFwd = eAnchor == BlurAnchor::Trailing ? 0.0 : 0.5 * flWidth;
-		w.t0 = float( Clamp01( flT - flBack ) );
-		w.t1 = float( Clamp01( flT + flFwd ) );
+		}
+		if ( !( outputIntervalNs > 0.0 ) || !( gameIntervalNs > 0.0 ) )
+			return w;
+		w.t0 = float( Clamp01( flT - flS * outputIntervalNs / gameIntervalNs ) );
 		return w;
 	}
 }

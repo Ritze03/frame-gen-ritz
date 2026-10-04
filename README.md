@@ -241,7 +241,7 @@ else                        { /* recordSynth(cb, prev(d.prevId), curr(d.currId),
 - **Pause at refresh rate**: on, the output is capped at the refresh and generation stops once the game reaches it; off, the cap is gone and `ExtraTimer()` asks the host to paint on its own timer. `Inputs::canExceedRefresh` is a host capability: where a present between ticks cannot be shown, off behaves as on.
 - **GPU limit**: generation may use at most 25% of a game interval; otherwise the output rate is lowered, then it passes through, with a probe every 10 s. A switch turns it off.
 - **Pass-through** (real frame, renderer inert) only when the game reaches the output rate (a ratio band, 1.02 / 1.10), the renderer is unavailable, or the cost guard trips. **Resets** on a new stream, a format change, a gap over 100 ms, or `Discontinuity()`.
-- **Blur window**: `BlurWindow(t, outputIntervalNs, gameIntervalNs, amount, BlurRelative, BlurAnchor)` returns the `[t0, t1]` span of the pair for the motion-blur pass (`recordSynthBlur`): trailing for blur without interpolation, centred with it, `amount` 0..1 of the output or game interval, clamped to the pair.
+- **Blur window**: `BlurWindow(t, outputIntervalNs, gameIntervalNs, amount, BlurRelative)` returns the `[t0, t1]` span of the pair for the motion-blur pass (`recordSynthBlur`). Always a trailing window that ends at the shown instant (no future frame, no added delay): `[(m - s)/M, m/M]` for an output shutter `s` in output intervals, or the film look `[a, a + L]` in real-frame intervals; clamped to the pair.
 
 `INTEGRATION.md` has the full host contract, every field, a minimal loop and the reasoning behind each rule. `meson test -C <build> pacing` runs the CPU-only tests (`gpu/pacingtest.cpp`).
 

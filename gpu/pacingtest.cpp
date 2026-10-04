@@ -1721,115 +1721,126 @@ TEST_CASE( "pacing: 234 fps on 280 Hz, target = refresh, Smoothness never presen
 }
 
 // ---------------------------------------------------------------------------
-//  Motion-blur window
+//  Motion-blur window (trailing shutter: the window ends at the shown instant)
 // ---------------------------------------------------------------------------
 
 namespace
 {
 	constexpr double kOut = 8.0e6;     // output interval: 8 ms (125 Hz)
-	constexpr double kGame = 32.0e6;   // game interval: 32 ms (a pair spans 4 outputs)
+	constexpr double kGame = 32.0e6;   // game interval: 32 ms (a pair spans 4 outputs, M = 4)
 	constexpr float kEps = 1e-6f;
 
 	bool Near( float a, float b ) { return std::fabs( a - b ) < kEps; }
 }
 
-TEST_CASE( "pacing: blur window, trailing on a real frame is [1 - s, 1]", "[pacing][blur]" )
+TEST_CASE( "pacing: blur window, blur only is [1 - s, 1]", "[pacing][blur]" )
 {
-	// Blur only (no interpolation): the real frame is shown (t = 1), nothing is delayed.
-	const BlurSpan w = BlurWindow( 1.0, kOut, kGame, 0.5, BlurRelative::GameFrame, BlurAnchor::Trailing );
-	CHECK( Near( w.t0, 0.5f ) );
-	CHECK( Near( w.t1, 1.0f ) );
-	const BlurSpan f = BlurWindow( 1.0, kOut, kGame, 1.0, BlurRelative::GameFrame, BlurAnchor::Trailing );
-	CHECK( Near( f.t0, 0.0f ) );
-	CHECK( Near( f.t1, 1.0f ) );
-}
-
-TEST_CASE( "pacing: blur window, centred straddles the generated instant", "[pacing][blur]" )
-{
-	const BlurSpan w = BlurWindow( 0.5, kOut, kGame, 0.4, BlurRelative::GameFrame, BlurAnchor::Centered );
-	CHECK( Near( w.t0, 0.3f ) );
-	CHECK( Near( w.t1, 0.7f ) );
-	// the same width trailing ends at t
-	const BlurSpan tr = BlurWindow( 0.5, kOut, kGame, 0.4, BlurRelative::GameFrame, BlurAnchor::Trailing );
-	CHECK( Near( tr.t0, 0.1f ) );
-	CHECK( Near( tr.t1, 0.5f ) );
-}
-
-TEST_CASE( "pacing: blur window, shown-frame vs game-frame relative", "[pacing][blur]" )
-{
-	// Shown-frame: amount of the OUTPUT interval, turned into a share of the pair (8/32 = 0.25).
-	const BlurSpan s = BlurWindow( 0.5, kOut, kGame, 1.0, BlurRelative::ShownFrame, BlurAnchor::Centered );
-	CHECK( Near( s.t0, 0.375f ) );
-	CHECK( Near( s.t1, 0.625f ) );
-	const BlurSpan s2 = BlurWindow( 0.5, kOut, kGame, 0.5, BlurRelative::ShownFrame, BlurAnchor::Trailing );
-	CHECK( Near( s2.t0, 0.5f - 0.125f ) );
-	CHECK( Near( s2.t1, 0.5f ) );
-	// Game-frame: amount of the game interval, whatever the output rate.
-	const BlurSpan g = BlurWindow( 0.5, kOut, kGame, 1.0, BlurRelative::GameFrame, BlurAnchor::Centered );
-	CHECK( Near( g.t0, 0.0f ) );
+	// No interpolation: the real frame is shown (t = 1), output interval = game interval.
+	{
+		const BlurRelative r = BlurRelative::ShownFrame;
+		const BlurSpan h = BlurWindow( 1.0, kGame, kGame, 0.5, r );
+		CHECK( Near( h.t0, 0.5f ) );
+		CHECK( Near( h.t1, 1.0f ) );
+		const BlurSpan f = BlurWindow( 1.0, kGame, kGame, 1.0, r );
+		CHECK( Near( f.t0, 0.0f ) );
+		CHECK( Near( f.t1, 1.0f ) );
+	}
+	// The film look at t = 1 is the same window.
+	const BlurSpan g = BlurWindow( 1.0, kGame, kGame, 0.5, BlurRelative::GameFrame );
+	CHECK( Near( g.t0, 0.5f ) );
 	CHECK( Near( g.t1, 1.0f ) );
-	const BlurSpan g2 = BlurWindow( 0.5, 2.0 * kOut, kGame, 0.5, BlurRelative::GameFrame, BlurAnchor::Trailing );
-	const BlurSpan g3 = BlurWindow( 0.5, 0.5 * kOut, kGame, 0.5, BlurRelative::GameFrame, BlurAnchor::Trailing );
-	CHECK( Near( g2.t0, g3.t0 ) );                       // independent of the output interval
-	CHECK( Near( g2.t1, g3.t1 ) );
-	// Shown-frame at the output interval equal to the game interval equals game-frame.
-	const BlurSpan e1 = BlurWindow( 0.7, kGame, kGame, 0.3, BlurRelative::ShownFrame, BlurAnchor::Centered );
-	const BlurSpan e2 = BlurWindow( 0.7, kGame, kGame, 0.3, BlurRelative::GameFrame, BlurAnchor::Centered );
-	CHECK( Near( e1.t0, e2.t0 ) );
-	CHECK( Near( e1.t1, e2.t1 ) );
+}
+
+TEST_CASE( "pacing: blur window with interpolation is [(m - s)/M, m/M], s = 1 tiles the pair", "[pacing][blur]" )
+{
+	const int M = 4;
+	for ( double s : { 0.25, 0.5, 1.0 } )
+		for ( int m = 1; m <= M; m++ )
+		{
+			const BlurSpan w = BlurWindow( double( m ) / M, kOut, kGame, s, BlurRelative::ShownFrame );
+			INFO( "s " << s << " m " << m );
+			CHECK( Near( w.t0, float( ( m - s ) / M ) ) );
+			CHECK( Near( w.t1, float( double( m ) / M ) ) );
+		}
+	// s = 1: neighbouring windows meet end to start (the pair is tiled exactly).
+	for ( int m = 1; m < M; m++ )
+		CHECK( Near( BlurWindow( double( m ) / M, kOut, kGame, 1.0, BlurRelative::ShownFrame ).t1,
+			BlurWindow( double( m + 1 ) / M, kOut, kGame, 1.0, BlurRelative::ShownFrame ).t0 ) );
+	// the window ends at the shown instant, never past it (no future frame needed)
+	CHECK( Near( BlurWindow( 0.3, kOut, kGame, 1.0, BlurRelative::ShownFrame ).t1, 0.3f ) );
+}
+
+TEST_CASE( "pacing: blur window, shown-frame length follows the output interval", "[pacing][blur]" )
+{
+	// Shown-frame: the same amount is a longer stretch of the pair at a lower output rate.
+	const BlurSpan a = BlurWindow( 0.8, kOut, kGame, 1.0, BlurRelative::ShownFrame );
+	const BlurSpan b = BlurWindow( 0.8, 2.0 * kOut, kGame, 1.0, BlurRelative::ShownFrame );
+	CHECK( Near( a.t1 - a.t0, 0.25f ) );
+	CHECK( Near( b.t1 - b.t0, 0.5f ) );
+}
+
+TEST_CASE( "pacing: blur window, the film look is [a, a + L] with a = clamp(t - L, 0, 1 - L)", "[pacing][blur]" )
+{
+	// Far enough into the pair: plain trailing.
+	const BlurSpan a = BlurWindow( 0.9, kOut, kGame, 0.5, BlurRelative::GameFrame );
+	CHECK( Near( a.t0, 0.4f ) );
+	CHECK( Near( a.t1, 0.9f ) );
+	// Near the start: the length is kept and the window is slid into the pair.
+	const BlurSpan b = BlurWindow( 0.25, kOut, kGame, 0.5, BlurRelative::GameFrame );
+	CHECK( Near( b.t0, 0.0f ) );
+	CHECK( Near( b.t1, 0.5f ) );
+	// L = 1 is the whole pair, whatever t.
+	const BlurSpan c = BlurWindow( 0.4, kOut, kGame, 1.0, BlurRelative::GameFrame );
+	CHECK( Near( c.t0, 0.0f ) );
+	CHECK( Near( c.t1, 1.0f ) );
+	// independent of the intervals
+	const BlurSpan d = BlurWindow( 0.9, 0.0, 0.0, 0.5, BlurRelative::GameFrame );
+	CHECK( Near( d.t0, 0.4f ) );
+	CHECK( Near( d.t1, 0.9f ) );
 }
 
 TEST_CASE( "pacing: blur window is clamped to the pair", "[pacing][blur]" )
 {
-	// Near 0: a trailing window is cut at 0, not shifted.
-	const BlurSpan a = BlurWindow( 0.1, kOut, kGame, 0.5, BlurRelative::GameFrame, BlurAnchor::Trailing );
+	// Shown-frame at a t that is not on m/M: cut at 0, not moved.
+	const BlurSpan a = BlurWindow( 0.1, kOut, kGame, 1.0, BlurRelative::ShownFrame );
 	CHECK( Near( a.t0, 0.0f ) );
 	CHECK( Near( a.t1, 0.1f ) );
-	// Near 1: a centred window is cut at 1.
-	const BlurSpan b = BlurWindow( 0.9, kOut, kGame, 0.5, BlurRelative::GameFrame, BlurAnchor::Centered );
-	CHECK( Near( b.t0, 0.65f ) );
-	CHECK( Near( b.t1, 1.0f ) );
-	// A centred window ON the real frame (t = 1).
-	const BlurSpan c = BlurWindow( 1.0, kOut, kGame, 0.5, BlurRelative::GameFrame, BlurAnchor::Centered );
-	CHECK( Near( c.t0, 0.75f ) );
-	CHECK( Near( c.t1, 1.0f ) );
 	// Out-of-range t, an oversized amount and an output interval above the game interval all stay inside [0, 1].
 	for ( double t : { -1.0, 0.0, 0.5, 1.0, 2.0 } )
 		for ( double amount : { 0.0, 0.25, 1.0, 5.0 } )
 			for ( double out : { 0.5 * kGame, kGame, 3.0 * kGame } )
 				for ( BlurRelative rel : { BlurRelative::ShownFrame, BlurRelative::GameFrame } )
-					for ( BlurAnchor anchor : { BlurAnchor::Trailing, BlurAnchor::Centered } )
-					{
-						const BlurSpan w = BlurWindow( t, out, kGame, amount, rel, anchor );
-						INFO( "t " << t << " amount " << amount << " out " << out );
-						CHECK( w.t0 >= 0.0f );
-						CHECK( w.t1 <= 1.0f );
-						CHECK( w.t0 <= w.t1 );
-					}
+				{
+					const BlurSpan w = BlurWindow( t, out, kGame, amount, rel );
+					INFO( "t " << t << " amount " << amount << " out " << out );
+					CHECK( w.t0 >= 0.0f );
+					CHECK( w.t1 <= 1.0f );
+					CHECK( w.t0 <= w.t1 );
+					CHECK( w.t1 <= std::max( 0.0f, std::min( float( t ), 1.0f ) ) + 1e-6f || rel == BlurRelative::GameFrame );
+				}
 }
 
 TEST_CASE( "pacing: blur window, amount 0 is a point", "[pacing][blur]" )
 {
-	for ( BlurAnchor anchor : { BlurAnchor::Trailing, BlurAnchor::Centered } )
-		for ( BlurRelative rel : { BlurRelative::ShownFrame, BlurRelative::GameFrame } )
-		{
-			const BlurSpan w = BlurWindow( 0.37, kOut, kGame, 0.0, rel, anchor );
-			CHECK( Near( w.t0, 0.37f ) );
-			CHECK( Near( w.t1, 0.37f ) );
-		}
+	for ( BlurRelative rel : { BlurRelative::ShownFrame, BlurRelative::GameFrame } )
+	{
+		const BlurSpan w = BlurWindow( 0.37, kOut, kGame, 0.0, rel );
+		CHECK( Near( w.t0, 0.37f ) );
+		CHECK( Near( w.t1, 0.37f ) );
+	}
 	// Unusable intervals (no estimate yet) degrade to a point as well, never NaN.
-	const BlurSpan z = BlurWindow( 1.0, 0.0, 0.0, 0.5, BlurRelative::ShownFrame, BlurAnchor::Trailing );
+	const BlurSpan z = BlurWindow( 1.0, 0.0, 0.0, 0.5, BlurRelative::ShownFrame );
 	CHECK( Near( z.t0, 1.0f ) );
 	CHECK( Near( z.t1, 1.0f ) );
-	const BlurSpan n = BlurWindow( 0.5, kOut, kGame, std::nan( "" ), BlurRelative::GameFrame, BlurAnchor::Centered );
+	const BlurSpan n = BlurWindow( 0.5, kOut, kGame, std::nan( "" ), BlurRelative::GameFrame );
 	CHECK( Near( n.t0, 0.5f ) );
 	CHECK( Near( n.t1, 0.5f ) );
 }
 
 TEST_CASE( "pacing: blur window follows the pacer's decision", "[pacing][blur]" )
 {
-	// A pair at 30 fps generated for 120 Hz: every synth's window lies inside the pair
-	// and a wider amount never gives a narrower window.
+	// A 30 fps game generated at 4x: every synth's window ends at its own t, lies inside the
+	// pair, and a larger shutter never gives a shorter window.
 	Driver drv;
 	drv.refreshHz = 125.0;
 	drv.multiplier = 4;
@@ -1841,13 +1852,12 @@ TEST_CASE( "pacing: blur window follows the pacer's decision", "[pacing][blur]" 
 		if ( p.d.t >= 1.0f )
 			continue;
 		nSynth++;
-		const BlurSpan narrow = BlurWindow( p.d.t, drv.pacer.OutputMs() * 1e6, drv.pacer.IntervalMs() * 1e6, 0.25, BlurRelative::ShownFrame, BlurAnchor::Centered );
-		const BlurSpan wide = BlurWindow( p.d.t, drv.pacer.OutputMs() * 1e6, drv.pacer.IntervalMs() * 1e6, 0.75, BlurRelative::ShownFrame, BlurAnchor::Centered );
-		CHECK( narrow.t0 >= 0.0f );
-		CHECK( wide.t1 <= 1.0f );
+		const BlurSpan narrow = BlurWindow( p.d.t, drv.pacer.OutputMs() * 1e6, drv.pacer.IntervalMs() * 1e6, 0.25, BlurRelative::ShownFrame );
+		const BlurSpan wide = BlurWindow( p.d.t, drv.pacer.OutputMs() * 1e6, drv.pacer.IntervalMs() * 1e6, 0.75, BlurRelative::ShownFrame );
+		CHECK( Near( wide.t1, p.d.t ) );
+		CHECK( Near( narrow.t1, p.d.t ) );
+		CHECK( wide.t0 >= 0.0f );
 		CHECK( wide.t1 - wide.t0 >= narrow.t1 - narrow.t0 );
-		CHECK( wide.t0 <= p.d.t );
-		CHECK( wide.t1 >= p.d.t );
 	}
 	CHECK( nSynth > 0 );
 }
