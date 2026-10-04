@@ -6,6 +6,8 @@
   compare.py multi [--bgra]   pairs (f[i], f[i+N]), N = 3, 4, GPU (one estimate + N-1 synths) vs interp.synth at
                               t = k/N, scored against the real in-between frames; plus the fallback cases
   compare.py bench [N]        fgtest --bench N --mult M at 1920x1080 and 2560x1440 (upscaled frame), M = 2, 3, 4
+  --set k=v[,k=v..]           (any mode) framegen::Settings for fgtest (field names, e.g. trustLow=16,flowScale=4);
+                              the same values are set on the Python reference (its module constants, at runtime)
 Work files go to $FG_WORK (default: /tmp/fgwork). fgtest is gpu/build/fgtest unless $FGTEST is set.
 Footage is ../footage unless $FG_FOOTAGE is set.
 """
@@ -23,6 +25,26 @@ import interp  # noqa: E402  (frozen reference)
 FOOT = os.environ.get("FG_FOOTAGE", os.path.join(HERE, "..", "footage"))
 FGTEST = os.environ.get("FGTEST", os.path.join(HERE, "build", "fgtest"))
 WORK = os.environ.get("FG_WORK", "/tmp/fgwork")
+SET = []  # ["--set", "k=v,..."] passed through to fgtest
+
+
+def apply_settings(spec):
+    """framegen::Settings field names -> the matching interp.py module constants (overridden at runtime)."""
+    for kv in spec.split(","):
+        k, v = kv.split("=")
+        v = float(v)
+        if k == "trustLow":
+            interp.TRUST = (v, interp.TRUST[1])
+        elif k == "trustHigh":
+            interp.TRUST = (interp.TRUST[0], v)
+        elif k == "subpixel":
+            interp.SUBPIX = (0.5, 0.25) if v else ()
+        elif k == "flowScale":
+            interp.FLOW_SCALE = int(v)
+        else:
+            name = {"globalFallback": "GLOBAL_FRAC", "sceneCutSad": "CUT_SAD", "hudBonus": "ZERO_BONUS",
+                    "smoothBonus": "SMOOTH_BONUS", "searchPenalty": "LAMBDA"}[k]
+            setattr(interp, name, v)
 
 
 def mad(x, y):
@@ -67,7 +89,7 @@ def check(bgra, split=False):
     sets.append(("cut bf/obs2", sets[0][1], None, sets[5][3]))
     sets.append(("bf@1200 stride24", fr[0], None, fr[24]))
     h, w = sets[0][1].shape[:2]
-    args = [FGTEST] + (["--bgra"] if bgra else []) + (["--split"] if split else []) + [str(w), str(h)]
+    args = [FGTEST] + SET + (["--bgra"] if bgra else []) + (["--split"] if split else []) + [str(w), str(h)]
     for k, (name, a, b, c) in enumerate(sets):
         write_rgba(f"{WORK}/a{k}.rgba", a)
         write_rgba(f"{WORK}/c{k}.rgba", c)
@@ -119,7 +141,7 @@ def multi(bgra):
         ts = [k / n for k in range(1, n)]
         sets = windows("battlefield", [300, 900, 1500, 2100], n) + windows("obs2", [3000, 9000, 15000, 22000], n)
         h, w = sets[0][1][0].shape[:2]
-        args = [FGTEST] + flag + ["--t", ",".join(f"{t:.9f}" for t in ts), str(w), str(h)]
+        args = [FGTEST] + SET + flag + ["--t", ",".join(f"{t:.9f}" for t in ts), str(w), str(h)]
         for k, (name, fr) in enumerate(sets):
             write_rgba(f"{WORK}/ma{n}_{k}.rgba", fr[0])
             write_rgba(f"{WORK}/mc{n}_{k}.rgba", fr[n])
@@ -150,7 +172,7 @@ def multi(bgra):
              ("bf@1200 stride16", fr[0], fr[16])]
     ts = [0.25, 1 / 3, 0.5, 2 / 3, 0.75]
     h, w = cases[0][1].shape[:2]
-    args = [FGTEST] + flag + ["--t", ",".join(f"{t:.9f}" for t in ts), str(w), str(h)]
+    args = [FGTEST] + SET + flag + ["--t", ",".join(f"{t:.9f}" for t in ts), str(w), str(h)]
     for k, (name, a, c) in enumerate(cases):
         write_rgba(f"{WORK}/fa{k}.rgba", a)
         write_rgba(f"{WORK}/fc{k}.rgba", c)
@@ -175,11 +197,16 @@ def bench(n):
         write_rgba(f"{WORK}/ba.rgba", aa)
         write_rgba(f"{WORK}/bc.rgba", cc)
         for mult in (2, 3, 4):
-            subprocess.run([FGTEST, "--bench", str(n), "--mult", str(mult), str(w), str(h), f"{WORK}/ba.rgba",
+            subprocess.run([FGTEST] + SET + ["--bench", str(n), "--mult", str(mult), str(w), str(h), f"{WORK}/ba.rgba",
                             f"{WORK}/bc.rgba", f"{WORK}/bo.rgba"], check=True)
 
 
 if __name__ == "__main__":
+    if "--set" in sys.argv:
+        i = sys.argv.index("--set")
+        SET = sys.argv[i:i + 2]
+        del sys.argv[i:i + 2]
+        apply_settings(SET[1])
     if len(sys.argv) > 1 and sys.argv[1] == "bench":
         bench(int(sys.argv[2]) if len(sys.argv) > 2 else 100)
     elif len(sys.argv) > 1 and sys.argv[1] == "multi":

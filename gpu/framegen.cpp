@@ -33,11 +33,12 @@ namespace framegen {
 // Must match the push-constant block in shaders/common.glsl.
 struct PC {
     int32_t w, h, bw, bh, pw, ph, offA, offC, srcA, srcC, fIn, fOut, fPar, radius, medIdx,
-        W, H, fw, fh, pf, eOff, eStride, nBlocks;
-    float s, ka, kc, wA, wC;
-    int32_t nearC, mid;
+        W, H, fw, fh, pf, fscale, sadAcc;
+    float s, wA, wC;
+    float lambda, smoothBonus, zeroBonus, cutSad, trust0, trustScale, globalFrac;
 };
 static_assert(sizeof(PC) <= 128, "push constants beyond the guaranteed minimum");
+static const int kEOff = 64;   // == E_OFF in common.glsl
 
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP, P_COUNT };
 
@@ -48,6 +49,7 @@ struct Interpolator::Impl {
     FG_FUNCS(X)
 #undef X
     InitInfo info{};
+    Settings set{};   // active settings (info.settings is only the init value)
     VkPhysicalDeviceMemoryProperties memProps{};
 
     VkSampler sampler = VK_NULL_HANDLE;
@@ -69,7 +71,7 @@ struct Interpolator::Impl {
     uint32_t W = 0, H = 0;
     int fw = 0, fh = 0;
     std::vector<Level> lv;
-    int fieldSub = 0, fieldPF = 0, fieldT = 0, eOff = 0, eStride = 0;
+    int fieldSub = 0, fieldPF = 0, fieldT = 0;
     VkBuffer buf[3]{};
     VkDeviceMemory mem[3]{};
     VkDeviceSize bufSize[3]{};
@@ -83,6 +85,7 @@ struct Interpolator::Impl {
 
     VkDescriptorSet takeSet(int ring, VkImageView prev, VkImageView curr, VkImageView out);
     bool createSizeDependent();
+    bool rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force);
     void destroySizeDependent();
     bool makeBuffer(int i, VkDeviceSize size);
 };
@@ -112,8 +115,8 @@ bool Interpolator::Impl::makeBuffer(int i, VkDeviceSize size) {
 
 bool Interpolator::Impl::createSizeDependent() {
     // interp.flow(): luma at 1/FLOW_SCALE (cv2 rounds the size), pyramid down to MIN_SIDE.
-    fw = rintHalfEven(W * 0.5);
-    fh = rintHalfEven(H * 0.5);
+    fw = rintHalfEven(W * (1.0 / set.flowScale));
+    fh = rintHalfEven(H * (1.0 / set.flowScale));
     lv.clear();
     int w = fw, h = fh, lumaOff = 0, fieldOff = 0;
     for (;;) {
@@ -135,9 +138,7 @@ bool Interpolator::Impl::createSizeDependent() {
     fieldOff += fw * fh;
     fieldT = fieldOff;   // per-pixel field looked up at time t (synth scratch, t != 0.5)
     fieldOff += fw * fh;
-    eStride = (int)(W + 3) / 4;
-    eOff = 64;
-    int uCount = eOff + eStride * (int)H;
+    int uCount = kEOff + (int)(W + 3) / 4 * (int)H;   // counters/medians, then the packed mismatch
     if (!makeBuffer(0, (VkDeviceSize)lumaOff * 4)) return false;
     if (!makeBuffer(1, (VkDeviceSize)fieldOff * 8)) return false;
     if (!makeBuffer(2, (VkDeviceSize)uCount * 4)) return false;
@@ -154,9 +155,10 @@ void Interpolator::Impl::destroySizeDependent() {
 
 bool Interpolator::init(const InitInfo& ii) {
     destroy();
-    if (!ii.getMemProps || !ii.gdpa || !ii.device) return false;
+    if (!ii.getMemProps || !ii.gdpa || !ii.device || !validate(ii.settings)) return false;
     m = new Impl();
     m->info = ii;
+    m->set = ii.settings;
     VkDevice d = ii.device;
 #define X(n) m->n = (PFN_vk##n)ii.gdpa(d, "vk" #n); if (!m->n) { destroy(); return false; }
     FG_FUNCS(X)
@@ -234,24 +236,55 @@ bool Interpolator::init(const InitInfo& ii) {
 }
 
 bool Interpolator::resize(uint32_t w, uint32_t h, VkFormat fmt) {
-    if (!m) return false;
+    return m && m->rebuild(w, h, fmt, false);
+}
+
+bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force) {
     // Invariant: W != 0 <=> all size-dependent buffers exist. Any failure leaves W = H = 0.
     // The output is written through an `rgba8` storage declaration: only 8-bit UNORM views.
     // Below kMinSize the flow resolution (W/2 x H/2, rounded) degenerates (W or H = 1 -> size-0 buffers).
     bool ok = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_UNORM) && w >= kMinSize && h >= kMinSize;
-    if (ok && w == m->W && h == m->H) { m->info.viewFormat = fmt; return true; }   // buffers do not depend on the format
-    m->destroySizeDependent();
-    m->W = m->H = 0;
-    m->haveEst = false;
+    if (ok && !force && w == W && h == H) { info.viewFormat = fmt; return true; }   // buffers do not depend on the format
+    destroySizeDependent();
+    W = H = 0;
+    haveEst = false;
     if (!ok) return false;
-    m->info.viewFormat = fmt;
-    m->W = w; m->H = h;
-    if (!m->createSizeDependent()) {
-        m->destroySizeDependent();
-        m->W = m->H = 0;
+    info.viewFormat = fmt;
+    W = w; H = h;
+    if (!createSizeDependent()) {
+        destroySizeDependent();
+        W = H = 0;
         return false;
     }
     return true;
+}
+
+bool Interpolator::validate(const Settings& s) {
+    auto in = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+    return in(s.trustLow, 0.0f, 255.0f) && in(s.trustHigh, 0.0f, 255.0f) && s.trustHigh - s.trustLow >= 1.0f &&
+           in(s.globalFallback, 0.0f, 1.0f) && s.globalFallback > 0.0f &&
+           in(s.sceneCutSad, 0.0f, 255.0f) && s.sceneCutSad > 0.0f &&
+           in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
+           (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4);
+}
+
+bool Interpolator::setSettings(const Settings& s) {
+    if (!m || !validate(s) || s.flowScale != m->set.flowScale) return false;
+    m->set = s;
+    return true;
+}
+
+bool Interpolator::reconfigure(const Settings& s) {
+    if (!m || !validate(s)) return false;
+    bool structural = s.flowScale != m->set.flowScale;
+    m->set = s;
+    // re-create only if a size is held (W == 0: a later resize() creates the buffers with the new settings)
+    if (structural && m->W) return m->rebuild(m->W, m->H, m->info.viewFormat, true);
+    return true;
+}
+
+Settings Interpolator::settings() const {
+    return m ? m->set : Settings{};
 }
 
 void Interpolator::destroy() {
@@ -340,9 +373,14 @@ struct Rec {
     PC pc{};
     Rec(Interpolator::Impl& i, VkCommandBuffer c) : I(i), cb(c) {
         pc.W = (int)I.W; pc.H = (int)I.H; pc.fw = I.fw; pc.fh = I.fh;
-        pc.pf = I.fieldPF; pc.eOff = I.eOff; pc.eStride = I.eStride;
-        pc.nBlocks = I.lv[0].bw * I.lv[0].bh;
-        pc.ka = pc.kc = 1.0f; pc.wA = pc.wC = 0.5f; pc.mid = 1;
+        pc.pf = I.fieldPF;
+        pc.bw = I.lv[0].bw; pc.bh = I.lv[0].bh;   // synth: finest block grid (scene-cut mean)
+        pc.fscale = (int)I.set.flowScale;
+        pc.wA = pc.wC = 0.5f;   // t = 0.5
+        // runtime settings, copied into this record's push constants
+        const Settings& s = I.set;
+        pc.lambda = s.searchPenalty; pc.smoothBonus = s.smoothBonus; pc.zeroBonus = s.hudBonus;
+        pc.cutSad = s.sceneCutSad; pc.trust0 = s.trustLow; pc.trustScale = 1.0f / (s.trustHigh - s.trustLow); pc.globalFrac = s.globalFallback;
     }
     // Appends a timestamp to the current profile (one is open only after a profiled recordEstimate).
     void stamp(const char* name) {
@@ -395,7 +433,8 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageV
     // 1. luma + 2x downsample
     const Level& l0 = I.lv[0];
     pc.w = l0.w; pc.h = l0.h; pc.offA = l0.offA; pc.offC = l0.offC;
-    r.run(P_LUMA, divUp(l0.w, 8), divUp(l0.h, 8));
+    int lt = I.set.flowScale == 4 ? 4 : 8;   // flow pixels per workgroup side (luma.comp main4 for fscale 4)
+    r.run(P_LUMA, divUp(l0.w, lt), divUp(l0.h, lt));
     r.cbar();
     r.stamp("luma");
     // 2. pyramid
@@ -426,6 +465,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageV
             r.cbar();
         }
         pc.fOut = l.fS;
+        pc.sadAcc = i == 0 && !I.set.subpixel;   // without sub-pixel refinement the search's SAD is final
         r.run(P_SEARCH, l.bw, l.bh);
         r.cbar();
         pc.fIn = l.fS; pc.fOut = l.fM;
@@ -435,12 +475,15 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageV
     }
     // 6. sub-pixel refinement (+ SAD sum for the scene-cut test)
     pc.w = l0.w; pc.h = l0.h; pc.bw = l0.bw; pc.bh = l0.bh; pc.offA = l0.offA; pc.offC = l0.offC;
-    pc.fIn = l0.fM; pc.fOut = I.fieldSub;
-    r.run(P_SUBPIX, l0.bw, l0.bh);
-    r.cbar();
-    r.stamp("subpixel");
+    pc.fIn = l0.fM;
+    if (I.set.subpixel) {
+        pc.fOut = I.fieldSub;
+        r.run(P_SUBPIX, l0.bw, l0.bh);
+        r.cbar();
+        r.stamp("subpixel");
+        pc.fIn = I.fieldSub;
+    }
     // 8. per-pixel vector choice at flow res
-    pc.fIn = I.fieldSub;
     r.run(P_PIXFIELD, divUp(I.fw, 16), divUp(I.fh, 16));
     r.cbar();
     r.stamp("pixel field");
@@ -460,17 +503,13 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView
     // counter scratch): the CS -> transfer -> CS chain orders all earlier reads/writes of our buffers.
     r.clearCounters(1, set);   // untrusted count only; the SAD sum belongs to the estimate
     PC& pc = r.pc;
-    const bool mid = t == 0.5f;
-    pc.nearC = t > 0.5f;
-    if (!mid) {
-        // numpy float32 constants of interp.synth / field_at (computed in double, then rounded)
+    if (t != 0.5f) {
+        // numpy float32 constants of interp.synth / field_at (computed in double, then rounded); the warp
+        // factors float32(2t), float32(2(1 - t)) are exactly 2 wC, 2 wA (scaling by 2 commutes with rounding)
         double td = t;
         pc.s = (float)(2.0 * td - 1.0);
-        pc.ka = (float)(2.0 * td);
-        pc.kc = (float)(2.0 * (1.0 - td));
         pc.wA = (float)(1.0 - td);
         pc.wC = (float)td;
-        pc.mid = 0;
         // 9a. field lookup at time t (flow res)
         pc.fIn = I.fieldPF; pc.fOut = I.fieldT;
         r.run(P_LOOKUP, divUp(I.fw, 8), divUp(I.fh, 8));
@@ -479,7 +518,7 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView
         r.stamp("lookup");
     }
     // 9. full-res mismatch
-    r.run(P_ERROR, divUp(I.eStride, 8), divUp((int)I.H, 8));
+    r.run(P_ERROR, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8));
     r.cbar();
     r.stamp("mismatch");
     // 10-11. box + trust + resolve

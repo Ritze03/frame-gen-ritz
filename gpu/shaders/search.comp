@@ -4,13 +4,14 @@
 // other parents, zero, global median; LAMBDA penalty on all but own), then integer search +-radius
 // around it, cost = SAD + LAMBDA*|step|_1. Coarsest level (medIdx < 0): seed = 0.
 // Bilateral: a sampled at q - v, c at q + v. All vectors here are integers -> exact texel taps.
+// sadAcc (finest level with sub-pixel refinement off): also adds the winning SAD to the scene-cut sum.
 #include "common.glsl"
 layout(local_size_x = 64) in;
 
 const int MAXR = 6, MAXT = 8 + 2 * MAXR, MAXC = (2 * MAXR + 1) * (2 * MAXR + 1);
 shared float ta[MAXT * MAXT], tc[MAXT * MAXT];
 shared float red[6][64];
-shared float cost[MAXC];
+shared float cost[MAXC], sadc[MAXC];
 shared ivec2 seedS;
 
 void main() {
@@ -65,7 +66,8 @@ void main() {
         for (int y = 0; y < 8; y++)
             for (int x = 0; x < 8; x++)
                 sum += abs(ta[(y - dy + R) * T + (x - dx + R)] - tc[(y + dy + R) * T + (x + dx + R)]);
-        cost[ci] = sum * (1.0 / 64.0) + LAMBDA * float(abs(dx) + abs(dy));
+        sadc[ci] = sum * (1.0 / 64.0);
+        cost[ci] = sadc[ci] + LAMBDA * float(abs(dx) + abs(dy));
     }
     barrier();
     if (lid == 0) {
@@ -74,5 +76,6 @@ void main() {
         for (int ci = 1; ci < D * D; ci++)
             if (cost[ci] < best) { best = cost[ci]; bi = ci; }
         field[pc.fOut + blk.y * pc.bw + blk.x] = vec2(s + ivec2(bi % D - R, bi / D - R));
+        if (pc.sadAcc != 0) atomicAdd(u[U_SADSUM], uint(roundEven(sadc[bi] * 256.0)));   // as subpix.comp
     }
 }

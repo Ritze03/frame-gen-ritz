@@ -7,7 +7,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 void main() {
     ivec2 g = ivec2(gl_GlobalInvocationID.xy);
-    if (g.x >= pc.eStride || g.y >= pc.H) return;
+    if (g.x >= E_STRIDE || g.y >= pc.H) return;
     uint packed = 0u;
     for (int i = 0; i < 4; i++) {
         ivec2 p = ivec2(g.x * 4 + i, g.y);
@@ -16,5 +16,5 @@ void main() {
             packed |= mismatch(p, wa, wc) << (8 * i);
         }
     }
-    u[pc.eOff + g.y * pc.eStride + g.x] = packed;
+    u[E_OFF + g.y * E_STRIDE + g.x] = packed;
 }

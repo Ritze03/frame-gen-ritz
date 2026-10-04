@@ -7,10 +7,10 @@ layout(set = 0, binding = 3) uniform sampler2D texPrev;                  // fram
 layout(set = 0, binding = 4) uniform sampler2D texCurr;                  // frame c
 layout(set = 0, binding = 5, rgba8) uniform writeonly image2D outImg;
 
-// One push-constant block for every pass; each pass documents which fields it reads.
+// One push-constant block for every pass; each pass documents which fields it reads. 128 bytes (full).
 layout(push_constant) uniform PC {
     int w, h;        // level size (unpadded)
-    int bw, bh;      // block grid of this level
+    int bw, bh;      // block grid of this level (synth passes: the finest level)
     int pw, ph;      // parent block grid / source size
     int offA, offC;  // luma offsets of this level
     int srcA, srcC;  // luma offsets of the source level
@@ -21,23 +21,27 @@ layout(push_constant) uniform PC {
     int W, H;        // full resolution
     int fw, fh;      // flow resolution
     int pf;          // pixel-field offset
-    int eOff, eStride;
-    int nBlocks;     // finest-level block count (scene-cut mean)
+    int fscale;      // FLOW_SCALE: flow res = full res / fscale (1, 2, 4)
+    int sadAcc;      // search: also add the winning SAD to the scene-cut sum (finest level, sub-pixel off)
     // per generated frame (synth passes), t = time of the generated frame in (0, 1)
     float s;         // lookup: 2t - 1
-    float ka, kc;    // warp: a(q - ka g), c(q + kc g); ka = 2t, kc = 2(1 - t)
-    float wA, wC;    // blend weights 1 - t, t (unused when mid != 0)
-    int nearC;       // fallback frame: 0 = a (t <= 0.5), 1 = c (t > 0.5)
-    int mid;         // t == 0.5: the exact 2x path, blend 0.5 * (wa + wc)
+    float wA, wC;    // blend weights 1 - t, t; warp a(q - 2 wC g), c(q + 2 wA g); wC == 0.5: the exact 2x path
+    // runtime settings (framegen::Settings)
+    float lambda, smoothBonus, zeroBonus, cutSad, trust0, trustScale, globalFrac;
 } pc;
 
 const int BLOCK = 8;
-const float LAMBDA = 0.5;
-const float CUT_SAD = 30.0;
-const float SMOOTH_BONUS = 0.5;
-const float ZERO_BONUS = 1.0;
-const float TRUST0 = 12.0, TRUST1 = 40.0;
-const float GLOBAL_FRAC = 0.15;
+#define LAMBDA pc.lambda
+#define CUT_SAD pc.cutSad
+#define SMOOTH_BONUS pc.smoothBonus
+#define ZERO_BONUS pc.zeroBonus
+#define TRUST0 pc.trust0
+#define TRUST_SCALE pc.trustScale   // 1 / (TRUST1 - TRUST0): the folded constant of a constant division
+#define GLOBAL_FRAC pc.globalFrac
+#define NEAR_C (pc.wC > 0.5)   // fallback frame: a for t <= 0.5, c after
+#define MID (pc.wC == 0.5)     // t == 0.5: blend 0.5 * (wa + wc) exactly as the 2x path
+const int E_OFF = 64;          // packed mismatch in u[], after the counters and medians
+#define E_STRIDE ((pc.W + 3) >> 2)
 const int U_UNTRUSTED = 0, U_SADSUM = 1, U_MEDIAN = 4;
 
 // luma texel with clamp-to-edge (== cv2 BORDER_REPLICATE, and == the replicate pad_to_block)
@@ -71,17 +75,18 @@ vec2 sampleF(int off, vec2 p) {
          + p10 * (f.y * (1.0 - f.x)) + p11 * (f.y * f.x);
 }
 
-// full-res half-vector at pixel p: cv2.resize(pf, 2x, INTER_LINEAR) (+ edge pad for odd sizes) * FLOW_SCALE
+// full-res half-vector at pixel p: cv2.resize(pf, fscale x, INTER_LINEAR) (+ edge pad) * FLOW_SCALE
 vec2 halfVec(ivec2 p) {
-    p = min(p, ivec2(2 * pc.fw - 1, 2 * pc.fh - 1));
-    vec2 s = (vec2(p) + 0.5) * 0.5 - 0.5;
+    int S = pc.fscale;
+    p = min(p, ivec2(S * pc.fw - 1, S * pc.fh - 1));
+    vec2 s = (vec2(p) + 0.5) * (1.0 / float(S)) - 0.5;
     vec2 fl = floor(s);
     vec2 f = s - fl;
     ivec2 i0 = clamp(ivec2(fl), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
     ivec2 i1 = clamp(ivec2(fl) + 1, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
     vec2 v00 = field[pc.pf + i0.y * pc.fw + i0.x], v01 = field[pc.pf + i0.y * pc.fw + i1.x];
     vec2 v10 = field[pc.pf + i1.y * pc.fw + i0.x], v11 = field[pc.pf + i1.y * pc.fw + i1.x];
-    return 2.0 * mix(mix(v00, v01, f.x), mix(v10, v11, f.x), f.y);
+    return float(S) * mix(mix(v00, v01, f.x), mix(v10, v11, f.x), f.y);
 }
 
 // cv2.remap of a uint8 RGB frame at p (pixel-centre coords): bilinear, clamp to edge, rounded to 8 bit.
@@ -92,9 +97,10 @@ vec3 sampleRGB(sampler2D t, vec2 p) {
 
 uint mismatch(ivec2 p, out vec3 wa, out vec3 wc) {
     vec2 hv = halfVec(p);
-    // a(q - 2t g), c(q + 2(1 - t) g); float32 product then sum like numpy (ka = kc = 1 at t = 0.5: exact)
-    precise vec2 pa = vec2(p) - pc.ka * hv;
-    precise vec2 pc_ = vec2(p) + pc.kc * hv;
+    // a(q - 2t g), c(q + 2(1 - t) g); float32 product then sum like numpy (2t = 2(1 - t) = 1 at t = 0.5: exact)
+    precise float ka = 2.0 * pc.wC, kc = 2.0 * pc.wA;   // exact: interp's float32(2t), float32(2(1 - t))
+    precise vec2 pa = vec2(p) - ka * hv;
+    precise vec2 pc_ = vec2(p) + kc * hv;
     wa = sampleRGB(texPrev, pa);
     wc = sampleRGB(texCurr, pc_);
     vec3 d = abs(wa - wc);

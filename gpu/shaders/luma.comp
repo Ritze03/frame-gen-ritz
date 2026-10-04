@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// Pass 1: luma (cv2 BGR2GRAY, rounded to uint8) + INTER_AREA 2x downsample of a and c to flow res.
+// Pass 1: luma (cv2 BGR2GRAY, rounded to uint8) + INTER_AREA 1/fscale downsample of a and c to flow res
+// (mean of the valid pixels of each fscale x fscale cell, as cv2's integer-scale area path).
 #include "common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -9,14 +10,45 @@ float y8(sampler2D t, ivec2 p) {
     return float((c.r * 4899u + c.g * 9617u + c.b * 1868u + 8192u) >> 14);
 }
 
-void main() {
-    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
-    if (o.x >= pc.w || o.y >= pc.h) return;
+shared float sA[64], sC[64];
+shared int sN[64];
+
+// fscale 4: a 2x2-thread quad per flow pixel (each thread sums a 2x2 of the 4x4 cell), 4x4 flow pixels per
+// workgroup. One thread per flow pixel with 32 serial fetches is latency-bound (~4x slower). All sums are of
+// integer lumas (exact in float), so the order does not change the result.
+void main4() {
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 o = ivec2(gl_WorkGroupID.xy) * 4 + (l >> 1);
+    ivec2 b = 4 * o + 2 * (l & 1);
     float sa = 0.0, sc = 0.0;
     int n = 0;
     for (int j = 0; j < 2; j++)
         for (int i = 0; i < 2; i++) {
-            ivec2 p = 2 * o + ivec2(i, j);
+            ivec2 p = b + ivec2(i, j);
+            if (p.x < pc.W && p.y < pc.H) { sa += y8(texPrev, p); sc += y8(texCurr, p); n++; }
+        }
+    sA[lid] = sa; sC[lid] = sc; sN[lid] = n;
+    barrier();
+    if ((l.x & 1) == 0 && (l.y & 1) == 0 && o.x < pc.w && o.y < pc.h) {
+        sa = sA[lid] + sA[lid + 1] + sA[lid + 8] + sA[lid + 9];
+        sc = sC[lid] + sC[lid + 1] + sC[lid + 8] + sC[lid + 9];
+        n = sN[lid] + sN[lid + 1] + sN[lid + 8] + sN[lid + 9];
+        luma[pc.offA + o.y * pc.w + o.x] = sa / float(n);
+        luma[pc.offC + o.y * pc.w + o.x] = sc / float(n);
+    }
+}
+
+void main() {
+    int S = pc.fscale;
+    if (S == 4) { main4(); return; }   // dynamically uniform: the barrier in main4 is allowed
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= pc.w || o.y >= pc.h) return;
+    float sa = 0.0, sc = 0.0;
+    int n = 0;
+    for (int j = 0; j < S; j++)
+        for (int i = 0; i < S; i++) {
+            ivec2 p = S * o + ivec2(i, j);
             if (p.x < pc.W && p.y < pc.H) { sa += y8(texPrev, p); sc += y8(texCurr, p); n++; }
         }
     luma[pc.offA + o.y * pc.w + o.x] = sa / float(n);

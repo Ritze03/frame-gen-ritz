@@ -1,8 +1,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// Passes 10+11: 7x7 box of e (replicate border), trust t = ramp(e, 12..40), count untrusted pixels,
+// Passes 10+11: 7x7 box of e (replicate border), trust t = ramp(e, TRUST0..TRUST1), count untrusted pixels,
 // out = mix((1-t) wa + t wc, near, u) with near = a (t <= 0.5) or c; at t = 0.5 the blend is
-// 0.5 * (wa + wc) exactly as in the 2x path. The global decisions (scene cut, >15% untrusted) are applied by
+// 0.5 * (wa + wc) exactly as in the 2x path. The global decisions (scene cut, > GLOBAL_FRAC untrusted) are applied by
 // fallback.comp once every workgroup has added to the counter.
 #include "common.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -14,7 +14,7 @@ shared uint cnt;
 
 uint eAt(ivec2 p) {
     p = clamp(p, ivec2(0), ivec2(pc.W - 1, pc.H - 1));
-    return (u[pc.eOff + p.y * pc.eStride + (p.x >> 2)] >> (8 * (p.x & 3))) & 255u;
+    return (u[E_OFF + p.y * E_STRIDE + (p.x >> 2)] >> (8 * (p.x & 3))) & 255u;
 }
 
 void main() {
@@ -39,14 +39,14 @@ void main() {
         float s = 0.0;
         for (int k = 0; k < 7; k++) s += hs[(l.y + k) * TS + l.x];
         float e = s * (1.0 / 49.0);
-        t = clamp((e - TRUST0) / (TRUST1 - TRUST0), 0.0, 1.0);
+        t = clamp((e - TRUST0) * TRUST_SCALE, 0.0, 1.0);   // TRUST_SCALE = 1 / (TRUST1 - TRUST0), rounded on the CPU
         if (t > 0.5) atomicAdd(cnt, 1u);
         vec3 wa, wc;
         mismatch(p, wa, wc);
-        vec4 a = pc.nearC != 0 ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
+        vec4 a = NEAR_C ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
         vec3 a8 = floor(a.rgb * 255.0 + 0.5);
         vec3 m;
-        if (pc.mid != 0) {
+        if (MID) {
             m = 0.5 * (wa + wc);
         } else {
             precise vec3 mt = pc.wA * wa + pc.wC * wc;

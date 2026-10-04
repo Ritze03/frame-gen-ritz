@@ -5,6 +5,9 @@
 // image, all in one command buffer. With several t the k-th output goes to out.rgba.<k>.
 // --bench N --mult M: per real pair one estimate + M-1 synths at t = k/M (M = 2: record(0.5)). --bgra uses B8G8R8A8_UNORM images/views for
 // inputs and output (the file data stays RGBA; channels are swizzled on upload/readback).
+// --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
+// smoothBonus searchPenalty subpixel flowScale), passed to init. --then k=v[,..]: per pair, in the same command buffer
+// as record(t[0]) -> out.rgba.0, setSettings(--set + these) then record(t[0]) -> out.rgba.1 (runtime-change test).
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
 
@@ -16,6 +19,28 @@
 #include <vector>
 
 #define CK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { fprintf(stderr, "%s failed: %d\n", #x, r_); exit(1); } } while (0)
+
+// "k=v,k=v" -> fields of s; false on an unknown key
+static bool parseSettings(char* str, framegen::Settings& s) {
+    for (char* tok = strtok(str, ","); tok; tok = strtok(nullptr, ",")) {
+        char* eq = strchr(tok, '=');
+        if (!eq) return false;
+        *eq = 0;
+        double v = atof(eq + 1);
+        std::string k = tok;
+        if (k == "trustLow") s.trustLow = (float)v;
+        else if (k == "trustHigh") s.trustHigh = (float)v;
+        else if (k == "globalFallback") s.globalFallback = (float)v;
+        else if (k == "sceneCutSad") s.sceneCutSad = (float)v;
+        else if (k == "hudBonus") s.hudBonus = (float)v;
+        else if (k == "smoothBonus") s.smoothBonus = (float)v;
+        else if (k == "searchPenalty") s.searchPenalty = (float)v;
+        else if (k == "subpixel") s.subpixel = v != 0;
+        else if (k == "flowScale") s.flowScale = (uint32_t)v;
+        else { fprintf(stderr, "unknown setting %s\n", tok); return false; }
+    }
+    return true;
+}
 
 static VkDevice dev;
 static VkPhysicalDevice phys;
@@ -73,12 +98,16 @@ int main(int argc, char** argv) {
     int bench = 0, mult = 2;
     bool split = false;
     std::vector<float> ts{0.5f};
+    framegen::Settings setA;
+    char* thenArg = nullptr;
     std::vector<std::string> pos;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bgra")) bgra = true;
         else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mult") && i + 1 < argc) mult = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--split")) split = true;
+        else if (!strcmp(argv[i], "--set") && i + 1 < argc) { if (!parseSettings(argv[++i], setA)) return 2; }
+        else if (!strcmp(argv[i], "--then") && i + 1 < argc) thenArg = argv[++i];
         else if (!strcmp(argv[i], "--t") && i + 1 < argc) {
             ts.clear();
             for (char* tok = strtok(argv[++i], ","); tok; tok = strtok(nullptr, ",")) ts.push_back((float)atof(tok));
@@ -89,6 +118,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: fgtest [--bgra] [--bench N] W H prev.rgba curr.rgba out.rgba [...]\n");
         return 2;
     }
+    framegen::Settings setB = setA;
+    if (thenArg && !parseSettings(thenArg, setB)) return 2;
+    if (thenArg) ts.resize(2, ts[0]);   // two outputs per pair
     uint32_t W = atoi(pos[0].c_str()), H = atoi(pos[1].c_str());
     size_t bytes = (size_t)W * H * 4;
     VkFormat fmt = bgra ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
@@ -193,7 +225,8 @@ int main(int argc, char** argv) {
     info.height = H;
     info.viewFormat = fmt;
     info.getMemProps = vkGetPhysicalDeviceMemoryProperties;
-    if (!fg.init(info)) { fprintf(stderr, "fg.init failed\n"); return 1; }
+    info.settings = setA;
+    if (!fg.init(info)) { fprintf(stderr, "fg.init failed (invalid --set?)\n"); return 1; }
 
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -215,7 +248,12 @@ int main(int argc, char** argv) {
         upload(pos[p], prev);
         upload(pos[p + 1], curr);
         begin();
-        if (ts.size() == 1 && !split) {
+        if (thenArg) {
+            if (!fg.record(cb, prev.view, curr.view, outs[0].view, ts[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
+            if (!fg.setSettings(setB)) { fprintf(stderr, "setSettings failed (invalid or structural --then?)\n"); return 1; }
+            if (!fg.record(cb, prev.view, curr.view, outs[1].view, ts[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
+            fg.setSettings(setA);   // the next pair starts from A again
+        } else if (ts.size() == 1 && !split) {
             if (!fg.record(cb, prev.view, curr.view, out.view, ts[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
         } else {
             if (!fg.recordEstimate(cb, prev.view, curr.view)) { fprintf(stderr, "fg.recordEstimate failed\n"); return 1; }
