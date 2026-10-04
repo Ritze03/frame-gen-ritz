@@ -360,6 +360,10 @@ Vocabulary: a **present tick** is one display refresh (a vblank, a frame callbac
 | `Reset()` | frame generation switched off/on, new session | forget everything |
 | `StatusDue(now)` / `TakeStatus(inputs, now)` | for a HUD / log, every `kStatusPeriodNs` (250 ms) | returns `Report` |
 
+**Skippable ticks (real-rate mode).** With frame generation off and a lag buffer or blur (and for video files), a present tick with nothing new to show and no new real frame to ingest comes back `Decision::skip` when `bSkippable` is set, exactly like an FG cadence tick: commit nothing, the display keeps the last buffer. A tick that brings a new real frame is never skipped (its ring copy is needed even when the frame is not shown yet). Without it a 100 ms buffer at 30 fps composited on every tick (about 120/s instead of about 60/s). The host's existing handling of `skip` is all it takes.
+
+**Cold start.** Until the interval estimator has measured the game rate, the lag buffer holds at its current value (0 at start) and the history depth stays at its default; neither is sized from a guessed interval.
+
 `Pacer::Inputs`, read fresh at each paint (frame generation, the buffer and blur each have their own fields, see "How the features combine"): `now`, `presentNs` (V; 0 = now; a predicted present time, or an output timer's target), `mode` (`Off`/`Fixed`/`Target`), `multiplier` (2..`kMaxN` = 8), `targetFps` (0 = the display's refresh), `priority` (`LowLatency`/`Smoothness`), `refreshHz`, `pauseAtRefresh`, `canExceedRefresh`, `costGuard`, `estimateMs`/`synthMs`/`costSeq` (the renderer's last GPU timings and a counter that changes with every new measurement; < 0 = none), `rendererOk` (false when the host cannot run the renderer: HDR, 10-bit, ...); `frameGen` (frame generation on; default true), `lagBuffer` (`LagBufferSettings`: the lag-spike buffer, off by default, see "Lag-spike buffer"), `extraDelayNs` (a fixed extra delay on top of it, default 0), `blur` / `blurSamples` / `blurAmount` / `blurRelative` (motion blur; active when `blur && blurAmount > 0 && blurSamples >= 2`).
 
 ### What the host applies (`Pacer::Decision`)
