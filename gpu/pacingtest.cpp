@@ -35,6 +35,7 @@ namespace
 		int    depth = 0;       // HistoryDepth() after this paint
 		double delayMs = 0.0;   // the pacer's total delay D after this paint
 		int64_t tau = 0;        // the content time after this paint
+		bool   gen = false;     // Pacer::Generating() after this paint
 	};
 
 	struct Driver
@@ -124,7 +125,7 @@ namespace
 		Pacer::Decision Paint( Ns t, bool bPresentTick = true )
 		{
 			const Pacer::Decision d = pacer.OnPaint( Inputs( t ), newestId, bPresentTick, skipVblanks && !uiRepaints );
-			log.push_back( { t, d, pacer.BufferMs(), pacer.HistoryDepth(), pacer.DelayMs(), pacer.ContentNs() } );
+			log.push_back( { t, d, pacer.BufferMs(), pacer.HistoryDepth(), pacer.DelayMs(), pacer.ContentNs(), pacer.Generating() } );
 			forced = d.repaintNext;
 			return d;
 		}
@@ -3540,4 +3541,371 @@ TEST_CASE( "high fps: the lag buffer at 400 fps is capped by the history, not ex
 	CHECK( top.pacer.HistoryDepth() <= kHistoryMax );
 	CHECK( top.pacer.BufferMs() <= 60.0 + 1e-6 );
 	CHECK( top.pacer.BufferMs() >= 55.0 );
+}
+
+// ---------------------------------------------------------------------------
+//  The generate / pass decision: a steady rate and a dwell (no flapping near the target)
+// ---------------------------------------------------------------------------
+//
+// The user's report: the HUD's "Both" readout kept switching between "game > output" and the
+// lone game number "for no apparent reason" -- 246 flips in 246 s at a 280 Hz target with a
+// game wandering 210..330 fps. The decision was made on the pacing's own 8-frame median.
+
+namespace
+{
+	// 280 Hz, Target = the display's refresh (target 0), Smoothness, Pause at refresh OFF on a
+	// backend that can exceed it: the user's profile.
+	Driver FlapDriver()
+	{
+		Driver drv;
+		drv.refreshHz = 280.0;
+		drv.mode = Mode::Target;
+		drv.targetFps = 0;
+		drv.priority = Priority::Smoothness;
+		drv.pauseAtRefresh = false;
+		drv.canExceed = true;
+		return drv;
+	}
+
+	// A deterministic, portable jitter source (uniform, scaled to the requested sigma).
+	struct Jitter
+	{
+		uint64_t s = 0x9E3779B97F4A7C15ull;
+		double Next()   // uniform in [-1, 1)
+		{
+			s ^= s << 13;
+			s ^= s >> 7;
+			s ^= s << 17;
+			return double( s >> 11 ) / double( 1ull << 52 ) - 1.0;
+		}
+		double Sigma( double flSigma ) { return Next() * flSigma * 1.7320508075688772; }   // uniform +-sqrt3 sigma: stddev sigma
+	};
+
+	// Arrivals at fpsAt(t) with relative interval jitter `sigma`; a gap (hitch) of hitchMs extra
+	// at the first arrival at or after hitchAt (-1 = none).
+	template <class F>
+	std::vector<Ns> Arrivals( Ns t0, Ns t1, F fpsAt, double sigma, uint64_t seed = 1, Ns hitchAt = ~Ns( 0 ), double hitchMs = 0.0 )
+	{
+		Jitter j;
+		j.s ^= seed * 0xD1B54A32D192ED03ull;
+		std::vector<Ns> v;
+		Ns t = t0;
+		bool bHitched = false;
+		while ( t < t1 )
+		{
+			v.push_back( t );
+			double flIv = 1000.0 / fpsAt( double( t - t0 ) / 1e9 ) * ( 1.0 + j.Sigma( sigma ) );
+			flIv = std::max( flIv, 1.0 );
+			if ( !bHitched && t >= hitchAt )
+			{
+				flIv += hitchMs;
+				bHitched = true;
+			}
+			t += Ns( flIv * 1e6 );
+		}
+		return v;
+	}
+
+	struct Flips
+	{
+		int n = 0;                    // changes of Generating() after tSkip
+		double minGapMs = 1e9;        // the shortest time between two of them
+		std::vector<double> atS;      // when
+	};
+
+	Flips CountFlips( const Driver &drv, Ns tSkip )
+	{
+		Flips f;
+		bool bPrev = false, bFirst = true;
+		Ns tPrev = 0;
+		for ( const Painted &p : drv.log )
+		{
+			if ( p.t < tSkip )
+			{
+				bPrev = p.gen;
+				bFirst = false;
+				continue;
+			}
+			if ( !bFirst && p.gen != bPrev )
+			{
+				f.n++;
+				f.atS.push_back( double( p.t ) / 1e9 );
+				if ( tPrev != 0 )
+					f.minGapMs = std::min( f.minGapMs, double( p.t - tPrev ) / 1e6 );
+				tPrev = p.t;
+			}
+			bPrev = p.gen;
+			bFirst = false;
+		}
+		return f;
+	}
+
+	// The first change of Generating() at or after t (seconds), or -1.
+	double FirstFlipAfter( const Driver &drv, double flS )
+	{
+		bool bPrev = false;
+		bool bHave = false;
+		for ( const Painted &p : drv.log )
+		{
+			if ( double( p.t ) / 1e9 >= flS && bHave && p.gen != bPrev )
+				return double( p.t ) / 1e9;
+			bPrev = p.gen;
+			bHave = true;
+		}
+		return -1.0;
+	}
+}
+
+TEST_CASE( "steady rate: a hitch does not move it, a real step pulls it all the way", "[steady]" )
+{
+	SteadyRate r;
+	CHECK_FALSE( r.Valid() );
+	for ( int i = 0; i < 200; i++ )
+		r.AddInterval( 3.7 );
+	CHECK( r.Valid() );
+	CHECK( std::fabs( r.IntervalMs() - 3.7 ) < 1e-9 );
+	r.AddInterval( 50.0 );                         // one hitch among 3.7 ms frames
+	CHECK( std::fabs( r.IntervalMs() / 3.7 - 1.0 ) < 0.015 );
+	for ( int i = 0; i < 100; i++ )
+		r.AddInterval( 3.7 );
+	CHECK( std::fabs( r.IntervalMs() / 3.7 - 1.0 ) < 0.005 );      // and it is gone again
+
+	// 300 -> 150 fps: within ~0.1 s the measure is above the 1.10 start ratio at 280 Hz (3.93 ms).
+	SteadyRate s;
+	for ( int i = 0; i < 200; i++ )
+		s.AddInterval( 1000.0 / 300.0 );
+	double flT = 0.0;
+	while ( s.IntervalMs() < 3.93 && flT < 2000.0 )
+	{
+		s.AddInterval( 1000.0 / 150.0 );
+		flT += 1000.0 / 150.0;
+	}
+	CHECK( flT < 200.0 );
+
+	// Its mean is the true rate (frame-weighted): 10% / 25% uniform-ish jitter around 3.7 ms.
+	for ( double flSigma : { 0.10, 0.25 } )
+	{
+		SteadyRate m;
+		Jitter j;
+		for ( int i = 0; i < 4000; i++ )
+			m.AddInterval( 3.7 * ( 1.0 + j.Sigma( flSigma ) ) );
+		CHECK( std::fabs( m.IntervalMs() / 3.7 - 1.0 ) < 0.03 );
+	}
+
+	// Young history = the median of what there is (no wild first mean).
+	SteadyRate y;
+	for ( double v : { 3.7, 3.7, 3.7, 40.0 } )
+		y.AddInterval( v );
+	CHECK( std::fabs( y.IntervalMs() - 3.7 ) < 1e-9 );
+}
+
+TEST_CASE( "decision: a game hovering near the target does not flap (Target auto, 280 Hz)", "[steady][flap]" )
+{
+	struct Case { double fps, sigma, drift; };
+	const Case cases[] = {
+		{ 255, 0.10, 0 }, { 262, 0.10, 0 }, { 270, 0.10, 0 }, { 275, 0.10, 0 },
+		{ 255, 0.25, 0 }, { 262, 0.25, 0 }, { 270, 0.25, 0 }, { 275, 0.25, 0 },
+		{ 262, 0.10, 0.15 }, { 270, 0.10, 0.15 },
+	};
+	for ( const Case &c : cases )
+	{
+		for ( uint64_t seed = 1; seed <= 3; seed++ )
+		{
+			Driver drv = FlapDriver();
+			const Ns tEnd = 60 * 1000 * MS;
+			// a slow +-15% drift: a period of ~58 s
+			auto fpsAt = [&]( double t ) { return c.fps * ( 1.0 + c.drift * std::sin( t * c.fps * 0.0004 ) ); };
+			drv.RunArrivals( Arrivals( 3 * MS, tEnd, fpsAt, c.sigma, seed ), tEnd );
+			const Flips f = CountFlips( drv, 2000 * MS );
+			INFO( "fps " << c.fps << " sigma " << c.sigma << " drift " << c.drift << " seed " << seed << " flips " << f.n );
+			CHECK( f.n <= 3 );                                    // per minute (the run is one)
+			CHECK( f.minGapMs >= kStartDwellMs - 1.0 );           // never a flip-flop inside the dwell
+		}
+	}
+}
+
+TEST_CASE( "decision: Target 400 and Fixed 3x near their own edges do not flap either", "[steady][flap]" )
+{
+	// An explicit target flaps the same way near the target (a 380 fps game, target 400).
+	Driver t = FlapDriver();
+	t.targetFps = 400;
+	const Ns tEnd = 60 * 1000 * MS;
+	t.RunArrivals( Arrivals( 3 * MS, tEnd, []( double ) { return 380.0; }, 0.10 ), tEnd );
+	CHECK( CountFlips( t, 2000 * MS ).n <= 3 );
+	// Fixed 3x with Pause at refresh ON: r = min(3, game / refresh) -> it hovers at 270 fps too.
+	Driver f = FlapDriver();
+	f.mode = Mode::Fixed;
+	f.multiplier = 3;
+	f.pauseAtRefresh = true;
+	f.canExceed = false;
+	f.RunArrivals( Arrivals( 3 * MS, tEnd, []( double ) { return 270.0; }, 0.10 ), tEnd );
+	CHECK( CountFlips( f, 2000 * MS ).n <= 3 );
+	// Fixed 3x with Pause off, and an explicit 400 target at 270 fps: generating throughout, as before.
+	Driver g = FlapDriver();
+	g.mode = Mode::Fixed;
+	g.multiplier = 3;
+	g.RunArrivals( Arrivals( 3 * MS, 10 * 1000 * MS, []( double ) { return 270.0; }, 0.10 ), 10 * 1000 * MS );
+	CHECK( CountFlips( g, 500 * MS ).n == 0 );
+	CHECK( g.pacer.Generating() );
+	Driver h = FlapDriver();
+	h.targetFps = 400;
+	h.RunArrivals( Arrivals( 3 * MS, 10 * 1000 * MS, []( double ) { return 270.0; }, 0.10 ), 10 * 1000 * MS );
+	CHECK( CountFlips( h, 500 * MS ).n == 0 );
+	CHECK( h.pacer.Generating() );
+	// ... and a game above the target (450 fps vs 400) passes through.
+	Driver k = FlapDriver();
+	k.targetFps = 400;
+	k.RunArrivals( Arrivals( 3 * MS, 10 * 1000 * MS, []( double ) { return 450.0; }, 0.10 ), 10 * 1000 * MS );
+	CHECK_FALSE( k.pacer.Generating() );
+}
+
+TEST_CASE( "decision: a game that really drops starts generating within 0.5 s, one that really rises stops within 1.5 s", "[steady][flap]" )
+{
+	for ( uint64_t seed = 1; seed <= 3; seed++ )
+	{
+		// 300 -> 150 fps at t = 5 s (the arrivals' own clock starts at 3 ms).
+		Driver d = FlapDriver();
+		const Ns tEnd = 12 * 1000 * MS;
+		d.RunArrivals( Arrivals( 3 * MS, tEnd, []( double t ) { return t < 5.0 ? 300.0 : 150.0; }, 0.10, seed ), tEnd );
+		REQUIRE_FALSE( d.log[ d.log.size() / 4 ].gen );
+		const double flOn = FirstFlipAfter( d, 5.0 );
+		INFO( "seed " << seed << " starts at " << flOn );
+		CHECK( flOn > 5.0 );
+		CHECK( flOn - 5.0 < 0.5 );
+		CHECK( flOn - 5.0 >= 0.3 * 0.5 );          // not instantly: the dwell and the steady rate
+		CHECK( d.pacer.Generating() );
+
+		// 150 -> 320 fps at t = 5 s.
+		Driver u = FlapDriver();
+		u.RunArrivals( Arrivals( 3 * MS, tEnd, []( double t ) { return t < 5.0 ? 150.0 : 320.0; }, 0.10, seed ), tEnd );
+		REQUIRE( u.log[ u.log.size() / 4 ].gen );
+		const double flOff = FirstFlipAfter( u, 5.0 );
+		INFO( "seed " << seed << " stops at " << flOff );
+		CHECK( flOff > 5.0 );
+		CHECK( flOff - 5.0 < 1.5 );
+		CHECK( flOff - 5.0 >= kStopDwellMs / 1000.0 );   // the dwell: never sooner than 1 s
+		CHECK_FALSE( u.pacer.Generating() );
+	}
+}
+
+TEST_CASE( "decision: a single hitch does not flip the state", "[steady][flap]" )
+{
+	// 50 ms is below kGapResetNs (a longer stall is the gap path and drops the history).
+	for ( double flFps : { 200.0, 262.0, 300.0 } )
+	{
+		for ( double flHitchMs : { 50.0, 90.0 } )
+		{
+			Driver d = FlapDriver();
+			const Ns tEnd = 20 * 1000 * MS;
+			d.RunArrivals( Arrivals( 3 * MS, tEnd, [&]( double ) { return flFps; }, 0.10, 1, 10 * 1000 * MS, flHitchMs ), tEnd );
+			INFO( "fps " << flFps << " hitch " << flHitchMs << " ms" );
+			CHECK( CountFlips( d, 3000 * MS ).n == 0 );
+		}
+	}
+}
+
+TEST_CASE( "decision: the dwell is time, not frames: a steady change lands after 0.3 s to start, 1 s to stop", "[steady][flap]" )
+{
+	// Exactly periodic frames, so only the dwell (and the rate measure's short lag) is measured.
+	Driver d = FlapDriver();
+	d.Run( 4 * 1000 * MS, 1000.0 / 300.0 );          // 0.93 -> passing through
+	REQUIRE_FALSE( d.pacer.Generating() );
+	const Ns tStep = d.now;
+	d.Run( 3 * 1000 * MS, 1000.0 / 240.0 );          // 1.167 > 1.10
+	const double flOn = FirstFlipAfter( d, double( tStep ) / 1e9 ) - double( tStep ) / 1e9;
+	CHECK( flOn >= kStartDwellMs / 1000.0 );
+	CHECK( flOn < 1.0 );          // a mild change (300 -> 240 fps): the rate measure needs ~0.45 s to cross
+	const Ns tBack = d.now;
+	d.Run( 4 * 1000 * MS, 1000.0 / 300.0 );
+	const double flOff = FirstFlipAfter( d, double( tBack ) / 1e9 ) - double( tBack ) / 1e9;
+	CHECK( flOff >= kStopDwellMs / 1000.0 );
+	CHECK( flOff < 1.5 );
+	CHECK_FALSE( d.pacer.Generating() );
+}
+
+TEST_CASE( "decision: the pacing still follows the 8-frame median, only the decision is steady", "[steady]" )
+{
+	// A 100 fps game at 4x display speed (Target 400, pause off): the output interval, the delay
+	// and the cadence come from the median interval exactly as before.
+	Driver d = FlapDriver();
+	d.targetFps = 400;
+	d.Run( 3 * 1000 * MS, 10.0 );
+	CHECK( d.pacer.Generating() );
+	CHECK( std::fabs( d.pacer.OutputMs() - 2.5 ) < 1e-6 );
+	CHECK( std::fabs( d.pacer.IntervalMs() - 10.0 ) < 1e-6 );
+	// ... and video mode keeps its immediate, PTS-exact decision (no dwell).
+	Pacer p;
+	const FrameFormat fmt{ 1920, 1080, 87 };
+	for ( int i = 0; i < 4; i++ )
+		p.OnFrame( uint64_t( i + 1 ), Ns( i ) * 41'666'667ull, 1, fmt );
+	Pacer::Inputs in;
+	in.now = in.presentNs = 0;
+	in.mode = Mode::Target;
+	in.targetFps = 0;
+	in.refreshHz = 144.0;
+	p.OnPaint( in, 1, true, false );
+	CHECK( p.Planning() );
+}
+
+TEST_CASE( "status: generating is the steady signal, activeN the instantaneous one", "[steady][status]" )
+{
+	// Clearly generating: Fixed 2x of a 60 fps game on 125 Hz is 2x.
+	Driver a;
+	a.mode = Mode::Fixed;
+	a.multiplier = 2;
+	a.priority = Priority::Smoothness;
+	Pacer::Report r;
+	for ( int i = 0; i < 6; i++ )
+	{
+		a.Run( 250 * MS, 1000.0 / 60.0 );
+		r = a.Status();
+	}
+	CHECK( r.fgActive );
+	CHECK( r.generating );
+	CHECK( r.steadyMultiplier > 1.8f );
+	CHECK( r.steadyMultiplier < 2.2f );
+
+	// Passing through (a 200 fps game, 125 Hz): never.
+	Driver b;
+	b.mode = Mode::Target;
+	b.targetFps = 0;
+	b.priority = Priority::Smoothness;
+	for ( int i = 0; i < 6; i++ )
+	{
+		b.Run( 250 * MS, 1000.0 / 200.0 );
+		r = b.Status();
+	}
+	CHECK_FALSE( r.fgActive );
+	CHECK_FALSE( r.generating );
+
+	// The pacer says Generate (a 262 fps game on 280 Hz: ratio 1.07, inside the hold band) but the
+	// effective multiplier is ~1.07: fgActive / activeN claim generation, `generating` does not.
+	Driver c = FlapDriver();
+	c.Run( 1000 * MS, 1000.0 / 262.0 );
+	for ( int i = 0; i < 6; i++ )
+	{
+		c.Run( 250 * MS, 1000.0 / 262.0 );
+		r = c.Status();
+	}
+	CHECK( r.fgActive );
+	CHECK( r.activeN >= 2 );
+	CHECK( r.steadyMultiplier < 1.2f );
+	CHECK_FALSE( r.generating );
+
+	// A game that stops needing generation clears it as soon as the pacer stops (fgActive false),
+	// and a long run of real frames never turns it on again.
+	Driver e = FlapDriver();
+	for ( int i = 0; i < 8; i++ )
+	{
+		e.Run( 250 * MS, 1000.0 / 200.0 );
+		r = e.Status();
+	}
+	REQUIRE( r.generating );
+	for ( int i = 0; i < 16; i++ )
+	{
+		e.Run( 250 * MS, 1000.0 / 330.0 );
+		r = e.Status();
+	}
+	CHECK_FALSE( r.fgActive );
+	CHECK_FALSE( r.generating );
 }
