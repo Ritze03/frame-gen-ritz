@@ -571,15 +571,15 @@ static void synthOut(Ctx& c, int i, float t) {
 // the sample times and weights exactly as documented (framegen.h), for the CPU references
 static std::vector<float> sampleTimes(int N, float t0, float t1) {
     std::vector<float> t(N);
-    for (int k = 0; k < N; k++) t[k] = std::min(std::max((float)(t0 + ((double)t1 - t0) * k / (N - 1)), t0), t1);
-    t[N - 1] = t1;
+    // midpoints of N equal slices of [t0, t1] (box-filter shutter); never t0 or t1 themselves
+    for (int k = 0; k < N; k++) t[k] = std::min(std::max((float)(t0 + ((double)t1 - t0) * (k + 0.5) / N), t0), t1);
     return t;
 }
 static std::vector<double> sampleWeights(int N, BlurWeights w) {
     std::vector<double> g(N, 1.0);
     double sum = 0;
     for (int k = 0; k < N; k++) {
-        double x = (2.0 * k - (N - 1)) / (N - 1);
+        double x = (2.0 * k + 1 - N) / N;   // slice centre; the window ends are x = -+1
         if (w == BlurWeights::Gaussian) g[k] = std::exp(-2.0 * x * x);
         sum += g[k];
     }
@@ -809,14 +809,13 @@ static int check(int W, int H) {
                     if (dMu > 2.0 || dSig > 1.0)
                         printf("   N=%d [%g,%g] %s: mean edge %.2f (model %.2f), sigma %.2f (model %.2f + softness: %.2f)\n", N, wd[0], wd[1], wn[wi], m.mu, r.mu, m.sigma, r.sigma, sigPred);
                     if (wi == 0) {
-                        // even weights: the full smear extent is speed x (t1 - t0) (+ ~1 px of antialiasing) when the window ends
-                        // on a real frame (sharp edge there); a window of interpolated frames only also carries the
-                        // interpolation's own edge softness: extent in [D - 1, D + 1 + softness of one frame]
-                        double D = kObjV * (wd[1] - wd[0]);
-                        bool realEnd = wd[0] <= 0.0f || wd[1] >= 1.0f;
-                        bool ok = realEnd ? std::fabs(m.ext - (D + 1.0)) <= 2.0 : (m.ext >= D - 1.0 && m.ext <= D + 1.0 + singleExt);
-                        worstExt = std::max(worstExt, realEnd ? std::fabs(m.ext - (D + 1.0)) : 0.0);
-                        if (!ok) { extOk = false; printf("   N=%d [%g,%g] even: extent %.1f px, window speed x (t1 - t0) = %.1f px (single interpolated frame %.1f px)\n", N, wd[0], wd[1], m.ext, D, singleExt); }
+                        // even weights: the outermost samples are the midpoints of the first / last slice, so the
+                        // sample span is speed x (t1 - t0) x (N - 1)/N; the smear extent is that span + ~1 px of
+                        // antialiasing + the softness of one interpolated frame (no sample is a sharp real frame any more)
+                        double D = kObjV * (wd[1] - wd[0]) * (N - 1) / (double)N;
+                        bool ok = m.ext >= D - 1.0 && m.ext <= D + 1.0 + singleExt;
+                        worstExt = std::max(worstExt, std::fabs(m.ext - (D + 1.0)));
+                        if (!ok) { extOk = false; printf("   N=%d [%g,%g] even: extent %.1f px, speed x (t1 - t0) x (N-1)/N = %.1f px (single interpolated frame %.1f px)\n", N, wd[0], wd[1], m.ext, D, singleExt); }
                     }
                     if (pm != UiProtection::Off) {
                         size_t bad = 0;
@@ -831,11 +830,44 @@ static int check(int W, int H) {
                     }
                 }
             }
-        printf("   plain recordSynth(0.75): edge sigma %.2f px; worst |mean - model| %.2f px, worst |sigma - (model + softness)| %.2f px, worst |extent - (speed x window + 1)| over the real-end windows %.2f px\n", e0.sigma, worstMu, worstSig, worstExt);
+        printf("   plain recordSynth(0.75): edge sigma %.2f px; worst |mean - model| %.2f px, worst |sigma - (model + softness)| %.2f px, worst |extent - (D + 1)|, D = speed x window x (N-1)/N, %.2f px\n", e0.sigma, worstMu, worstSig, worstExt);
         expect(muOk, "mean edge position within 2 px of the ideal model (N = 2..8, even + gaussian, 3 windows)");
         expect(sigOk, "edge spread (sigma) within 1 px of the ideal model's (+ the softness of the interpolated frames it is made of)");
-        expect(extOk, "even weights: smear extent = speed x (t1 - t0) (+1) +- 2 px (windows ending on a real frame), within [D-1, D+1+single frame softness] (interior windows)");
+        expect(extOk, "even weights: smear extent within [D-1, D+1+single frame softness], D = speed x (t1 - t0) x (N-1)/N (midpoint samples)");
         if (pm != UiProtection::Off) expect(xhOk, "crosshair pixels equal the real frame (<= 1 level) in every blurred output");
+    }
+    // ---- 4b. midpoint rule: windows that tile (100 % blur) share no sample, and the weights cover the interval uniformly
+    {
+        printf("[midpoint sampling: tiling at 100 %%]\n");
+        bool noEnds = true, tiles = true, gaussSym = true;
+        for (int N : {2, 3, 4, 5, 8, 16}) {
+            auto a = sampleTimes(N, 0.0f, 0.5f), b = sampleTimes(N, 0.5f, 1.0f), z = sampleTimes(N, 0.0f, 1.0f);
+            for (float t : z) noEnds = noEnds && t > 0.0f && t < 1.0f;
+            // adjacent windows [0, .5] and [.5, 1]: no shared instant, and together they are the 2N midpoints of the pair
+            for (int k = 0; k < N; k++) {
+                tiles = tiles && a[k] < 0.5f && b[k] > 0.5f;
+                tiles = tiles && std::fabs(a[k] - (k + 0.5) / (2.0 * N)) < 1e-6 && std::fabs(b[k] - (0.5 + (k + 0.5) / (2.0 * N))) < 1e-6;
+            }
+            auto gw = sampleWeights(N, BlurWeights::Gaussian);
+            for (int k = 0; k < N; k++) gaussSym = gaussSym && std::fabs(gw[k] - gw[N - 1 - k]) < 1e-12;
+        }
+        expect(noEnds, "midpoint rule: no sample of a blurred window is exactly t = 0 or t = 1");
+        expect(tiles, "windows [0, .5] and [.5, 1] share no sample; together = 2N uniform midpoints of the pair");
+        expect(gaussSym, "Gaussian weights are symmetric about the window centre");
+        // GPU: two tiled outputs of the same pair; each real frame is blended in only through interpolated samples, so
+        // output([0,1]) (Even, N = 8) equals the average of output([0,.5]) and output([.5,1]) (Even, N = 4) up to rounding
+        Settings s; s.uiProtection = UiProtection::Off;
+        Ctx c(W, H, s);
+        c.fg.setSettings(withBlur(s, 4, BlurWeights::Even));
+        blurOut(c, 0, 0.0f, 0.5f); blurOut(c, 1, 0.5f, 1.0f);
+        auto ha = c.get(0), hb = c.get(1);
+        c.fg.setSettings(withBlur(s, 8, BlurWeights::Even));
+        blurOut(c, 2, 0.0f, 1.0f);
+        auto whole = c.get(2);
+        int worst = 0;
+        for (size_t i = 0; i < (size_t)W * H * 4; i++) { if (i % 4 == 3) continue; worst = std::max(worst, std::abs((int)whole[i] - (((int)ha[i] + (int)hb[i] + 1) >> 1))); }
+        printf("   N=8 [0,1] vs mean of N=4 [0,.5] and [.5,1]: worst difference %d levels\n", worst);
+        expect(worst <= 2, "tiled windows: one 8-sample [0,1] output == the mean of the two 4-sample half windows (<= 2 levels)");
     }
     // ---- 5. rings: 8 outputs x 8 samples in one pair; mixed N in one submission; 32 outputs; the 33rd is refused
     {

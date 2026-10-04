@@ -4,7 +4,7 @@
 // have produced (resolve.comp: 7x7 mean of e, trust ramp, warps, mix with the nearer real frame; the whole-frame
 // fallbacks of fallback.comp: scene cut or more than globalFrac untrusted -> the nearer real frame) and a sample
 // with t <= 0 / t >= 1 is the real frame prev / curr. Everything is accumulated in registers, one dispatch for all
-// samples: no sub-frame is ever written to memory. Weights: even, or Gaussian with the window ends at +-2 sigma.
+// samples: no sub-frame is ever written to memory. Weights: even, or Gaussian with the window ends at +-2 sigma (weights from the slice centres, x_k = (2k + 1 - N) / N).
 // alpha: weighted like the colour (from the nearer real frame of each sample).
 //
 // The "more than globalFrac untrusted" decision of a sample needs the count over the WHOLE frame, which only exists
@@ -133,7 +133,8 @@ void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
 void main() {
     int lid = int(gl_LocalInvocationIndex);
     if (lid < pc.n) {
-        float x = pc.n > 1 ? (2.0 * float(lid) - float(pc.n - 1)) / float(pc.n - 1) : 0.0;
+        // midpoint rule: slice centres map to x = (2k + 1 - N) / N, the window ends to x = -+1 (exp(-2 x^2) as before)
+        float x = (2.0 * float(lid) + 1.0 - float(pc.n)) / float(pc.n);
         wk[lid] = pc.gauss != 0 ? exp(-2.0 * x * x) : 1.0;
     }
     if (lid < 16) cnt[lid] = 0u;

@@ -21,7 +21,7 @@ enum class UiProtection : uint32_t {
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
 enum class BlurWeights : uint32_t {
     Even = 0,       // every sub-frame 1/N: a plain box shutter
-    Gaussian = 1,   // w_k ~ exp(-2 x_k^2), x_k = (2k - (N-1)) / (N-1) in [-1, 1]: a Gaussian whose sigma is 1/4 of the
+    Gaussian = 1,   // w_k ~ exp(-2 x_k^2), x_k = (2k + 1 - N) / N, the slice centre mapped so the window ends are x = -+1: a Gaussian whose sigma is 1/4 of the
                     // window, so the ends of the window carry exp(-2) = 13.5 % of the centre's weight
 };
 
@@ -144,8 +144,8 @@ struct Settings {
     // Interpolation-based motion blur (recordSynthBlur()): one output = the weighted average of blurSamples
     // interpolated sub-frames spread evenly over a window [t0, t1] of the current real pair, a longer, smoother
     // "shutter" than a single instant. 0 or 1 = off (recordSynthBlur then equals recordSynth at the window's end t1).
-    // 2..kBlurMaxSamples; any value works: the sub-frames sit at t0 + (t1 - t0) k / (N - 1), k = 0..N-1 (both window
-    // ends included), with the weights of blurWeights. Runtime: setSettings() at any time; the scratch it needs (per sample one
+    // 2..kBlurMaxSamples; any value works: the sub-frames sit at the MIDPOINTS of N equal slices of the window,
+    // t_k = t0 + (t1 - t0)(k + 0.5)/N, k = 0..N-1 (a box-filter shutter; no sample on a window end), with the weights of blurWeights. Runtime: setSettings() at any time; the scratch it needs (per sample one
     // field at t and one mismatch image: ~3 B per pixel at flowScale 2, 9 B at flowScale 1) is allocated by the first
     // blurred record and only grows. Off = byte-identical to a library without it.
     // Cost (RX 7900 XTX, per output, on top of the pair's estimate): see "Motion blur" in INTEGRATION.md.
@@ -262,12 +262,14 @@ public:
 
     // ---- Motion blur ----
     // recordSynthBlur(cb, prev, curr, out, t0, t1): out = the weighted average of Settings::blurSamples sub-frames of
-    // the latest recordEstimate's pair, at t = t0 + (t1 - t0) k / (N - 1), k = 0..N-1, with Settings::blurWeights.
+    // the latest recordEstimate's pair, at t_k = t0 + (t1 - t0)(k + 0.5)/N, k = 0..N-1 (the midpoints of N equal slices: windows that tile, e.g. [0, .5] and
+    // [.5, 1], share no sample, so no real frame is counted twice), with Settings::blurWeights.
     // 0 <= t0 <= t1 <= 1 (else false). A sub-frame is exactly what recordSynth(t) would have produced (the same
     // fallbacks per sub-frame: per pixel trust ramp, scene cut, more than globalFallback untrusted -> the nearer real
-    // frame); t <= 0 / t >= 1 is the real frame prev / curr (no synthesis, so a window ending at 1 is cheaper). Each
+    // frame); t <= 0 / t >= 1 is the real frame prev / curr (with blur on and t0 < t1 no sample is ever exactly 0 or 1, so every sample is a synthesis). Each
     // sub-frame is rounded to 8 bit like a recordSynth output, the average is rounded once.
-    //   t0 == t1, or blur off (blurSamples < 2): one instant, t1: the same as recordSynth(t1) (t1 = 0 / 1: a copy of
+    //   N >= 2 and t0 < t1: the midpoint rule above. t0 == t1, or blur off (blurSamples < 2): one instant, t1 (NOT the
+    //   window centre: that keeps the point case equal to recordSynth(t1)): the same as recordSynth(t1) (t1 = 0 / 1: a copy of
     //   prev / curr). With blur off and t0 < t1 the window collapses to its END t1: a host that centres its window
     //   on the output's t should call recordSynth(t) itself while blur is off.
     // Cost: the estimate is shared by every output of the pair; the per-sample work (field lookup, mismatch) is one
