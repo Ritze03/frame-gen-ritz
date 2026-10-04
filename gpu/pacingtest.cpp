@@ -2658,3 +2658,404 @@ TEST_CASE( "lag buffer: a new stream forgets the spikes, a stall does not", "[la
 	CHECK( drv.pacer.BufferMs() == 0.0 );
 	CHECK( drv.Status().spikesInWindow == 0 );
 }
+
+// ======================================================================
+//  Video / timestamps mode (Pacer::OnFrame)
+// ======================================================================
+
+namespace
+{
+	// A host's video loop: frames with PTS (ns) announced a little ahead of the clock, one
+	// paint per present tick at V = tick time. Media clock: V = offset + pts / rate.
+	struct VideoDriver
+	{
+		Pacer pacer;
+		double refreshHz = 144.0;
+		double fps = 24.0;             // pts_k = llround( k * 1e9 / fps )
+		double rate = 1.0;
+		Mode mode = Mode::Target;      // target 0 = every tick of the display
+		int multiplier = 2;
+		int targetFps = 0;
+		bool frameGen = true;
+		bool blur = false;
+		double blurAmount = 0.5;
+		LagBufferSettings lag;
+		Ns extraDelayNs = 0;
+		int64_t offsetNs = 1'000'000'000;
+		int lookahead = 2;             // frames kept announced ahead of the one on screen
+		int withholdFrom = -1;         // frame indexes in [withholdFrom, withholdTo) are not announced before releaseAtNs
+		int withholdTo = -1;
+		int64_t releaseAtNs = 0;
+		FrameFormat fmt{ 1920, 1080, 87 };
+
+		int nextFrame = 0;
+		uint64_t tick = 0;
+		struct Out { int64_t V; int64_t tau; Pacer::Decision d; };
+		std::vector<Out> log;
+
+		int64_t Pts( int k ) const { return int64_t( std::llround( double( k ) * 1e9 / fps ) ); }
+		int64_t PtsOfId( uint64_t id ) const { return Pts( int( id ) - 1 ); }   // id = k + 1
+		int64_t TickNs( uint64_t i ) const { return int64_t( double( i ) * 1e9 / refreshHz ); }
+
+		Pacer::Inputs Inputs( int64_t V ) const
+		{
+			Pacer::Inputs in;
+			in.now = Ns( V );
+			in.presentNs = Ns( V );
+			in.mode = mode;
+			in.multiplier = multiplier;
+			in.targetFps = targetFps;
+			in.refreshHz = refreshHz;
+			in.frameGen = frameGen;
+			in.blur = blur;
+			in.blurSamples = 4;
+			in.blurAmount = blurAmount;
+			in.lagBuffer = lag;
+			in.extraDelayNs = extraDelayNs;
+			in.mediaOffsetNs = offsetNs;
+			in.playbackRate = rate;
+			return in;
+		}
+
+		void Announce( int64_t tau )
+		{
+			while ( pacer.WantsFrame() && Pts( nextFrame ) <= tau + int64_t( lookahead ) * int64_t( 1e9 / fps ) )
+			{
+				if ( nextFrame >= withholdFrom && nextFrame < withholdTo && TickNs( tick ) < releaseAtNs )
+					break;
+				pacer.OnFrame( uint64_t( nextFrame ) + 1, Ns( Pts( nextFrame ) ), 1, fmt );
+				nextFrame++;
+			}
+		}
+
+		Pacer::Decision Tick()
+		{
+			const int64_t V = TickNs( tick );
+			const int64_t tau = int64_t( std::llround( double( V - offsetNs ) * rate ) );
+			Announce( tau );
+			const Pacer::Decision d = pacer.OnPaint( Inputs( V ), nextFrame ? uint64_t( nextFrame ) : 0, true );
+			log.push_back( { V, tau, d } );
+			tick++;
+			return d;
+		}
+
+		// Ticks from the current one until V reaches tEndNs.
+		void RunTo( int64_t tEndNs ) { while ( TickNs( tick ) < tEndNs ) Tick(); }
+
+		// The content time an output SHOWS, in PTS ns: a real frame's own PTS or the
+		// interpolated instant of its pair (the end of the blur window when blurred).
+		double Shown( const Pacer::Decision &d ) const
+		{
+			if ( d.prevId == 0 || d.t1 >= 1.0f )
+				return double( PtsOfId( d.prevId == 0 ? d.showId : d.currId ) );
+			const double a = double( PtsOfId( d.prevId ) ), b = double( PtsOfId( d.currId ) );
+			return a + double( d.t1 ) * ( b - a );
+		}
+	};
+}
+
+TEST_CASE( "video: 24 fps on 144 Hz, every tick is an output at its exact content time", "[video]" )
+{
+	VideoDriver v;
+	v.RunTo( v.offsetNs + 3'000'000'000 );
+	int nChecked = 0, nSynth = 0, nReal = 0;
+	for ( const auto &o : v.log )
+	{
+		if ( o.tau < v.Pts( 2 ) )
+			continue;                                    // warm-up: the first frames
+		const int k = int( std::floor( double( o.tau ) / ( 1e9 / 24.0 ) + 1e-9 ) );
+		const double span = double( v.Pts( k + 1 ) - v.Pts( k ) );
+		const double tExp = double( o.tau - v.Pts( k ) ) / span;
+		CHECK( o.d.newOutput );
+		CHECK_FALSE( o.d.inert );
+		CHECK_FALSE( o.d.skip );
+		if ( o.d.prevId != 0 )
+		{
+			CHECK( std::fabs( double( o.d.t ) - tExp ) < 1e-6 );
+			CHECK( o.d.prevId == uint64_t( k ) + 1 );
+			CHECK( o.d.currId == uint64_t( k ) + 2 );
+			nSynth++;
+		}
+		else
+		{
+			// On a real frame: t ~ 0 of pair k or ~1 of pair k-1.
+			CHECK( std::min( tExp, 1.0 - tExp ) < 1e-4 + 1e-9 );
+			nReal++;
+		}
+		nChecked++;
+	}
+	CHECK( nChecked > 250 );
+	CHECK( nSynth == nChecked - nReal );
+	CHECK( nReal >= 10 );                                // one real frame per 6 ticks
+	CHECK( v.pacer.Generating() );
+	const Pacer::Report r = v.pacer.TakeStatus( v.Inputs( v.TickNs( v.tick ) ), Ns( v.TickNs( v.tick ) ) );
+	CHECK( r.reason == Reason::Normal );
+	CHECK( r.delayMs == 0.0f );
+	CHECK( std::fabs( r.gameFps - 24.0f ) < 0.01f );
+}
+
+TEST_CASE( "video: 24 fps film, Fixed 2x keeps a steady 3-tick cadence on 144 Hz", "[video]" )
+{
+	VideoDriver v;
+	v.mode = Mode::Fixed;
+	v.multiplier = 2;
+	v.RunTo( v.offsetNs + 3'000'000'000 );
+	// 48 outputs a second out of 144 ticks: one new output every 3 ticks.
+	int nNew = 0;
+	int64_t lastNewTick = -1;
+	for ( size_t i = 0; i < v.log.size(); i++ )
+	{
+		if ( v.log[ i ].tau < v.Pts( 4 ) )
+			continue;
+		if ( v.log[ i ].d.newOutput )
+		{
+			if ( lastNewTick >= 0 )
+				CHECK( int64_t( i ) - lastNewTick == 3 );
+			lastNewTick = int64_t( i );
+			nNew++;
+		}
+	}
+	CHECK( nNew > 100 );
+}
+
+TEST_CASE( "video: 23.976 fps on 120 Hz over 60 s does not drift", "[video]" )
+{
+	VideoDriver v;
+	v.refreshHz = 120.0;
+	v.fps = 24000.0 / 1001.0;
+	v.RunTo( v.offsetNs + 60'000'000'000 );
+	REQUIRE( v.log.size() >= 7200 );
+	double flMaxErr = 0.0;
+	int nExactReal = 0, nOnTick = 0;
+	for ( const auto &o : v.log )
+	{
+		if ( o.tau < v.Pts( 2 ) )
+			continue;
+		CHECK( o.d.newOutput || o.d.prevId == 0 );
+		const int k = int( std::floor( double( o.tau ) / ( 1e9 / v.fps ) ) );
+		const int kk = o.tau >= v.Pts( k + 1 ) ? k + 1 : ( o.tau < v.Pts( k ) ? k - 1 : k );
+		const double span = double( v.Pts( kk + 1 ) - v.Pts( kk ) );
+		const double flErr = std::fabs( v.Shown( o.d ) - double( o.tau ) ) / span;
+		flMaxErr = std::max( flMaxErr, flErr );
+		// A PTS that falls on a tick (every 200th frame: 1001 ticks) is shown as itself.
+		if ( std::llabs( o.tau - v.Pts( kk ) ) < 2 || std::llabs( o.tau - v.Pts( kk + 1 ) ) < 2 )
+		{
+			nOnTick++;
+			if ( o.d.prevId == 0 )
+				nExactReal++;
+		}
+	}
+	CHECK( flMaxErr <= 1e-4 );
+	CHECK( nOnTick >= 5 );                               // 60 s / (200 frames = 8.34 s) = 7
+	CHECK( nExactReal == nOnTick );
+	// The content time of the very last output is where the media clock says, not a drift away.
+	const auto &last = v.log.back();
+	CHECK( std::fabs( v.Shown( last.d ) - double( last.tau ) ) < 0.01 * 1e9 / v.fps );
+}
+
+TEST_CASE( "video: a late decoder holds t = 1 (WaitingForDecoder) and resumes on the exact t", "[video]" )
+{
+	VideoDriver v;
+	v.withholdFrom = 10;
+	v.withholdTo = 11;
+	// Frame 10 (pts 416.7 ms) is released at tau = pts_9 + 0.5 span, i.e. while frame 9 is on screen.
+	v.releaseAtNs = v.offsetNs + v.Pts( 9 ) + int64_t( 0.5 * ( v.Pts( 10 ) - v.Pts( 9 ) ) );
+	bool bSawWait = false;
+	double flPrev = 0.0;
+	for ( int i = 0; i < 400 && v.TickNs( v.tick ) < v.offsetNs + v.Pts( 14 ); i++ )
+	{
+		const Pacer::Decision d = v.Tick();
+		const auto &o = v.log.back();
+		if ( o.tau < v.Pts( 3 ) )
+			continue;
+		const double flShown = v.Shown( d );
+		CHECK( flShown >= flPrev - 1.0 );                // the content never goes backwards
+		flPrev = flShown;
+		if ( v.pacer.WaitingForDecoder() )
+		{
+			bSawWait = true;
+			CHECK( o.tau > v.Pts( 9 ) );
+			CHECK( d.prevId == 0 );
+			CHECK( d.t == 1.0f );
+			CHECK( d.showId == 10 );                     // frame 9, id 10
+			CHECK( v.pacer.TakeStatus( v.Inputs( o.V ), Ns( o.V ) ).reason == Reason::WaitingForDecoder );
+		}
+		else if ( o.tau > v.Pts( 9 ) && d.prevId != 0 )
+		{
+			int k = 9;
+			while ( v.Pts( k + 1 ) <= o.tau )
+				k++;
+			CHECK( d.prevId == uint64_t( k ) + 1 );
+			const double tExp = double( o.tau - v.Pts( k ) ) / double( v.Pts( k + 1 ) - v.Pts( k ) );
+			CHECK( std::fabs( double( d.t ) - tExp ) < 1e-6 );
+		}
+	}
+	CHECK( bSawWait );
+	CHECK_FALSE( v.pacer.WaitingForDecoder() );
+}
+
+TEST_CASE( "video: Discontinuity is a seek, the first frame is shown directly", "[video]" )
+{
+	VideoDriver v;
+	v.RunTo( v.offsetNs + 1'000'000'000 );
+	REQUIRE( v.pacer.Generating() );
+	// Seek to 10 s: a new timeline.
+	v.pacer.Discontinuity();
+	CHECK( v.pacer.PendingFrames() == 0 );
+	const int kSeek = 240;                               // 10 s of film
+	v.nextFrame = kSeek;
+	v.offsetNs = v.TickNs( v.tick ) - v.Pts( kSeek ) - 10'000'000;   // pts_240 is due 10 ms from now
+	v.lookahead = 0;                                     // only the first frame is decoded yet
+	const Pacer::Decision d = v.Tick();
+	CHECK( d.reset );
+	CHECK( d.prevId == 0 );
+	CHECK( d.t == 1.0f );
+	CHECK( d.showId == uint64_t( kSeek ) + 1 );          // before its time: shown directly
+	CHECK_FALSE( d.inert );
+	v.lookahead = 2;
+	v.RunTo( v.TickNs( v.tick ) + 1'000'000'000 );
+	int nSynth = 0;
+	for ( const auto &o : v.log )
+		if ( o.d.prevId != 0 && o.tau > v.Pts( kSeek ) && o.d.prevId > uint64_t( kSeek ) )
+		{
+			const int k = int( o.d.prevId ) - 1;
+			CHECK( std::fabs( double( o.d.t ) - double( o.tau - v.Pts( k ) ) / double( v.Pts( k + 1 ) - v.Pts( k ) ) ) < 1e-6 );
+			nSynth++;
+		}
+	CHECK( nSynth > 100 );
+}
+
+TEST_CASE( "video: a PTS that goes backwards is a seek, an equal one a duplicate", "[video]" )
+{
+	Pacer p;
+	FrameFormat f{ 64, 64, 1 };
+	p.OnFrame( 1, 1000 * MS, 1, f );
+	p.OnFrame( 2, 1041 * MS, 1, f );
+	CHECK( p.PendingFrames() == 2 );
+	CHECK( p.OnFrame( 2, 1041 * MS, 1, f ) );            // duplicate, ignored
+	CHECK( p.PendingFrames() == 2 );
+	p.OnFrame( 9, 500 * MS, 1, f );                      // backwards: forgets, keeps this one
+	CHECK( p.PendingFrames() == 1 );
+	CHECK( p.Timestamps() );
+}
+
+TEST_CASE( "video: the announced-ahead queue is bounded", "[video]" )
+{
+	Pacer p;
+	FrameFormat f{ 64, 64, 1 };
+	int nAccepted = 0;
+	for ( int i = 0; i < 20; i++ )
+		nAccepted += p.OnFrame( uint64_t( i ) + 1, Ns( i ) * 41 * MS, 1, f ) ? 1 : 0;
+	CHECK( nAccepted == kVideoLookahead );
+	CHECK_FALSE( p.WantsFrame() );
+}
+
+TEST_CASE( "video: blur's window comes from the PTS spacing", "[video][blur]" )
+{
+	VideoDriver v;
+	v.blur = true;
+	v.blurAmount = 0.5;                                  // ShownFrame: s * o / g = 0.5 / 6 of the pair
+	v.RunTo( v.offsetNs + 2'000'000'000 );
+	int nChecked = 0;
+	for ( const auto &o : v.log )
+	{
+		if ( o.tau < v.Pts( 4 ) || o.d.prevId == 0 )
+			continue;
+		const double w = 0.5 / 6.0;
+		CHECK( std::fabs( double( o.d.t1 ) - double( o.d.t ) ) < 1e-6 );
+		CHECK( std::fabs( double( o.d.t0 ) - std::max( 0.0, double( o.d.t ) - w ) ) < 2e-4 );
+		nChecked++;
+	}
+	CHECK( nChecked > 100 );
+	CHECK( v.pacer.TakeStatus( v.Inputs( v.TickNs( v.tick ) ), Ns( v.TickNs( v.tick ) ) ).blurActive );
+}
+
+TEST_CASE( "video: the lag buffer, the extra delay and the priorities are inert", "[video]" )
+{
+	VideoDriver a, b;
+	b.lag.enabled = true;
+	b.lag.testMode = LagTestMode::ForceMax;
+	b.extraDelayNs = 50 * MS;
+	a.RunTo( a.offsetNs + 2'000'000'000 );
+	b.RunTo( b.offsetNs + 2'000'000'000 );
+	REQUIRE( a.log.size() == b.log.size() );
+	for ( size_t i = 0; i < a.log.size(); i++ )
+	{
+		CHECK( a.log[ i ].d.t == b.log[ i ].d.t );
+		CHECK( a.log[ i ].d.prevId == b.log[ i ].d.prevId );
+		CHECK( a.log[ i ].d.showId == b.log[ i ].d.showId );
+	}
+	CHECK( b.pacer.BufferMs() == 0.0 );
+	CHECK( b.pacer.DelayMs() == 0.0 );
+	CHECK( b.pacer.HistoryDepth() == kHistory );
+	const Pacer::Report r = b.pacer.TakeStatus( b.Inputs( b.TickNs( b.tick ) ), Ns( b.TickNs( b.tick ) ) );
+	CHECK( r.bufferDelayMs == 0.0f );
+	CHECK( r.bufferTargetMs == 0.0f );
+}
+
+TEST_CASE( "video: frame generation off schedules real frames at their PTS, one new output per frame", "[video]" )
+{
+	VideoDriver v;
+	v.frameGen = false;
+	v.RunTo( v.offsetNs + 2'000'000'000 );
+	int nNew = 0;
+	for ( const auto &o : v.log )
+	{
+		if ( o.tau < v.Pts( 3 ) )
+			continue;
+		CHECK( o.d.prevId == 0 );
+		CHECK_FALSE( o.d.inert );
+		// The frame whose time has come, not the newest announced one.
+		const int k = int( std::floor( double( o.tau + 4000 ) / ( 1e9 / 24.0 ) ) );   // within the 1e-4 snap
+		CHECK( std::llabs( v.PtsOfId( o.d.showId ) - v.Pts( k ) ) < 2 );
+		nNew += o.d.newOutput ? 1 : 0;
+	}
+	CHECK( nNew >= 40 );
+	CHECK( nNew <= 50 );                                 // ~24 a second for ~1.9 s
+}
+
+TEST_CASE( "video: content at the output rate is scheduled, not passed through", "[video]" )
+{
+	VideoDriver v;
+	v.fps = 60.0;
+	v.refreshHz = 60.0;
+	v.RunTo( v.offsetNs + 1'000'000'000 );
+	for ( const auto &o : v.log )
+	{
+		if ( o.tau < v.Pts( 4 ) )
+			continue;
+		CHECK( o.d.prevId == 0 );
+		CHECK_FALSE( o.d.inert );
+		CHECK( std::llabs( v.PtsOfId( o.d.showId ) - o.tau ) < int64_t( 1e9 / 60 ) );
+	}
+	CHECK( v.pacer.TakeStatus( v.Inputs( v.TickNs( v.tick ) ), Ns( v.TickNs( v.tick ) ) ).reason == Reason::GameTooFast );
+}
+
+TEST_CASE( "video: 2x playback rate maps the media clock", "[video]" )
+{
+	VideoDriver v;
+	v.rate = 2.0;
+	v.RunTo( v.offsetNs + 2'000'000'000 );
+	int n = 0;
+	for ( const auto &o : v.log )
+	{
+		if ( o.tau < v.Pts( 3 ) || o.d.prevId == 0 )
+			continue;
+		const int k = int( o.d.prevId ) - 1;
+		CHECK( std::fabs( double( o.d.t ) - double( o.tau - v.Pts( k ) ) / double( v.Pts( k + 1 ) - v.Pts( k ) ) ) < 1e-6 );
+		n++;
+	}
+	CHECK( n > 100 );
+	CHECK( std::fabs( v.pacer.TakeStatus( v.Inputs( v.TickNs( v.tick ) ), Ns( v.TickNs( v.tick ) ) ).gameFps - 24.0f ) < 0.01f );
+}
+
+TEST_CASE( "video: arrival and timestamp sources do not mix silently", "[video]" )
+{
+	Pacer p;
+	FrameFormat f{ 64, 64, 1 };
+	p.OnFrame( 1, 10 * MS, 1, f );
+	CHECK( p.Timestamps() );
+	p.OnArrival( 2, 20 * MS, 1, f );
+	CHECK_FALSE( p.Timestamps() );
+	CHECK( p.PendingFrames() == 0 );
+}

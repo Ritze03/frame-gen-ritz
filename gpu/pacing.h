@@ -169,6 +169,23 @@
 // The buffer works because D >= spike: the late frame has arrived by the time the
 // content time needs the gap filled. The first hitch of a session always freezes.
 
+// VIDEO / TIMESTAMPS MODE (Pacer::OnFrame; the default stays arrival-timed, byte-identical).
+// A video's frames carry presentation timestamps (PTS) and the decoder has the next ones
+// ready, so nothing needs to be guessed from arrival times and no latency is at stake. The
+// host announces each frame with OnFrame( id, ptsNs, ... ) instead of OnArrival and gives
+// the media clock in Inputs (mediaOffsetNs, playbackRate): the present time at which PTS p
+// is to appear is  V = mediaOffsetNs + p / playbackRate. The paint at V then shows the
+// content time  tau = (V - mediaOffsetNs) * playbackRate  -- the PTS that belongs to V, D = 0
+// -- exactly: t = (tau - pts_k) / (pts_k+1 - pts_k) with no clamp, so 24 fps film on a
+// 144 Hz display lands every output at its own content time (no 3:2-style judder). Frame
+// generation's cadence (fixed N, target fps, pause at refresh), blur and the cost guard work
+// as before; the lag-spike buffer, extraDelayNs and the delay priorities are inert (there are
+// no arrival spikes to size a buffer for and D is 0). If the next frame is not there yet
+// (a decoder hiccup) the last real frame is held at t = 1 -- never extrapolated -- and
+// Report::reason is WaitingForDecoder. In this mode the pacer is never inert: even a
+// pass-through must schedule (frames are announced AHEAD, so "the newest" is not what is
+// due). Pause / seek: Discontinuity() (or Reset()). INTEGRATION.md has the host contract.
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -209,6 +226,10 @@ namespace framegen::pacing
 	// kCostProbeMaxNs.
 	constexpr Ns     kCostProbeNs     = 10'000'000'000ull;
 	constexpr Ns     kCostProbeMaxNs  = 3'000'000'000ull;
+	// Video mode: frames announced ahead of the one being shown that the pacer holds
+	// (OnFrame returns false when full), and the t within which a synth snaps to a real frame.
+	constexpr int    kVideoLookahead  = 8;
+	constexpr double kPtsSnap         = 1e-4;
 	// Status is worth publishing this often.
 	constexpr Ns     kStatusPeriodNs  = 250 * kNsPerMs;
 
@@ -279,6 +300,7 @@ namespace framegen::pacing
 		GameTooFast,
 		GameStalled,
 		RendererUnavailable,
+		WaitingForDecoder,   // video mode: the next frame is not announced yet; the last real frame is held
 	};
 
 	// ------------------------------------------------------------------
@@ -558,7 +580,9 @@ namespace framegen::pacing
 		}
 
 		int  Count() const { return m_nCount; }
-		bool Valid() const { return m_nCount >= kMinSamples; }
+		bool Valid() const { return m_nCount >= m_nMin; }
+		// Video (timestamps) mode trusts exact PTS deltas after one interval.
+		void SetMinSamples( int n ) { m_nMin = std::max( n, 1 ); }
 
 		// Median of what we have, clamped. 0 when there is nothing yet.
 		double IntervalMs() const
@@ -577,6 +601,7 @@ namespace framegen::pacing
 		double m_flMs[ kIntervalWindow ] = {};
 		int m_nCount = 0;
 		int m_nHead = 0;
+		int m_nMin = kMinSamples;
 	};
 
 	// ------------------------------------------------------------------
@@ -645,6 +670,12 @@ namespace framegen::pacing
 			int    blurSamples = 0;
 			double blurAmount = 0.5;   // 0..1, the shutter (see BlurWindow)
 			BlurRelative blurRelative = BlurRelative::ShownFrame;
+
+			// --- video / timestamps mode (only read after OnFrame; see the header) ---
+			// The media clock: PTS p is to be shown at V = mediaOffsetNs + p / playbackRate.
+			// Read fresh at each paint (a rate change or an A/V trim takes effect at once).
+			int64_t mediaOffsetNs = 0;
+			double  playbackRate = 1.0;
 		};
 
 		// What to do for this paint.
@@ -720,6 +751,53 @@ namespace framegen::pacing
 			DropHistory( Cause::Other, false );
 			m_ulNewestId = 0;
 			m_bPending = false;
+			if ( m_bPts )
+				m_bHaveArrival = false;   // the next PTS is on a new timeline: no interval across a seek
+		}
+
+		// VIDEO MODE: a decoded frame, announced in presentation order, with its PTS in
+		// nanoseconds (any origin, the media clock in Inputs maps it to V). Frames may be
+		// announced AHEAD of the one on screen (up to kVideoLookahead; false = full, announce it
+		// again later -- WantsFrame() says); the pacer promotes each when its time comes and
+		// reports it in Decision::newestId, where the renderer copies it. A new stream key or
+		// FrameFormat is a reset; a PTS that goes backwards is an implicit seek (a reset); an
+		// equal PTS is a duplicate and ignored. Mixing with OnArrival resets.
+		bool OnFrame( uint64_t ulFrameId, Ns ptsNs, uint64_t ulStreamKey, const FrameFormat &format )
+		{
+			if ( !m_bPts )
+			{
+				if ( m_bHaveStream )
+					DropHistory( Cause::Stream, true );
+				m_bPts = true;
+			}
+			else if ( m_bHaveStream && ( ulStreamKey != m_ulStreamKey || format != m_Format ) )
+			{
+				DropHistory( Cause::Stream, true );
+				m_bHaveArrival = false;
+			}
+			m_Est.SetMinSamples( 1 );
+			if ( m_bHaveArrival )
+			{
+				if ( ptsNs == m_ulLastArrival )
+					return true;
+				if ( ptsNs < m_ulLastArrival )
+					DropHistory( Cause::Other, false );
+				else if ( m_nPend >= kVideoLookahead )
+					return false;
+				else
+					m_Est.AddInterval( ptsNs - m_ulLastArrival );
+			}
+			if ( m_nPend >= kVideoLookahead )
+				return false;
+			m_Pend[ m_nPend++ ] = HistFrame{ ulFrameId, int64_t( ptsNs ) };
+			m_ulStreamKey = ulStreamKey;
+			m_Format = format;
+			m_bHaveStream = true;
+			m_ulLastArrival = ptsNs;
+			m_bHaveArrival = true;
+			m_ulNewestId = ulFrameId;
+			m_bPending = true;
+			return true;
 		}
 
 		// A real frame became the newest usable one. "Arrival" = the earliest point
@@ -731,6 +809,13 @@ namespace framegen::pacing
 		// key, or another size/format, is a reset.
 		void OnArrival( uint64_t ulFrameId, Ns tNs, uint64_t ulStreamKey, const FrameFormat &format )
 		{
+			if ( m_bPts )
+			{
+				// Back from timestamps to arrival timing: another kind of source.
+				DropHistory( Cause::Stream, true );
+				m_bPts = false;
+			}
+			m_Est.SetMinSamples( kMinSamples );
 			m_flLastIntervalMs = 0.0;
 			if ( m_bHaveStream && ( ulStreamKey != m_ulStreamKey || format != m_Format ) )
 			{
@@ -772,7 +857,7 @@ namespace framegen::pacing
 		// be dropped (Decision::skip) instead of re-presenting the cached image.
 		Decision OnPaint( const Inputs &in, uint64_t ulNewestId, bool bPresentTick, bool bSkippable = false )
 		{
-			if ( ulNewestId != m_ulNewestId )
+			if ( !m_bPts && ulNewestId != m_ulNewestId )
 			{
 				// The newest frame changed behind our back (the source switched with no
 				// arrival of its own, or this is the first paint): no interval, no
@@ -787,6 +872,15 @@ namespace framegen::pacing
 			m_bPending = false;
 
 			Evaluate( in );
+			if ( m_bPts && m_Plan.state == State::Pass )
+			{
+				// Video: a pass-through still has to SCHEDULE (the newest announced frame is
+				// not the due one): real-rate planning, never inert.
+				m_Plan.state = State::Generate;
+				m_Plan.realRate = true;
+				m_Plan.inert = false;
+				m_Plan.oMs = 0.0;
+			}
 
 			Decision d;
 			d.newestId = ulNewestId;
@@ -806,6 +900,11 @@ namespace framegen::pacing
 					break;
 
 				case State::Warming:
+					if ( m_bPts )
+					{
+						PaintVideo( in, d, bPresentTick, bSkippable );
+						break;
+					}
 					// Ask for the ring copy so the first pair after warm-up has its
 					// previous frame.
 					PushNewest( ulNewestId );
@@ -815,6 +914,11 @@ namespace framegen::pacing
 					break;
 
 				case State::Generate:
+					if ( m_bPts )
+					{
+						PaintVideo( in, d, bPresentTick, bSkippable );
+						break;
+					}
 					PaintGenerated( in, d, bFresh, bPresentTick, bSkippable );
 					if ( d.skip )
 						m_bPending = bFresh;
@@ -867,7 +971,7 @@ namespace framegen::pacing
 			{
 				s.reason = Reason::RendererUnavailable;
 			}
-			else if ( m_bHaveArrival && ulNow > m_ulLastArrival + m_ulGapNs )
+			else if ( !m_bPts && m_bHaveArrival && ulNow > m_ulLastArrival + m_ulGapNs )
 			{
 				s.reason = Reason::GameStalled;
 			}
@@ -877,7 +981,7 @@ namespace framegen::pacing
 			}
 			else
 			{
-				s.reason = m_Plan.reason;
+				s.reason = ( m_bPts && m_bWaiting ) ? Reason::WaitingForDecoder : m_Plan.reason;
 				if ( m_Plan.state == State::Generate )
 				{
 					s.delayMs = float( m_flDelayMs );
@@ -911,6 +1015,13 @@ namespace framegen::pacing
 		// copies to keep: Settings::uiHistory): kHistory, more with a delay; follows the
 		// delay, see kHistoryMargin.
 		int    HistoryDepth() const { return m_nDepth; }
+		// Video mode: OnFrame was the last source, the pacer has room for another announced
+		// frame, how many are held ahead, and whether the last paint held a frame for want of
+		// the next one (Reason::WaitingForDecoder).
+		bool   Timestamps() const { return m_bPts; }
+		bool   WantsFrame() const { return m_nPend < kVideoLookahead; }
+		int    PendingFrames() const { return m_nPend; }
+		bool   WaitingForDecoder() const { return m_bPts && m_bWaiting; }
 		bool   CostBlocked() const { return m_bCostBlocked; }
 		// The effective output interval (after the cost guard), ms; 0 when not generating.
 		double OutputMs() const { return m_Plan.state == State::Generate ? m_Plan.oMs : 0.0; }
@@ -1178,6 +1289,8 @@ namespace framegen::pacing
 			m_nPairSynths = 0;
 			m_flBlurMs = 0.0;
 			m_Last = Decision();
+			m_nPend = 0;
+			m_bWaiting = false;
 		}
 
 		void PushNewest( uint64_t ulId )
@@ -1215,8 +1328,19 @@ namespace framegen::pacing
 
 			Plan p;
 			m_bExtra = false;
-			UpdateBuffer( in, int64_t( in.presentNs ? in.presentNs : in.now ) );
-			UpdateDepth( in );
+			if ( m_bPts )
+			{
+				// Video: no arrival spikes to size a buffer for and D is 0 on the media clock.
+				m_flBufMs = m_flTargetMs = 0.0;
+				m_ulExtraNs = 0;
+				m_nDepth = kHistory;
+				m_flDtMs = 0.0;
+			}
+			else
+			{
+				UpdateBuffer( in, int64_t( in.presentNs ? in.presentNs : in.now ) );
+				UpdateDepth( in );
+			}
 			const bool bFG = in.frameGen;
 			const bool bBlur = BlurActive( in );
 			const bool bDelay = m_ulExtraNs > 0;
@@ -1536,6 +1660,126 @@ namespace framegen::pacing
 			m_bExpectPaint = true;
 		}
 
+		// ---- video mode: one output per tick at the PTS that belongs to the tick ----
+
+		void PaintVideo( const Inputs &in, Decision &d, bool bPresentTick, bool bSkippable )
+		{
+			const int64_t V = int64_t( in.presentNs ? in.presentNs : in.now );
+			const double flRate = ( in.playbackRate > 0.0 && std::isfinite( in.playbackRate ) ) ? in.playbackRate : 1.0;
+			const int64_t tau = int64_t( std::llround( double( V - in.mediaOffsetNs ) * flRate ) );
+			m_flDelayMs = 0.0;
+			const bool bSynth = m_Plan.state == State::Generate && !m_Plan.realRate;
+			const bool bHaveLast = m_Last.outId != 0;
+
+			auto RepeatLast = [&]( bool bSkip )
+			{
+				const bool bReset = d.reset;
+				const uint64_t ulNewest = d.newestId;
+				d = m_Last;
+				d.newestId = ulNewest;
+				d.reset = bReset;
+				d.newOutput = false;
+				d.repaintNext = true;
+				d.skip = bSkip;
+			};
+
+			d.newestId = m_nHist > 0 ? m_Hist[ m_nHist - 1 ].id : 0;
+			d.showId = d.newestId;
+			d.t = d.t0 = d.t1 = 1.0f;
+			if ( !bPresentTick && bHaveLast )
+			{
+				RepeatLast( false );    // a UI repaint between ticks: nothing new is due
+				return;
+			}
+
+			// The output cadence (Fixed N / Target below the refresh): a tick that does not
+			// cross the output interval keeps the previous image.
+			const double flTickMs = 1000.0 / std::max( in.refreshHz, 1.0 );
+			const bool bCadence = bSynth && m_Plan.oMs > flTickMs * 1.02;
+			if ( bCadence )
+			{
+				const int64_t nTickNs = int64_t( flTickMs * 1e6 );
+				const int64_t nOutNs = int64_t( m_Plan.oMs * 1e6 );
+				const bool bDue = m_nNextDue != 0 && V + nTickNs / 2 >= m_nNextDue;
+				if ( m_nNextDue != 0 && !bDue && bHaveLast )
+				{
+					RepeatLast( bSkippable );
+					return;
+				}
+				m_nNextDue = bDue ? std::max( m_nNextDue + nOutNs, V + nOutNs - nTickNs ) : V + nOutNs;
+			}
+			else
+			{
+				m_nNextDue = 0;
+			}
+
+			// Promote announced frames until the newest known one is past tau (the upper end
+			// of the pair that brackets it), or none is left.
+			while ( m_nPend > 0 && ( m_nHist == 0 || m_Hist[ m_nHist - 1 ].arrival <= tau ) )
+			{
+				while ( m_nHist >= m_nDepth )
+				{
+					for ( int i = 1; i < m_nHist; i++ )
+						m_Hist[ i - 1 ] = m_Hist[ i ];
+					m_nHist--;
+				}
+				m_Hist[ m_nHist++ ] = m_Pend[ 0 ];
+				for ( int i = 1; i < m_nPend; i++ )
+					m_Pend[ i - 1 ] = m_Pend[ i ];
+				m_nPend--;
+			}
+			d.newestId = m_nHist > 0 ? m_Hist[ m_nHist - 1 ].id : 0;
+			d.showId = d.newestId;
+			if ( m_nHist == 0 )
+			{
+				m_bWaiting = false;
+				return;                 // nothing announced yet
+			}
+
+			int j = m_nHist - 1;        // the last frame whose time has come
+			while ( j >= 0 && m_Hist[ j ].arrival > tau )
+				j--;
+			const bool bHaveNext = j >= 0 && j + 1 < m_nHist;
+			// A frame whose time has come with none after it: the decoder is late (or the
+			// stream ended): hold it, never extrapolate.
+			m_bWaiting = j == m_nHist - 1 && tau > m_Hist[ j ].arrival;
+
+			int jReal = std::max( j, 0 );          // before the first frame: show the first
+			double t = 1.0;
+			bool bReal = true;
+			if ( bHaveNext )
+			{
+				// Within kPtsSnap of a frame's time is that frame (a tick time is rounded to
+				// whole ns; the frame itself is not a tick late for it, and no synth that
+				// close is worth making).
+				const double flSpan = double( std::max<int64_t>( m_Hist[ j + 1 ].arrival - m_Hist[ j ].arrival, 1 ) );
+				t = double( tau - m_Hist[ j ].arrival ) / flSpan;
+				if ( t >= 1.0 - kPtsSnap )
+					jReal = j + 1;
+				else if ( t > kPtsSnap && bSynth )
+					bReal = false;
+			}
+
+			m_nTauLast = tau;
+			m_bTauValid = true;
+			if ( bReal )
+			{
+				if ( bHaveLast && m_Last.prevId == 0 && m_Last.t0 == 1.0f && m_Last.showId == m_Hist[ jReal ].id && !BlurActive( in ) )
+				{
+					RepeatLast( false );    // the same real frame again: nothing new to present
+					return;
+				}
+				d.newOutput = true;
+				FinishReal( in, d, jReal );
+			}
+			else
+			{
+				d.newOutput = true;
+				FinishSynth( in, d, j, t, m_Last.t < 1.0f && bHaveLast );
+			}
+			d.repaintNext = true;
+		}
+
 		// ---- the shared end of every output: which pair, which window, which image ----
 
 		// The output interval ShownFrame blur is measured in, ns.
@@ -1723,6 +1967,12 @@ namespace framegen::pacing
 		uint64_t m_ulStreamKey = 0;
 		FrameFormat m_Format;
 		IntervalEstimator m_Est;
+
+		// -- video mode --
+		bool     m_bPts = false;             // the stream is timestamped (OnFrame)
+		bool     m_bWaiting = false;         // the last paint held a frame for want of the next
+		HistFrame m_Pend[ kVideoLookahead ]; // announced, not yet promoted
+		int      m_nPend = 0;
 
 		// -- the output sequence in progress --
 		HistFrame m_Hist[ kHistoryMax ];
