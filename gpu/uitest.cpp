@@ -146,7 +146,7 @@ struct Scene {
     std::vector<uint8_t> uiCol;   // overlay RGB(A)
     int cx, cy;                   // crosshair centre
     int hx0, hy0, hx1, hy1;       // hud box
-    Scene(int w, int h, int nf, int cxOff, int cyOff) : W(w), H(h), NF(nf) {
+    Scene(int w, int h, int nf, int cxOff, int cyOff, int arm = 16) : W(w), H(h), NF(nf) {
         bgW = W + kPanX * (NF + 1);
         bgH = H + kPanY * (NF + 1);
         bg.resize((size_t)bgW * bgH * 4);
@@ -182,8 +182,8 @@ struct Scene {
         // crosshair: arms 3 px thick, from 5 to 16 px out, centre dot 3x3; 1 px black outline, then colour
         auto inCross = [&](int dx, int dy, int grow) {
             int ax = std::abs(dx), ay = std::abs(dy);
-            bool hArm = ay <= 1 + grow && ax >= 5 - grow && ax <= 16 + grow;
-            bool vArm = ax <= 1 + grow && ay >= 5 - grow && ay <= 16 + grow;
+            bool hArm = ay <= 1 + grow && ax >= 5 - grow && ax <= arm + grow;
+            bool vArm = ax <= 1 + grow && ay >= 5 - grow && ay <= arm + grow;
             bool dot = ax <= 1 + grow && ay <= 1 + grow;
             return hArm || vArm || dot;
         };
@@ -351,8 +351,11 @@ static int check(int W, int H, bool hash) {
         if (wantFull) expect(m.psnrBg >= mOff.psnrBg - 0.3, "background PSNR within 0.3 dB of Off (or better)");
         return r;
     };
-    Settings c1; c1.uiProtection = UiProtection::Crosshair;
-    Settings w1; w1.uiProtection = UiProtection::WholeScreen;
+    // the test crosshair is 35x35 px incl. outline: size the box via the height fraction to fit it (default 0.025 is
+    // 18 px at 720, smaller than this crosshair)
+    const float kFitFrac = 43.0f / H;   // 43 px: the crosshair plus 4 px of room per side
+    Settings c1; c1.uiProtection = UiProtection::Crosshair; c1.uiBoxHeightFrac = kFitFrac;
+    Settings w1; w1.uiProtection = UiProtection::WholeScreen; w1.uiBoxHeightFrac = kFitFrac;
     Result rc = run("Crosshair", c1, true, true, false);
     Result rw = run("WholeScreen", w1, true, true, true);
     Result rci = run("Crosshair(i)", c1, false, true, false);
@@ -374,7 +377,7 @@ static int check(int W, int H, bool hash) {
         Metrics m4 = measure(so, r4.out[0], realO, &truthO), m4b = measure(so, r4.out[1], realO, nullptr);
         printf(" Offset crosshair (+37,-23), box 120x120 offset (+37,-23): crosshair wrong %zu/%zu (t=0.25: %zu), PSNR bg %.2f dB\n", m4.xhBad, m4.xhN, m4b.xhBad, m4.psnrBg);
         expect(m4.xhBad == 0 && m4b.xhBad == 0, "offset box protects the off-centre crosshair exactly");
-        Settings c5 = c1;   // default centred box on an off-centre crosshair (37,-23 is inside the 3% box): still covered
+        Settings c5 = c1;   // default centred box on an off-centre crosshair (37,-23 is inside the fitted box): still covered
         Settings c6 = c1; c6.uiBoxWidth = 60; c6.uiBoxHeight = 60;   // centred 60x60: the crosshair at (+37,-23) lies outside it
         Result r6 = runSequence(so, c6, true, nullptr);
         Metrics m6 = measure(so, r6.out[0], realO, &truthO);
@@ -401,9 +404,45 @@ static int check(int W, int H, bool hash) {
         });
         expect(r2.out[0] == rOff.out[0] && r2.out[1] == rOff.out[1], "runtime switch WholeScreen -> Off: later output bit-identical to an Off run");
     }
+    // box sizing: Interpolator::boxSize (pure arithmetic, same numbers the library protects)
+    {
+        auto side = [&](Settings s, uint32_t w, uint32_t h, uint32_t* bh = nullptr) {
+            uint32_t bw, bh_; Interpolator::boxSize(s, w, h, &bw, &bh_); if (bh) *bh = bh_; return bw; };
+        Settings d;   // defaults: uiBoxHeightFrac 0.025
+        expect(side(d, 1280, 960) == 24 && side(d, 1920, 1080) == 27 && side(d, 2560, 1440) == 36 && side(d, 3840, 2160) == 54,
+               "default box 24 / 27 / 36 / 54 px at 960 / 1080 / 1440 / 2160 high");
+        Settings t = d; t.uiBoxHeightFrac = 0.001f;
+        expect(side(t, 1280, 960) == 8, "minimum box side is 8 px (frac 0.001 at 960 high)");
+        t.uiBoxHeightFrac = 1.0f;
+        expect(side(t, 1280, 960) == 960, "frac 1 is clamped to min(w, h)");
+        Settings e = d; e.uiBoxWidth = 100; e.uiBoxHeight = 50;
+        uint32_t eh; uint32_t ew = side(e, 1280, 960, &eh);
+        expect(ew == 100 && eh == 50, "an explicit px size wins over the fraction");
+        Settings l = d; l.uiBoxHeightFrac = 0.0f; l.uiCrosshairArea = 0.03f;
+        expect(side(l, 1280, 960) == 192, "legacy: frac 0, area 0.03 gives 192 px at 1280x960");
+        l.uiCrosshairArea = 0.0001f;
+        expect(side(l, 1280, 960) == 32, "legacy keeps its 32 px minimum");
+    }
+    // DEFAULT fraction + small crosshair that fits: pixel-exact (default 0.025 is 18 px at 720; a crosshair with
+    // arms out to 7 px plus outline is 17 px)
+    {
+        Scene sm(W, H, 12, 0, 0, 7);
+        auto realS = sm.frame(11);
+        Settings cd; cd.uiProtection = UiProtection::Crosshair;
+        uint32_t bw, bh; Interpolator::boxSize(cd, W, H, &bw, &bh);
+        Result rs = runSequence(sm, cd, true, nullptr);
+        Metrics ms = measure(sm, rs.out[0], realS, nullptr), ms2 = measure(sm, rs.out[1], realS, nullptr);
+        printf(" Small crosshair (17 px) in the default %ux%u box: crosshair wrong %zu/%zu\n", bw, bh, ms.xhBad, ms.xhN);
+        expect(bw >= 17 && ms.xhBad == 0 && ms2.xhBad == 0, "default-fraction box around a small crosshair is pixel-exact");
+    }
     // settings validation
     {
         Settings bad;
+        bad.uiBoxHeightFrac = -0.1f; expect(!Interpolator::validate(bad), "validate rejects uiBoxHeightFrac < 0");
+        bad = Settings{}; bad.uiBoxHeightFrac = 1.5f; expect(!Interpolator::validate(bad), "validate rejects uiBoxHeightFrac > 1");
+        bad = Settings{}; bad.uiBoxHeightFrac = std::nanf(""); expect(!Interpolator::validate(bad), "validate rejects uiBoxHeightFrac NaN");
+        bad = Settings{}; bad.uiBoxHeightFrac = 0.0f; expect(Interpolator::validate(bad), "validate accepts uiBoxHeightFrac 0 (legacy)");
+        bad = Settings{};
         bad.uiBoxWidth = 20000; expect(!Interpolator::validate(bad), "validate rejects uiBoxWidth 20000");
         bad = Settings{}; bad.uiBoxOffsetX = -20000; expect(!Interpolator::validate(bad), "validate rejects uiBoxOffsetX -20000");
         bad = Settings{}; bad.uiCrosshairArea = 0.0f; expect(!Interpolator::validate(bad), "validate rejects uiCrosshairArea 0");
@@ -670,6 +709,7 @@ static void bench(int W, int H) {
     Settings sOff, sC, sW, sWn;
     sC.uiProtection = UiProtection::Crosshair;
     sW.uiProtection = UiProtection::WholeScreen;
+    sC.uiBoxHeightFrac = sW.uiBoxHeightFrac = 43.0f / H;   // box fitted to the 35 px test crosshair
     sWn = sW; sWn.uiMaxStillFraction = 1.0f;
     Mode modes[] = {{"Off", sOff}, {"Crosshair", sC}, {"WholeScreen", sW}, {"WholeScreen, no still-skip", sWn}};
     Img ring[NIMG];

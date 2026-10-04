@@ -388,14 +388,24 @@ void Interpolator::Impl::destroySizeDependent() {
 // Static-UI protection: resources
 // ---------------------------------------------------------------------------------------------------------
 
-// The crosshair box: explicit pixel sizes win over the area fraction; clamped into the frame.
+// The crosshair box: explicit pixel sizes win over the height fraction; clamped into the frame.
+void Interpolator::boxSize(const Settings& set, uint32_t w, uint32_t h, uint32_t* boxW, uint32_t* boxH) {
+    const int fw_ = (int)w, fh_ = (int)h;
+    int side;
+    if (set.uiBoxHeightFrac > 0.0f)
+        side = std::min(std::max((int)std::lround((double)h * set.uiBoxHeightFrac), 8), std::min(fw_, fh_));
+    else   // legacy: area fraction, old 32 px minimum
+        side = std::min(std::max((int)std::lround(std::sqrt((double)set.uiCrosshairArea * fw_ * fh_)), 32), std::min(fw_, fh_));
+    *boxW = set.uiBoxWidth ? (uint32_t)std::min(std::max((int)set.uiBoxWidth, 4), fw_) : (uint32_t)side;
+    *boxH = set.uiBoxHeight ? (uint32_t)std::min(std::max((int)set.uiBoxHeight, 4), fh_) : (uint32_t)side;
+}
+
 UiBox Interpolator::Impl::computeBox() const {
     const int fw_ = (int)W, fh_ = (int)H;
-    int side = (int)std::lround(std::sqrt((double)set.uiCrosshairArea * fw_ * fh_));
-    side = std::min(std::max(side, 32), std::min(fw_, fh_));
+    uint32_t bw, bh;
+    Interpolator::boxSize(set, W, H, &bw, &bh);
     UiBox b{};
-    b.w = set.uiBoxWidth ? std::min(std::max((int)set.uiBoxWidth, 4), fw_) : side;
-    b.h = set.uiBoxHeight ? std::min(std::max((int)set.uiBoxHeight, 4), fh_) : side;
+    b.w = (int)bw; b.h = (int)bh;
     b.x = std::min(std::max((fw_ - b.w) / 2 + set.uiBoxOffsetX, 0), fw_ - b.w);
     b.y = std::min(std::max((fh_ - b.h) / 2 + set.uiBoxOffsetY, 0), fh_ - b.h);
     return b;
@@ -898,6 +908,7 @@ bool Interpolator::validate(const Settings& s) {
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::WholeScreen &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
+           in(s.uiBoxHeightFrac, 0.0f, 1.0f) &&
            s.uiBoxWidth <= 16384 && s.uiBoxHeight <= 16384 &&
            s.uiBoxOffsetX >= -16384 && s.uiBoxOffsetX <= 16384 && s.uiBoxOffsetY >= -16384 && s.uiBoxOffsetY <= 16384 &&
            s.uiStillFrames >= 1 && s.uiStillFrames <= 255 && in(s.uiStillThreshold, 0.0f, 255.0f) &&
