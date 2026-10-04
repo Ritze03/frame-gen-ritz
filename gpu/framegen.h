@@ -25,9 +25,41 @@ enum class BlurWeights : uint32_t {
                     // window, so the ends of the window carry exp(-2) = 13.5 % of the centre's weight
 };
 
+// Image formats (README.md / INTEGRATION.md "Formats"). Chosen at init() by InitInfo::viewFormat, which maps to exactly one:
+//   Rgba8    B8G8R8A8_UNORM, R8G8B8A8_UNORM                            the default; the shaders and output are unchanged
+//   Rgb10    A2B10G10R10_UNORM_PACK32, A2R10G10B10_UNORM_PACK32
+//   RgbaF16  R16G16B16A16_SFLOAT                                       linear / scRGB / encoded, see InitInfo::transfer
+//   Nv12     R8_UNORM (the Y plane view), chroma R8G8_UNORM            8-bit 4:2:0, two plane views per frame (Frame::chroma)
+//   P010     R16_UNORM (the Y plane view), chroma R16G16_UNORM         10-bit 4:2:0 in the high bits of 16-bit words
+// Only the format-specific shaders differ per format (the motion estimate runs on luma and is the same code for all).
+enum class Format : uint32_t { Rgba8 = 0, Rgb10 = 1, RgbaF16 = 2, Nv12 = 3, P010 = 4 };
+// The format class of a view format, false if the library does not know it.
+bool formatOf(VkFormat viewFormat, Format* out);
+
+// How RgbaF16 values are encoded (InitInfo::transfer). Only the mismatch / stillness measurement depends on it; the
+// frames are always warped and blended in their own space.
+enum class Transfer : uint32_t {
+    Encoded = 0,   // display-encoded values (sRGB / gamma / PQ / HLG): the level of a channel is value * 255
+    Linear = 1,    // linear light (scRGB, or any linear float): 1.0 = InitInfo::linearWhiteNits; measured as PQ codes
+};
+
+// The colour matrix of a YUV format (InitInfo::yuvMatrix).
+enum class YuvMatrix : uint32_t { Bt601 = 0, Bt709 = 1, Bt2020 = 2 };
+
+// One image as the library takes it: the view, and for the two-plane formats (Nv12, P010) the CbCr plane view. A plain
+// VkImageView converts implicitly, so a host that only uses RGB formats passes views exactly as before.
+struct Frame {
+    VkImageView view = VK_NULL_HANDLE;     // the image view (RGB formats), or the Y plane view (Nv12, P010)
+    VkImageView chroma = VK_NULL_HANDLE;   // Nv12 / P010: the CbCr plane view (half resolution); ignored otherwise
+    Frame() = default;
+    Frame(VkImageView v, VkImageView c = VK_NULL_HANDLE) : view(v), chroma(c) {}
+};
+
 // Tuning knobs. The defaults are the tuned values of proto/interp.py (the approved look); with them the
 // output is byte-identical to the library without settings. Costs and mismatches are in 8-bit luma/RGB
-// levels (0-255). Interpolator::validate() states the accepted ranges; anything else is rejected.
+// levels (0-255) in EVERY format: 10-bit and float input is measured as the levels of an 8-bit picture of the same
+// content (10-bit codes / 4, PQ codes, YCbCr differences converted to R'G'B'), so a value means the same perceived
+// amount in all of them. Interpolator::validate() states the accepted ranges; anything else is rejected.
 struct Settings {
     // ---- runtime: setSettings() at any time; applies to every record*() call recorded after it ----
     // Per-pixel fallback ramp on the 7x7-averaged mismatch |warped prev - warped curr|: below trustLow the
@@ -67,8 +99,8 @@ struct Settings {
     // byte-identical to a library without it.
     // Cost (RX 7900 XTX, 2560x1440, GPU time per real frame): Crosshair ~0.07 ms, WholeScreen ~0.09 ms typical
     // and <= ~0.25 ms in the worst case below the uiMaxStillFraction skip (about half of it is the full-frame copy
-    // into the clean image). Memory: uiHistory (default kUiFrames = 3) clean copies of the frame (4 bytes/px each: 44 MB
-    // at 1440p for 3, 14.7 MB per kept frame), under 1 MB for the box, and for WholeScreen about 1 byte/px of mask per
+    // into the clean image). Memory: uiHistory (default kUiFrames = 3) clean copies of the frame (Rgba8 and Rgb10 4 bytes/px each: 44 MB
+    // at 1440p for 3, 14.7 MB per kept frame; RgbaF16 8, Nv12 1.5, P010 3), under 1 MB for the box, and for WholeScreen about 1 byte/px of mask per
     // kept frame plus the 1/2-res cell state (+ ~15 MB at 1440p).
     UiProtection uiProtection = UiProtection::Off;
     // How many observed real frames keep their clean copy + mask (LRU by observe order), [kUiFrames, kUiFramesMax].
@@ -131,12 +163,24 @@ struct InitInfo {
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkGetDeviceProcAddr gdpa = nullptr;   // all device functions are loaded through this
     uint32_t width = 0, height = 0;           // >= kMinSize each
-    // B8G8R8A8_UNORM or R8G8B8A8_UNORM only (8-bit, UNORM, never _SRGB). Anything else -> init false.
+    // The format of the views you pass, which also picks the Format (see there): B8G8R8A8_UNORM or R8G8B8A8_UNORM
+    // (default; 8-bit UNORM, never _SRGB), A2B10G10R10 / A2R10G10B10 UNORM_PACK32, R16G16B16A16_SFLOAT, or for the
+    // two-plane formats the format of the Y plane view (R8_UNORM / R16_UNORM). Anything else -> init false.
     VkFormat viewFormat = VK_FORMAT_B8G8R8A8_UNORM;
     // Required (instance-level, cannot come from gdpa): used to put the buffers in DEVICE_LOCAL memory.
     // init() returns false if null.
     PFN_vkGetPhysicalDeviceMemoryProperties getMemProps = nullptr;
+    // Optional (instance-level): lets init() check that the device can use a non-Rgba8 format (sampled with linear
+    // filtering and storage, for the views you pass and for the library's own clean copies) and refuse it with a reason
+    // (Interpolator::initError()). Null = no check, the host vouches for it. Never consulted for Rgba8.
+    PFN_vkGetPhysicalDeviceFormatProperties getFormatProps = nullptr;
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    // RgbaF16 only. Fixed at init (it is baked into the pipelines): a stream does not change its encoding.
+    Transfer transfer = Transfer::Encoded;
+    float linearWhiteNits = 80.0f;   // Transfer::Linear: the luminance of the value 1.0 (80 = scRGB). (0, 10000]
+    // Nv12 / P010 only: how the planes encode colour. Defaults: BT.709, limited (video) range.
+    YuvMatrix yuvMatrix = YuvMatrix::Bt709;
+    bool yuvFullRange = false;
     Settings settings{};                      // init() returns false if !Interpolator::validate(settings)
 };
 
@@ -149,9 +193,15 @@ public:
     // caller must guarantee every previous record has retired first (fence/timeline wait, or
     // vkQueueWaitIdle/vkDeviceWaitIdle; resolution changes are rare).
     bool init(const InitInfo&);
+    // Why the last init() returned false (a string literal); null after a successful init or before any.
+    const char* initError() const { return err_; }
+    // The active format (Rgba8 if not initialised).
+    Format format() const;
     void destroy();
     // Re-creates the size-dependent buffers. Same retire rule as above. On false the object stays
     // alive but holds no size (record() returns false) until a later resize() succeeds.
+    // viewFormat may change only within the same Format (B8G8R8A8 <-> R8G8B8A8, A2B10G10R10 <-> A2R10G10B10): the pipelines
+    // belong to the format chosen at init(); another Format needs a new init() (false here).
     bool resize(uint32_t w, uint32_t h, VkFormat viewFormat);
 
     // Settings (see struct Settings). validate(): true if every field is finite and in range.
@@ -179,10 +229,12 @@ public:
     //                                     recordEstimate, each into its own out (N x: t = k/N, k = 1..N-1)
     //   record(prev, curr, out, t)        = recordEstimate + recordSynth (2x: t = 0.5)
     //
-    // All views: 2D, single mip/layer, the same size as init/resize, format viewFormat, i.e. 8-bit UNORM
-    // (an _SRGB view gives wrong luma; 10-bit is unsupported: skip FG or convert first),
-    // VK_IMAGE_LAYOUT_GENERAL on entry and exit.
-    // prev/curr: SAMPLED usage, already made readable by the caller. out: STORAGE usage, caller-owned.
+    // All views: 2D, single mip/layer, the same size as init/resize, format viewFormat (a Frame of the two-plane formats:
+    // `view` = the Y plane view at full size, `chroma` = the CbCr plane view at half size, rounded up), i.e. an 8-bit
+    // UNORM view for Rgba8 (an _SRGB view gives wrong luma), VK_IMAGE_LAYOUT_GENERAL on entry and exit. The "Formats"
+    // section of INTEGRATION.md has the host contract per format (image flags, plane views, device features).
+    // prev/curr: SAMPLED usage, already made readable by the caller. out: STORAGE usage, caller-owned (for the two-plane
+    // formats both plane views of out are written: Y at full, CbCr at half resolution).
     //
     // recordEstimate ends with a COMPUTE -> COMPUTE barrier on the library's own buffers. recordSynth ends
     // with a COMPUTE_SHADER SHADER_WRITE -> COMPUTE_SHADER SHADER_READ memory barrier (valid on a
@@ -203,9 +255,9 @@ public:
     // recordEstimate): keep those per beginFrame() and per not-yet-retired submission <= kUiSets too.
     // recordSynth also returns false if no recordEstimate was recorded since init/resize, or if prev/curr
     // are not the views of the latest recordEstimate (it always uses the latest estimate).
-    bool recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageView curr);
-    bool recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t);
-    bool record(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t = 0.5f);
+    bool recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr);
+    bool recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t);
+    bool record(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t = 0.5f);
 
     // ---- Motion blur ----
     // recordSynthBlur(cb, prev, curr, out, t0, t1): out = the weighted average of Settings::blurSamples sub-frames of
@@ -225,7 +277,7 @@ public:
     // Rings: takes ONE synth set (not one per sample) and the same UI sets as recordSynth. Same preconditions and
     // refusals as recordSynth (no estimate, prev/curr not the estimate's, ring full), plus false if the scratch
     // cannot be allocated. Like recordSynth: out in GENERAL, written by the last pass, SHADER_WRITE -> SHADER_READ barrier.
-    bool recordSynthBlur(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t0, float t1);
+    bool recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t0, float t1);
 
     // ---- Static UI protection (Settings::uiProtection != Off) ----
     // The library keeps, per real frame it has "observed", its own clean copy (UI inpainted out) and the
@@ -258,7 +310,7 @@ public:
     // it (so such hosts must observe explicitly). Once recordObserve has been called, estimates no longer
     // observe implicitly: a pair of which a view has not been observed (protection was just switched on, an
     // observe was skipped, the entry was evicted) is simply interpolated unprotected, as with Off.
-    bool recordObserve(VkCommandBuffer cb, VkImageView frame);
+    bool recordObserve(VkCommandBuffer cb, Frame frame);
 
     // Frees the clean copies that Settings::uiHistory no longer keeps (they stay allocated, unused, when it is
     // lowered, so a later raise costs nothing). Retire rule of resize()/destroy(): every earlier record must have
@@ -288,6 +340,7 @@ public:
     struct Impl;
 private:
     Impl* m = nullptr;
+    const char* err_ = nullptr;
 };
 
 }  // namespace framegen

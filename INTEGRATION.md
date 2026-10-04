@@ -16,7 +16,7 @@ Root: `/home/mo/Schinken/Programming/GitHubProjects/gamescope-ritz`. `R` = `src/
 - Raw handles are available: `g_device.device()` (H:1306), `physDev()` (H:1307), `g_device.vk.*` dispatch table (used e.g. R:1798), `CVulkanTexture::vkImage()` (H:213), `srgbView()/linearView()` (H:199-200), `width()/height()/drmFormat()/format()`. **An external plain-Vulkan library can therefore record straight into `cmdBuffer->rawBuffer()`.** This is the recommended route.
 
 ## Images (formats, views, layouts, barriers)
-- `layers[0].tex` is `gamescope::Rc<CVulkanTexture>`. For a game it is the commit's imported dmabuf (`commit_t::vulkanTex`, `src/commit.h:42`). Its format follows the client, typically `DRM_FORMAT_XRGB8888/ARGB8888` -> `VK_FORMAT_B8G8R8A8_*`, or `ABGR8888` -> `R8G8B8A8_*` (R:241-243). 10-bit formats are possible. **Assume BGRA8 or RGBA8, and possibly 10-bit.** The FG library supports only `B8G8R8A8_UNORM` / `R8G8B8A8_UNORM` views: on a 10-bit layer 0 gamescope must skip FG (or convert to 8-bit first).
+- `layers[0].tex` is `gamescope::Rc<CVulkanTexture>`. For a game it is the commit's imported dmabuf (`commit_t::vulkanTex`, `src/commit.h:42`). Its format follows the client, typically `DRM_FORMAT_XRGB8888/ARGB8888` -> `VK_FORMAT_B8G8R8A8_*`, or `ABGR8888` -> `R8G8B8A8_*` (R:241-243). 10-bit formats are possible. **Assume BGRA8 or RGBA8, and possibly 10-bit.** The library takes `B8G8R8A8_UNORM` / `R8G8B8A8_UNORM` views as before (the default), and, since the "Formats" section below, also 10-bit `A2B10G10R10` / `A2R10G10B10`, `R16G16B16A16_SFLOAT` and the two-plane video formats (NV12, P010) as separate shader variants. gamescope can use them as it likes, or keep skipping FG for anything but 8-bit.
 - View naming is inverted. `m_srgbView` is created with `DRMFormatToVulkan(fmt,false)` = **UNORM** (R:2722, R:2736). `m_linearView` uses `DRMFormatToVulkan(fmt,true)` = **_SRGB**, is created only when `bSampled`, and has STORAGE usage stripped (R:2744-2750). The pre-pass reads layer 0 through `setTextureSrgb(0,true)` -> `srgbView()`, which is the UNORM view and gives raw encoded values (R:1905). It samples nearest and unnormalized (`cs` setup ~R:5654-5660). Targets are written through `srgbView()` (UNORM) as a storage image (R:~1933). **FG should sample `srgbView()` (UNORM) with its own linear sampler.** All views passed to FG must be UNORM, never `_SRGB` (`linearView()`): an `_SRGB` view decodes to linear and gives wrong luma. The library cannot check this from a `VkImageView`.
 - Layout: every gamescope image is in `VK_IMAGE_LAYOUT_GENERAL` while in use. Sampler and target descriptors use GENERAL (R:1900, R:~1936). Barriers come from `insertBarrier()` (R:2083-2143): UNDEFINED->GENERAL for discarded/dest images, foreign/external queue-family import for dmabufs (`needsImport = externalImage()`, R:2044-2054), and ALL_COMMANDS->ALL_COMMANDS. `markDirty()` makes the next `insertBarrier()` emit a write->read barrier (R:2075-2081).
 - Two pitfalls for raw recording:
@@ -52,14 +52,19 @@ struct InitInfo {
   VkPhysicalDevice phys; VkDevice device;
   PFN_vkGetDeviceProcAddr gdpa;   // load via this; gamescope uses its own dispatch table (g_device.vk)
   uint32_t width, height;         // >= kMinSize (16) each
-  VkFormat viewFormat;            // B8G8R8A8_UNORM or R8G8B8A8_UNORM only (never _SRGB, never 10-bit)
+  VkFormat viewFormat;            // default B8G8R8A8_UNORM; R8G8B8A8_UNORM, or another Format (see "Formats"); never _SRGB
   PFN_vkGetPhysicalDeviceMemoryProperties getMemProps;   // REQUIRED: g_device.vk.GetPhysicalDeviceMemoryProperties (H:1166)
+  PFN_vkGetPhysicalDeviceFormatProperties getFormatProps;   // optional: lets init() check non-Rgba8 formats (see "Formats")
   VkPipelineCache pipelineCache;  // optional
+  Transfer transfer; float linearWhiteNits;   // RgbaF16 only (see "Formats")
+  YuvMatrix yuvMatrix; bool yuvFullRange;     // Nv12 / P010 only
   Settings settings;              // tuning knobs, defaults = the approved look (see "Settings" below)
 };
 class Interpolator {
 public:
   bool init(const InitInfo&);     // owns its buffers (DEVICE_LOCAL), descriptor pool, sampler, pipelines
+  const char* initError() const;  // why the last init() returned false
+  Format format() const;          // the Format of viewFormat (Rgba8, Rgb10, RgbaF16, Nv12, P010)
   void destroy();
   bool resize(uint32_t w, uint32_t h, VkFormat viewFormat);   // re-create on size/format change
   static bool validate(const Settings&);
@@ -67,21 +72,22 @@ public:
   bool reconfigure(const Settings&);   // also flowScale: re-creates buffers (retire rule of resize)
   Settings settings() const;
   void beginFrame();              // once per command buffer, before its first record*() call
-  // All three views: UNORM 8-bit, single mip/layer, VK_IMAGE_LAYOUT_GENERAL on entry and exit.
+  // All views (Frame; a plain VkImageView converts implicitly): single mip/layer, VK_IMAGE_LAYOUT_GENERAL on entry and exit,
+  // 8-bit UNORM for Rgba8, see "Formats" for the others (Nv12 / P010: Frame{Y plane view, CbCr plane view}).
   // prev/curr: SAMPLED usage, made readable by the caller (gamescope: prepareSrcImage + insertBarrier).
   // out: STORAGE usage, caller-owned. Ends with COMPUTE SHADER_WRITE -> COMPUTE SHADER_READ.
   // recordSynth ends with COMPUTE SHADER_WRITE -> COMPUTE SHADER_READ; recordEstimate ends with a COMPUTE -> COMPUTE barrier.
-  bool recordObserve(VkCommandBuffer cb, VkImageView frame);                               // once per NEW real frame, only if Settings::uiProtection != Off (see "Static UI protection")
-  bool recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageView curr);            // passes 1-8, once per real pair
-  bool recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t);   // frame at t in (0,1)
-  bool record(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t = 0.5f); // = estimate + synth
-  bool recordSynthBlur(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t0, float t1);   // motion blur over [t0, t1] (see "Motion blur")
+  bool recordObserve(VkCommandBuffer cb, Frame frame);                               // once per NEW real frame, only if Settings::uiProtection != Off (see "Static UI protection")
+  bool recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr);            // passes 1-8, once per real pair
+  bool recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t);   // frame at t in (0,1)
+  bool record(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t = 0.5f); // = estimate + synth
+  bool recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t0, float t1);   // motion blur over [t0, t1] (see "Motion blur")
   void releaseUnusedUi();         // free the UI clean copies Settings::uiHistory no longer keeps (retire rule of resize)
   static constexpr uint32_t kSetRing = 32, kUiSets = 64, kUiFrames = 3, kUiFramesMax = 65, kMinSize = 16;
 };
 }
 ```
-- **Return values.** `init()`/`resize()` return false below 16x16, for any format other than BGRA8/RGBA8 UNORM, for a null `getMemProps`, or on any Vulkan allocation failure. The object then holds no size and every `record*()` call returns false. gamescope skips frame generation for that surface (shows layer 0 as is). `record()`/`recordEstimate()`/`recordSynth()` return false and record nothing when the object is not initialised, `t` is outside (0, 1), or the per-submission limit of their ring is hit. `recordSynth()` also returns false when there was no `recordEstimate()` since init/resize, or when its `prev`/`curr` are not the views of the latest `recordEstimate()`. `out` is then untouched, so gamescope must not substitute it as layer 0 for that composite (and for N× must not present that slot).
+- **Return values.** `init()`/`resize()` return false below 16x16, for a `viewFormat` that is not one of the supported formats (see "Formats"; `resize()` also for one of another `Format` than `init()` chose), for a null `getMemProps`, or on any Vulkan allocation failure. The object then holds no size and every `record*()` call returns false. gamescope skips frame generation for that surface (shows layer 0 as is). `record()`/`recordEstimate()`/`recordSynth()` return false and record nothing when the object is not initialised, `t` is outside (0, 1), or the per-submission limit of their ring is hit. `recordSynth()` also returns false when there was no `recordEstimate()` since init/resize, or when its `prev`/`curr` are not the views of the latest `recordEstimate()`. `out` is then untouched, so gamescope must not substitute it as layer 0 for that composite (and for N× must not present that slot).
 - **Descriptor rings.** Two rings of `kSetRing` = 32 descriptor sets each: every `recordEstimate()` takes the next estimate set, every `recordSynth()` the next synth set, and `record()` takes one of each (it checks both first, so a refused `record()` records nothing). At most 32 estimates and 32 synths may follow one `beginFrame()`; the 33rd of either returns false (and asserts in debug builds), so overflow cannot silently corrupt an earlier record's set. Across submissions the caller must keep the estimates and the synths of all not-yet-retired submissions at <= 32 each, in total. At 4× one real pair uses 1 estimate + 3 synths; gamescope's 1-2 composites per refresh are far below the limit. Call `beginFrame()` once per command buffer, before FG's first record in it.
 - **Lifetime.** `resize()`, `destroy()` and `init()` on a live object free buffers that earlier records still use. The caller must make sure every previous record has retired first: wait on the composite timeline point, or `vkQueueWaitIdle`/`vkDeviceWaitIdle` on a resolution or format change (rare). There is no deferred free.
 - **`t` and the nearer-frame fallback.** `t` is the time of the generated frame between prev (0) and curr (1). `t == 0.5` is exactly the 2× midpoint path (byte-identical to the 2×-only library). Otherwise the per-pixel field is looked up at time `t` (a tiny flow-res pass), prev/curr are warped by `2t` / `2(1-t)` of it and blended `(1-t)·wa + t·wc`. Every fallback (untrusted pixels, scene cut, more than `Settings::globalFallback` (15 %) untrusted) presents the **nearer real frame**: prev for `t <= 0.5`, curr for `t > 0.5`, so a failed generated frame looks like the base frame rate for one step rather than a jump back to prev. Fallback is decided per `t`: within one pair some generated frames can be held and others not.
@@ -130,6 +136,62 @@ The settings only change the per-pair estimate; the per-synth cost (~0.06 ms at 
 4. **Static HUD protection: Off / Normal / Strong** — `hudBonus` 0 / 1 / 2.5. Plain language: "Keeps crosshairs, text and other fixed overlays from wobbling or being dragged along with the scene. Too strong can make slow-moving areas stutter."
 5. Expert only (config/convar, no overlay entry): `searchPenalty`, `smoothBonus`, `sceneCutSad`, `globalFallback` on its own, and a "scene-cut detection" toggle (`sceneCutSad` 255 = off). The Low/High preset values above are suggestions within the validated ranges; only the defaults were reviewed visually by the user.
 
+## Formats (`InitInfo::viewFormat`, `framegen::Format`, `framegen::Frame`)
+
+The library works on more than 8-bit RGB: 10-bit RGB, half-float RGB (linear / scRGB / encoded) and the two-plane video formats NV12 and P010. The format is chosen **once at `init()`** by `InitInfo::viewFormat`, which maps to exactly one `Format` (`framegen::formatOf()`, `Interpolator::format()`):
+
+| `Format` | `viewFormat` | What the host passes per frame (`Frame`) | Clean copy (UI protection), per px |
+|---|---|---|---|
+| `Rgba8` (default) | `B8G8R8A8_UNORM`, `R8G8B8A8_UNORM` | one view (`Frame::view`); a plain `VkImageView` converts implicitly | 4 B (`R8G8B8A8`) |
+| `Rgb10` | `A2B10G10R10_UNORM_PACK32`, `A2R10G10B10_UNORM_PACK32` | one view | 4 B |
+| `RgbaF16` | `R16G16B16A16_SFLOAT` | one view | 8 B |
+| `Nv12` | `R8_UNORM` (the Y plane view) | `Frame{Y plane view, CbCr plane view}`; CbCr is `R8G8_UNORM`, half size rounded up | 1.5 B (`R8` + `R8G8`) |
+| `P010` | `R16_UNORM` (the Y plane view) | `Frame{Y plane view, CbCr plane view}`; CbCr is `R16G16_UNORM` | 3 B (`R16` + `R16G16`) |
+
+At 1440p one clean copy is 14.7 MB (Rgba8, Rgb10), 29.5 MB (RgbaF16), 5.5 MB (Nv12), 11.1 MB (P010); the host's own frame buffers (`pacing.h`'s `HistoryDepth()`) are in the host's format and scale the same way.
+
+**Unchanged for 8-bit RGB.** Rgba8 is the default and the shaders it uses compile to the **same SPIR-V as before this section existed** (see "Rgba8 stays byte-identical" below): a host that passes `B8G8R8A8` / `R8G8B8A8` views changes nothing, not even its build.
+
+### Host contract per format
+
+- **All formats:** views are 2D, single mip/layer, the size given to `init()`/`resize()`, `VK_IMAGE_LAYOUT_GENERAL` on entry and exit, `prev`/`curr` with SAMPLED usage and `out` with STORAGE usage, like before. The library samples with linear filtering and writes with `imageStore`: the device must support SAMPLED + SAMPLED_FILTER_LINEAR + STORAGE_IMAGE on the view format (optimal tiling). Pass `InitInfo::getFormatProps` (`vkGetPhysicalDeviceFormatProperties`, instance-level, optional) and `init()` checks this for the view format and the library's own clean-copy format and returns false with `Interpolator::initError()` set to a reason; with null it trusts the host. Rgba8 is never checked (as before).
+- **Device feature:** every format except Rgba8 and RgbaF16 writes through a storage image of format `rgb10_a2` / `r8` / `rg8` / `r16` / `rg16`, which needs **`shaderStorageImageExtendedFormats`** enabled at device creation. gamescope enables only `shaderInt16` today, so enabling Rgb10, Nv12 or P010 there is one more line in its `VkPhysicalDeviceFeatures`. RgbaF16 (`rgba16f`) and Rgba8 need nothing extra. No format needs `shaderStorageImageRead/WriteWithoutFormat`.
+- **Rgb10:** values are UNORM codes, treated as perceptually encoded (SDR gamma or PQ); alpha (2 bit) passes through. `A2R10G10B10` additionally needs the device to offer storage on it, which many do not (the init check says so).
+- **RgbaF16:** `InitInfo::transfer` says how the values are encoded (fixed at init, it is baked into the pipelines): `Transfer::Encoded` (default; sRGB / gamma / PQ / HLG already applied) or `Transfer::Linear` (linear light, scRGB or plain linear; `InitInfo::linearWhiteNits` is the luminance of 1.0, default 80 = scRGB). Values above 1.0 and negative values are kept, the output is never clamped. Only the *measurement* (mismatch, stillness, luma) depends on the transfer; the frames are warped and blended in their own space.
+- **Nv12 / P010:** create ONE multi-planar image, `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` / `VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16`, with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT` and usage SAMPLED (+ STORAGE for `out`), then two views, each with a `VkImageViewUsageCreateInfo` of SAMPLED (+ STORAGE for `out`): the **Y view** (`aspectMask = PLANE_0`, format `R8_UNORM` / `R16_UNORM`) and the **CbCr view** (`PLANE_1`, `R8G8_UNORM` / `R16G16_UNORM`), passed as `Frame{y, cbcr}`. `InitInfo::viewFormat` is the Y view's format. Two separate single-plane images (an R8 and an R8G8 image) work just as well, which is also what the library allocates for its own clean copies; `formattest` runs both (`--separate-planes`). **`out`'s two views are both written**: Y at full resolution, CbCr at half resolution. No `VkSamplerYcbcrConversion` is used or needed in the library; the host's device must have the `samplerYcbcrConversion` feature enabled only for creating multi-planar images at all. P010 samples are 10 bits in the high bits of a 16-bit word (`code << 6`): the library reads `code`, writes `code << 6` exactly (code grid of 10 bits), so the low 6 bits of its output are zero. `InitInfo::yuvMatrix` (`Bt601`, `Bt709` default, `Bt2020`) and `InitInfo::yuvFullRange` (default limited/video range 16-235 / 16-240) describe the colour; they only change how mismatch and luma are measured (below), never the warp or the blend, which run on Y'CbCr directly (a linear transform of R'G'B', so blending in it equals blending in R'G'B'). **Chroma is assumed centre-sited** (the chroma texel sits in the middle of its 2x2 block): the CbCr view is sampled at the same normalised coordinate as luma and written from the 2x2 block centre; zero-motion pixels and every fallback therefore round-trip a chroma texel exactly, whatever the real siting (left-sited MPEG-2/H.264 video just has a quarter-texel chroma shift that is the same in the input and in the output). Chroma of a generated frame uses the trust and the vectors of the top-left pixel of its 2x2 block. Odd sizes work (chroma is `(w+1)/2 x (h+1)/2`).
+
+### Thresholds and transfer: one scale for every format
+
+Every level-based setting (`trustLow/High`, `sceneCutSad`, `hudBonus`, `smoothBonus`, `searchPenalty`, `uiStillThreshold`) **keeps its meaning of "8-bit levels" in every format**; nothing is rescaled per format by the host. Inside, the library converts what it measures to the levels of an 8-bit picture of the same content, so a value means the same *perceived* amount:
+
+| Format | Level of a channel (mismatch, stillness) | Luma for the motion estimate |
+|---|---|---|
+| Rgba8 | the code (as before, rounded) | `(4899 R + 9617 G + 1868 B + 8192) >> 14` as before |
+| Rgb10 | `code / 1023 * 255` (unrounded) | the same weights, in floats |
+| RgbaF16, `Encoded` | `value * 255` | same weights, floats |
+| RgbaF16, `Linear` | `PQ(value * linearWhiteNits / 10000) * 255`: a perceptually uniform code, so a level weighs the same in the shadows and in a 1000-nit highlight | same weights on the PQ levels |
+| Nv12 / P010 | the (Y, Cb, Cr) difference is converted to the R'G'B' difference it stands for (matrix and range of `InitInfo`), then the max channel as for RGB | the Y plane, `(Y - black) * 255/219` (limited) so it spans 0-255 like RGB luma; 10-bit codes / 4 first |
+
+Blending, warping and the fallback frame always stay in the source's own space, and the packed mismatch is clamped to 255. Because the metric is in 8-bit levels, the default settings are the tuned ones for every format; only the *source* of the number differs. Stillness for UI protection is measured the same way and stored as 8-bit levels (so a pixel that is bit-identical in two frames is still in every format).
+
+### Shader variants, build, embedded size
+
+Only the shaders that touch colour are format-specific: `luma`, `error`, `resolve`, `fallback`, `ui_detect`, `ui_box_update`, `ui_inpaint`, `ui_patch`, `blur_error`, `blur_resolve` (+ `ui_inpaint_chroma`, `ui_patch_chroma` for the YUV formats, the half-resolution CbCr passes). The motion estimate (`down`, `medhist`, `search`, `median3`, `subpix`, `pixfield`, `lookup`, `ui_mask`, `ui_box_mask`, `blur_lookup`) runs on luma only and is **one shader for all formats**. Each colour shader is compiled once per format **from the same source** with `-DFG_FORMAT_RGB10|F16|NV12|P010` (`shaders/format.glsl`); `init()` creates only the pipelines of the chosen format, so the other variants cost nothing at runtime. `gpu/meson.build` generates `<name>_<fmt>_spv.h` with the array `<name>_<fmt>_spv` (`fmt` = `rgb10`, `f16`, `nv12`, `p010`); **Rgba8 keeps the historical `<name>_spv.h` / `<name>_spv`**. `framegen.cpp` includes each variant set behind `__has_include`: a host that compiles only the historical shaders gets an Rgba8-only library that refuses other formats at `init()` with "the shader variants of this format are not built into the library". The meson option `formats` (array, default all four) picks the variants of the standalone build.
+
+Embedded SPIR-V (words x 4): the Rgba8 set (20 shaders, as before) 205,396 B; plus Rgb10 111,156 B, RgbaF16 120,496 B, Nv12 150,320 B, P010 150,320 B if built. **What gamescope's `src/meson.build` `custom_target` list must do:** for Rgba8, **nothing** (same names, same sources, no `-D`). To offer a format, add the variant shaders of that format to the list with `-DFG_FORMAT_<FMT>=1`, output `<name>_<fmt>_spv.h` and `--vn <name>_<fmt>_spv` for the 10 colour shaders (+ the 2 chroma shaders for `nv12` / `p010`); the library then picks them up through `__has_include`.
+
+### Rgba8 stays byte-identical
+
+With no `-D`, `format.glsl` declares nothing and its macros expand to exactly the tokens the shaders used to contain, so glslang produces **the same SPIR-V**. Verified on the 20 library shaders (`glslangValidator -V --target-env vulkan1.2 --vn <name>_spv`, the exact flags of both builds): the generated headers of this tree and of `f8c9423` are `cmp`-identical for every one. The C++ side adds nothing for Rgba8 (same descriptor layouts, pools and pipelines; no format query). As a smoke test on top of that, `uitest check --hash 640 360` (RGBA and BGRA) prints identical FNV-1a hashes for all 11 generated frames from a build of `f8c9423` and from this tree, and `blurtest check` passes in both.
+
+### Spec constants and layout of the variants (for maintainers)
+
+Specialization constants of the non-Rgba8 colour pipelines (`VkSpecializationInfo` at pipeline creation; there is no spare push-constant space, the block is full at 128 bytes): RgbaF16 `0 = linear?`, `1 = white nits`; YUV `0 YU_SCALE` (sample -> level), `1 YU_QL` (one code in levels), `2 YU_CODES`, `3 YU_BLACK`, `4 YU_YS` (luma gain), `5..8` the R'G'B' per Cb/Cr level (matrix and range folded in). The descriptor set of a YUV `Interpolator` has three more bindings (8, 9: the CbCr planes of `prev`/`curr`, immutable sampler; 10: the CbCr plane of `out`); the UI set two more (4: `srcC`, 5: `dstC`). They are created only for the YUV formats.
+
+### Tests (`gpu/formattest.cpp`, single frames, no footage)
+
+`formattest check [W H]` (default 640x360) runs, per format the device supports, a 12-frame synthetic sequence (the `uitest` scene) and compares against the same scene run through Rgba8 and against the format's own quantised ground truth, all after decoding to 8-bit RGB levels: sane output (not worse than Rgba8 by more than 1.5 dB; YUV 4 dB, because half-resolution chroma loses on the saturated noisy texture), both YUV planes written (a 0-filled sentinel output), a narrow blur window, static crosshair and HUD box exact with `Crosshair` / `WholeScreen` (and wrong without, so the check has teeth), no cost of protection to the background; plus a 10-bit/float gradient (Rgb10 and RgbaF16 give 4x / far more distinct values than Rgba8 on a 0.2-0.3 ramp), linear float highlights above 1.0 kept, and API checks (`_SRGB` refused with a reason, `resize()` across formats refused, a YUV frame without a chroma view refused). `formattest time [W H]` prints one GPU time per format.
+
 ## Static UI protection (`Settings::uiProtection`)
 The crosshair protection that used to live in the host (gamescope-ritz `FrameGenHost.cpp`: `RecordCrosshairDetect`/`RecordCrosshairPatch`, `cs_fg_crosshair_*.comp`, `cs_fg_inpaint.comp`) is part of the library, in two modes. The reason it is in the library: any host gets it by flipping a setting, the repository is public, and the algorithm only needs the frames.
 
@@ -142,7 +204,7 @@ The crosshair protection that used to live in the host (gamescope-ritz `FrameGen
 | `uiCrosshairArea` | 0.03 | (0, 1] | Area-derived box: square of side `round(sqrt(area*w*h))`, clamped to [32, min(w, h)] (333 px at 2560x1440). |
 | `uiBoxOffsetX`, `uiBoxOffsetY` | 0, 0 | -16384..16384 | Box centre relative to the frame centre (+x right, +y down). Clamped so the box stays inside the frame. |
 | `uiStillFrames` | 8 | 1-255 | Consecutive still real frames before a pixel is masked. |
-| `uiStillThreshold` | 3.5 | 0-255 (8-bit levels) | A pixel is still if no channel moved more than this since the previous real frame. |
+| `uiStillThreshold` | 3.5 | 0-255 (8-bit levels, in every format) | A pixel is still if no channel moved more than this since the previous real frame. |
 | `uiInpaintReach` | 12 | 1-16 | Inpaint walk length per direction. |
 | `uiMaxStillFraction` | 0.75 | (0, 1] | WholeScreen: skip the whole-screen passes of a frame whose still share outside the box exceeds this (1 = never). |
 
@@ -153,7 +215,7 @@ The crosshair protection that used to live in the host (gamescope-ritz `FrameGen
 - Implicit observe: a host that never calls `recordObserve` is observed by `recordEstimate` (prev if unseen, curr unless it is the newest observed view). Caveat: new content under the same view handle is not noticed, and a frame never used in a pair is never seen by the counters. Once `recordObserve` was called, estimates do not observe implicitly; a pair of which a view was not observed (just switched on, skipped, evicted) is interpolated unprotected like `Off`.
 - `recordSynth` returns false if an observe evicted one of the pair's two entries since its `recordEstimate` (observe two newer frames between them) or re-observed one of the views.
 - Descriptor sets: a third ring of `kUiSets` = 64 sets. `recordObserve` takes 1 (Crosshair) or 2 (WholeScreen), each `recordSynth` takes up to 2, an implicit observe in `recordEstimate` takes the same as `recordObserve`. Keep them per `beginFrame()` and per not-yet-retired submission <= 64 (a normal 4x frame needs about 3 + 2x3). Exhaustion returns false and records nothing.
-- Retire rule: `resize()`, `destroy()` and `reconfigure()` that changes `flowScale` free all UI resources; same rule as the other buffers (all earlier records retired). `setSettings()` only creates (the first time a mode is switched on: `uiHistory` clean images + buffers, WholeScreen: + masks and cell state) and returns false if that allocation fails (settings unchanged). Growing the box allocates a bigger buffer at the next `recordObserve`; the old one goes to a graveyard that is freed by the next `resize`/`destroy`, so no GPU wait is needed. The clean images are always `R8G8B8A8_UNORM` in logical channel order, independent of `viewFormat`, and are moved UNDEFINED -> GENERAL by a one-off barrier at the first `recordObserve`.
+- Retire rule: `resize()`, `destroy()` and `reconfigure()` that changes `flowScale` free all UI resources; same rule as the other buffers (all earlier records retired). `setSettings()` only creates (the first time a mode is switched on: `uiHistory` clean images + buffers, WholeScreen: + masks and cell state) and returns false if that allocation fails (settings unchanged). Growing the box allocates a bigger buffer at the next `recordObserve`; the old one goes to a graveyard that is freed by the next `resize`/`destroy`, so no GPU wait is needed. The clean images are in the source's own format, in logical channel order (`R8G8B8A8_UNORM` for Rgba8 as always, `A2B10G10R10_UNORM_PACK32` for Rgb10, `R16G16B16A16_SFLOAT`, and for NV12 / P010 two images, `R8` + `R8G8` or `R16` + `R16G16`), independent of the BGRA/RGBA order of `viewFormat`, and are moved UNDEFINED -> GENERAL by a one-off barrier at the first `recordObserve`.
 - Profile names: `ui_detect` (clean copy, stillness, masks) and `ui_inpaint` per `recordObserve`; `ui_patch` per `recordSynth`. An observe opens the profile the next `recordEstimate` continues.
 
 **Algorithm** (shaders `gpu/shaders/ui_*.comp`, common header `ui_common.glsl`, all embedded with the usual `--vn <name>_spv`):

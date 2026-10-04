@@ -18,14 +18,36 @@ shaders = shader_gen.process(
   'shaders/ui_inpaint.comp', 'shaders/ui_patch.comp',
   'shaders/blur_lookup.comp', 'shaders/blur_error.comp', 'shaders/blur_resolve.comp')
 
+# Per-format variants of the colour shaders (README.md "Formats"): the same sources, compiled once per format with
+# -DFG_FORMAT_<FMT>=1 into <name>_<fmt>_spv.h / <name>_<fmt>_spv. Rgba8 is the plain build above and keeps its names.
+# framegen.cpp includes each variant behind __has_include, so a format that is not built is simply refused at init.
+colour_srcs = ['shaders/luma.comp', 'shaders/error.comp', 'shaders/resolve.comp', 'shaders/fallback.comp',
+               'shaders/ui_detect.comp', 'shaders/ui_box_update.comp', 'shaders/ui_inpaint.comp', 'shaders/ui_patch.comp',
+               'shaders/blur_error.comp', 'shaders/blur_resolve.comp']
+chroma_srcs = ['shaders/ui_inpaint_chroma.comp', 'shaders/ui_patch_chroma.comp']   # YUV only: the half-resolution CbCr plane
+variant_shaders = []
+foreach f : get_option('formats')
+  g = generator(glslang,
+    output : '@BASENAME@_' + f + '_spv.h',
+    depfile : '@BASENAME@_' + f + '_spv.h.d',
+    arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+                 '-DFG_FORMAT_' + f.to_upper() + '=1', '--vn', '@BASENAME@_' + f + '_spv', '-o', '@OUTPUT@', '@INPUT@'])
+  variant_shaders += [g.process(colour_srcs)]
+  if f == 'nv12' or f == 'p010'
+    variant_shaders += [g.process(chroma_srcs)]
+  endif
+endforeach
+
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
-framegen_lib = static_library('framegen', 'framegen.cpp', shaders,
+framegen_lib = static_library('framegen', 'framegen.cpp', shaders, variant_shaders,
   dependencies : vulkan.partial_dependency(compile_args : true, includes : true))
 framegen_dep = declare_dependency(link_with : framegen_lib, include_directories : include_directories('.'))
 
 executable('fgtest', 'fgtest.cpp', dependencies : [framegen_dep, vulkan])
 
 executable('uitest', 'uitest.cpp', dependencies : [framegen_dep, vulkan])
+
+executable('formattest', 'formattest.cpp', dependencies : [framegen_dep, vulkan])
 
 blend_bench = shader_gen.process('blendbench.comp')   # test only: the naive blend the benchmark compares against
 executable('blurtest', 'blurtest.cpp', blend_bench, dependencies : [framegen_dep, vulkan])

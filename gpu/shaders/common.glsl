@@ -1,11 +1,17 @@
 // Shared declarations for all framegen passes. Mirrors proto/interp.py (the frozen reference).
+#include "format.glsl"
 
 layout(set = 0, binding = 0, std430) buffer LumaBuf { float luma[]; };   // luma pyramids of a and c
 layout(set = 0, binding = 1, std430) buffer FieldBuf { vec2 field[]; };  // half-vector fields
 layout(set = 0, binding = 2, std430) buffer UBuf { uint u[]; };          // counters, medians, packed mismatch
 layout(set = 0, binding = 3) uniform sampler2D texPrev;                  // frame a (linear, clamp to edge)
 layout(set = 0, binding = 4) uniform sampler2D texCurr;                  // frame c
-layout(set = 0, binding = 5, rgba8) uniform writeonly image2D outImg;
+layout(set = 0, binding = 5, FG_FMT) uniform writeonly image2D outImg;
+#ifdef FG_YUV
+layout(set = 0, binding = 8) uniform sampler2D texPrevC;                 // CbCr planes of a and c (half resolution)
+layout(set = 0, binding = 9) uniform sampler2D texCurrC;
+layout(set = 0, binding = 10, FG_FMTC) uniform writeonly image2D outImgC;  // CbCr plane of the output
+#endif
 
 // One push-constant block for every pass; each pass documents which fields it reads. 128 bytes (full).
 layout(push_constant) uniform PC {
@@ -90,10 +96,29 @@ vec2 halfVec(ivec2 p) {
 }
 
 // cv2.remap of a uint8 RGB frame at p (pixel-centre coords): bilinear, clamp to edge, rounded to 8 bit.
+// (Other formats: the same bilinear sample in the source's own space, see format.glsl.)
+#ifndef FG_YUV
 vec3 sampleRGB(sampler2D t, vec2 p) {
     p = roundEven(p * 32.0) * (1.0 / 32.0);
-    return floor(textureLod(t, (p + 0.5) / vec2(pc.W, pc.H), 0.0).rgb * 255.0 + 0.5);
+    return FG_FETCH(textureLod(t, (p + 0.5) / vec2(pc.W, pc.H), 0.0).rgb);
 }
+#endif
+#ifdef FG_YUV
+// (Y, Cb, Cr) levels at p: the chroma plane is sampled at the same normalised position (centre-sited chroma), which
+// upsamples it bilinearly.
+vec3 sampleYUV(sampler2D ty, sampler2D tc, vec2 p) {
+    p = roundEven(p * 32.0) * (1.0 / 32.0);
+    vec2 uv = (p + 0.5) / vec2(pc.W, pc.H);
+    return vec3(textureLod(ty, uv, 0.0).r, textureLod(tc, uv, 0.0).rg) * YU_SCALE;
+}
+vec2 sampleC(sampler2D tc, vec2 p) {
+    p = roundEven(p * 32.0) * (1.0 / 32.0);
+    return textureLod(tc, (p + 0.5) / vec2(pc.W, pc.H), 0.0).rg * YU_SCALE;
+}
+#define FG_SAMPLE(t, tc, p) sampleYUV(t, tc, p)
+#else
+#define FG_SAMPLE(t, tc, p) sampleRGB(t, p)
+#endif
 
 uint mismatch(ivec2 p, out vec3 wa, out vec3 wc) {
     vec2 hv = halfVec(p);
@@ -101,8 +126,22 @@ uint mismatch(ivec2 p, out vec3 wa, out vec3 wc) {
     precise float ka = 2.0 * pc.wC, kc = 2.0 * pc.wA;   // exact: interp's float32(2t), float32(2(1 - t))
     precise vec2 pa = vec2(p) - ka * hv;
     precise vec2 pc_ = vec2(p) + kc * hv;
-    wa = sampleRGB(texPrev, pa);
-    wc = sampleRGB(texCurr, pc_);
-    vec3 d = abs(wa - wc);
-    return uint(max(d.r, max(d.g, d.b)));
+    wa = FG_SAMPLE(texPrev, texPrevC, pa);
+    wc = FG_SAMPLE(texCurr, texCurrC, pc_);
+    vec3 d = FG_DIFF(wa, wc);
+    return FG_PACKE(max(d.r, max(d.g, d.b)));
 }
+
+#ifdef FG_YUV
+// The chroma of the 2x2 block whose top-left pixel is p (even coordinates), warped like the luma: the sample point is the
+// block centre p + 0.5 (where a centre-sited chroma texel sits), so at zero motion the texel itself comes back.
+void warpChroma(ivec2 p, out vec2 ca, out vec2 cc) {
+    vec2 hv = halfVec(p);
+    precise float ka = 2.0 * pc.wC, kc = 2.0 * pc.wA;
+    vec2 q = vec2(p) + 0.5;
+    precise vec2 pa = q - ka * hv;
+    precise vec2 pc_ = q + kc * hv;
+    ca = sampleC(texPrevC, pa);
+    cc = sampleC(texCurrC, pc_);
+}
+#endif

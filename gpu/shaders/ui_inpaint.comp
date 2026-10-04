@@ -12,7 +12,7 @@
 // A tile with no masked pixel exits before staging, one entirely inside the masked area (nothing to walk to) right after. Whole screen: unflagged 32x32 tiles (also in the halo, where
 // their mask was never written) count as unmasked, and suppressed frames exit at once.
 #include "ui_common.glsl"
-layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(set = 0, binding = 1, FG_FMT) uniform writeonly image2D dst;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const int T = 16;

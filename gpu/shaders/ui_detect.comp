@@ -7,7 +7,10 @@
 //   Cells with count >= still are "still": counted into M[0] and their 32x32 tiles (plus the tiles within the
 //   2 px dilation) are flagged in M[4 + tile], which is what lets every later whole-screen pass skip the rest.
 #include "ui_common.glsl"
-layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(set = 0, binding = 1, FG_FMT) uniform writeonly image2D dst;
+#ifdef FG_YUV
+layout(set = 0, binding = 5, FG_FMTC) uniform writeonly image2D dstC;
+#endif
 layout(local_size_x = 8, local_size_y = 8) in;
 
 shared uint sBits;
@@ -29,7 +32,13 @@ void main() {
                 if (p.x < pc.W && p.y < pc.H) {
                     vec4 v = texelFetch(src, p, 0);
                     imageStore(dst, p, v);
-                    sum += floor(v.rgb * 255.0 + 0.5);
+#ifdef FG_YUV
+                    vec4 vc = texelFetch(srcC, p >> 1, 0);
+                    if (((p.x | p.y) & 1) == 0) imageStore(dstC, p >> 1, vc);
+                    sum += fgStillYuv(v.r, vc.rg);
+#else
+                    sum += FG_STILL(v.rgb);
+#endif
                     n++;
                 }
             }

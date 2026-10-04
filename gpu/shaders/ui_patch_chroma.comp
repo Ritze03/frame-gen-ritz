@@ -1,0 +1,25 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// YUV only (compiled for FG_FORMAT_NV12 / FG_FORMAT_P010): ui_patch.comp for the half-resolution CbCr plane. A chroma
+// texel takes the strongest mask byte of its 2x2 pixels (inside the mask rectangle, in a live tile), so every pixel of a
+// protected element gets its real chroma back; out = mix(out, real, mask). One thread per texel of the mask rectangle.
+#include "ui_common.glsl"
+layout(set = 0, binding = 5, FG_FMTC) uniform image2D imgC;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 c = ivec2(pc.maskX >> 1, pc.maskY >> 1) + ivec2(gl_GlobalInvocationID.xy);
+    uint a = 0u;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            ivec2 q = 2 * c + ivec2(i, j);
+            ivec2 rel = q - ivec2(pc.maskX, pc.maskY);
+            if (rel.x < 0 || rel.y < 0 || rel.x >= pc.maskW || rel.y >= pc.maskH) continue;
+            if (pc.gate != 0 && !tileLive(q / TILE)) continue;
+            a = max(a, maskByte(rel));
+        }
+    if (a == 0u) return;
+    vec4 o = imageLoad(imgC, c);
+    vec2 real = texelFetch(srcC, c, 0).rg;
+    imageStore(imgC, c, vec4(mix(o.rg, real, float(a) * (1.0 / 255.0)), o.ba));
+}

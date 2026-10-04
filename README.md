@@ -44,9 +44,10 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 | `gpu/framegen.h`, `gpu/framegen.cpp` | The Vulkan library (`framegen::Interpolator`) |
 | `gpu/pacing.h` | Host-agnostic pacing: which frame to show when, pass-through, cost guard, motion-blur window (`framegen::pacing`, header-only, no Vulkan) |
 | `gpu/pacingtest.cpp`, `gpu/minitest.h` | CPU-only tests of the pacing header and the lag-spike buffer (`meson test`), with a tiny Catch2 stand-in |
-| `gpu/shaders/*.comp` | GLSL compute passes (`ui_*.comp`: static-UI protection, `blur_*.comp`: motion blur) |
+| `gpu/shaders/*.comp` | GLSL compute passes (`ui_*.comp`: static-UI protection, `blur_*.comp`: motion blur); `format.glsl` selects the per-format variants of the colour passes |
 | `gpu/fgtest.cpp` | Test and benchmark tool for raw RGBA frame files |
 | `gpu/uitest.cpp` | Validation and benchmark of static-UI protection on a synthetic scene |
+| `gpu/formattest.cpp` | Single-frame checks of every image format (Rgb10, RgbaF16, Nv12, P010) against Rgba8 on a synthetic scene |
 | `gpu/blurtest.cpp`, `gpu/blendbench.comp` | Validation and benchmark of the motion blur on a synthetic scene (the shader is the naive blend the benchmark compares against) |
 | `gpu/compare.py` | GPU vs Python reference checks, and the benchmark runs |
 | `INTEGRATION.md` | Integration spec for gamescope-ritz, full API contract, settings, costs |
@@ -84,7 +85,26 @@ meson setup build
 ninja -C build
 ```
 
-This builds the static library `framegen` (the shaders are embedded as SPIR-V headers) and the `fgtest` tool. The library needs only the Vulkan headers, because it loads every device function through `vkGetDeviceProcAddr`.
+This builds the static library `framegen` (the shaders are embedded as SPIR-V headers) and the test tools. `meson setup build -Dformats=rgb10,nv12` builds only some of the non-Rgba8 shader variants (default: all, see "Formats"). The library needs only the Vulkan headers, because it loads every device function through `vkGetDeviceProcAddr`.
+
+## Formats
+
+The library is not limited to 8-bit RGB games. The format is picked once at `init()` by `InitInfo::viewFormat`:
+
+| Format | `viewFormat` | Frame |
+|---|---|---|
+| `Rgba8` (default) | `B8G8R8A8_UNORM`, `R8G8B8A8_UNORM` | one view |
+| `Rgb10` | `A2B10G10R10_UNORM_PACK32`, `A2R10G10B10_UNORM_PACK32` | one view |
+| `RgbaF16` | `R16G16B16A16_SFLOAT` (`InitInfo::transfer`: encoded, or linear / scRGB with `linearWhiteNits`) | one view |
+| `Nv12` | `R8_UNORM` (Y plane view; chroma `R8G8_UNORM`) | `Frame{Y view, CbCr view}` |
+| `P010` | `R16_UNORM` (Y plane view; chroma `R16G16_UNORM`; 10 bits in the high bits) | `Frame{Y view, CbCr view}` |
+
+- **Rgba8 is untouched.** Each colour shader is built once per format from the same source (`-DFG_FORMAT_*`, `gpu/shaders/format.glsl`); with no define it compiles to the same SPIR-V as before (checked with `cmp` for all 20 shaders), keeps its header names, and a host that passes plain `VkImageView`s changes nothing. The other variants are only loaded when chosen. The motion estimate runs on luma and is the same code for every format.
+- **Thresholds keep their meaning.** Every level-based setting stays in "8-bit levels": the library converts what it measures to the levels of an 8-bit picture (10-bit codes / 4, PQ codes for linear float, YCbCr differences mapped to R'G'B'), so a number means the same perceived amount in every format. Blending and warping stay in the source's own space.
+- **Host contract.** NV12 / P010: one multi-planar image created with `MUTABLE_FORMAT | EXTENDED_USAGE`, plane views (`PLANE_0` as `R8`/`R16`, `PLANE_1` as `R8G8`/`R16G16`); `out`'s two views are both written (Y full, CbCr half resolution; chroma assumed centre-sited). Every format except Rgba8 and RgbaF16 needs the device feature `shaderStorageImageExtendedFormats`. `InitInfo::getFormatProps` lets `init()` check device support and report a reason (`initError()`).
+- **Memory** of one UI-protection clean copy at 1440p: Rgba8 / Rgb10 14.7 MB, RgbaF16 29.5 MB, Nv12 5.5 MB, P010 11.1 MB. **Embedded SPIR-V:** Rgba8 205 KB as before; Rgb10 +111 KB, RgbaF16 +120 KB, Nv12 and P010 +150 KB each.
+
+Full contract, the threshold table per format, build and gamescope notes: INTEGRATION.md "Formats".
 
 ## Static UI protection
 
@@ -174,6 +194,14 @@ gpu/build/uitest deep [W H]              # Settings::uiHistory: a synth from a p
 gpu/build/uitest bench [W H]             # per-pass GPU times: moving / still / 70% still scenes, all modes
 ```
 
+`formattest` (needs no footage) checks every image format (Rgb10, RgbaF16 encoded and linear, NV12, P010) on the same kind of synthetic scene, single frames only (640x360 by default, a few milliseconds of GPU per format):
+
+```sh
+gpu/build/formattest check [--separate-planes] [W H]   # per format: output vs the Rgba8 path, YUV planes written, blur, exact crosshair / HUD
+                                                       # with UI protection, 10-bit gradient precision, float highlights above 1.0, API refusals
+gpu/build/formattest time [W H]                        # one GPU time per format (estimate + one synth), default 1920x1080
+```
+
 If Lossless Scaling's implicit Vulkan layer is installed, disable implicit layers when testing and benchmarking: `VK_LOADER_LAYERS_DISABLE='~implicit~'`.
 
 Python reference (needs NumPy and OpenCV; `render.py` also needs ffmpeg):
@@ -196,7 +224,7 @@ info.phys = physicalDevice;
 info.device = device;
 info.gdpa = vkGetDeviceProcAddr;
 info.width = w; info.height = h;                       // >= kMinSize (16)
-info.viewFormat = VK_FORMAT_B8G8R8A8_UNORM;            // or R8G8B8A8_UNORM; never _SRGB, never 10-bit
+info.viewFormat = VK_FORMAT_B8G8R8A8_UNORM;            // or R8G8B8A8_UNORM, or another format ("Formats"); never _SRGB
 info.getMemProps = vkGetPhysicalDeviceMemoryProperties; // required
 framegen::Interpolator fg;
 if (!fg.init(info)) { /* no frame generation for this surface */ }
@@ -213,7 +241,7 @@ for (int k = 1; k < N; ++k)
     slotOk[k - 1] = fg.recordSynth(cb, prevView, currView, outView[k - 1], float(k) / N);
 ```
 
-- All views are 2D, single mip/layer, 8-bit UNORM in `viewFormat`, and in `VK_IMAGE_LAYOUT_GENERAL` on entry and exit. `prev`/`curr` need SAMPLED usage and must already be readable. `out` needs STORAGE usage and is owned by the caller.
+- All views are 2D, single mip/layer, in `viewFormat` (8-bit UNORM for Rgba8; two plane views per `Frame` for NV12 / P010), and in `VK_IMAGE_LAYOUT_GENERAL` on entry and exit. `prev`/`curr` need SAMPLED usage and must already be readable. `out` needs STORAGE usage and is owned by the caller.
 - Every `record*()` returns `false` and records nothing if the object is not initialised, `t` is outside (0, 1), or more than `kSetRing` (32) estimates or synths were recorded since `beginFrame()`. `recordSynth()` also fails without a matching `recordEstimate()`. Present an output only if its call returned `true`.
 - Synths end with a compute-to-compute barrier only. Other consumers of `out` (fragment, transfer) need the caller's own barrier.
 - Not thread-safe. All records of one `Interpolator` must go to one queue, in recording order.
@@ -289,7 +317,7 @@ For video, `Pacer::OnFrame(id, ptsNs, streamKey, format)` replaces `OnArrival`: 
 
 ## Limitations
 
-- 8-bit UNORM RGBA/BGRA only. There is no HDR or 10-bit support, so the caller must skip frame generation or convert first.
+- Supported formats: 8-bit RGBA/BGRA, 10-bit RGB (A2B10G10R10), half-float RGB (linear/scRGB or encoded), NV12 and P010. Not supported: `_SRGB` views, 4:2:2 / 4:4:4 and 12/16-bit YUV, `VkSamplerYcbcrConversion` sampling (chroma is sampled bilinearly, centre-sited), BT.2020 constant luminance, and full-range P010 is treated as 8-bit-full-range gain (0.3 % off).
 - HUD drawn into the game image can still show artifacts, especially translucent HUD elements and scrolling or changing text. Solid, static HUD is handled by the optional static-UI protection (`uiProtection`, above); semi-transparent or shape-changing UI is not protected by it either. Overlays composited later by gamescope are not affected.
 - Repetitive structures (stairs, ladders, fences) under fast motion can lock onto the wrong period. Both warps then agree, so the mismatch test cannot catch it.
 - Very fast flicks below the whole-frame fallback threshold can show seams between warped and held regions.

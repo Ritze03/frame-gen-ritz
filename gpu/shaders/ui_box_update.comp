@@ -10,7 +10,12 @@ layout(local_size_x = 8, local_size_y = 8) in;
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (p.x >= pc.boxW || p.y >= pc.boxH) return;
-    vec3 now = floor(texelFetch(src, ivec2(pc.boxX, pc.boxY) + p, 0).rgb * 255.0 + 0.5);
+#ifdef FG_YUV
+    ivec2 sp = ivec2(pc.boxX, pc.boxY) + p;
+    vec3 now = fgStillYuv(texelFetch(src, sp, 0).r, texelFetch(srcC, sp >> 1, 0).rg);
+#else
+    vec3 now = FG_STILL(texelFetch(src, ivec2(pc.boxX, pc.boxY) + p, 0).rgb);
+#endif
     int i = p.y * pc.boxW + p.x;
     uint old = st[i];
     uint count = 0u;

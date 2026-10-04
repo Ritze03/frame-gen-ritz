@@ -5,10 +5,25 @@
 #include "common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
+#if defined(FG_YUV)
+// the Y plane is the luma already (levels, full range)
+float y8(sampler2D t, ivec2 p) { return fgLuma(texelFetch(t, p, 0).r); }
+#elif defined(FG_FORMAT_RGB10) || defined(FG_FORMAT_F16)
+// not rounded to an integer: the same weights as below, on the levels of a perceptually encoded picture
+float y8(sampler2D t, ivec2 p) {
+#if defined(FG_FORMAT_F16)
+    vec3 c = fgMetric(texelFetch(t, p, 0).rgb);
+#else
+    vec3 c = texelFetch(t, p, 0).rgb * 255.0;
+#endif
+    return dot(c, vec3(4899.0, 9617.0, 1868.0)) * (1.0 / 16384.0);
+}
+#else
 float y8(sampler2D t, ivec2 p) {
     uvec3 c = uvec3(texelFetch(t, p, 0).rgb * 255.0 + 0.5);
     return float((c.r * 4899u + c.g * 9617u + c.b * 1868u + 8192u) >> 14);
 }
+#endif
 
 shared float sA[64], sC[64];
 shared int sN[64];
