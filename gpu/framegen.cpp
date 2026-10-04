@@ -27,7 +27,123 @@
 #include "blur_error_spv.h"
 #include "blur_resolve_spv.h"
 
+// The colour shaders of the formats other than Rgba8 (shaders/format.glsl), when built.
+// rgb10: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
+#if __has_include("luma_rgb10_spv.h")
+#define FG_HAVE_RGB10 1
+#include "luma_rgb10_spv.h"
+#include "error_rgb10_spv.h"
+#include "resolve_rgb10_spv.h"
+#include "fallback_rgb10_spv.h"
+#include "ui_detect_rgb10_spv.h"
+#include "ui_box_update_rgb10_spv.h"
+#include "ui_inpaint_rgb10_spv.h"
+#include "ui_patch_rgb10_spv.h"
+#include "blur_error_rgb10_spv.h"
+#include "blur_resolve_rgb10_spv.h"
+#endif
+// f16: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
+#if __has_include("luma_f16_spv.h")
+#define FG_HAVE_F16 1
+#include "luma_f16_spv.h"
+#include "error_f16_spv.h"
+#include "resolve_f16_spv.h"
+#include "fallback_f16_spv.h"
+#include "ui_detect_f16_spv.h"
+#include "ui_box_update_f16_spv.h"
+#include "ui_inpaint_f16_spv.h"
+#include "ui_patch_f16_spv.h"
+#include "blur_error_f16_spv.h"
+#include "blur_resolve_f16_spv.h"
+#endif
+// nv12: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
+#if __has_include("luma_nv12_spv.h")
+#define FG_HAVE_NV12 1
+#include "luma_nv12_spv.h"
+#include "error_nv12_spv.h"
+#include "resolve_nv12_spv.h"
+#include "fallback_nv12_spv.h"
+#include "ui_detect_nv12_spv.h"
+#include "ui_box_update_nv12_spv.h"
+#include "ui_inpaint_nv12_spv.h"
+#include "ui_patch_nv12_spv.h"
+#include "blur_error_nv12_spv.h"
+#include "blur_resolve_nv12_spv.h"
+#include "ui_inpaint_chroma_nv12_spv.h"
+#include "ui_patch_chroma_nv12_spv.h"
+#endif
+// p010: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
+#if __has_include("luma_p010_spv.h")
+#define FG_HAVE_P010 1
+#include "luma_p010_spv.h"
+#include "error_p010_spv.h"
+#include "resolve_p010_spv.h"
+#include "fallback_p010_spv.h"
+#include "ui_detect_p010_spv.h"
+#include "ui_box_update_p010_spv.h"
+#include "ui_inpaint_p010_spv.h"
+#include "ui_patch_p010_spv.h"
+#include "blur_error_p010_spv.h"
+#include "blur_resolve_p010_spv.h"
+#include "ui_inpaint_chroma_p010_spv.h"
+#include "ui_patch_chroma_p010_spv.h"
+#endif
+
 namespace framegen {
+
+bool formatOf(VkFormat f, Format* out) {
+    Format r;
+    switch (f) {
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_R8G8B8A8_UNORM: r = Format::Rgba8; break;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: r = Format::Rgb10; break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: r = Format::RgbaF16; break;
+    case VK_FORMAT_R8_UNORM: r = Format::Nv12; break;
+    case VK_FORMAT_R16_UNORM: r = Format::P010; break;
+    default: return false;
+    }
+    if (out) *out = r;
+    return true;
+}
+
+namespace {
+struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
+#define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
+// The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
+struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC; };
+#define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
+    SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}}
+// false = this format's variants were not built into the library (meson option `formats`)
+bool colourSpv(Format f, ColourSpv& c) {
+    switch (f) {
+    case Format::Rgba8: c = COLOUR_SET(); return true;
+#ifdef FG_HAVE_RGB10
+    case Format::Rgb10: c = COLOUR_SET(_rgb10); return true;
+#endif
+#ifdef FG_HAVE_F16
+    case Format::RgbaF16: c = COLOUR_SET(_f16); return true;
+#endif
+#ifdef FG_HAVE_NV12
+    case Format::Nv12: c = COLOUR_SET(_nv12); c.uiInpaintC = SPV(ui_inpaint_chroma_nv12); c.uiPatchC = SPV(ui_patch_chroma_nv12); return true;
+#endif
+#ifdef FG_HAVE_P010
+    case Format::P010: c = COLOUR_SET(_p010); c.uiInpaintC = SPV(ui_inpaint_chroma_p010); c.uiPatchC = SPV(ui_patch_chroma_p010); return true;
+#endif
+    default: return false;
+    }
+}
+inline bool isYuv(Format f) { return f == Format::Nv12 || f == Format::P010; }
+// the view / clean-copy formats of a Format: the library's own clean copies are in the source's own format, in logical channel order
+VkFormat cleanFormat(Format f) {
+    switch (f) {
+    case Format::Rgb10: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case Format::RgbaF16: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case Format::Nv12: return VK_FORMAT_R8_UNORM;
+    case Format::P010: return VK_FORMAT_R16_UNORM;
+    default: return VK_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+VkFormat cleanFormatC(Format f) { return f == Format::P010 ? VK_FORMAT_R16G16_UNORM : VK_FORMAT_R8G8_UNORM; }
+}  // namespace
 
 #define FG_FUNCS(X) \
     X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) X(AllocateMemory) X(FreeMemory) \
@@ -57,7 +173,7 @@ struct UiPC {
     int32_t reach, reset, tilesX, tilesY, stillLimit, maskX, maskY, maskW, maskH, maskStride, maskOff, gate;
 };
 static_assert(sizeof(UiPC) <= 128, "push constants beyond the guaranteed minimum");
-enum UiPipe { U_DETECT, U_BOX_UPDATE, U_BOX_MASK, U_MASK, U_INPAINT, U_PATCH, U_COUNT };
+enum UiPipe { U_DETECT, U_BOX_UPDATE, U_BOX_MASK, U_MASK, U_INPAINT, U_PATCH, U_COUNT, U_INPAINT_C = U_COUNT, U_PATCH_C, U_COUNT_ALL };   // _C: the CbCr plane (YUV only)
 static const int kUiCell = 2;    // whole-screen detection resolution: 1/kUiCell per axis (1, 2 or 4; 8 x cell divides the tile)
 static const int kUiTile = 32;   // == TILE in ui_common.glsl
 static const int kUiInpTile = 16;   // == T in ui_inpaint.comp
@@ -77,6 +193,8 @@ struct UiBox { int x, y, w, h; bool operator==(const UiBox& o) const { return x 
 // One observed real frame: the clean copy, the mask of the box (full res) and, whole screen, of the whole frame.
 struct UiEntry {
     VkImage img = VK_NULL_HANDLE; VkDeviceMemory imgMem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE;
+    VkImage imgC = VK_NULL_HANDLE; VkDeviceMemory imgMemC = VK_NULL_HANDLE; VkImageView viewC = VK_NULL_HANDLE;   // YUV: the CbCr plane
+    Frame frame() const { return Frame(view, viewC); }
     UiBuf box;   // header (4 words) + the box mask; grown lazily when the box grows
     UiBuf ws;    // header + tile flags + the full-frame mask (allocated with WholeScreen)
     VkImageView key = VK_NULL_HANDLE;   // the host view this entry describes (null = dead)
@@ -95,6 +213,10 @@ struct Interpolator::Impl {
     FG_FUNCS(X)
 #undef X
     InitInfo info{};
+    Format fmt = Format::Rgba8;
+    bool yuv = false;
+    ColourSpv cs{};
+    VkFormat cleanFmt = VK_FORMAT_R8G8B8A8_UNORM, cleanFmtC = VK_FORMAT_UNDEFINED;
     Settings set{};   // active settings (info.settings is only the init value)
     VkPhysicalDeviceMemoryProperties memProps{};
 
@@ -102,6 +224,7 @@ struct Interpolator::Impl {
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipes[P_COUNT]{};
+    bool makePipe(const Spv& sp, VkPipelineLayout lay, VkPipeline& out, const VkSpecializationInfo* spec);
     // motion blur (recordSynthBlur): own push-constant layout over the same set layout, 4 pipelines, and a scratch
     // that is created by the first blur record and only ever grows (the old buffer waits in the graveyard)
     VkPipelineLayout blurLayout = VK_NULL_HANDLE;
@@ -118,7 +241,7 @@ struct Interpolator::Impl {
     uint32_t frameSets[2]{};     // sets taken from each ring since the last beginFrame()
     // latest recordEstimate (recordSynth uses its results)
     bool haveEst = false;
-    VkImageView estPrev = VK_NULL_HANDLE, estCurr = VK_NULL_HANDLE;
+    VkImageView estPrev = VK_NULL_HANDLE, estCurr = VK_NULL_HANDLE;   // the Y / only views of the estimate's pair
 
     // size dependent
     uint32_t W = 0, H = 0;
@@ -132,7 +255,7 @@ struct Interpolator::Impl {
     // ---- static-UI protection (framegen.h, recordObserve) ----
     VkDescriptorSetLayout uiDsl = VK_NULL_HANDLE;
     VkPipelineLayout uiLayout = VK_NULL_HANDLE;
-    VkPipeline uiPipes[U_COUNT]{};
+    VkPipeline uiPipes[U_COUNT_ALL]{};
     VkDescriptorPool uiPool = VK_NULL_HANDLE;
     VkDescriptorSet uiSets[kUiSets]{};
     uint32_t uiSetIdx = 0, uiFrameSets = 0;
@@ -160,6 +283,7 @@ struct Interpolator::Impl {
     bool allocBuf(UiBuf& b, VkDeviceSize bytes);
     void freeBuf(UiBuf& b);
     bool growBuf(UiBuf& b, VkDeviceSize bytes);
+    bool allocImage(VkFormat f, uint32_t w, uint32_t h, VkImage& img, VkDeviceMemory& mem, VkImageView& view);
     bool allocEntryImage(UiEntry& e);
     bool uiEnsure();
     void uiFreeEntry(UiEntry& e);
@@ -167,9 +291,9 @@ struct Interpolator::Impl {
     void uiAdopted(const Settings& old);
     int uiFind(VkImageView v) const;
     int uiPick(VkImageView v) const;
-    VkDescriptorSet takeUiSet(VkImageView src, VkImageView img, const UiBuf& s, const UiBuf& m);
-    bool uiObserveRecord(VkCommandBuffer cb, VkImageView view);
-    void uiRecordPatch(VkCommandBuffer cb, VkImageView curr, VkImageView out, const UiEntry& e);
+    VkDescriptorSet takeUiSet(Frame src, Frame img, const UiBuf& s, const UiBuf& m);
+    bool uiObserveRecord(VkCommandBuffer cb, Frame view);
+    void uiRecordPatch(VkCommandBuffer cb, Frame curr, Frame out, const UiEntry& e);
 
     // profiling
     bool profiling = false;
@@ -178,7 +302,8 @@ struct Interpolator::Impl {
     std::vector<const char*> qnames;
     uint32_t qcount = 0;
 
-    VkDescriptorSet takeSet(int ring, VkImageView prev, VkImageView curr, VkImageView out, bool blur = false);
+    VkDescriptorSet takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur = false);
+    bool framesOk(const Frame& a) const { return a.view && (!yuv || a.chroma); }
     bool createSizeDependent();
     bool rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force);
     void destroySizeDependent();
@@ -329,33 +454,39 @@ bool Interpolator::Impl::growBlur(UiBuf& b, VkDeviceSize bytes) {
     return true;
 }
 
-bool Interpolator::Impl::allocEntryImage(UiEntry& e) {
+bool Interpolator::Impl::allocImage(VkFormat f, uint32_t w, uint32_t h, VkImage& img, VkDeviceMemory& mem, VkImageView& view) {
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_R8G8B8A8_UNORM;   // always RGBA8, in logical channel order: only the library reads and writes it
-    ici.extent = {W, H, 1};
+    ici.format = f;   // in logical channel order, in the source's own format: only the library reads and writes it
+    ici.extent = {w, h, 1};
     ici.mipLevels = ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (CreateImage(info.device, &ici, nullptr, &e.img) != VK_SUCCESS) { e.img = VK_NULL_HANDLE; return false; }
+    if (CreateImage(info.device, &ici, nullptr, &img) != VK_SUCCESS) { img = VK_NULL_HANDLE; return false; }
     VkMemoryRequirements req;
-    GetImageMemoryRequirements(info.device, e.img, &req);
+    GetImageMemoryRequirements(info.device, img, &req);
     uint32_t type = localType(req.memoryTypeBits);
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type;
-    if (type == UINT32_MAX || AllocateMemory(info.device, &mai, nullptr, &e.imgMem) != VK_SUCCESS) { e.imgMem = VK_NULL_HANDLE; return false; }
-    if (BindImageMemory(info.device, e.img, e.imgMem, 0) != VK_SUCCESS) return false;
+    if (type == UINT32_MAX || AllocateMemory(info.device, &mai, nullptr, &mem) != VK_SUCCESS) { mem = VK_NULL_HANDLE; return false; }
+    if (BindImageMemory(info.device, img, mem, 0) != VK_SUCCESS) return false;
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vci.image = e.img;
+    vci.image = img;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.format = f;
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (CreateImageView(info.device, &vci, nullptr, &e.view) != VK_SUCCESS) { e.view = VK_NULL_HANDLE; return false; }
-    uiPendingInit.push_back(e.img);
+    if (CreateImageView(info.device, &vci, nullptr, &view) != VK_SUCCESS) { view = VK_NULL_HANDLE; return false; }
+    uiPendingInit.push_back(img);
     return true;
+}
+
+// One clean copy: the frame in its own format (Rgba8: always R8G8B8A8, as before), for YUV a second image for CbCr.
+bool Interpolator::Impl::allocEntryImage(UiEntry& e) {
+    if (!allocImage(cleanFmt, W, H, e.img, e.imgMem, e.view)) return false;
+    return !yuv || allocImage(cleanFmtC, (W + 1) / 2, (H + 1) / 2, e.imgC, e.imgMemC, e.viewC);
 }
 
 // Creates what the active mode needs and does not have yet; never frees. Called by setSettings/reconfigure (the new
@@ -415,12 +546,17 @@ bool Interpolator::Impl::uiEnsure() {
 // Frees one entry's resources (retire rule of resize()/destroy()).
 void Interpolator::Impl::uiFreeEntry(UiEntry& e) {
     VkDevice d = info.device;
-    if (e.view) DestroyImageView(d, e.view, nullptr);
-    if (e.img) {
-        uiPendingInit.erase(std::remove(uiPendingInit.begin(), uiPendingInit.end(), e.img), uiPendingInit.end());
-        DestroyImage(d, e.img, nullptr);
+    for (int i = 0; i < 2; i++) {   // luma / only image, then the CbCr plane
+        VkImageView& v = i ? e.viewC : e.view;
+        VkImage& im = i ? e.imgC : e.img;
+        VkDeviceMemory& mm = i ? e.imgMemC : e.imgMem;
+        if (v) DestroyImageView(d, v, nullptr);
+        if (im) {
+            uiPendingInit.erase(std::remove(uiPendingInit.begin(), uiPendingInit.end(), im), uiPendingInit.end());
+            DestroyImage(d, im, nullptr);
+        }
+        if (mm) FreeMemory(d, mm, nullptr);
     }
-    if (e.imgMem) FreeMemory(d, e.imgMem, nullptr);
     freeBuf(e.box);
     freeBuf(e.ws);
     e = UiEntry{};
@@ -467,14 +603,16 @@ int Interpolator::Impl::uiPick(VkImageView v) const {
     return best;
 }
 
-VkDescriptorSet Interpolator::Impl::takeUiSet(VkImageView src, VkImageView img, const UiBuf& s, const UiBuf& m) {
+VkDescriptorSet Interpolator::Impl::takeUiSet(Frame src, Frame img, const UiBuf& s, const UiBuf& m) {
     VkDescriptorSet set_ = uiSets[uiSetIdx];
     uiSetIdx = (uiSetIdx + 1) % kUiSets;
     uiFrameSets++;
-    VkDescriptorImageInfo ii[2] = {{VK_NULL_HANDLE, src, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, img, VK_IMAGE_LAYOUT_GENERAL}};
+    VkDescriptorImageInfo ii[4] = {{VK_NULL_HANDLE, src.view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, img.view, VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, src.chroma, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, img.chroma, VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorBufferInfo bi[2] = {{s.b, 0, VK_WHOLE_SIZE}, {m.b, 0, VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet wr[4]{};
-    for (int i = 0; i < 4; i++) {
+    VkWriteDescriptorSet wr[6]{};
+    const uint32_t n = yuv ? 6 : 4;
+    for (uint32_t i = 0; i < n; i++) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[i].dstSet = set_;
         wr[i].dstBinding = i;
@@ -487,46 +625,102 @@ VkDescriptorSet Interpolator::Impl::takeUiSet(VkImageView src, VkImageView img, 
     wr[2].descriptorType = wr[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     wr[2].pBufferInfo = &bi[0];
     wr[3].pBufferInfo = &bi[1];
-    UpdateDescriptorSets(info.device, 4, wr, 0, nullptr);
+    if (yuv) {   // the CbCr planes: sampled source (4), storage destination (5)
+        wr[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[4].pImageInfo = &ii[2];
+        wr[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        wr[5].pImageInfo = &ii[3];
+    }
+    UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
     return set_;
 }
 
+bool Interpolator::Impl::makePipe(const Spv& sp, VkPipelineLayout lay, VkPipeline& out, const VkSpecializationInfo* spec) {
+    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smci.codeSize = sp.size;
+    smci.pCode = sp.code;
+    VkShaderModule sm;
+    if (CreateShaderModule(info.device, &smci, nullptr, &sm) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", spec};
+    cpci.layout = lay;
+    VkResult r = CreateComputePipelines(info.device, info.pipelineCache, 1, &cpci, nullptr, &out);
+    DestroyShaderModule(info.device, sm, nullptr);
+    if (r != VK_SUCCESS) { out = VK_NULL_HANDLE; return false; }
+    return true;
+}
+
+namespace {
+// Device support of one format for what the library does with it: sampled (linearly filtered) and storage, optimal tiling.
+bool formatUsable(PFN_vkGetPhysicalDeviceFormatProperties fp, VkPhysicalDevice phys, VkFormat f) {
+    VkFormatProperties p{};
+    fp(phys, f, &p);
+    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                      VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    return (p.optimalTilingFeatures & need) == need;
+}
+}  // namespace
+
 bool Interpolator::init(const InitInfo& ii) {
     destroy();
-    if (!ii.getMemProps || !ii.gdpa || !ii.device || !validate(ii.settings)) return false;
+    err_ = nullptr;
+    if (!ii.getMemProps || !ii.gdpa || !ii.device || !validate(ii.settings)) { err_ = "missing getMemProps / gdpa / device, or invalid settings"; return false; }
+    Format fmt;
+    if (!formatOf(ii.viewFormat, &fmt)) { err_ = "unsupported viewFormat (see framegen::Format)"; return false; }
+    ColourSpv cs{};
+    if (!colourSpv(fmt, cs)) { err_ = "the shader variants of this format are not built into the library (meson option 'formats')"; return false; }
+    if (fmt == Format::RgbaF16 && ii.transfer == Transfer::Linear && !(ii.linearWhiteNits > 0.0f && ii.linearWhiteNits <= 10000.0f)) {
+        err_ = "linearWhiteNits must be in (0, 10000]";
+        return false;
+    }
+    if (fmt != Format::Rgba8 && ii.getFormatProps) {   // never for Rgba8: existing hosts behave exactly as before
+        if (!formatUsable(ii.getFormatProps, ii.phys, ii.viewFormat)) { err_ = "the device cannot sample (linear) and store the view format"; return false; }
+        if (!formatUsable(ii.getFormatProps, ii.phys, cleanFormat(fmt))) { err_ = "the device cannot sample and store the format of the clean copies"; return false; }
+        if (isYuv(fmt) && !formatUsable(ii.getFormatProps, ii.phys, cleanFormatC(fmt))) { err_ = "the device cannot sample and store the chroma plane format"; return false; }
+    }
     m = new Impl();
     m->info = ii;
     m->set = ii.settings;
+    m->fmt = fmt;
+    m->yuv = isYuv(fmt);
+    m->cs = cs;
+    m->cleanFmt = cleanFormat(fmt);
+    m->cleanFmtC = m->yuv ? cleanFormatC(fmt) : VK_FORMAT_UNDEFINED;
     VkDevice d = ii.device;
-#define X(n) m->n = (PFN_vk##n)ii.gdpa(d, "vk" #n); if (!m->n) { destroy(); return false; }
+#define X(n) m->n = (PFN_vk##n)ii.gdpa(d, "vk" #n); if (!m->n) { destroy(); err_ = "a device function could not be loaded through gdpa"; return false; }
     FG_FUNCS(X)
 #undef X
     ii.getMemProps(ii.phys, &m->memProps);
+    const char* fail = "a Vulkan object could not be created";   // err_ of every `destroy(); return false;` below
 
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
     sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sci.maxLod = 0.0f;
-    if (m->CreateSampler(d, &sci, nullptr, &m->sampler) != VK_SUCCESS) { destroy(); return false; }
+    if (m->CreateSampler(d, &sci, nullptr, &m->sampler) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
 
-    // bindings 0-2 buffers, 3-4 prev/curr, 5 out; 6-7: motion-blur scratch (only the blur passes use them)
-    VkDescriptorSetLayoutBinding b[8]{};
-    VkDescriptorType types[8] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    for (int i = 0; i < 8; i++) {
+    // bindings 0-2 buffers, 3-4 prev/curr, 5 out; 6-7: motion-blur scratch (only the blur passes use them);
+    // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out
+    const uint32_t nb = m->yuv ? 11 : 8;
+    VkDescriptorSetLayoutBinding b[11]{};
+    VkDescriptorType types[11] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    for (uint32_t i = 0; i < nb; i++) {
         b[i].binding = i;
         b[i].descriptorType = types[i];
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        if (i == 3 || i == 4) b[i].pImmutableSamplers = &m->sampler;
+        if (i == 3 || i == 4 || i == 8 || i == 9) b[i].pImmutableSamplers = &m->sampler;
     }
     VkDescriptorSetLayoutCreateInfo dci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dci.bindingCount = 8;
+    dci.bindingCount = nb;
     dci.pBindings = b;
-    if (m->CreateDescriptorSetLayout(d, &dci, nullptr, &m->dsl) != VK_SUCCESS) { destroy(); return false; }
+    if (m->CreateDescriptorSetLayout(d, &dci, nullptr, &m->dsl) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
 
     VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC)};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -534,26 +728,52 @@ bool Interpolator::init(const InitInfo& ii) {
     plci.pSetLayouts = &m->dsl;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &pcr;
-    if (m->CreatePipelineLayout(d, &plci, nullptr, &m->layout) != VK_SUCCESS) { destroy(); return false; }
+    if (m->CreatePipelineLayout(d, &plci, nullptr, &m->layout) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
 
-    struct { const uint32_t* code; size_t size; } spv[P_COUNT] = {
-        {luma_spv, sizeof(luma_spv)}, {down_spv, sizeof(down_spv)}, {medhist_spv, sizeof(medhist_spv)},
-        {search_spv, sizeof(search_spv)}, {median3_spv, sizeof(median3_spv)}, {subpix_spv, sizeof(subpix_spv)},
-        {pixfield_spv, sizeof(pixfield_spv)}, {error_spv, sizeof(error_spv)}, {resolve_spv, sizeof(resolve_spv)},
-        {fallback_spv, sizeof(fallback_spv)}, {lookup_spv, sizeof(lookup_spv)}};
-    for (int i = 0; i < P_COUNT; i++) {
-        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smci.codeSize = spv[i].size;
-        smci.pCode = spv[i].code;
-        VkShaderModule sm;
-        if (m->CreateShaderModule(d, &smci, nullptr, &sm) != VK_SUCCESS) { destroy(); return false; }
-        VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", nullptr};
-        cpci.layout = m->layout;
-        VkResult r = m->CreateComputePipelines(d, ii.pipelineCache, 1, &cpci, nullptr, &m->pipes[i]);
-        m->DestroyShaderModule(d, sm, nullptr);
-        if (r != VK_SUCCESS) { destroy(); return false; }
+    // Specialization constants of the colour shaders (shaders/format.glsl): the transfer of float input, or the
+    // sample scale / range / matrix of YUV. Plain Rgba8 and Rgb10 have none.
+    union W32 { uint32_t u; float f; };
+    W32 sd[9]{};
+    VkSpecializationMapEntry ents[9]{};
+    VkSpecializationInfo specInfo{};
+    const VkSpecializationInfo* spec = nullptr;
+    if (fmt == Format::RgbaF16) {
+        sd[0].u = ii.transfer == Transfer::Linear ? 1u : 0u;
+        sd[1].f = ii.linearWhiteNits;
+        specInfo.mapEntryCount = 2;
+    } else if (m->yuv) {
+        double kr = 0.2126, kb = 0.0722;   // BT.709
+        if (ii.yuvMatrix == YuvMatrix::Bt601) { kr = 0.299; kb = 0.114; }
+        if (ii.yuvMatrix == YuvMatrix::Bt2020) { kr = 0.2627; kb = 0.0593; }
+        const double kg = 1.0 - kr - kb;
+        const double sY = ii.yuvFullRange ? 1.0 : 255.0 / 219.0, sC = ii.yuvFullRange ? 1.0 : 255.0 / 224.0;
+        const bool p010 = fmt == Format::P010;
+        sd[0].f = p010 ? 65535.0f / 256.0f : 255.0f;   // YU_SCALE: R16 sample -> level (code10 / 4), or R8 sample -> level
+        sd[1].f = p010 ? 0.25f : 1.0f;                  // YU_QL
+        sd[2].f = p010 ? 1023.0f : 255.0f;              // YU_CODES
+        sd[3].f = ii.yuvFullRange ? 0.0f : 16.0f;       // YU_BLACK
+        sd[4].f = (float)sY;                            // YU_YS
+        sd[5].f = (float)(sC * 2.0 * (1.0 - kr));                // YU_RCR
+        sd[6].f = (float)(sC * 2.0 * (1.0 - kb));                // YU_BCB
+        sd[7].f = (float)(-sC * 2.0 * (1.0 - kb) * kb / kg);     // YU_GCB
+        sd[8].f = (float)(-sC * 2.0 * (1.0 - kr) * kr / kg);     // YU_GCR
+        specInfo.mapEntryCount = 9;
     }
+    if (specInfo.mapEntryCount) {
+        for (uint32_t i = 0; i < specInfo.mapEntryCount; i++) ents[i] = {i, i * 4, 4};
+        specInfo.pMapEntries = ents;
+        specInfo.dataSize = specInfo.mapEntryCount * 4;
+        specInfo.pData = sd;
+        spec = &specInfo;
+    }
+
+    // the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's
+    struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
+        {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
+        {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
+        {SPV(lookup), nullptr}};
+    for (int i = 0; i < P_COUNT; i++)
+        if (!m->makePipe(spv[i].sp, m->layout, m->pipes[i], spv[i].sc)) { destroy(); err_ = fail; return false; }
 
     // motion-blur passes: the same set layout, their own (larger) push-constant block
     {
@@ -563,100 +783,81 @@ bool Interpolator::init(const InitInfo& ii) {
         bplci.pSetLayouts = &m->dsl;
         bplci.pushConstantRangeCount = 1;
         bplci.pPushConstantRanges = &bpcr;
-        if (m->CreatePipelineLayout(d, &bplci, nullptr, &m->blurLayout) != VK_SUCCESS) { destroy(); return false; }
-        struct { const uint32_t* code; size_t size; } bspv[B_COUNT_] = {
-            {blur_lookup_spv, sizeof(blur_lookup_spv)}, {blur_error_spv, sizeof(blur_error_spv)},
-            {blur_resolve_spv, sizeof(blur_resolve_spv)}};
-        for (int i = 0; i < B_COUNT_; i++) {
-            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            smci.codeSize = bspv[i].size;
-            smci.pCode = bspv[i].code;
-            VkShaderModule sm;
-            if (m->CreateShaderModule(d, &smci, nullptr, &sm) != VK_SUCCESS) { destroy(); return false; }
-            VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-            cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", nullptr};
-            cpci.layout = m->blurLayout;
-            VkResult r = m->CreateComputePipelines(d, ii.pipelineCache, 1, &cpci, nullptr, &m->blurPipes[i]);
-            m->DestroyShaderModule(d, sm, nullptr);
-            if (r != VK_SUCCESS) { destroy(); return false; }
-        }
+        if (m->CreatePipelineLayout(d, &bplci, nullptr, &m->blurLayout) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
+        struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
+            {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
+        for (int i = 0; i < B_COUNT_; i++)
+            if (!m->makePipe(bspv[i].sp, m->blurLayout, m->blurPipes[i], bspv[i].sc)) { destroy(); err_ = fail; return false; }
     }
 
+    const uint32_t nSamp = m->yuv ? 4 : 2, nImg = m->yuv ? 2 : 1;
     VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * 2 * kSetRing},
-                                  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 2 * kSetRing},
-                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kSetRing}};
+                                  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSamp * 2 * kSetRing},
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, nImg * 2 * kSetRing}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 2 * kSetRing;
     dpci.poolSizeCount = 3;
     dpci.pPoolSizes = ps;
-    if (m->CreateDescriptorPool(d, &dpci, nullptr, &m->pool) != VK_SUCCESS) { destroy(); return false; }
+    if (m->CreateDescriptorPool(d, &dpci, nullptr, &m->pool) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
     VkDescriptorSetLayout layouts[2 * kSetRing];
     for (auto& l : layouts) l = m->dsl;
     VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsai.descriptorPool = m->pool;
     dsai.descriptorSetCount = 2 * kSetRing;
     dsai.pSetLayouts = layouts;
-    if (m->AllocateDescriptorSets(d, &dsai, &m->sets[0][0]) != VK_SUCCESS) { destroy(); return false; }
+    if (m->AllocateDescriptorSets(d, &dsai, &m->sets[0][0]) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
 
-    // static-UI protection: own set layout (sampled frame, storage image, 2 storage buffers), push constants,
-    // pipelines and a ring of kUiSets sets. Created always (small); resources only when the mode needs them.
+    // static-UI protection: own set layout (sampled frame, storage image, 2 storage buffers; YUV: + the CbCr planes),
+    // push constants, pipelines and a ring of kUiSets sets. Created always (small); resources only when the mode needs them.
     {
-        VkDescriptorSetLayoutBinding ub[4]{};
-        VkDescriptorType ut[4] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-        for (int i = 0; i < 4; i++) {
+        const uint32_t nu = m->yuv ? 6 : 4;
+        VkDescriptorSetLayoutBinding ub[6]{};
+        VkDescriptorType ut[6] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+        for (uint32_t i = 0; i < nu; i++) {
             ub[i].binding = i;
             ub[i].descriptorType = ut[i];
             ub[i].descriptorCount = 1;
             ub[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
         ub[0].pImmutableSamplers = &m->sampler;
+        ub[4].pImmutableSamplers = &m->sampler;
         VkDescriptorSetLayoutCreateInfo udci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        udci.bindingCount = 4;
+        udci.bindingCount = nu;
         udci.pBindings = ub;
-        if (m->CreateDescriptorSetLayout(d, &udci, nullptr, &m->uiDsl) != VK_SUCCESS) { destroy(); return false; }
+        if (m->CreateDescriptorSetLayout(d, &udci, nullptr, &m->uiDsl) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
         VkPushConstantRange upcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(UiPC)};
         VkPipelineLayoutCreateInfo uplci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         uplci.setLayoutCount = 1;
         uplci.pSetLayouts = &m->uiDsl;
         uplci.pushConstantRangeCount = 1;
         uplci.pPushConstantRanges = &upcr;
-        if (m->CreatePipelineLayout(d, &uplci, nullptr, &m->uiLayout) != VK_SUCCESS) { destroy(); return false; }
-        struct { const uint32_t* code; size_t size; } uspv[U_COUNT] = {
-            {ui_detect_spv, sizeof(ui_detect_spv)}, {ui_box_update_spv, sizeof(ui_box_update_spv)},
-            {ui_box_mask_spv, sizeof(ui_box_mask_spv)}, {ui_mask_spv, sizeof(ui_mask_spv)},
-            {ui_inpaint_spv, sizeof(ui_inpaint_spv)}, {ui_patch_spv, sizeof(ui_patch_spv)}};
-        for (int i = 0; i < U_COUNT; i++) {
-            VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            smci.codeSize = uspv[i].size;
-            smci.pCode = uspv[i].code;
-            VkShaderModule sm;
-            if (m->CreateShaderModule(d, &smci, nullptr, &sm) != VK_SUCCESS) { destroy(); return false; }
-            VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-            cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", nullptr};
-            cpci.layout = m->uiLayout;
-            VkResult r = m->CreateComputePipelines(d, ii.pipelineCache, 1, &cpci, nullptr, &m->uiPipes[i]);
-            m->DestroyShaderModule(d, sm, nullptr);
-            if (r != VK_SUCCESS) { destroy(); return false; }
-        }
-        VkDescriptorPoolSize ups[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kUiSets},
-                                       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kUiSets},
+        if (m->CreatePipelineLayout(d, &uplci, nullptr, &m->uiLayout) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
+        struct { Spv sp; const VkSpecializationInfo* sc; } uspv[U_COUNT_ALL] = {
+            {cs.uiDetect, spec}, {cs.uiBoxUpdate, spec}, {SPV(ui_box_mask), nullptr}, {SPV(ui_mask), nullptr},
+            {cs.uiInpaint, spec}, {cs.uiPatch, spec}, {cs.uiInpaintC, spec}, {cs.uiPatchC, spec}};
+        for (int i = 0; i < (m->yuv ? (int)U_COUNT_ALL : (int)U_COUNT); i++)
+            if (!m->makePipe(uspv[i].sp, m->uiLayout, m->uiPipes[i], uspv[i].sc)) { destroy(); err_ = fail; return false; }
+        const uint32_t nuS = m->yuv ? 2 : 1;
+        VkDescriptorPoolSize ups[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nuS * kUiSets},
+                                       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, nuS * kUiSets},
                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kUiSets}};
         VkDescriptorPoolCreateInfo udpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         udpci.maxSets = kUiSets;
         udpci.poolSizeCount = 3;
         udpci.pPoolSizes = ups;
-        if (m->CreateDescriptorPool(d, &udpci, nullptr, &m->uiPool) != VK_SUCCESS) { destroy(); return false; }
+        if (m->CreateDescriptorPool(d, &udpci, nullptr, &m->uiPool) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
         VkDescriptorSetLayout ul[kUiSets];
         for (auto& l : ul) l = m->uiDsl;
         VkDescriptorSetAllocateInfo udsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         udsai.descriptorPool = m->uiPool;
         udsai.descriptorSetCount = kUiSets;
         udsai.pSetLayouts = ul;
-        if (m->AllocateDescriptorSets(d, &udsai, m->uiSets) != VK_SUCCESS) { destroy(); return false; }
+        if (m->AllocateDescriptorSets(d, &udsai, m->uiSets) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
     }
 
-    if (!resize(ii.width, ii.height, ii.viewFormat)) { destroy(); return false; }
+    if (!resize(ii.width, ii.height, ii.viewFormat)) { destroy(); err_ = "resize failed: size below kMinSize or an allocation failed"; return false; }
     return true;
 }
 
@@ -666,9 +867,10 @@ bool Interpolator::resize(uint32_t w, uint32_t h, VkFormat fmt) {
 
 bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force) {
     // Invariant: W != 0 <=> all size-dependent buffers exist. Any failure leaves W = H = 0.
-    // The output is written through an `rgba8` storage declaration: only 8-bit UNORM views.
+    // The pipelines belong to the Format chosen at init(): a view format of another Format is refused (BGRA <-> RGBA is fine).
     // Below kMinSize the flow resolution (W/2 x H/2, rounded) degenerates (W or H = 1 -> size-0 buffers).
-    bool ok = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_UNORM) && w >= kMinSize && h >= kMinSize;
+    Format nf;
+    bool ok = formatOf(fmt, &nf) && nf == this->fmt && w >= kMinSize && h >= kMinSize;
     if (ok && !force && w == W && h == H) { info.viewFormat = fmt; return true; }   // buffers do not depend on the format
     destroySizeDependent();
     W = H = 0;
@@ -731,6 +933,10 @@ void Interpolator::releaseUnusedUi() {
         if (!e.active && (e.img || e.ws.b || e.box.b)) m->uiFreeEntry(e);
 }
 
+Format Interpolator::format() const {
+    return m ? m->fmt : Format::Rgba8;
+}
+
 Settings Interpolator::settings() const {
     return m ? m->set : Settings{};
 }
@@ -787,40 +993,46 @@ bool Interpolator::readTimings(std::vector<const char*>& names, std::vector<uint
     return true;
 }
 
-VkDescriptorSet Interpolator::Impl::takeSet(int ring, VkImageView prev, VkImageView curr, VkImageView out, bool blur) {
+VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur) {
     VkDescriptorSet set = sets[ring][setIdx[ring]];
     setIdx[ring] = (setIdx[ring] + 1) % kSetRing;
     frameSets[ring]++;
     VkDescriptorBufferInfo bi[3], bb[2] = {{blurField.b, 0, VK_WHOLE_SIZE}, {blurErr.b, 0, VK_WHOLE_SIZE}};
-    VkDescriptorImageInfo ii[3] = {{VK_NULL_HANDLE, prev, VK_IMAGE_LAYOUT_GENERAL},
-                                   {VK_NULL_HANDLE, curr, VK_IMAGE_LAYOUT_GENERAL},
-                                   {VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet wr[8]{};
-    uint32_t n = ring == R_SYNTH ? 6 : 5;   // estimate sets never get binding 5 (out)
-    for (uint32_t i = 0; i < n; i++) {
-        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet = set;
-        wr[i].dstBinding = i;
-        wr[i].descriptorCount = 1;
-        if (i < 3) {
-            bi[i] = {buf[i], 0, VK_WHOLE_SIZE};
-            wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            wr[i].pBufferInfo = &bi[i];
-        } else {
-            wr[i].descriptorType = i == 5 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            wr[i].pImageInfo = &ii[i - 3];
-        }
+    VkDescriptorImageInfo ii[6] = {{VK_NULL_HANDLE, prev.view, VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, curr.view, VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, prev.chroma, VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, curr.chroma, VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, out.chroma, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[11]{};
+    uint32_t n = 0;
+    auto add = [&](uint32_t binding, VkDescriptorType t) -> VkWriteDescriptorSet& {
+        VkWriteDescriptorSet& w = wr[n++];
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = set;
+        w.dstBinding = binding;
+        w.descriptorCount = 1;
+        w.descriptorType = t;
+        return w;
+    };
+    const VkDescriptorType BUF = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, SMP = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                           IMG = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    for (uint32_t i = 0; i < 3; i++) {
+        bi[i] = {buf[i], 0, VK_WHOLE_SIZE};
+        add(i, BUF).pBufferInfo = &bi[i];
     }
+    add(3, SMP).pImageInfo = &ii[0];
+    add(4, SMP).pImageInfo = &ii[1];
+    const bool synth = ring == R_SYNTH;   // estimate sets never get the output (no estimate pass uses it)
+    if (synth) add(5, IMG).pImageInfo = &ii[2];
     if (blur) {   // the motion-blur scratch (the caller has made sure it exists)
-        for (uint32_t i = 6; i < 8; i++) {
-            wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            wr[i].dstSet = set;
-            wr[i].dstBinding = i;
-            wr[i].descriptorCount = 1;
-            wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            wr[i].pBufferInfo = &bb[i - 6];
-        }
-        n = 8;
+        add(6, BUF).pBufferInfo = &bb[0];
+        add(7, BUF).pBufferInfo = &bb[1];
+    }
+    if (yuv) {   // the CbCr planes
+        add(8, SMP).pImageInfo = &ii[3];
+        add(9, SMP).pImageInfo = &ii[4];
+        if (synth) add(10, IMG).pImageInfo = &ii[5];
     }
     UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
     return set;
@@ -877,6 +1089,8 @@ struct Rec {
 // Static-UI protection: recording
 // ---------------------------------------------------------------------------------------------------------
 namespace {
+// 8x8 groups covering the chroma texels (2x2 pixels) that overlap the pixel span [o, o + n)
+uint32_t chromaGroups(int o, int n) { return divUp(((o + n - 1) >> 1) - (o >> 1) + 1, 8); }
 void uiDispatch(Interpolator::Impl& I, VkCommandBuffer cb, UiPipe p, VkDescriptorSet set, const UiPC& pc, uint32_t gx, uint32_t gy) {
     I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.uiPipes[p]);
     I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.uiLayout, 0, 1, &set, 0, nullptr);
@@ -887,10 +1101,10 @@ void uiDispatch(Interpolator::Impl& I, VkCommandBuffer cb, UiPipe p, VkDescripto
 
 // Records the observe of one real frame into the entry it picks: clean copy, stillness, masks, inpaint.
 // The caller has checked uiActive() and the set ring (uiObserveSets()).
-bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, VkImageView view) {
+bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
     const bool ws = set.uiProtection == UiProtection::WholeScreen;
     const UiBox bx = computeBox();
-    const int e = uiPick(view);
+    const int e = uiPick(view.view);
     UiEntry& E = uiE[e];
     // buffers first (they may fail and must not leave a half-observed entry): the box mask of this entry, and the
     // box state; growing the state buffer or moving the box restarts the box counters
@@ -918,7 +1132,7 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, VkImageView view) {
         uiPendingInit.clear();
     }
 
-    E.key = view;
+    E.key = view.view;
     E.seq = ++uiSeq;
     E.bx = bx;
     E.hasBox = true;
@@ -944,8 +1158,8 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, VkImageView view) {
     pc.stillLimit = (int)std::floor((double)set.uiMaxStillFraction * cw * ch);
     const int fullStride = ((int)W + 3) / 4, boxStride = (bx.w + 3) / 4;
 
-    VkDescriptorSet boxSet = takeUiSet(view, E.view, uiBoxState, E.box);
-    VkDescriptorSet wsSet = ws ? takeUiSet(view, E.view, uiCellState, E.ws) : VK_NULL_HANDLE;
+    VkDescriptorSet boxSet = takeUiSet(view, E.frame(), uiBoxState, E.box);
+    VkDescriptorSet wsSet = ws ? takeUiSet(view, E.frame(), uiCellState, E.ws) : VK_NULL_HANDLE;
 
     // 1. clean copy (+ whole screen: the still cells, tile flags)
     pc.wholeScreen = ws;
@@ -966,10 +1180,14 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, VkImageView view) {
     r.cbar();
     r.stamp("ui_detect");
     // 4. inpaint the clean copy (whole screen first: the box, last, owns its pixels)
-    if (ws) uiDispatch(*this, cb, U_INPAINT, wsSet, pc, divUp((int)W, kUiInpTile), divUp((int)H, kUiInpTile));
+    if (ws) {
+        uiDispatch(*this, cb, U_INPAINT, wsSet, pc, divUp((int)W, kUiInpTile), divUp((int)H, kUiInpTile));
+        if (yuv) uiDispatch(*this, cb, U_INPAINT_C, wsSet, pc, divUp(((int)W + 1) / 2, 8), divUp(((int)H + 1) / 2, 8));   // the other plane: no hazard
+    }
     r.cbar();
     pc.maskX = bx.x; pc.maskY = bx.y; pc.maskW = bx.w; pc.maskH = bx.h; pc.maskStride = boxStride; pc.maskOff = 4; pc.gate = 0;
     uiDispatch(*this, cb, U_INPAINT, boxSet, pc, divUp(bx.w, kUiInpTile), divUp(bx.h, kUiInpTile));
+    if (yuv) uiDispatch(*this, cb, U_INPAINT_C, boxSet, pc, chromaGroups(bx.x, bx.w), chromaGroups(bx.y, bx.h));
     r.cbar();
     r.stamp("ui_inpaint");
 
@@ -979,7 +1197,7 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, VkImageView view) {
 }
 
 // After a generated frame is complete: paste the real pixels of the frame the synth leads up to (curr) over it.
-void Interpolator::Impl::uiRecordPatch(VkCommandBuffer cb, VkImageView curr, VkImageView out, const UiEntry& E) {
+void Interpolator::Impl::uiRecordPatch(VkCommandBuffer cb, Frame curr, Frame out, const UiEntry& E) {
     Rec r(*this, cb);
     UiPC pc{};
     pc.W = (int)W; pc.H = (int)H;
@@ -987,19 +1205,24 @@ void Interpolator::Impl::uiRecordPatch(VkCommandBuffer cb, VkImageView curr, VkI
     pc.stillLimit = (int)std::floor((double)set.uiMaxStillFraction * cw * ch);
     if (E.hasWs) {
         pc.maskW = (int)W; pc.maskH = (int)H; pc.maskStride = ((int)W + 3) / 4; pc.maskOff = 4 + tilesX * tilesY; pc.gate = 1;
-        uiDispatch(*this, cb, U_PATCH, takeUiSet(curr, out, uiCellState, E.ws), pc, tilesX, tilesY * 4);
+        VkDescriptorSet wsSet = takeUiSet(curr, out, uiCellState, E.ws);
+        uiDispatch(*this, cb, U_PATCH, wsSet, pc, tilesX, tilesY * 4);
+        if (yuv) uiDispatch(*this, cb, U_PATCH_C, wsSet, pc, divUp(((int)W + 1) / 2, 8), divUp(((int)H + 1) / 2, 8));
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
     }
     if (E.hasBox) {
         pc.maskX = E.bx.x; pc.maskY = E.bx.y; pc.maskW = E.bx.w; pc.maskH = E.bx.h;
         pc.maskStride = (E.bx.w + 3) / 4; pc.maskOff = 4; pc.gate = 0;
-        uiDispatch(*this, cb, U_PATCH, takeUiSet(curr, out, uiBoxState, E.box), pc, divUp(pc.maskStride, 8), divUp(E.bx.h, 8));
+        VkDescriptorSet boxSet = takeUiSet(curr, out, uiBoxState, E.box);
+        uiDispatch(*this, cb, U_PATCH, boxSet, pc, divUp(pc.maskStride, 8), divUp(E.bx.h, 8));
+        if (yuv) uiDispatch(*this, cb, U_PATCH_C, boxSet, pc, chromaGroups(E.bx.x, E.bx.w), chromaGroups(E.bx.y, E.bx.h));
     }
 }
 
-bool Interpolator::recordObserve(VkCommandBuffer cb, VkImageView frame) {
-    if (!m || !m->W || !frame) return false;
+bool Interpolator::recordObserve(VkCommandBuffer cb, Frame frame) {
+    if (!m || !m->W) return false;
     Impl& I = *m;
+    if (!I.framesOk(frame)) return false;
     if (I.set.uiProtection == UiProtection::Off) return true;
     if (!I.uiActive()) return false;
     I.uiExplicit = true;
@@ -1015,9 +1238,10 @@ bool Interpolator::recordObserve(VkCommandBuffer cb, VkImageView frame) {
     return I.uiObserveRecord(cb, frame);
 }
 
-bool Interpolator::recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageView curr) {
+bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     if (!m || !m->W) return false;
     Impl& I = *m;
+    if (!I.framesOk(prev) || !I.framesOk(curr)) return false;
     // The next set in the ring may still be referenced by an earlier record of this submission.
     assert(I.frameSets[Impl::R_EST] < kSetRing && "framegen: more than kSetRing recordEstimate() since beginFrame()");
     if (I.frameSets[Impl::R_EST] >= kSetRing) return false;
@@ -1029,9 +1253,9 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageV
     bool ui = I.uiActive();
     if (ui) {
         if (!I.uiExplicit) {
-            needObs += I.uiFind(prev) < 0;
-            needObs += I.uiLast < 0 || I.uiE[I.uiLast].key != curr;
-        } else if (I.uiFind(prev) < 0 || I.uiFind(curr) < 0) {
+            needObs += I.uiFind(prev.view) < 0;
+            needObs += I.uiLast < 0 || I.uiE[I.uiLast].key != curr.view;
+        } else if (I.uiFind(prev.view) < 0 || I.uiFind(curr.view) < 0) {
             ui = false;
         }
         if (ui && I.uiFrameSets + needObs * I.uiObserveSets() > kUiSets) return false;
@@ -1048,23 +1272,23 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageV
     }
     I.profPending = false;   // an open profile that an observe started is continued by this estimate
 
-    VkImageView estP = prev, estC = curr;
+    Frame estP = prev, estC = curr;
     int ep = -1, ec = -1;
     if (ui) {
         if (!I.uiExplicit) {
-            if (I.uiFind(prev) < 0 && !I.uiObserveRecord(cb, prev)) return false;
-            if ((I.uiLast < 0 || I.uiE[I.uiLast].key != curr) && !I.uiObserveRecord(cb, curr)) return false;
+            if (I.uiFind(prev.view) < 0 && !I.uiObserveRecord(cb, prev)) return false;
+            if ((I.uiLast < 0 || I.uiE[I.uiLast].key != curr.view) && !I.uiObserveRecord(cb, curr)) return false;
         }
-        ep = I.uiFind(prev);
-        ec = I.uiFind(curr);
+        ep = I.uiFind(prev.view);
+        ec = I.uiFind(curr.view);
         if (ep < 0 || ec < 0 || ep == ec) return false;   // (implicit: the second observe evicted the first: cannot happen with at least kUiFrames >= 3 active entries)
-        estP = I.uiE[ep].view;
-        estC = I.uiE[ec].view;
+        estP = I.uiE[ep].frame();
+        estC = I.uiE[ec].frame();
     }
-    VkDescriptorSet set = I.takeSet(Impl::R_EST, estP, estC, VK_NULL_HANDLE);
+    VkDescriptorSet set = I.takeSet(Impl::R_EST, estP, estC, Frame());
     I.haveEst = true;
-    I.estPrev = prev;
-    I.estCurr = curr;
+    I.estPrev = prev.view;
+    I.estCurr = curr.view;
     I.estUi = ui;
     if (ui) {
         I.estEnt[0] = ep; I.estEnt[1] = ec;
@@ -1134,19 +1358,19 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, VkImageView prev, VkImageV
     return true;
 }
 
-bool Interpolator::recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t) {
+bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t) {
     if (!m || !m->W || !(t > 0.0f && t < 1.0f)) return false;
     Impl& I = *m;
-    if (!I.haveEst || prev != I.estPrev || curr != I.estCurr) return false;
+    if (!I.haveEst || prev.view != I.estPrev || curr.view != I.estCurr || !I.framesOk(prev) || !I.framesOk(curr) || !I.framesOk(out)) return false;
     assert(I.frameSets[Impl::R_SYNTH] < kSetRing && "framegen: more than kSetRing recordSynth() since beginFrame()");
     if (I.frameSets[Impl::R_SYNTH] >= kSetRing) return false;
-    VkImageView srcP = prev, srcC = curr;
+    Frame srcP = prev, srcC = curr;
     if (I.estUi) {
         // the clean copies the estimate saw must still be those frames (not evicted / re-observed since)
         const UiEntry &ep = I.uiE[I.estEnt[0]], &ec = I.uiE[I.estEnt[1]];
         if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || !ep.view || !ec.view) return false;
         if (I.uiFrameSets + 2 > kUiSets) return false;
-        srcP = ep.view; srcC = ec.view;
+        srcP = ep.frame(); srcC = ec.frame();
     }
     VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out);
 
@@ -1192,21 +1416,21 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, VkImageView prev, VkImageView
     return true;
 }
 
-bool Interpolator::recordSynthBlur(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t0, float t1) {
+bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t0, float t1) {
     if (!m || !m->W || !(t0 >= 0.0f && t1 <= 1.0f && t0 <= t1)) return false;   // (also false for NaN)
     Impl& I = *m;
     const uint32_t N = I.set.blurSamples;
     const bool blur = N >= 2 && t0 < t1;
     if (!blur && t1 > 0.0f && t1 < 1.0f) return recordSynth(cb, prev, curr, out, t1);   // one interior instant
-    if (!I.haveEst || prev != I.estPrev || curr != I.estCurr) return false;
+    if (!I.haveEst || prev.view != I.estPrev || curr.view != I.estCurr || !I.framesOk(prev) || !I.framesOk(curr) || !I.framesOk(out)) return false;
     assert(I.frameSets[Impl::R_SYNTH] < kSetRing && "framegen: more than kSetRing recordSynth()/recordSynthBlur() since beginFrame()");
     if (I.frameSets[Impl::R_SYNTH] >= kSetRing) return false;
-    VkImageView srcP = prev, srcC = curr;
+    Frame srcP = prev, srcC = curr;
     if (I.estUi) {
         const UiEntry &ep = I.uiE[I.estEnt[0]], &ec = I.uiE[I.estEnt[1]];
         if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || !ep.view || !ec.view) return false;
         if (I.uiFrameSets + 2 > kUiSets) return false;
-        srcP = ep.view; srcC = ec.view;
+        srcP = ep.frame(); srcC = ec.frame();
     }
 
     // the samples: evenly spaced over [t0, t1] (both ends), the ends exactly t0 / t1
@@ -1272,7 +1496,7 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, VkImageView prev, VkImage
     return true;
 }
 
-bool Interpolator::record(VkCommandBuffer cb, VkImageView prev, VkImageView curr, VkImageView out, float t) {
+bool Interpolator::record(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t) {
     if (!m || !m->W || !(t > 0.0f && t < 1.0f)) return false;
     // both rings must have room, so that a refused record() records nothing
     assert(m->frameSets[0] < kSetRing && m->frameSets[1] < kSetRing && "framegen: more than kSetRing records since beginFrame()");

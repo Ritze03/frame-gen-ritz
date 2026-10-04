@@ -1,0 +1,4 @@
+# Image formats besides Rgba8 (always built) whose shader variants are compiled and embedded. Each adds about 100-140 KB
+# of SPIR-V; a format that is not built makes Interpolator::init() fail with a clear reason when it is asked for.
+option('formats', type : 'array', choices : ['rgb10', 'f16', 'nv12', 'p010'], value : ['rgb10', 'f16', 'nv12', 'p010'],
+       description : 'Shader variants for formats other than Rgba8')

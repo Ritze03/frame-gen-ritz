@@ -5,7 +5,7 @@
 // only flagged tiles, none if the frame is suppressed. The generated frame is read AND written (each thread touches
 // only its own texels). One thread per mask word; 4 workgroups per tile in y like ui_mask.comp.
 #include "ui_common.glsl"
-layout(set = 0, binding = 1, rgba8) uniform image2D img;
+layout(set = 0, binding = 1, FG_FMT) uniform image2D img;
 layout(local_size_x = 8, local_size_y = 8) in;
 
 void main() {

@@ -1,0 +1,60 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// YUV only (compiled for FG_FORMAT_NV12 / FG_FORMAT_P010): ui_inpaint.comp for the half-resolution CbCr plane. A chroma
+// texel (2x2 pixels) is masked if any of its pixels is. For each masked texel: walk out along 8 directions, in chroma
+// texels, to the first texel none of whose pixels is masked (at most reach / 2 steps, at least 1), and average those REAL
+// chroma texels weighted 1/distance^2, like the luma pass. A walk that meets the edge of the mask rectangle (a texel only
+// partly inside it) stops. A texel with no clean neighbour within reach is left as the real one. One thread per texel
+// of the mask rectangle; only masked texels are written.
+#include "ui_common.glsl"
+layout(set = 0, binding = 5, FG_FMTC) uniform writeonly image2D dstC;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// pixel state: 0 unmasked, 1 masked, 2 outside the mask rectangle (unknown)
+uint pxState(ivec2 q) {
+    ivec2 rel = q - ivec2(pc.maskX, pc.maskY);
+    if (rel.x < 0 || rel.y < 0 || rel.x >= pc.maskW || rel.y >= pc.maskH) return 2u;
+    if (pc.gate != 0 && !tileLive(q / TILE)) return 0u;
+    return maskByte(rel) != 0u ? 1u : 0u;
+}
+
+// texel state: 2 if any pixel is outside the rectangle, else 1 if any is masked, else 0
+uint blkState(ivec2 c) {
+    uint r = 0u;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            uint s = pxState(2 * c + ivec2(i, j));
+            if (s == 2u) return 2u;
+            r = max(r, s);
+        }
+    return r;
+}
+
+void main() {
+    ivec2 c = ivec2(pc.maskX >> 1, pc.maskY >> 1) + ivec2(gl_GlobalInvocationID.xy);
+    ivec2 p0 = 2 * c;
+    if (p0.x >= pc.maskX + pc.maskW || p0.y >= pc.maskY + pc.maskH) return;
+    bool masked = false;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) masked = masked || pxState(p0 + ivec2(i, j)) == 1u;
+    if (!masked) return;
+    const ivec2 dirs[8] = ivec2[8](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1),
+                                   ivec2(1, 1), ivec2(-1, 1), ivec2(1, -1), ivec2(-1, -1));
+    int R = max(pc.reach / 2, 1);
+    vec2 acc = vec2(0.0);
+    float wsum = 0.0;
+    for (int d = 0; d < 8; d++) {
+        for (int s = 1; s <= R; s++) {
+            ivec2 q = c + dirs[d] * s;
+            uint st = blkState(q);
+            if (st == 2u) break;
+            if (st == 0u) {
+                float w = 1.0 / (float(s * s) * (d < 4 ? 1.0 : 2.0));
+                acc += texelFetch(srcC, q, 0).rg * w;
+                wsum += w;
+                break;
+            }
+        }
+    }
+    if (wsum > 0.0) imageStore(dstC, c, vec4(acc / wsum, 0.0, 1.0));
+}

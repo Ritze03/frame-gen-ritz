@@ -17,6 +17,64 @@ layout(local_size_x = 16, local_size_y = 16) in;
 shared float wk[16];
 shared uint cnt[16];
 
+#ifdef FG_YUV
+// One 16x16 tile: all threads of the workgroup. counting: add this tile's untrusted counts to u[CNT0 + k].
+// YUV: v.x is the luma level at p; v.yz the chroma levels of the 2x2 block of p, filled only by even-even pixels (they
+// write the chroma plane), with the trust of that pixel.
+void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 p = tile * TS + ivec2(gl_LocalInvocationID.xy);
+    bool inside = p.x < pc.W && p.y < pc.H;
+    bool chroma = inside && ((p.x | p.y) & 1) == 0;
+    vec3 acc = vec3(0.0);
+    float untrustedLimit = pc.globalFrac * float(pc.W) * float(pc.H);
+    for (int k = 0; k < pc.n; k++) {
+        float t = pc.t[k];
+        vec3 v = vec3(0.0);
+        if (t <= 0.0 || t >= 1.0) {   // a real frame
+            if (inside) {
+                bool c = t >= 1.0;
+                v.x = (c ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0)).r * YU_SCALE;
+                if (chroma) v.yz = (c ? texelFetch(texCurrC, p >> 1, 0) : texelFetch(texPrevC, p >> 1, 0)).rg * YU_SCALE;
+            }
+        } else {
+            bool nearC = t > 0.5;
+            bool fb = cut || (!counting && float(u[CNT0 + k]) > untrustedLimit);   // uniform across the workgroup
+            if (fb) {   // no box needed
+                if (inside) {
+                    v.x = (nearC ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0)).r * YU_SCALE;
+                    if (chroma) v.yz = (nearC ? texelFetch(texCurrC, p >> 1, 0) : texelFetch(texPrevC, p >> 1, 0)).rg * YU_SCALE;
+                }
+            } else {
+                float e = boxMean(k, tile);
+                if (inside) {
+                    float tr = clamp((e - pc.trust0) * pc.trustScale, 0.0, 1.0);
+                    if (counting && tr > 0.5) atomicAdd(cnt[k], 1u);
+                    vec3 wa, wc;
+                    mismatch(k, t, p, wa, wc);
+                    float ny = (nearC ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0)).r * YU_SCALE;
+                    precise float mty = (1.0 - t) * wa.x + t * wc.x;
+                    v.x = mty * (1.0 - tr) + ny * tr;
+                    if (chroma) {
+                        vec2 ca, cc;
+                        warpChroma(k, t, p, ca, cc);
+                        vec2 nc = (nearC ? texelFetch(texCurrC, p >> 1, 0) : texelFetch(texPrevC, p >> 1, 0)).rg * YU_SCALE;
+                        precise vec2 mtc = (1.0 - t) * ca + t * cc;
+                        v.yz = mtc * (1.0 - tr) + nc * tr;
+                    }
+                }
+            }
+        }
+        acc += wk[k] * v;
+    }
+    if (inside) imageStore(outImg, p, vec4(fgOut(acc.x / wsum), 0.0, 0.0, 1.0));
+    if (chroma) imageStore(outImgC, p >> 1, vec4(fgOut2(acc.yz / wsum), 0.0, 1.0));
+    if (counting) {
+        barrier();
+        if (lid < pc.n && cnt[lid] > 0u) atomicAdd(u[CNT0 + lid], cnt[lid]);
+    }
+}
+#else
 // One 16x16 tile: all threads of the workgroup. counting: add this tile's untrusted counts to u[CNT0 + k].
 void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
     int lid = int(gl_LocalInvocationIndex);
@@ -32,7 +90,7 @@ void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
         if (t <= 0.0 || t >= 1.0) {   // a real frame
             if (inside) {
                 vec4 r = t >= 1.0 ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
-                v = floor(r.rgb * 255.0 + 0.5);
+                v = FG_FETCH(r.rgb);
                 a = r.a;
             }
         } else {
@@ -41,7 +99,7 @@ void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
             if (fb) {   // no box needed
                 if (inside) {
                     vec4 r = nearC ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
-                    v = floor(r.rgb * 255.0 + 0.5);
+                    v = FG_FETCH(r.rgb);
                     a = r.a;
                 }
             } else {
@@ -52,7 +110,7 @@ void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
                     vec3 wa, wc;
                     mismatch(k, t, p, wa, wc);
                     vec4 r = nearC ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
-                    vec3 a8 = floor(r.rgb * 255.0 + 0.5);
+                    vec3 a8 = FG_FETCH(r.rgb);
                     precise vec3 mt = (1.0 - t) * wa + t * wc;
                     vec3 o = mt * (1.0 - tr) + a8 * tr;
                     v = clamp(floor(o + 0.5), 0.0, 255.0);
@@ -63,12 +121,14 @@ void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
         acc += wk[k] * v;
         accA += wk[k] * a;
     }
-    if (inside) imageStore(outImg, p, vec4(clamp(floor(acc / wsum + 0.5), 0.0, 255.0) * (1.0 / 255.0), accA / wsum));
+    if (inside) imageStore(outImg, p, FG_STORE(acc / wsum, accA / wsum));
     if (counting) {
         barrier();
         if (lid < pc.n && cnt[lid] > 0u) atomicAdd(u[CNT0 + lid], cnt[lid]);
     }
 }
+
+#endif
 
 void main() {
     int lid = int(gl_LocalInvocationIndex);

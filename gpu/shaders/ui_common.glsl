@@ -9,7 +9,12 @@
 //            (byte k = pixel 4x + k, 0 = none, 255 = full, 128 = feather), maskStride words per row, covering the
 //            rectangle (maskX, maskY, maskW, maskH) of the frame.
 
+#include "format.glsl"
+
 layout(set = 0, binding = 0) uniform sampler2D src;
+#ifdef FG_YUV
+layout(set = 0, binding = 4) uniform sampler2D srcC;   // CbCr plane of the sampled frame
+#endif
 layout(set = 0, binding = 2, std430) buffer StateBuf { uint st[]; };
 layout(set = 0, binding = 3, std430) buffer MaskBuf { uint mk[]; };
 

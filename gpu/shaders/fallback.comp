@@ -15,5 +15,9 @@ void main() {
         for (int i = 0; i < 8; i++) {
             ivec2 p = ivec2(gl_WorkGroupID.xy) * 64 + ivec2(i, j) * 8 + ivec2(gl_LocalInvocationID.xy);
             if (p.x < pc.W && p.y < pc.H) imageStore(outImg, p, NEAR_C ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0));
+#ifdef FG_YUV
+            if (p.x < pc.W && p.y < pc.H && ((p.x | p.y) & 1) == 0)   // the chroma texel of the even-even pixel of each block
+                imageStore(outImgC, p >> 1, NEAR_C ? texelFetch(texCurrC, p >> 1, 0) : texelFetch(texPrevC, p >> 1, 0));
+#endif
         }
 }
