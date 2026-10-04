@@ -43,7 +43,7 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 | `proto/NOTES.md` | Experiment log: what was tried, measured and kept |
 | `gpu/framegen.h`, `gpu/framegen.cpp` | The Vulkan library (`framegen::Interpolator`) |
 | `gpu/pacing.h` | Host-agnostic pacing: which frame to show when, pass-through, cost guard, motion-blur window (`framegen::pacing`, header-only, no Vulkan) |
-| `gpu/pacingtest.cpp`, `gpu/minitest.h` | CPU-only tests of the pacing header (`meson test`), with a tiny Catch2 stand-in |
+| `gpu/pacingtest.cpp`, `gpu/minitest.h` | CPU-only tests of the pacing header and the lag-spike buffer (`meson test`), with a tiny Catch2 stand-in |
 | `gpu/shaders/*.comp` | GLSL compute passes (`ui_*.comp`: static-UI protection, `blur_*.comp`: motion blur) |
 | `gpu/fgtest.cpp` | Test and benchmark tool for raw RGBA frame files |
 | `gpu/uitest.cpp` | Validation and benchmark of static-UI protection on a synthetic scene |
@@ -170,6 +170,7 @@ gpu/build/blurtest bench [W H]           # GPU cost: one synth, N x recordSynth 
 gpu/build/uitest check [--bgra] [W H]    # default 1280x720: asserts the exact crosshair / HUD pixels, PSNR, validation
 gpu/build/uitest check --hash            # also prints a hash per generated frame of the Off run (compare against the
                                          # library before the feature to prove byte-identical output)
+gpu/build/uitest deep [W H]              # Settings::uiHistory: a synth from a pair 10 frames behind the newest is still protected (default 640x360)
 gpu/build/uitest bench [W H]             # per-pass GPU times: moving / still / 70% still scenes, all modes
 ```
 
@@ -237,6 +238,7 @@ for (int k = 1; k < N; ++k)
 | `uiBoxOffsetX`, `uiBoxOffsetY` | 0, 0 | Box centre offset from the frame centre, pixels (+x right, +y down). The box is clamped into the frame. |
 | `uiStillFrames`, `uiStillThreshold` | 8, 3.5 | A pixel is protected after this many consecutive real frames in which no channel moved more than this many levels. |
 | `uiInpaintReach` | 12 | Walk length (1-16 px) of the inpaint. |
+| `uiHistory` | 3 | Observed frames that keep their UI-protection clean copy (3 to 65). Raise it to `Pacer::HistoryDepth()` when the lag-spike buffer plays older pairs. 4 B/px per kept frame. Runtime. |
 | `blurSamples` | 0 | Motion blur: sub-frames averaged by `recordSynthBlur()`. 0 or 1 = off, 2-16 on (see above). Runtime. |
 | `blurWeights` | Gaussian | `Even` (1/N each) or `Gaussian` (ends of the window at 2 sigma). Runtime. |
 | `uiMaxStillFraction` | 0.75 | WholeScreen: above this still share (of cells outside the box) the whole-screen passes are skipped for that frame. 1 = never. |
@@ -264,7 +266,20 @@ else               { /* recordSynthBlur(cb, prev(d.prevId), curr(d.currId), out,
 - **Pause at refresh rate**: on, the output is capped at the refresh and generation stops once the game reaches it; off, the cap is gone and `ExtraTimer()` asks the host to paint on its own timer. `Inputs::canExceedRefresh` is a host capability: where a present between ticks cannot be shown, off behaves as on.
 - **GPU limit**: generation may use at most 25% of a game interval; otherwise the output rate is lowered, then it passes through, with a probe every 10 s. A switch turns it off.
 - **Pass-through** (real frame, renderer inert) only when the game reaches the output rate (a ratio band, 1.02 / 1.10), the renderer is unavailable, or the cost guard trips. **Resets** on a new stream, a format change, a gap over 100 ms, or `Discontinuity()`.
-- **Three features, one timeline**: frame generation (which instants get an output), motion blur (what each output shows over time: a trailing window `[t0, t1]` ending at the output's instant, `BlurWindow`) and the lag-spike buffer (how far behind real time we show: `Inputs::extraDelayNs`, the hook; the detection is a later change) are separate switches that work alone and together. Every `Decision` carries `{prevId, currId, t0, t1, showId}` and the host makes **one** renderer call, `recordSynthBlur(prev, curr, out, t0, t1)`. With frame generation off, the planner runs real-rate: one output per real frame at its own time, gaps the buffer covers filled with synths.
+- **Three features, one timeline**: frame generation (which instants get an output), motion blur (what each output shows over time: a trailing window `[t0, t1]` ending at the output's instant, `BlurWindow`) and the lag-spike buffer (how far behind real time we show: `Inputs::lagBuffer`, see below) are separate switches that work alone and together. Every `Decision` carries `{prevId, currId, t0, t1, showId}` and the host makes **one** renderer call, `recordSynthBlur(prev, curr, out, t0, t1)`. With frame generation off, the planner runs real-rate: one output per real frame at its own time, gaps the buffer covers filled with synths.
+
+### Lag-spike buffer
+
+Some games, especially on Linux, hitch: a frame arrives one, two or three intervals late and the picture freezes. The buffer (`Pacer::Inputs::lagBuffer`, off by default) keeps a small adaptive extra delay so that the next hitch is **filled with generated frames instead of frozen**. In the user's words: *"some games on Linux are sometimes unplayable because of lag spikes ... in case one frame is missing, it can just fully generate between the lag spike ... mainly usable for controller games since it will add ... delay. But it could just turn a game from unplayable into a playable one."* It is independent of the multiplier (frame generation off plans real-rate: real frames, gaps filled) and works together with frame generation and motion blur.
+
+- **Detection**: an interval above 1.75x the smoothed interval is a spike; its size is `interval - smoothed` ("missing frames x interval"). *"The starters ... should be like 1, 2, maybe 3 missing frames, so it shouldn't go that high."*
+- **Judgement**: a spike larger than `maxBufferMs` is an outlier and never sizes the buffer (*"single, like huge lag spikes, for example, when you're compiling and drops down to like 10 FPS, it shouldn't build a 100 millisecond buffer"*); it is only counted.
+- **Recency**: target = max over spikes of `size x w(age)`, `w` falling smoothly (cosine) from 1 to 0.3 over `lookbackSec`, 0 beyond; +10 % +1 ms margin; floored at half the long-run mean spike size while spikes recur. The newest big spike dominates, a game that hitches every 2-3 minutes keeps a steady buffer, and one spike fades away after the window (*"the longer the game has been running, the better it can adjust ... only like the newest biggest lag spike in the last 5 minutes actually affects ... and everything else is just smoothed out"*).
+- **Settings**: `enabled` (false), `lookbackSec` 300 (1-600), `maxBufferMs` 50 (0-250; *"something insane like 250 milliseconds"* is allowed, the default is 50), `testMode` Off / ForceMin / ForceMax (pins the target at 0 or at the max, through the same ramp, so the user can feel each end).
+- **Smooth**: the buffer ramps at most 3 % of real time (content speed 0.97x-1.03x), never jumps, and shrinks only after the target has stayed low for 2 s.
+- **Frames follow the buffer**: the real frames the host keeps (`HistoryDepth()`, `Report::historyFrames`) and, with UI protection, the clean copies (`Settings::uiHistory`) follow the **current** buffer: `ceil((delay) / interval) + 2`, 3 with no buffer, at most 65. Memory is **per buffered frame**: 4 B/px each, 4.9 MB at 1280x960 and 14.7 MB at 1440p (250 ms at 60 fps = 17 frames: 84 / 251 MB, and the same again for UI-protection clean copies).
+- **Costs**: the buffer is real latency (at most `maxBufferMs`), so it suits controller games; the host's audio is not delayed, so above ~50-80 ms lip-sync drifts.
+- **Report**: `bufferDelayMs`, `bufferTargetMs`, `lastSpikeMs`, `spikesInWindow`, `outliersIgnored`, `historyFrames`, for a line like "buffer 32 ms (last spike 28 ms)".
 
 `INTEGRATION.md` has the full host contract, every field, a minimal loop and the reasoning behind each rule. `meson test -C <build> pacing` runs the CPU-only tests (`gpu/pacingtest.cpp`).
 
