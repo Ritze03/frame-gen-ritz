@@ -1,0 +1,99 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// CrosshairV2, observe / track, box: per box pixel (full resolution) the whole detection state machine, in place (each
+// thread touches only its own three state words; the neighbours it reads for the contrast come from the frame, not from
+// the state). Four state words per pixel, stored at st[4 i ..]:
+//   w0 = previous ORIGINAL pixel (r | g << 8 | b << 16) | still-and-contrasty count << 24
+//   w1 = last confirmed colour (same packing) | flags << 24: bit 0 in the mask, bit 1 has a stored colour,
+//        bit 2 "still in this pair" (the pair gate, read by ui_v2_mask.comp)
+//   w2 = consecutive changed frames while in the mask | consecutive stored-colour matches while out of it << 8
+// Per frame (reset: the state describes no previous frame, everything starts at 0):
+//   still     max channel |now - previous original| <= thr      (the same test as V1's ui_box_update.comp)
+//   contrasty max channel |now - median7x7(now)| >= cthr          (a crosshair has an edge, a flat background does not)
+//   out of the mask: count = still && contrasty ? count + 1 : 0; enters at count >= still frames (uiStillFrames), OR at once
+//     if it matched its stored colour for `reentry` consecutive (contrasty) frames (fast re-entry: the crosshair came back)
+//   in the mask: leaves after `leave` consecutive changed frames (hysteresis: one flickering frame does not drop it);
+//     while still it refreshes the stored colour
+// The median is computed only where its result can matter (a pixel that is out of the mask and still or matching), so a
+// moving scene pays for none of it. Levels are the 8-bit-equivalent ones of every format (FG_STILL / fgStillYuv).
+#extension GL_EXT_control_flow_attributes : require
+#include "ui_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+vec3 pixAt(ivec2 p) {   // the frame pixel as 8-bit-equivalent integer levels; clamped to the frame
+    p = clamp(p, ivec2(0), ivec2(pc.W - 1, pc.H - 1));
+#ifdef FG_YUV
+    return fgStillYuv(texelFetch(src, p, 0).r, texelFetch(srcC, p >> 1, 0).rg);
+#else
+    return FG_STILL(texelFetch(src, p, 0).rgb);
+#endif
+}
+
+float maxAbs(vec3 d) { d = abs(d); return max(d.r, max(d.g, d.b)); }
+vec3 unpack(uint w) { return vec3(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u)); }
+uint packRgb(vec3 c) { uvec3 q = uvec3(c); return q.r | (q.g << 8) | (q.b << 16); }
+
+// max channel |v - median7x7| at the frame position p (v = the pixel itself), per channel. The levels are integers 0..255, so the
+// median is found by a binary search on the VALUE (the smallest m with at least 25 of the 49 values <= m): 8 steps of 49 compares
+// per channel, all on constant indices so the 49 values stay in registers (a counting rank over a dynamically indexed array spilled
+// to scratch and cost 0.12 ms per call at 1440p). YUV: the (Y, Cb, Cr) difference to the median is converted to the R'G'B'
+// difference it stands for first (as the mismatch metric does), so the threshold is on the scale of 8-bit RGB levels there too
+// and not on the compressed limited-range codes.
+float contrastAt(ivec2 p, vec3 v) {
+    vec3 w[49];
+    [[unroll]] for (int j = 0; j < 7; j++)
+        [[unroll]] for (int i = 0; i < 7; i++) w[j * 7 + i] = pixAt(p + ivec2(i - 3, j - 3));
+    vec3 d;
+    [[unroll]] for (int c = 0; c < 3; c++) {
+        int lo = 0, hi = 255;
+        for (int it = 0; it < 8; it++) {
+            int mid = (lo + hi) >> 1;
+            int cnt = 0;
+            [[unroll]] for (int j = 0; j < 49; j++) cnt += w[j][c] <= float(mid) ? 1 : 0;
+            if (cnt >= 25) hi = mid; else lo = mid + 1;
+        }
+        d[c] = v[c] - float(lo);
+    }
+#ifdef FG_YUV
+    d = fgYuvDiff(d);
+#endif
+    return maxAbs(d);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.boxW || p.y >= pc.boxH) return;
+    ivec2 sp = ivec2(pc.boxX, pc.boxY) + p;
+    vec3 now = pixAt(sp);
+    int i = (p.y * pc.boxW + p.x) * 4;
+    uint cnt = 0u, flags = 0u, leave = 0u, match = 0u;
+    vec3 stored = vec3(0.0);
+    if (pc.reset == 0) {
+        uint w0 = st[i], w1 = st[i + 1], w2 = st[i + 2];
+        flags = w1 >> 24;
+        stored = unpack(w1);
+        leave = w2 & 255u;
+        match = (w2 >> 8) & 255u;
+        bool still = maxAbs(now - unpack(w0)) <= pc.thr;
+        bool inMask = (flags & 1u) != 0u, hasStored = (flags & 2u) != 0u;
+        bool matchS = !inMask && hasStored && pc.reentry > 0 && maxAbs(now - stored) <= pc.thr;
+        bool contrasty = pc.cthr <= 0.0;
+        if (!inMask && !contrasty && (still || matchS)) contrasty = contrastAt(sp, now) >= pc.cthr;
+        if (inMask) {
+            leave = still ? 0u : min(leave + 1u, 255u);
+            if (still) stored = now;
+            if (int(leave) >= pc.leave) { inMask = false; leave = 0u; match = 0u; }
+            cnt = 0u;
+        } else {
+            cnt = (still && contrasty) ? min((w0 >> 24) + 1u, 255u) : 0u;
+            match = (matchS && contrasty) ? min(match + 1u, 255u) : 0u;
+            if (int(cnt) >= pc.still || (pc.reentry > 0 && hasStored && int(match) >= pc.reentry)) {
+                inMask = true; hasStored = true; stored = now; leave = 0u; match = 0u;
+            }
+        }
+        flags = (inMask ? 1u : 0u) | (hasStored ? 2u : 0u) | (still ? 4u : 0u);
+    }
+    st[i] = packRgb(now) | (cnt << 24);
+    st[i + 1] = packRgb(stored) | (flags << 24);
+    st[i + 2] = leave | (match << 8);
+}

@@ -23,6 +23,9 @@
 #include "ui_mask_spv.h"
 #include "ui_inpaint_spv.h"
 #include "ui_patch_spv.h"
+#include "ui_v2_update_spv.h"
+#include "ui_v2_mask_spv.h"
+#include "ui_v2_lumafill_spv.h"
 #include "blur_lookup_spv.h"
 #include "blur_error_spv.h"
 #include "blur_resolve_spv.h"
@@ -39,6 +42,8 @@
 #include "ui_box_update_rgb10_spv.h"
 #include "ui_inpaint_rgb10_spv.h"
 #include "ui_patch_rgb10_spv.h"
+#include "ui_v2_update_rgb10_spv.h"
+#include "ui_v2_lumafill_rgb10_spv.h"
 #include "blur_error_rgb10_spv.h"
 #include "blur_resolve_rgb10_spv.h"
 #endif
@@ -53,6 +58,8 @@
 #include "ui_box_update_f16_spv.h"
 #include "ui_inpaint_f16_spv.h"
 #include "ui_patch_f16_spv.h"
+#include "ui_v2_update_f16_spv.h"
+#include "ui_v2_lumafill_f16_spv.h"
 #include "blur_error_f16_spv.h"
 #include "blur_resolve_f16_spv.h"
 #endif
@@ -67,6 +74,8 @@
 #include "ui_box_update_nv12_spv.h"
 #include "ui_inpaint_nv12_spv.h"
 #include "ui_patch_nv12_spv.h"
+#include "ui_v2_update_nv12_spv.h"
+#include "ui_v2_lumafill_nv12_spv.h"
 #include "blur_error_nv12_spv.h"
 #include "blur_resolve_nv12_spv.h"
 #include "ui_inpaint_chroma_nv12_spv.h"
@@ -83,6 +92,8 @@
 #include "ui_box_update_p010_spv.h"
 #include "ui_inpaint_p010_spv.h"
 #include "ui_patch_p010_spv.h"
+#include "ui_v2_update_p010_spv.h"
+#include "ui_v2_lumafill_p010_spv.h"
 #include "blur_error_p010_spv.h"
 #include "blur_resolve_p010_spv.h"
 #include "ui_inpaint_chroma_p010_spv.h"
@@ -109,9 +120,10 @@ namespace {
 struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
-struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC; };
+struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill; };
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
-    SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}}
+    SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
+    SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f)}
 // false = this format's variants were not built into the library (meson option `formats`)
 bool colourSpv(Format f, ColourSpv& c) {
     switch (f) {
@@ -171,9 +183,11 @@ struct UiPC {
     int32_t W, H, boxX, boxY, boxW, boxH, cell, cw, ch, wholeScreen, still;
     float thr;
     int32_t reach, reset, tilesX, tilesY, stillLimit, maskX, maskY, maskW, maskH, maskStride, maskOff, gate, track;
+    float cthr;                                          // CrosshairV2 (appended: the other passes never read these)
+    int32_t leave, reentry, binary, lumaOff;
 };
 static_assert(sizeof(UiPC) <= 128, "push constants beyond the guaranteed minimum");
-enum UiPipe { U_DETECT, U_BOX_UPDATE, U_BOX_MASK, U_MASK, U_INPAINT, U_PATCH, U_COUNT, U_INPAINT_C = U_COUNT, U_PATCH_C, U_COUNT_ALL };   // _C: the CbCr plane (YUV only)
+enum UiPipe { U_DETECT, U_BOX_UPDATE, U_BOX_MASK, U_MASK, U_INPAINT, U_PATCH, U_V2_UPDATE, U_V2_MASK, U_V2_FILL, U_COUNT, U_INPAINT_C = U_COUNT, U_PATCH_C, U_COUNT_ALL };   // _C: the CbCr plane (YUV only)
 static const int kUiCell = 2;    // whole-screen detection resolution: 1/kUiCell per axis (1, 2 or 4; 8 x cell divides the tile)
 static const int kUiTile = 32;   // == TILE in ui_common.glsl
 static const int kUiInpTile = 16;   // == T in ui_inpaint.comp
@@ -201,6 +215,7 @@ struct UiEntry {
     uint64_t seq = 0;                   // observe order (LRU, and "is this still the frame the estimate saw")
     UiBox bx{};                         // the box at observe time
     bool hasBox = false, hasWs = false;
+    bool v2 = false;                    // observed under CrosshairV2: the box buffer holds a V2 mask (255 paste / 64 confirmed), no clean copy
     bool active = false;                // in the LRU set (Settings::uiHistory of them); an inactive one keeps its memory
 };
 
@@ -272,10 +287,13 @@ struct Interpolator::Impl {
     int cw = 0, ch = 0, tilesX = 0, tilesY = 0;
     // the pair of the latest recordEstimate, when it ran on clean copies
     bool estUi = false;
+    bool estClean = false;           // ... and the pair was read from the clean copies (every mode but CrosshairV2)
     int estEnt[2]{-1, -1};
     uint64_t estSeq[2]{};
     bool profPending = false;        // an observe opened the current profile and no estimate has continued it yet
 
+    bool v2() const { return set.uiProtection == UiProtection::CrosshairV2; }
+    bool v2Fill() const { return v2() && set.uiEstimateFill; }   // CrosshairV2 with the luma fill of the estimate on
     bool uiActive() const { return W && set.uiProtection != UiProtection::Off && uiImgs && (set.uiProtection != UiProtection::WholeScreen || uiWsRes); }
     uint32_t uiObserveSets() const { return set.uiProtection == UiProtection::WholeScreen ? 2 : 1; }
     UiBox computeBox() const;
@@ -292,8 +310,12 @@ struct Interpolator::Impl {
     int uiFind(VkImageView v) const;
     int uiPick(VkImageView v) const;
     VkDescriptorSet takeUiSet(Frame src, Frame img, const UiBuf& s, const UiBuf& m);
+    VkDescriptorSet takeUiSetV2(Frame src, const UiBuf& s, const UiBuf& m);
     bool uiObserveRecord(VkCommandBuffer cb, Frame view);
+    bool uiObserveRecordV2(VkCommandBuffer cb, Frame view);
     bool uiTrackRecord(VkCommandBuffer cb, Frame view);
+    bool uiTrackRecordV2(VkCommandBuffer cb, Frame view);
+    void uiRecordLumaFill(VkCommandBuffer cb, Frame frame, const UiEntry& e, int lumaOff);
     void uiFlushPendingInit(VkCommandBuffer cb);
     void uiRecordPatch(VkCommandBuffer cb, Frame curr, Frame out, const UiEntry& e);
 
@@ -510,6 +532,7 @@ bool Interpolator::Impl::allocEntryImage(UiEntry& e) {
 bool Interpolator::Impl::uiEnsure() {
     if (!W || set.uiProtection == UiProtection::Off) return true;
     const int want = (int)std::min(std::max(set.uiHistory, kUiFrames), kUiFramesMax);
+    const bool needImg = !v2();   // CrosshairV2 reads the host's frames directly: no clean copies
     const bool first = !uiImgs;
     int nAct = 0;
     for (const UiEntry& e : uiE) nAct += e.active;
@@ -518,7 +541,7 @@ bool Interpolator::Impl::uiEnsure() {
     for (int i = 0; nAct < want && i < (int)kUiFramesMax; i++) {
         UiEntry& e = uiE[i];
         if (e.active) continue;
-        if (!e.img && !allocEntryImage(e)) {
+        if (needImg && !e.img && !allocEntryImage(e)) {
             if (first) uiDestroy(); else { uiFreeEntry(e); rollback(); }
             return false;
         }
@@ -526,6 +549,13 @@ bool Interpolator::Impl::uiEnsure() {
         added.push_back(i);
         nAct++;
     }
+    // entries that were activated under V2 have no clean copy: a switch to another mode needs them now
+    if (needImg)
+        for (UiEntry& e : uiE)
+            if (e.active && !e.img && !allocEntryImage(e)) {
+                if (first) uiDestroy(); else { uiFreeEntry(e); rollback(); }
+                return false;
+            }
     if (set.uiProtection == UiProtection::WholeScreen) {
         const VkDeviceSize wsWords = 4 + (VkDeviceSize)tilesX * tilesY + (VkDeviceSize)((W + 3) / 4) * H;
         const bool firstWs = !uiWsRes;
@@ -597,6 +627,12 @@ void Interpolator::Impl::uiAdopted(const Settings& old) {
     }
     if (set.uiProtection != UiProtection::WholeScreen) uiCellHist = false;
     if (set.uiProtection == UiProtection::Off || old.uiProtection == UiProtection::Off) uiBoxHist = false;
+    // V2 keeps another state layout and another mask format than the other modes: nothing observed under one is valid under the other
+    if (set.uiProtection != old.uiProtection && (set.uiProtection == UiProtection::CrosshairV2 || old.uiProtection == UiProtection::CrosshairV2)) {
+        for (UiEntry& e : uiE) e.key = VK_NULL_HANDLE;
+        uiLast = -1;
+        uiBoxHist = false;
+    }
 }
 
 int Interpolator::Impl::uiFind(VkImageView v) const {
@@ -643,6 +679,33 @@ VkDescriptorSet Interpolator::Impl::takeUiSet(Frame src, Frame img, const UiBuf&
         wr[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         wr[5].pImageInfo = &ii[3];
     }
+    UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
+    return set_;
+}
+
+// The set of a CrosshairV2 pass: the sampled frame (+ its CbCr plane for YUV), the state buffer and the mask buffer. No storage
+// image: the V2 passes never write one and the bindings they do not use stay as they are.
+VkDescriptorSet Interpolator::Impl::takeUiSetV2(Frame src, const UiBuf& s, const UiBuf& m) {
+    VkDescriptorSet set_ = uiSets[uiSetIdx];
+    uiSetIdx = (uiSetIdx + 1) % kUiSets;
+    uiFrameSets++;
+    VkDescriptorImageInfo ii[2] = {{VK_NULL_HANDLE, src.view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, src.chroma, VK_IMAGE_LAYOUT_GENERAL}};
+    VkDescriptorBufferInfo bi[2] = {{s.b, 0, VK_WHOLE_SIZE}, {m.b, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wr[4]{};
+    uint32_t n = 0;
+    auto add = [&](uint32_t binding, VkDescriptorType t) -> VkWriteDescriptorSet& {
+        VkWriteDescriptorSet& w = wr[n++];
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = set_;
+        w.dstBinding = binding;
+        w.descriptorCount = 1;
+        w.descriptorType = t;
+        return w;
+    };
+    add(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo = &ii[0];
+    add(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo = &bi[0];
+    add(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo = &bi[1];
+    if (yuv) add(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo = &ii[1];
     UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
     return set_;
 }
@@ -848,7 +911,8 @@ bool Interpolator::init(const InitInfo& ii) {
         if (m->CreatePipelineLayout(d, &uplci, nullptr, &m->uiLayout) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
         struct { Spv sp; const VkSpecializationInfo* sc; } uspv[U_COUNT_ALL] = {
             {cs.uiDetect, spec}, {cs.uiBoxUpdate, spec}, {SPV(ui_box_mask), nullptr}, {SPV(ui_mask), nullptr},
-            {cs.uiInpaint, spec}, {cs.uiPatch, spec}, {cs.uiInpaintC, spec}, {cs.uiPatchC, spec}};
+            {cs.uiInpaint, spec}, {cs.uiPatch, spec}, {cs.uiV2Update, spec}, {SPV(ui_v2_mask), nullptr}, {cs.uiV2Fill, spec},
+            {cs.uiInpaintC, spec}, {cs.uiPatchC, spec}};
         for (int i = 0; i < (m->yuv ? (int)U_COUNT_ALL : (int)U_COUNT); i++)
             if (!m->makePipe(uspv[i].sp, m->uiLayout, m->uiPipes[i], uspv[i].sc)) { destroy(); err_ = fail; return false; }
         const uint32_t nuS = m->yuv ? 2 : 1;
@@ -905,7 +969,7 @@ bool Interpolator::validate(const Settings& s) {
            in(s.sceneCutSad, 0.0f, 255.0f) && s.sceneCutSad > 0.0f &&
            in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) &&
-           (uint32_t)s.uiProtection <= (uint32_t)UiProtection::WholeScreen &&
+           (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
            in(s.uiBoxHeightFrac, 0.0f, 1.0f) &&
@@ -914,6 +978,7 @@ bool Interpolator::validate(const Settings& s) {
            s.uiStillFrames >= 1 && s.uiStillFrames <= 255 && in(s.uiStillThreshold, 0.0f, 255.0f) &&
            s.uiInpaintReach >= 1 && s.uiInpaintReach <= 16 &&
            in(s.uiMaxStillFraction, 0.0f, 1.0f) && s.uiMaxStillFraction > 0.0f &&
+           in(s.uiContrastThreshold, 0.0f, 255.0f) && s.uiLeaveFrames >= 1 && s.uiLeaveFrames <= 255 && s.uiReentryFrames <= 255 &&
            s.uiHistory >= kUiFrames && s.uiHistory <= kUiFramesMax;
 }
 
@@ -1132,9 +1197,98 @@ void Interpolator::Impl::uiFlushPendingInit(VkCommandBuffer cb) {
     }
 }
 
+// CrosshairV2 push constants shared by its observe / track / fill passes.
+static UiPC v2Pc(const Interpolator::Impl& I, const UiBox& bx) {
+    UiPC pc{};
+    pc.W = (int)I.W; pc.H = (int)I.H;
+    pc.boxX = bx.x; pc.boxY = bx.y; pc.boxW = bx.w; pc.boxH = bx.h;
+    pc.still = (int)I.set.uiStillFrames;
+    pc.thr = I.set.uiStillThreshold;
+    pc.cthr = I.set.uiContrastThreshold;
+    pc.leave = (int)I.set.uiLeaveFrames;
+    pc.reentry = (int)I.set.uiReentryFrames;
+    return pc;
+}
+
+// CrosshairV2 observe of one real frame: the state machine of the box (ui_v2_update) and then its mask (ui_v2_mask). No
+// clean copy, no inpaint: the entry only holds the mask. The caller has checked uiActive() and the set ring (1 set).
+bool Interpolator::Impl::uiObserveRecordV2(VkCommandBuffer cb, Frame view) {
+    const UiBox bx = computeBox();
+    const int e = uiPick(view.view);
+    UiEntry& E = uiE[e];
+    const VkDeviceSize maskWords = 4 + (VkDeviceSize)((bx.w + 3) / 4) * bx.h;
+    const VkBuffer oldState = uiBoxState.b;
+    if (!growBuf(E.box, maskWords * 4) || !growBuf(uiBoxState, (VkDeviceSize)bx.w * bx.h * 16)) return false;   // 4 state words per pixel
+    if (uiBoxState.b != oldState || !(bx == uiPrevBox)) uiBoxHist = false;
+    uiPrevBox = bx;
+    E.key = view.view;
+    E.seq = ++uiSeq;
+    E.bx = bx;
+    E.hasBox = true;
+    E.hasWs = false;
+    E.v2 = true;
+    uiLast = e;
+
+    Rec r(*this, cb);
+    // WAR/WAW against every earlier record's use of this entry's mask and of the state buffer (the fill and the patch of an
+    // earlier pair read the mask; the previous observe or track wrote the state)
+    r.barrier(CS, RW, CS, RW);
+    UiPC pc = v2Pc(*this, bx);
+    pc.reset = !uiBoxHist;
+    VkDescriptorSet boxSet = takeUiSetV2(view, uiBoxState, E.box);
+    uiDispatch(*this, cb, U_V2_UPDATE, boxSet, pc, divUp(bx.w, 8), divUp(bx.h, 8));
+    r.cbar();
+    const int boxStride = (bx.w + 3) / 4;
+    pc.maskX = bx.x; pc.maskY = bx.y; pc.maskW = bx.w; pc.maskH = bx.h; pc.maskStride = boxStride; pc.maskOff = 4;
+    uiDispatch(*this, cb, U_V2_MASK, boxSet, pc, divUp(boxStride, 8), divUp(bx.h, 8));
+    r.cbar();
+    r.stamp("ui_detect");
+    uiBoxHist = true;
+    uiCellHist = false;
+    return true;
+}
+
+// CrosshairV2 track: the same ui_v2_update pass an observe runs, on the same state, and nothing else (no mask, no entry).
+bool Interpolator::Impl::uiTrackRecordV2(VkCommandBuffer cb, Frame view) {
+    const UiBox bx = computeBox();
+    const VkBuffer oldState = uiBoxState.b;
+    if (!growBuf(uiBoxState, (VkDeviceSize)bx.w * bx.h * 16)) return false;
+    if (uiBoxState.b != oldState || !(bx == uiPrevBox)) uiBoxHist = false;
+    uiPrevBox = bx;
+    Rec r(*this, cb);
+    r.cbar();
+    UiPC pc = v2Pc(*this, bx);
+    pc.reset = !uiBoxHist;
+    pc.track = 1;
+    VkDescriptorSet boxSet = takeUiSetV2(view, uiBoxState, uiBoxState);   // the mask binding is a placeholder: ui_v2_update never touches it
+    uiDispatch(*this, cb, U_V2_UPDATE, boxSet, pc, divUp(bx.w, 8), divUp(bx.h, 8));
+    r.cbar();
+    uiBoxHist = true;
+    uiCellHist = false;
+    return true;
+}
+
+// CrosshairV2, estimate: the flow-resolution luma of one frame of the pair (already written by luma.comp at lumaOff in buf[0])
+// gets the cells that hold a UI pixel re-averaged over their not-UI pixels (ui_v2_lumafill.comp). The caller restores its
+// own descriptor set afterwards.
+void Interpolator::Impl::uiRecordLumaFill(VkCommandBuffer cb, Frame frame, const UiEntry& E, int lumaOff) {
+    if (!E.hasBox) return;
+    UiPC pc = v2Pc(*this, E.bx);
+    pc.cell = (int)set.flowScale; pc.cw = fw; pc.ch = fh;
+    pc.reach = 8;
+    pc.maskX = E.bx.x; pc.maskY = E.bx.y; pc.maskW = E.bx.w; pc.maskH = E.bx.h; pc.maskStride = (E.bx.w + 3) / 4; pc.maskOff = 4;
+    pc.lumaOff = lumaOff;
+    UiBuf luma; luma.b = buf[0]; luma.size = bufSize[0];
+    VkDescriptorSet fillSet = takeUiSetV2(frame, luma, E.box);
+    const int S = (int)set.flowScale;
+    const int cells0 = E.bx.x / S, cells1 = (E.bx.x + E.bx.w - 1) / S, rows0 = E.bx.y / S, rows1 = (E.bx.y + E.bx.h - 1) / S;
+    uiDispatch(*this, cb, U_V2_FILL, fillSet, pc, divUp(cells1 - cells0 + 1, 8), divUp(rows1 - rows0 + 1, 8));
+}
+
 // Records the observe of one real frame into the entry it picks: clean copy, stillness, masks, inpaint.
 // The caller has checked uiActive() and the set ring (uiObserveSets()).
 bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
+    if (v2()) return uiObserveRecordV2(cb, view);
     const bool ws = set.uiProtection == UiProtection::WholeScreen;
     const UiBox bx = computeBox();
     const int e = uiPick(view.view);
@@ -1154,6 +1308,7 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
     E.bx = bx;
     E.hasBox = true;
     E.hasWs = ws;
+    E.v2 = false;
     uiLast = e;
 
     Rec r(*this, cb);
@@ -1220,6 +1375,7 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
 // observe's bindings, so the set gets harmless placeholders: the first active entry's clean image (never written with
 // track = 1) and the box state as the "mask" (never touched with track = 1).
 bool Interpolator::Impl::uiTrackRecord(VkCommandBuffer cb, Frame view) {
+    if (v2()) return uiTrackRecordV2(cb, view);
     const bool ws = set.uiProtection == UiProtection::WholeScreen;
     const UiBox bx = computeBox();
     const UiEntry* ph = nullptr;
@@ -1274,6 +1430,7 @@ void Interpolator::Impl::uiRecordPatch(VkCommandBuffer cb, Frame curr, Frame out
     if (E.hasBox) {
         pc.maskX = E.bx.x; pc.maskY = E.bx.y; pc.maskW = E.bx.w; pc.maskH = E.bx.h;
         pc.maskStride = (E.bx.w + 3) / 4; pc.maskOff = 4; pc.gate = 0;
+        pc.binary = E.v2;   // CrosshairV2: only mask bytes of 255 (unchanged in this pair) are pasted
         VkDescriptorSet boxSet = takeUiSet(curr, out, uiBoxState, E.box);
         uiDispatch(*this, cb, U_PATCH, boxSet, pc, divUp(pc.maskStride, 8), divUp(E.bx.h, 8));
         if (yuv) uiDispatch(*this, cb, U_PATCH_C, boxSet, pc, chromaGroups(E.bx.x, E.bx.w), chromaGroups(E.bx.y, E.bx.h));
@@ -1329,7 +1486,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         } else if (I.uiFind(prev.view) < 0 || I.uiFind(curr.view) < 0) {
             ui = false;
         }
-        if (ui && I.uiFrameSets + needObs * I.uiObserveSets() > kUiSets) return false;
+        if (ui && I.uiFrameSets + needObs * I.uiObserveSets() + (I.v2Fill() ? 2 : 0) > kUiSets) return false;   // V2 with the fill: + its two luma fills
     }
 
     if (!I.profPending) {
@@ -1353,14 +1510,17 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         ep = I.uiFind(prev.view);
         ec = I.uiFind(curr.view);
         if (ep < 0 || ec < 0 || ep == ec) return false;   // (implicit: the second observe evicted the first: cannot happen with at least kUiFrames >= 3 active entries)
-        estP = I.uiE[ep].frame();
-        estC = I.uiE[ec].frame();
+        if (!I.v2()) {   // V2 estimates on the host's own frames (its masked pixels are filled in the luma only)
+            estP = I.uiE[ep].frame();
+            estC = I.uiE[ec].frame();
+        }
     }
     VkDescriptorSet set = I.takeSet(Impl::R_EST, estP, estC, Frame());
     I.haveEst = true;
     I.estPrev = prev.view;
     I.estCurr = curr.view;
     I.estUi = ui;
+    I.estClean = ui && !I.v2();
     if (ui) {
         I.estEnt[0] = ep; I.estEnt[1] = ec;
         I.estSeq[0] = I.uiE[ep].seq; I.estSeq[1] = I.uiE[ec].seq;
@@ -1376,6 +1536,13 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     r.run(P_LUMA, divUp(l0.w, lt), divUp(l0.h, lt));
     r.cbar();
     r.stamp("luma");
+    if (ui && I.v2Fill()) {   // CrosshairV2, uiEstimateFill: the UI pixels of both frames are missing for the estimate (luma only, never the colour passes)
+        I.uiRecordLumaFill(cb, prev, I.uiE[ep], l0.offA);
+        I.uiRecordLumaFill(cb, curr, I.uiE[ec], l0.offC);
+        r.cbar();
+        I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);   // the fills bound the UI set
+        r.stamp("ui_fill");
+    }
     // 2. pyramid
     for (size_t i = 1; i < I.lv.size(); i++) {
         const Level &s = I.lv[i - 1], &t = I.lv[i];
@@ -1437,11 +1604,11 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
     if (I.frameSets[Impl::R_SYNTH] >= kSetRing) return false;
     Frame srcP = prev, srcC = curr;
     if (I.estUi) {
-        // the clean copies the estimate saw must still be those frames (not evicted / re-observed since)
+        // the entries the estimate saw must still be those frames (not evicted / re-observed since); the clean copies too
         const UiEntry &ep = I.uiE[I.estEnt[0]], &ec = I.uiE[I.estEnt[1]];
-        if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || !ep.view || !ec.view) return false;
+        if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || (I.estClean && (!ep.view || !ec.view))) return false;
         if (I.uiFrameSets + 2 > kUiSets) return false;
-        srcP = ep.frame(); srcC = ec.frame();
+        if (I.estClean) { srcP = ep.frame(); srcC = ec.frame(); }
     }
     VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out);
 
@@ -1499,9 +1666,9 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     Frame srcP = prev, srcC = curr;
     if (I.estUi) {
         const UiEntry &ep = I.uiE[I.estEnt[0]], &ec = I.uiE[I.estEnt[1]];
-        if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || !ep.view || !ec.view) return false;
+        if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || (I.estClean && (!ep.view || !ec.view))) return false;
         if (I.uiFrameSets + 2 > kUiSets) return false;
-        srcP = ep.frame(); srcC = ec.frame();
+        if (I.estClean) { srcP = ep.frame(); srcC = ec.frame(); }
     }
 
     // the samples: the MIDPOINTS of N equal slices of [t0, t1], t_k = t0 + (t1 - t0)(k + 0.5)/N (a box-filter shutter).
@@ -1573,7 +1740,7 @@ bool Interpolator::record(VkCommandBuffer cb, Frame prev, Frame curr, Frame out,
     // both rings must have room, so that a refused record() records nothing
     assert(m->frameSets[0] < kSetRing && m->frameSets[1] < kSetRing && "framegen: more than kSetRing records since beginFrame()");
     if (m->frameSets[Impl::R_EST] >= kSetRing || m->frameSets[Impl::R_SYNTH] >= kSetRing) return false;
-    if (m->uiActive() && m->uiFrameSets + 2 * m->uiObserveSets() + 2 > kUiSets) return false;   // 2 implicit observes + the patch
+    if (m->uiActive() && m->uiFrameSets + 2 * m->uiObserveSets() + 2 + (m->v2Fill() ? 2 : 0) > kUiSets) return false;   // 2 implicit observes + the patch (+ V2's two luma fills)
     return recordEstimate(cb, prev, curr) && recordSynth(cb, prev, curr, out, t);
 }
 

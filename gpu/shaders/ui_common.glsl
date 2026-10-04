@@ -33,6 +33,12 @@ layout(push_constant) uniform PC {
     int maskX, maskY, maskW, maskH, maskStride, maskOff;
     int gate;                 // 1: tile flags + suppression apply (whole screen)
     int track;                // 1: recordTrack: advance the stillness state only (ui_detect: no copy, no tile flags / counts)
+    // CrosshairV2 (ui_v2_*.comp, ui_patch*.comp); appended, so the passes above never see them
+    float cthr;               // local-contrast threshold, 8-bit levels (0 = no contrast gate)
+    int leave;                // consecutive changed frames before a masked pixel leaves the mask
+    int reentry;              // consecutive frames a left pixel must match its stored colour to re-enter at once (0 = off)
+    int binary;               // patch: paste only mask bytes of exactly 255 (V2 masks hold 255 = paste, 64 = confirmed but changed this pair)
+    int lumaOff;              // ui_v2_lumafill: offset of this frame's flow-res luma in the luma buffer (bound as S)
 } pc;
 
 const int TILE = 32;

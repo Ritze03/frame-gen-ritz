@@ -18,7 +18,7 @@ void main() {
             if (pc.gate != 0 && !tileLive(q / TILE)) continue;
             a = max(a, maskByte(rel));
         }
-    if (a == 0u) return;
+    if (a == 0u || (pc.binary != 0 && a != 255u)) return;   // CrosshairV2: see ui_patch.comp
     vec4 o = imageLoad(imgC, c);
     vec2 real = texelFetch(srcC, c, 0).rg;
     imageStore(imgC, c, vec4(mix(o.rg, real, float(a) * (1.0 / 255.0)), o.ba));

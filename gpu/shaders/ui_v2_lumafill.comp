@@ -1,0 +1,68 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// CrosshairV2, estimate: masked pixels are MISSING for the motion estimate. Rewrites, in the flow-resolution luma of one
+// frame (binding 2, as raw float bits, at pc.lumaOff), every cell that contains a UI pixel (mask byte != 0, so the grown
+// ring and the pixels that changed in this pair count too): the cell's luma becomes the mean of its NOT-UI pixels, and a
+// cell with none (a 2 px arm, grown, covers whole 2x2 cells) takes the mean of the not-UI pixels of a window widened by one
+// cell per step, up to REACH px. A cell without UI pixels is not touched (so the pass is a no-op away from the box, and
+// the unprotected luma is byte-for-byte what luma.comp wrote). The fill lives ONLY in the luma buffer, which only the
+// search / sub-pixel / pixel-field passes read: the colour passes (mismatch, resolve, fallback, blur) sample the real
+// frames, so a filled value can never reach an output pixel. There is no clean copy and no 8-direction inpaint: the
+// moving streaks of V1 came from reading an inpainted copy in the colour warp.
+// binding 0: the frame (Y plane for YUV), binding 3: this frame's box mask. pc.cell = flow scale, pc.cw/ch = flow size,
+// pc.reach = reach in px, pc.mask* = the box, pc.lumaOff. One thread per flow cell; the grid starts at the box's first cell.
+#include "ui_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#if defined(FG_YUV)
+float y8(ivec2 p) { return fgLuma(texelFetch(src, p, 0).r); }
+#elif defined(FG_FORMAT_RGB10) || defined(FG_FORMAT_F16)
+float y8(ivec2 p) {   // == luma.comp
+#if defined(FG_FORMAT_F16)
+    vec3 c = fgMetric(texelFetch(src, p, 0).rgb);
+#else
+    vec3 c = texelFetch(src, p, 0).rgb * 255.0;
+#endif
+    return dot(c, vec3(4899.0, 9617.0, 1868.0)) * (1.0 / 16384.0);
+}
+#else
+float y8(ivec2 p) {   // == luma.comp
+    uvec3 c = uvec3(texelFetch(src, p, 0).rgb * 255.0 + 0.5);
+    return float((c.r * 4899u + c.g * 9617u + c.b * 1868u + 8192u) >> 14);
+}
+#endif
+
+bool uiPx(ivec2 p) {   // a UI pixel: inside the box and its mask byte is non-zero
+    ivec2 rel = p - ivec2(pc.maskX, pc.maskY);
+    if (rel.x < 0 || rel.y < 0 || rel.x >= pc.maskW || rel.y >= pc.maskH) return false;
+    return maskByte(rel) != 0u;
+}
+
+void main() {
+    int S = pc.cell;
+    ivec2 o = ivec2(pc.maskX / S, pc.maskY / S) + ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= pc.cw || o.y >= pc.ch) return;
+    ivec2 p0 = o * S;
+    bool hasUi = false;
+    for (int j = 0; j < S && !hasUi; j++)
+        for (int i = 0; i < S; i++) {
+            ivec2 p = p0 + ivec2(i, j);
+            if (p.x < pc.W && p.y < pc.H && uiPx(p)) { hasUi = true; break; }
+        }
+    if (!hasUi) return;
+    for (int k = 0; k <= pc.reach; k += S) {
+        float sum = 0.0;
+        int n = 0;
+        for (int y = p0.y - k; y < p0.y + S + k; y++)
+            for (int x = p0.x - k; x < p0.x + S + k; x++) {
+                ivec2 p = ivec2(x, y);
+                if (p.x < 0 || p.y < 0 || p.x >= pc.W || p.y >= pc.H || uiPx(p)) continue;
+                sum += y8(p);
+                n++;
+            }
+        if (n > 0) {
+            st[pc.lumaOff + o.y * pc.cw + o.x] = floatBitsToUint(sum / float(n));
+            return;
+        }
+    }
+}

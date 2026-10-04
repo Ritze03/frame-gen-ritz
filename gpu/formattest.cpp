@@ -646,6 +646,57 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         printf("    UI Crosshair:   crosshair wrong %zu/%zu\n", xh, xhN);
         expect(xh == 0, "crosshair pixels equal the real ones (Crosshair mode)");
     }
+    {   // CrosshairV2: the same box, no clean copies; crosshair exact, tracked == observed, background quality
+        Settings v; v.uiProtection = UiProtection::CrosshairV2; v.uiBoxWidth = v.uiBoxHeight = 64;
+        Result rv = runSequence(e, sc, v, false);
+        if (!rv.ok) { expect(false, "CrosshairV2 init + sequence"); return; }
+        auto v05 = decode(e, rv.out[0], W, H), v025 = decode(e, rv.out[1], W, H);
+        // V2 never pastes a pixel that changed in the pair. In 4:2:0 the chroma of a crosshair edge pixel is shared with the
+        // background behind it, which moves, so a few edge pixels DO change in the pair: only the ones that did not (decoded RGB
+        // within 1.5 levels of the previous frame) must be exact there. In the RGB formats every crosshair pixel is static.
+        auto prevDec = decode(e, encode(e, sc.frame(10), W, H), W, H);
+        size_t xh3 = 0, xh4 = 0, nStatic = 0, nChanged = 0;
+        for (size_t i = 0; i < (size_t)W * H; i++) {
+            if (sc.ui[i] != 1) continue;
+            float dp = 0, d5 = 0, d25 = 0;
+            for (int c = 0; c < 3; c++) {
+                dp = std::max(dp, std::fabs(real[i * 3 + c] - prevDec[i * 3 + c]));
+                d5 = std::max(d5, std::fabs(v05[i * 3 + c] - real[i * 3 + c]));
+                d25 = std::max(d25, std::fabs(v025[i * 3 + c] - real[i * 3 + c]));
+            }
+            if (isYuv(e) && dp > 1.5f) { nChanged++; continue; }
+            nStatic++;
+            xh3 += d5 > tol; xh4 += d25 > tol;
+        }
+        printf("    UI CrosshairV2: crosshair wrong %zu/%zu (t=.25: %zu)%s\n", xh3, nStatic, xh4, isYuv(e) ? "" : "");
+        if (isYuv(e)) printf("    (%zu crosshair edge pixels change with the chroma of the moving background in this pair and are not judged)\n", nChanged);
+        expect(xh3 == 0 && xh4 == 0, isYuv(e) ? "crosshair pixels that did not change in the pair equal the real ones (CrosshairV2, t = 0.5 and 0.25)"
+                                              : "crosshair pixels equal the real ones (CrosshairV2, t = 0.5 and 0.25)");
+        Result rvt = runSequence(e, sc, v, false, true);
+        expect(rvt.ok && rvt.out[0].p0 == rv.out[0].p0 && rvt.out[0].p1 == rv.out[0].p1 && rvt.out[1].p0 == rv.out[1].p0 && rvt.out[1].p1 == rv.out[1].p1,
+               "recordTrack (CrosshairV2): frames tracked instead of observed give bit-identical output");
+        expect(psnr(v05, truth, &near, false) >= pOff - 0.5, "CrosshairV2 does not cost background quality (-0.5 dB)");
+        // the optional luma fill of the motion estimate (uiEstimateFill): its own pass, compiled per format
+        Settings vf = v; vf.uiEstimateFill = true;
+        Result rf = runSequence(e, sc, vf, false);
+        if (!rf.ok) { expect(false, "CrosshairV2 + fill init + sequence"); return; }
+        auto f05 = decode(e, rf.out[0], W, H);
+        size_t xhf = 0;
+        for (size_t i = 0; i < (size_t)W * H; i++) {
+            if (sc.ui[i] != 1) continue;
+            float dp = 0, d5 = 0;
+            for (int c = 0; c < 3; c++) {
+                dp = std::max(dp, std::fabs(real[i * 3 + c] - prevDec[i * 3 + c]));
+                d5 = std::max(d5, std::fabs(f05[i * 3 + c] - real[i * 3 + c]));
+            }
+            if (isYuv(e) && dp > 1.5f) continue;
+            xhf += d5 > tol;
+        }
+        double pf = psnr(f05, truth, &near, false);
+        printf("    UI CrosshairV2 + estimate fill: crosshair wrong %zu, background PSNR %.2f dB (without the fill %.2f dB, Off %.2f dB)\n", xhf, pf, psnr(v05, truth, &near, false), pOff);
+        expect(xhf == 0, "CrosshairV2 + estimate fill: crosshair exact");
+        expect(pf >= pOff - 0.5, "CrosshairV2 + estimate fill does not cost background quality (-0.5 dB)");
+    }
     double pw = psnr(w05, truth, &near, false);
     expect(pw >= pOff - 0.5, "protection does not cost background quality (-0.5 dB)");
 }

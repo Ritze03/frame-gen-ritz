@@ -15,7 +15,7 @@ shaders = shader_gen.process(
   'shaders/median3.comp', 'shaders/subpix.comp', 'shaders/pixfield.comp', 'shaders/error.comp',
   'shaders/resolve.comp', 'shaders/fallback.comp', 'shaders/lookup.comp',
   'shaders/ui_detect.comp', 'shaders/ui_box_update.comp', 'shaders/ui_box_mask.comp', 'shaders/ui_mask.comp',
-  'shaders/ui_inpaint.comp', 'shaders/ui_patch.comp',
+  'shaders/ui_inpaint.comp', 'shaders/ui_patch.comp', 'shaders/ui_v2_update.comp', 'shaders/ui_v2_mask.comp', 'shaders/ui_v2_lumafill.comp',
   'shaders/blur_lookup.comp', 'shaders/blur_error.comp', 'shaders/blur_resolve.comp')
 
 # Per-format variants of the colour shaders (README.md "Formats"): the same sources, compiled once per format with
@@ -23,6 +23,7 @@ shaders = shader_gen.process(
 # framegen.cpp includes each variant behind __has_include, so a format that is not built is simply refused at init.
 colour_srcs = ['shaders/luma.comp', 'shaders/error.comp', 'shaders/resolve.comp', 'shaders/fallback.comp',
                'shaders/ui_detect.comp', 'shaders/ui_box_update.comp', 'shaders/ui_inpaint.comp', 'shaders/ui_patch.comp',
+               'shaders/ui_v2_update.comp', 'shaders/ui_v2_lumafill.comp',
                'shaders/blur_error.comp', 'shaders/blur_resolve.comp']
 chroma_srcs = ['shaders/ui_inpaint_chroma.comp', 'shaders/ui_patch_chroma.comp']   # YUV only: the half-resolution CbCr plane
 variant_shaders = []

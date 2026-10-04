@@ -115,16 +115,25 @@ A crosshair, a minimap frame or a health bar is static while the picture behind 
 - **Patch back**: after each generated frame, `out = mix(out, real pixel, mask)`. Masked pixels therefore show the exact pixels of the real frame.
 - There is deliberately no "is this a crosshair" test. Static for N frames *is* the detector. If the camera is still, static background is masked too, which is harmless: it is patched back with the identical real pixels, and any pixel that changes leaves the mask on the very next pair.
 
-Two modes (`Settings::uiProtection`, a runtime setting, `Off` by default and byte-identical to a library without the feature):
+Three modes (`Settings::uiProtection`, a runtime setting, `Off` by default and byte-identical to a library without the feature). The first two are described here; `CrosshairV2`, the third, is a different algorithm for the box alone and has its own paragraph below the table:
 
 | Mode | What is protected | How |
 |---|---|---|
 | `Crosshair` | the **box** (default: a centred square, side 2.5% of the frame height: 24 px at 960, 36 at 1440) | full resolution, every pixel |
+| `CrosshairV2` | the box only (no WholeScreen variant), same box settings | contrast-gated detection with hysteresis and fast re-entry, **no inpaint and no clean copy**, a pixel is pasted back only if it did not change in the pair being synthesised: see "CrosshairV2" below |
 | `WholeScreen` | the box, plus every solid static HUD element outside it | the box as above; outside it detection at half resolution (2x2 cell means, one counter per cell), the mask is upsampled and dilated at full resolution, and work is skipped for every 32x32 tile that cannot contain a still pixel (GPU-side tile flags); inpaint and patch touch only masked pixels in flagged tiles |
 
 The box is always full resolution in both modes, because the crosshair is the most noticeable thing if it breaks. **Size it for your reticle:** `uiBoxHeightFrac` (default 0.025) sets the side of the square as a fraction of the frame height, `round(height * frac)` clamped to [8, min(w, h)]: 24 px at 960, 27 at 1080, 36 at 1440, 54 at 2160. `uiBoxWidth`/`uiBoxHeight` set it in pixels instead (0 = take that side from the fraction; an explicit size wins), and `uiBoxOffsetX`/`uiBoxOffsetY` move its centre from the frame centre (for a game whose reticle is not dead centre). Rule of thumb: make the box **slightly larger than the crosshair** including its spread and outline, not much larger; a host can draw the box as a preview while the user adjusts a slider. Too small leaves the ends of the crosshair unprotected; too big holds background to the real frame too, which shows as small white speckles. The box is clamped into the frame. `Interpolator::boxSize()` returns the size the library will use. `uiCrosshairArea` is deprecated and used only when `uiBoxHeightFrac` is 0 (the old area box).
 
 `Why:` the former default, a 3% *area* box, was 192 px on 1280x960. It caught moving background around the reticle, which the user saw as small white pixel artifacts, and its 32 px minimum made a small box impossible. The side is now a plain fraction of the height, which is easy to reason about and to put on a slider.
+
+**CrosshairV2** (`UiProtection::CrosshairV2`, next to `Crosshair`, which is unchanged so the two can be compared). Measured on the user's CS2 footage (two 120 fps OBS recordings, the real crosshair stamped in exactly; `INTEGRATION.md` has the method and the table), V1's visible damage inside the protected area had three causes, and V2 removes each of them:
+
+1. *The warp reads the inpainted clean copy* (about 61 % of V1's artifact pixels). A pixel that was inpainted in `prev`'s copy but is real in `curr` (every time the mask shrinks) is warped as 8-direction streaks that move with the picture, the "moving patterns". **V2 has no inpaint and no clean copy**: the estimate and every colour pass read the host's own frames, so the generated frame is bit-identical to `Off` everywhere except on the pasted pixels (`uitest check` asserts it outside the box).
+2. *The paste lands on pixels that changed in the pair* (about 37 %): the half-alpha ring and the hard grow paste `curr` onto background that moved. **V2 pastes a pixel only if `max channel |curr - prev| <= uiStillThreshold` for the pair being synthesised** (the *pair gate*), at full strength, never a feather. Without the gate the measured artifacts were about 1.8 px/frame in the CPU model, with it about 0.02.
+3. *The mask flickers* (879-3378 px flip per frame with the old 249 px box, about 20 with a 27 px one): that shimmer is what triggers the streaks. V2 only lets a pixel **enter** after `uiStillFrames` (8) consecutive frames that are still **and contrasty** (`uiContrastThreshold`, default 20: max channel `|I - median7x7(I)|`, a crosshair has an edge, flat background does not), only **leaves** after `uiLeaveFrames` (4) consecutive changed frames (hysteresis), and **re-enters** within `uiReentryFrames` (2) frames when it shows the colour it was last confirmed in (the crosshair is back after a flash or a recoil).
+
+The mask is the confirmed pixels plus a hard 1 px grow, binary. `recordTrack` runs the same state machine pass, so a crosshair stays warm through pass-through. A mode that hides the UI from the *motion estimate* as well exists as an option, `uiEstimateFill` (off by default): measured on the footage it is a wash (it re-rolls the vectors of neighbouring blocks, equally often better and worse than `Off`), so the default leaves the estimate exactly as `Off` runs it. Trade-offs against V1: V1 also hides the crosshair from the estimate and the warp by inpainting it (so a *thick* crosshair on a hard-edged moving background interpolates better around it with V1: the colour passes of V2 still see the crosshair as an occluder, exactly as `Off` does); V2 never makes the picture around the crosshair worse than `Off` (with the defaults its output is bit-identical to `Off` outside the pasted pixels). On the footage, 12 segments, 1173 frames: artifact pixels per frame (worse than `Off` by more than 24 levels and 32 off the truth) V1 4.44 with a 27 px box (20.9 with the old 249 px one), V2 0.012; white specks 1.36 against 0.009; mask flips per frame 16.7 against 2.0 (1669 for 249 px); recall of the crosshair after the first 8 frames 0.917 against 0.977; V2's `observe` costs 0.022 ms at 1440p against V1's 0.066. Limits: opaque, static crosshairs only. A semi-transparent crosshair (its pixels change with the background behind it) and one that changes shape (a spread that follows movement) stay unprotected while they change, by design (a pixel that changed in the pair is never pasted); they come back `uiReentryFrames` / `uiStillFrames` frames after they settle. In 4:2:0 formats (NV12, P010) a few edge pixels of a crosshair share their chroma with the moving background and count as changed. No WholeScreen variant of V2 yet.
 
 `WholeScreen` bounds its worst case: if more than `uiMaxStillFraction` (75%) of the cells outside the box are still, that frame's whole-screen passes exit on the GPU (a nearly static picture needs no generated frame to differ from the real one). Costs, memory and measurements are in `INTEGRATION.md`. Limits: only *opaque, solid, static* UI is protected. Semi-transparent UI over moving background, UI whose shape changes every frame (a scrolling kill feed, an animated number) and UI that moves (a floating damage number) are not; they behave as before. The cell-mean detection also treats a very slowly moving gradient (under `uiStillThreshold` per frame) as still, which only means it is shown from the real frame.
 
@@ -191,7 +200,8 @@ gpu/build/blurtest bench [W H]           # GPU cost: one synth, N x recordSynth 
 `uitest` (needs no footage) validates and benchmarks static-UI protection on a synthetic sequence:
 
 ```sh
-gpu/build/uitest check [--bgra] [W H]    # default 1280x720: asserts the exact crosshair / HUD pixels, PSNR, validation
+gpu/build/uitest check [--bgra] [W H]    # default 1280x720: asserts the exact crosshair / HUD pixels, PSNR, validation; the CrosshairV2 block: exact crosshair, V2 == Off outside the box,
+                                         # shrinking/growing arm ends vs V1 (the control), hysteresis, fast re-entry, the pair gate (also under motion blur), mode switching
 gpu/build/uitest check --hash            # also prints a hash per generated frame of the Off run (compare against the
                                          # library before the feature to prove byte-identical output)
 gpu/build/uitest deep [W H]              # Settings::uiHistory: a synth from a pair 10 frames behind the newest is still protected (default 640x360)
@@ -266,13 +276,17 @@ for (int k = 1; k < N; ++k)
 | `smoothBonus` | 0.5 | Bonus for the smooth vector field. Higher = calmer but softer motion edges. |
 | `searchPenalty` | 0.5 | Search cost per pixel step. Higher = steadier on flat or repetitive surfaces, lower = follows small fast detail. |
 | `subpixel` | true | 1/2 + 1/4 px refinement. Off saves about 0.04-0.06 ms per pair, slightly softer on slow pans. |
-| `uiProtection` | Off | `Off`, `Crosshair` or `WholeScreen`: static-UI protection (see above). Runtime. |
+| `uiProtection` | Off | `Off`, `Crosshair`, `WholeScreen` or `CrosshairV2`: static-UI protection (see above). Runtime. |
 | `uiBoxHeightFrac` | 0.025 | Box = square of side round(frame height * frac), clamped to [8, min(w, h)]. [0, 1]; 0 = legacy area box. Runtime. |
 | `uiBoxWidth`, `uiBoxHeight` | 0, 0 | Size of the full-resolution box in pixels; 0 = take that side from `uiBoxHeightFrac`. Clamped to [4, frame]. Runtime. |
 | `uiCrosshairArea` | 0.03 | Deprecated; used only when `uiBoxHeightFrac` is 0: square of side sqrt(area * w * h), clamped to [32, min(w, h)]. (0, 1]. |
 | `uiBoxOffsetX`, `uiBoxOffsetY` | 0, 0 | Box centre offset from the frame centre, pixels (+x right, +y down). The box is clamped into the frame. |
 | `uiStillFrames`, `uiStillThreshold` | 8, 3.5 | A pixel is protected after this many consecutive real frames in which no channel moved more than this many levels. |
 | `uiInpaintReach` | 12 | Walk length (1-16 px) of the inpaint. |
+| `uiContrastThreshold` | 20 | CrosshairV2: a pixel can only enter the mask if its contrast `max channel \|I - median7x7(I)\|` is at least this many levels (0-255, 8-bit-equivalent in every format; 0 = no gate). |
+| `uiLeaveFrames` | 4 | CrosshairV2: consecutive changed frames before a masked pixel leaves the mask (1-255). |
+| `uiReentryFrames` | 2 | CrosshairV2: consecutive frames in its last confirmed colour before a left pixel re-enters at once (0-255, 0 = off). |
+| `uiEstimateFill` | false | CrosshairV2: also hide the UI from the motion estimate (luma only; see above, a wash on real footage). |
 | `uiHistory` | 3 | Observed frames that keep their UI-protection clean copy (3 to 65). Raise it to `Pacer::HistoryDepth()` when the lag-spike buffer plays older pairs. 4 B/px per kept frame. Runtime. |
 | `blurSamples` | 0 | Motion blur: sub-frames averaged by `recordSynthBlur()`. 0 or 1 = off, 2-16 on (see above). Runtime. |
 | `blurWeights` | Gaussian | `Even` (1/N each) or `Gaussian` (ends of the window at 2 sigma, weights taken at the slice centres). Runtime. |
@@ -325,7 +339,7 @@ For video, `Pacer::OnFrame(id, ptsNs, streamKey, format)` replaces `OnArrival`: 
 ## Limitations
 
 - Supported formats: 8-bit RGBA/BGRA, 10-bit RGB (A2B10G10R10), half-float RGB (linear/scRGB or encoded), NV12 and P010. Not supported: `_SRGB` views, 4:2:2 / 4:4:4 and 12/16-bit YUV, `VkSamplerYcbcrConversion` sampling (chroma is sampled bilinearly, centre-sited), BT.2020 constant luminance, and full-range P010 is treated as 8-bit-full-range gain (0.3 % off).
-- HUD drawn into the game image can still show artifacts, especially translucent HUD elements and scrolling or changing text. Solid, static HUD is handled by the optional static-UI protection (`uiProtection`, above); semi-transparent or shape-changing UI is not protected by it either. Overlays composited later by gamescope are not affected.
+- HUD drawn into the game image can still show artifacts, especially translucent HUD elements and scrolling or changing text. Solid, static HUD is handled by the optional static-UI protection (`uiProtection`, above); semi-transparent or shape-changing UI is not protected by it either (`CrosshairV2` leaves a crosshair that changes shape or transparency alone while it changes). Overlays composited later by gamescope are not affected.
 - Repetitive structures (stairs, ladders, fences) under fast motion can lock onto the wrong period. Both warps then agree, so the mismatch test cannot catch it.
 - Very fast flicks below the whole-frame fallback threshold can show seams between warped and held regions.
 - Interpolation adds latency, because a generated frame needs the next real frame.
