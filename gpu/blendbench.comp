@@ -1,0 +1,28 @@
+#version 450
+// blurtest only: the "naive" blend of N separately synthesised images (what a host without recordSynthBlur would do):
+// out = round(sum_k w_k * img_k), up to 8 images, weights in the push constants.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D s0;
+layout(set = 0, binding = 1) uniform sampler2D s1;
+layout(set = 0, binding = 2) uniform sampler2D s2;
+layout(set = 0, binding = 3) uniform sampler2D s3;
+layout(set = 0, binding = 4) uniform sampler2D s4;
+layout(set = 0, binding = 5) uniform sampler2D s5;
+layout(set = 0, binding = 6) uniform sampler2D s6;
+layout(set = 0, binding = 7) uniform sampler2D s7;
+layout(set = 0, binding = 8, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform PC { int n; float w[8]; } pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= imageSize(dst).x || p.y >= imageSize(dst).y) return;
+    vec3 a = pc.w[0] * floor(texelFetch(s0, p, 0).rgb * 255.0 + 0.5);
+    if (pc.n > 1) a += pc.w[1] * floor(texelFetch(s1, p, 0).rgb * 255.0 + 0.5);
+    if (pc.n > 2) a += pc.w[2] * floor(texelFetch(s2, p, 0).rgb * 255.0 + 0.5);
+    if (pc.n > 3) a += pc.w[3] * floor(texelFetch(s3, p, 0).rgb * 255.0 + 0.5);
+    if (pc.n > 4) a += pc.w[4] * floor(texelFetch(s4, p, 0).rgb * 255.0 + 0.5);
+    if (pc.n > 5) a += pc.w[5] * floor(texelFetch(s5, p, 0).rgb * 255.0 + 0.5);
+    if (pc.n > 6) a += pc.w[6] * floor(texelFetch(s6, p, 0).rgb * 255.0 + 0.5);
+    if (pc.n > 7) a += pc.w[7] * floor(texelFetch(s7, p, 0).rgb * 255.0 + 0.5);
+    imageStore(dst, p, vec4(floor(a + 0.5) / 255.0, 1.0));
+}

@@ -15,7 +15,8 @@ shaders = shader_gen.process(
   'shaders/median3.comp', 'shaders/subpix.comp', 'shaders/pixfield.comp', 'shaders/error.comp',
   'shaders/resolve.comp', 'shaders/fallback.comp', 'shaders/lookup.comp',
   'shaders/ui_detect.comp', 'shaders/ui_box_update.comp', 'shaders/ui_box_mask.comp', 'shaders/ui_mask.comp',
-  'shaders/ui_inpaint.comp', 'shaders/ui_patch.comp')
+  'shaders/ui_inpaint.comp', 'shaders/ui_patch.comp',
+  'shaders/blur_lookup.comp', 'shaders/blur_error.comp', 'shaders/blur_resolve.comp')
 
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
 framegen_lib = static_library('framegen', 'framegen.cpp', shaders,
@@ -25,3 +26,6 @@ framegen_dep = declare_dependency(link_with : framegen_lib, include_directories 
 executable('fgtest', 'fgtest.cpp', dependencies : [framegen_dep, vulkan])
 
 executable('uitest', 'uitest.cpp', dependencies : [framegen_dep, vulkan])
+
+blend_bench = shader_gen.process('blendbench.comp')   # test only: the naive blend the benchmark compares against
+executable('blurtest', 'blurtest.cpp', blend_bench, dependencies : [framegen_dep, vulkan])
