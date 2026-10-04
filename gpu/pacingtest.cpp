@@ -298,7 +298,7 @@ TEST_CASE( "pacing: the GPU budget in synths per pair", "[pacing]" )
 	CHECK( MaxSynthsPerPair( 50.0, 0.1, 0.01 ) == kMaxSynthsPerPair );
 }
 
-TEST_CASE( "pacing: interval is the median of the last 8, clamped to 4..50 ms", "[pacing]" )
+TEST_CASE( "pacing: interval is the median of the last 8, clamped to 1..50 ms", "[pacing]" )
 {
 	IntervalEstimator e;
 	CHECK_FALSE( e.Valid() );
@@ -343,7 +343,10 @@ TEST_CASE( "pacing: the interval estimate is clamped", "[pacing]" )
 		slow.AddInterval( 80 * MS );      // 12.5 fps (still under the 100 ms gap reset)
 	CHECK( slow.IntervalMs() == kMaxIntervalMs );
 
-	CHECK( ClampIntervalMs( 3.99 ) == 4.0 );
+	CHECK( kMinIntervalMs == 1.0 );
+	CHECK( ClampIntervalMs( 0.99 ) == 1.0 );
+	CHECK( ClampIntervalMs( 2.94 ) == 2.94 );      // 340 fps is measured, not read as 250
+	CHECK( ClampIntervalMs( 3.99 ) == 3.99 );
 	CHECK( ClampIntervalMs( 50.01 ) == 50.0 );
 	CHECK( ClampIntervalMs( 16.6 ) == 16.6 );
 
@@ -1833,7 +1836,9 @@ TEST_CASE( "pacing: 212 fps on 280 Hz, target = refresh, Low latency never prese
 	CheckHighRatio( 212.0, Priority::LowLatency, 0, 0.0, 540 );
 	CheckHighRatio( 212.0, Priority::LowLatency, 0, 1.0, 540 );
 	// +-2 ms is worse than the game's own interval spread: >= 90% of the ticks.
-	CheckHighRatio( 212.0, Priority::LowLatency, 0, 2.0, 500 );
+	// (487 measured since the interval clamp dropped to 1 ms: at +-2 ms on a 4.7 ms interval the
+	// 8-sample median briefly dips under the stop ratio, which the old 4 ms floor used to hide.)
+	CheckHighRatio( 212.0, Priority::LowLatency, 0, 2.0, 470 );
 	// A 2 ms paint lead hides frames that land in it: the count can dip a little under
 	// the game's (measured 421 / 424 and 416 / 424), never more than 3%.
 	CheckHighRatio( 212.0, Priority::LowLatency, 2 * MS, 1.0, 0, 0.97 );
@@ -1854,7 +1859,7 @@ TEST_CASE( "pacing: Smoothness keeps the output rate and never presents fewer th
 	// Smoothness's D >= one interval already clears any lead, so the paint-lead logic
 	// that Low latency used to carry is not needed there.
 	CheckHighRatio( 212.0, Priority::Smoothness, 4 * MS, 1.0, 540 );
-	CheckHighRatio( 212.0, Priority::Smoothness, 4 * MS, 2.0, 500 );      // measured 538
+	CheckHighRatio( 212.0, Priority::Smoothness, 4 * MS, 2.0, 0 );        // outputs 537 (>= the game's); "still generating at the end" is no longer guaranteed at +-2 ms, see above
 	CheckHighRatio( 120.0, Priority::Smoothness, 4 * MS, 1.0, 540 );
 }
 
@@ -2676,8 +2681,8 @@ TEST_CASE( "lag buffer: the history depth follows the buffer, ahead of the ramp"
 	for ( const Painted &p : drv.log )
 		if ( p.t > Ns( 12e9 ) && p.t < Ns( 16e9 ) )
 			CHECK( p.depth >= 5 );
-	// the ceiling covers 250 ms at the fastest game rate
-	CHECK( kHistoryMax >= int( std::ceil( kLagMaxBufferMs / kMinIntervalMs ) ) + kHistoryMargin );
+	// the ceiling covers 250 ms up to 250 fps (above that the buffer's cap shrinks, see "[highfps]")
+	CHECK( kHistoryMax >= int( std::ceil( kLagMaxBufferMs / 4.0 ) ) + kHistoryMargin );
 }
 
 TEST_CASE( "lag buffer: the buffer never exceeds what the history can hold at a fast game rate", "[lagbuffer]" )
@@ -3426,4 +3431,113 @@ TEST_CASE( "lag buffer: with the buffer enabled the target falling to zero still
 	CHECK( drv.pacer.BufferMs() > 40.0 );   // 3 % of 100 ms = 3 ms, not a jump
 	drv.Run( 3 * 1000 * MS, 1000.0 / 60.0 );
 	CHECK( drv.pacer.BufferMs() == 0.0 );
+}
+
+// ---------------------------------------------------------------------------
+//  High game rates: the interval clamp is 1 ms (1000 fps), not 4 ms (250 fps)
+// ---------------------------------------------------------------------------
+
+namespace
+{
+	// 280 Hz display, Target = the refresh, Pause at refresh rate on.
+	Driver HighFpsDriver()
+	{
+		Driver drv;
+		drv.refreshHz = 280.0;
+		drv.mode = Mode::Target;
+		drv.targetFps = 280;
+		drv.pauseAtRefresh = true;
+		drv.canExceed = false;
+		return drv;
+	}
+}
+
+TEST_CASE( "high fps: a 340 and a 450 fps game on 280 Hz with Pause at refresh on passes through", "[highfps]" )
+{
+	for ( double flFps : { 340.0, 450.0 } )
+	{
+		Driver drv = HighFpsDriver();
+		drv.Run( 2000 * MS, 1000.0 / flFps );
+		const Pacer::Report s = drv.Status();
+		CHECK( std::fabs( s.gameFps - float( flFps ) ) < 0.03f * float( flFps ) );
+		CHECK( s.delayMs == 0.0f );
+		CHECK( s.reason == Reason::GameTooFast );
+		CHECK( drv.pacer.DelayMs() == 0.0 );
+		int nChecked = 0;
+		for ( const Painted &p : drv.log )
+			if ( p.t > 1000 * MS )
+			{
+				nChecked++;
+				CHECK( p.d.inert );
+								CHECK( p.delayMs == 0.0 );
+			}
+		CHECK( nChecked > 100 );
+	}
+}
+
+TEST_CASE( "high fps: a 260 fps game on 280 Hz generates, and the hysteresis holds from both sides", "[highfps]" )
+{
+	// 260 fps: ratio 1.077, between the stop (1.02) and start (1.10) ratios.
+	Driver a = HighFpsDriver();
+	a.Run( 1500 * MS, 1000.0 / 260.0 );
+	CHECK( std::fabs( a.Status().gameFps - 260.0f ) < 8.0f );
+	// First decision uses the stop ratio alone: 1.077 > 1.02 -> generating.
+	CHECK( a.pacer.Generating() );
+
+	// ... a game that was passing through (340 fps) and drops to 260 stays passing: 1.077 < 1.10.
+	Driver b = HighFpsDriver();
+	b.Run( 1500 * MS, 1000.0 / 340.0 );
+	REQUIRE_FALSE( b.pacer.Generating() );
+	b.Run( 1500 * MS, 1000.0 / 260.0 );
+	CHECK_FALSE( b.pacer.Generating() );
+	// ... and starts only once the game is below ~254 fps (ratio > 1.10).
+	b.Run( 1500 * MS, 1000.0 / 250.0 );
+	CHECK( b.pacer.Generating() );
+
+	// From the other side: generating at 240, rising to 270 (ratio 1.037 > 1.02) keeps generating;
+	// 280 (1.0) stops it.
+	Driver c = HighFpsDriver();
+	c.Run( 1500 * MS, 1000.0 / 240.0 );
+	REQUIRE( c.pacer.Generating() );
+	c.Run( 1500 * MS, 1000.0 / 270.0 );
+	CHECK( c.pacer.Generating() );
+	c.Run( 1500 * MS, 1000.0 / 290.0 );
+	CHECK_FALSE( c.pacer.Generating() );
+}
+
+TEST_CASE( "high fps: fixed 2x with Pause off generates a 400 fps game at 800 fps", "[highfps]" )
+{
+	Driver drv;
+	drv.refreshHz = 280.0;
+	drv.mode = Mode::Fixed;
+	drv.multiplier = 2;
+	drv.pauseAtRefresh = false;
+	drv.canExceed = true;
+	drv.Run( 2000 * MS, 1000.0 / 400.0 );
+	CHECK( drv.pacer.Generating() );
+	const Pacer::Report s = drv.Status();
+	CHECK( std::fabs( s.gameFps - 400.0f ) < 12.0f );
+	CHECK( s.reason == Reason::Normal );
+	CHECK( std::fabs( drv.pacer.OutputMs() - 1.25 ) < 0.05 );
+	CHECK( drv.pacer.ExtraTimer() );       // 1.25 ms < the 3.57 ms tick: the host's own timer paints
+}
+
+TEST_CASE( "high fps: the lag buffer at 400 fps is capped by the history, not exploded", "[highfps][lagbuffer]" )
+{
+	Driver drv = LagDriver( 250.0 );
+	drv.lag.testMode = LagTestMode::ForceMax;
+	drv.Run( 12 * 1000 * MS, 2.5 );
+	CHECK( drv.pacer.HistoryDepth() <= kHistoryMax );
+	CHECK( drv.pacer.BufferMs() <= double( kHistoryMax - kHistory - kHistoryMargin ) * 2.5 + 1e-6 );   // 150 ms
+	CHECK( drv.pacer.BufferMs() >= 145.0 );
+	for ( const Painted &p : drv.log )
+		CHECK( p.depth <= kHistoryMax );
+
+	// 1000 fps (the clamp): 60 frames x 1 ms.
+	Driver top = LagDriver( 250.0 );
+	top.lag.testMode = LagTestMode::ForceMax;
+	top.Run( 8 * 1000 * MS, 1.0 );
+	CHECK( top.pacer.HistoryDepth() <= kHistoryMax );
+	CHECK( top.pacer.BufferMs() <= 60.0 + 1e-6 );
+	CHECK( top.pacer.BufferMs() >= 55.0 );
 }
