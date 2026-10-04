@@ -5,9 +5,9 @@ gpu/build*/
 __pycache__/
 *.pyc
 .playwright-mcp/
-.claude/teamlead/.state/
 *.mp4
 *.mkv
 *.rgba
 *.png
 .local-work/
+.claude/
