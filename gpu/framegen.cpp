@@ -184,7 +184,7 @@ struct UiPC {
     float thr;
     int32_t reach, reset, tilesX, tilesY, stillLimit, maskX, maskY, maskW, maskH, maskStride, maskOff, gate, track;
     float cthr;                                          // CrosshairV2 (appended: the other passes never read these)
-    int32_t leave, reentry, binary, lumaOff;
+    int32_t leave, reentry, binary, lumaOff, open;       // open: ui_inpaint*.comp, see ui_common.glsl
 };
 static_assert(sizeof(UiPC) <= 128, "push constants beyond the guaranteed minimum");
 enum UiPipe { U_DETECT, U_BOX_UPDATE, U_BOX_MASK, U_MASK, U_INPAINT, U_PATCH, U_V2_UPDATE, U_V2_MASK, U_V2_FILL, U_COUNT, U_INPAINT_C = U_COUNT, U_PATCH_C, U_COUNT_ALL };   // _C: the CbCr plane (YUV only)
@@ -214,6 +214,7 @@ struct UiEntry {
     VkImageView key = VK_NULL_HANDLE;   // the host view this entry describes (null = dead)
     uint64_t seq = 0;                   // observe order (LRU, and "is this still the frame the estimate saw")
     UiBox bx{};                         // the box at observe time
+    UiBox wr{};                         // its work rectangle at observe time (the box plus its margin): the rectangle of the mask buffer, the inpaint and the patch
     bool hasBox = false, hasWs = false;
     bool v2 = false;                    // observed under CrosshairV2: the box buffer holds a V2 mask (255 paste / 64 confirmed), no clean copy
     bool active = false;                // in the LRU set (Settings::uiHistory of them); an inactive one keeps its memory
@@ -297,6 +298,7 @@ struct Interpolator::Impl {
     bool uiActive() const { return W && set.uiProtection != UiProtection::Off && uiImgs && (set.uiProtection != UiProtection::WholeScreen || uiWsRes); }
     uint32_t uiObserveSets() const { return set.uiProtection == UiProtection::WholeScreen ? 2 : 1; }
     UiBox computeBox() const;
+    UiBox computeWork(const UiBox& box) const;
     uint32_t localType(uint32_t bits) const;
     bool allocBuf(UiBuf& b, VkDeviceSize bytes);
     void freeBuf(UiBuf& b);
@@ -422,15 +424,42 @@ void Interpolator::boxSize(const Settings& set, uint32_t w, uint32_t h, uint32_t
     *boxH = set.uiBoxHeight ? (uint32_t)std::min(std::max((int)set.uiBoxHeight, 4), fh_) : (uint32_t)side;
 }
 
-UiBox Interpolator::Impl::computeBox() const {
-    const int fw_ = (int)W, fh_ = (int)H;
+// The box rectangle in the frame: boxSize() centred on the frame centre plus the offset, clamped into the frame.
+void Interpolator::boxRect(const Settings& set, uint32_t w, uint32_t h, int32_t r[4]) {
     uint32_t bw, bh;
-    Interpolator::boxSize(set, W, H, &bw, &bh);
-    UiBox b{};
-    b.w = (int)bw; b.h = (int)bh;
-    b.x = std::min(std::max((fw_ - b.w) / 2 + set.uiBoxOffsetX, 0), fw_ - b.w);
-    b.y = std::min(std::max((fh_ - b.h) / 2 + set.uiBoxOffsetY, 0), fh_ - b.h);
-    return b;
+    boxSize(set, w, h, &bw, &bh);
+    const int fw_ = (int)w, fh_ = (int)h;
+    r[2] = (int32_t)bw; r[3] = (int32_t)bh;
+    r[0] = std::min(std::max((fw_ - r[2]) / 2 + set.uiBoxOffsetX, 0), fw_ - r[2]);
+    r[1] = std::min(std::max((fh_ - r[3]) / 2 + set.uiBoxOffsetY, 0), fh_ - r[3]);
+}
+
+// How far past the box a mode protects (the "work rectangle", workRect()): the V1 mask dilates 2 px, V2's grow is 1 px. Both modes look
+// for UI only inside the box; the margin lets the rim of what they found, and V1's inpaint source, extend past its edge. WholeScreen
+// keeps its box exactly as it was (its detection and inpaint of the rest of the frame are not box-bound).
+uint32_t Interpolator::boxMargin(const Settings& set) {
+    return set.uiProtection == UiProtection::Crosshair ? 2u : set.uiProtection == UiProtection::CrosshairV2 ? 1u : 0u;
+}
+
+void Interpolator::workRect(const Settings& set, uint32_t w, uint32_t h, int32_t r[4]) {
+    boxRect(set, w, h, r);
+    const int m = (int)boxMargin(set);
+    const int x0 = std::max(r[0] - m, 0), y0 = std::max(r[1] - m, 0);
+    const int x1 = std::min(r[0] + r[2] + m, (int)w), y1 = std::min(r[1] + r[3] + m, (int)h);
+    r[0] = x0; r[1] = y0; r[2] = x1 - x0; r[3] = y1 - y0;
+}
+
+UiBox Interpolator::Impl::computeBox() const {
+    int32_t r[4];
+    Interpolator::boxRect(set, W, H, r);
+    return UiBox{r[0], r[1], r[2], r[3]};
+}
+
+UiBox Interpolator::Impl::computeWork(const UiBox& b) const {
+    const int m = (int)Interpolator::boxMargin(set);
+    const int x0 = std::max(b.x - m, 0), y0 = std::max(b.y - m, 0);
+    const int x1 = std::min(b.x + b.w + m, (int)W), y1 = std::min(b.y + b.h + m, (int)H);
+    return UiBox{x0, y0, x1 - x0, y1 - y0};
 }
 
 uint32_t Interpolator::Impl::localType(uint32_t bits) const {
@@ -1198,10 +1227,11 @@ void Interpolator::Impl::uiFlushPendingInit(VkCommandBuffer cb) {
 }
 
 // CrosshairV2 push constants shared by its observe / track / fill passes.
-static UiPC v2Pc(const Interpolator::Impl& I, const UiBox& bx) {
+static UiPC v2Pc(const Interpolator::Impl& I, const UiBox& bx, const UiBox& wr) {
     UiPC pc{};
     pc.W = (int)I.W; pc.H = (int)I.H;
     pc.boxX = bx.x; pc.boxY = bx.y; pc.boxW = bx.w; pc.boxH = bx.h;
+    pc.maskX = wr.x; pc.maskY = wr.y; pc.maskW = wr.w; pc.maskH = wr.h; pc.maskStride = (wr.w + 3) / 4; pc.maskOff = 4;   // the work rectangle: state layout and mask
     pc.still = (int)I.set.uiStillFrames;
     pc.thr = I.set.uiStillThreshold;
     pc.cthr = I.set.uiContrastThreshold;
@@ -1213,17 +1243,18 @@ static UiPC v2Pc(const Interpolator::Impl& I, const UiBox& bx) {
 // CrosshairV2 observe of one real frame: the state machine of the box (ui_v2_update) and then its mask (ui_v2_mask). No
 // clean copy, no inpaint: the entry only holds the mask. The caller has checked uiActive() and the set ring (1 set).
 bool Interpolator::Impl::uiObserveRecordV2(VkCommandBuffer cb, Frame view) {
-    const UiBox bx = computeBox();
+    const UiBox bx = computeBox(), wr = computeWork(bx);
     const int e = uiPick(view.view);
     UiEntry& E = uiE[e];
-    const VkDeviceSize maskWords = 4 + (VkDeviceSize)((bx.w + 3) / 4) * bx.h;
+    const VkDeviceSize maskWords = 4 + (VkDeviceSize)((wr.w + 3) / 4) * wr.h;
     const VkBuffer oldState = uiBoxState.b;
-    if (!growBuf(E.box, maskWords * 4) || !growBuf(uiBoxState, (VkDeviceSize)bx.w * bx.h * 16)) return false;   // 4 state words per pixel
+    if (!growBuf(E.box, maskWords * 4) || !growBuf(uiBoxState, (VkDeviceSize)wr.w * wr.h * 16)) return false;   // 4 state words per pixel of the work rectangle
     if (uiBoxState.b != oldState || !(bx == uiPrevBox)) uiBoxHist = false;
     uiPrevBox = bx;
     E.key = view.view;
     E.seq = ++uiSeq;
     E.bx = bx;
+    E.wr = wr;
     E.hasBox = true;
     E.hasWs = false;
     E.v2 = true;
@@ -1233,14 +1264,12 @@ bool Interpolator::Impl::uiObserveRecordV2(VkCommandBuffer cb, Frame view) {
     // WAR/WAW against every earlier record's use of this entry's mask and of the state buffer (the fill and the patch of an
     // earlier pair read the mask; the previous observe or track wrote the state)
     r.barrier(CS, RW, CS, RW);
-    UiPC pc = v2Pc(*this, bx);
+    UiPC pc = v2Pc(*this, bx, wr);
     pc.reset = !uiBoxHist;
     VkDescriptorSet boxSet = takeUiSetV2(view, uiBoxState, E.box);
-    uiDispatch(*this, cb, U_V2_UPDATE, boxSet, pc, divUp(bx.w, 8), divUp(bx.h, 8));
+    uiDispatch(*this, cb, U_V2_UPDATE, boxSet, pc, divUp(wr.w, 8), divUp(wr.h, 8));
     r.cbar();
-    const int boxStride = (bx.w + 3) / 4;
-    pc.maskX = bx.x; pc.maskY = bx.y; pc.maskW = bx.w; pc.maskH = bx.h; pc.maskStride = boxStride; pc.maskOff = 4;
-    uiDispatch(*this, cb, U_V2_MASK, boxSet, pc, divUp(boxStride, 8), divUp(bx.h, 8));
+    uiDispatch(*this, cb, U_V2_MASK, boxSet, pc, divUp(pc.maskStride, 8), divUp(wr.h, 8));
     r.cbar();
     r.stamp("ui_detect");
     uiBoxHist = true;
@@ -1250,18 +1279,18 @@ bool Interpolator::Impl::uiObserveRecordV2(VkCommandBuffer cb, Frame view) {
 
 // CrosshairV2 track: the same ui_v2_update pass an observe runs, on the same state, and nothing else (no mask, no entry).
 bool Interpolator::Impl::uiTrackRecordV2(VkCommandBuffer cb, Frame view) {
-    const UiBox bx = computeBox();
+    const UiBox bx = computeBox(), wr = computeWork(bx);
     const VkBuffer oldState = uiBoxState.b;
-    if (!growBuf(uiBoxState, (VkDeviceSize)bx.w * bx.h * 16)) return false;
+    if (!growBuf(uiBoxState, (VkDeviceSize)wr.w * wr.h * 16)) return false;
     if (uiBoxState.b != oldState || !(bx == uiPrevBox)) uiBoxHist = false;
     uiPrevBox = bx;
     Rec r(*this, cb);
     r.cbar();
-    UiPC pc = v2Pc(*this, bx);
+    UiPC pc = v2Pc(*this, bx, wr);
     pc.reset = !uiBoxHist;
     pc.track = 1;
     VkDescriptorSet boxSet = takeUiSetV2(view, uiBoxState, uiBoxState);   // the mask binding is a placeholder: ui_v2_update never touches it
-    uiDispatch(*this, cb, U_V2_UPDATE, boxSet, pc, divUp(bx.w, 8), divUp(bx.h, 8));
+    uiDispatch(*this, cb, U_V2_UPDATE, boxSet, pc, divUp(wr.w, 8), divUp(wr.h, 8));
     r.cbar();
     uiBoxHist = true;
     uiCellHist = false;
@@ -1273,15 +1302,14 @@ bool Interpolator::Impl::uiTrackRecordV2(VkCommandBuffer cb, Frame view) {
 // own descriptor set afterwards.
 void Interpolator::Impl::uiRecordLumaFill(VkCommandBuffer cb, Frame frame, const UiEntry& E, int lumaOff) {
     if (!E.hasBox) return;
-    UiPC pc = v2Pc(*this, E.bx);
+    UiPC pc = v2Pc(*this, E.bx, E.wr);   // the mask rectangle = the work rectangle the entry was observed with
     pc.cell = (int)set.flowScale; pc.cw = fw; pc.ch = fh;
     pc.reach = 8;
-    pc.maskX = E.bx.x; pc.maskY = E.bx.y; pc.maskW = E.bx.w; pc.maskH = E.bx.h; pc.maskStride = (E.bx.w + 3) / 4; pc.maskOff = 4;
     pc.lumaOff = lumaOff;
     UiBuf luma; luma.b = buf[0]; luma.size = bufSize[0];
     VkDescriptorSet fillSet = takeUiSetV2(frame, luma, E.box);
     const int S = (int)set.flowScale;
-    const int cells0 = E.bx.x / S, cells1 = (E.bx.x + E.bx.w - 1) / S, rows0 = E.bx.y / S, rows1 = (E.bx.y + E.bx.h - 1) / S;
+    const int cells0 = E.wr.x / S, cells1 = (E.wr.x + E.wr.w - 1) / S, rows0 = E.wr.y / S, rows1 = (E.wr.y + E.wr.h - 1) / S;
     uiDispatch(*this, cb, U_V2_FILL, fillSet, pc, divUp(cells1 - cells0 + 1, 8), divUp(rows1 - rows0 + 1, 8));
 }
 
@@ -1290,12 +1318,13 @@ void Interpolator::Impl::uiRecordLumaFill(VkCommandBuffer cb, Frame frame, const
 bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
     if (v2()) return uiObserveRecordV2(cb, view);
     const bool ws = set.uiProtection == UiProtection::WholeScreen;
-    const UiBox bx = computeBox();
+    const UiBox bx = computeBox(), wr = computeWork(bx);   // wr = the box plus its margin (none for WholeScreen): the mask, inpaint and patch rectangle
     const int e = uiPick(view.view);
     UiEntry& E = uiE[e];
-    // buffers first (they may fail and must not leave a half-observed entry): the box mask of this entry, and the
-    // box state; growing the state buffer or moving the box restarts the box counters
-    const VkDeviceSize maskWords = 4 + (VkDeviceSize)((bx.w + 3) / 4) * bx.h;
+    // buffers first (they may fail and must not leave a half-observed entry): the box mask of this entry (work
+    // rectangle), and the box state (box only: detection never looks outside it); growing the state buffer or moving
+    // the box restarts the box counters
+    const VkDeviceSize maskWords = 4 + (VkDeviceSize)((wr.w + 3) / 4) * wr.h;
     const VkBuffer oldState = uiBoxState.b;
     if (!growBuf(E.box, maskWords * 4) || !growBuf(uiBoxState, (VkDeviceSize)bx.w * bx.h * 4)) return false;
     if (uiBoxState.b != oldState || !(bx == uiPrevBox)) uiBoxHist = false;
@@ -1306,6 +1335,7 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
     E.key = view.view;
     E.seq = ++uiSeq;
     E.bx = bx;
+    E.wr = wr;
     E.hasBox = true;
     E.hasWs = ws;
     E.v2 = false;
@@ -1328,7 +1358,7 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
     pc.reach = (int)set.uiInpaintReach;
     pc.tilesX = tilesX; pc.tilesY = tilesY;
     pc.stillLimit = (int)std::floor((double)set.uiMaxStillFraction * cw * ch);
-    const int fullStride = ((int)W + 3) / 4, boxStride = (bx.w + 3) / 4;
+    const int fullStride = ((int)W + 3) / 4, boxStride = (wr.w + 3) / 4;
 
     VkDescriptorSet boxSet = takeUiSet(view, E.frame(), uiBoxState, E.box);
     VkDescriptorSet wsSet = ws ? takeUiSet(view, E.frame(), uiCellState, E.ws) : VK_NULL_HANDLE;
@@ -1341,8 +1371,8 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
     pc.reset = !uiBoxHist;
     uiDispatch(*this, cb, U_BOX_UPDATE, boxSet, pc, divUp(bx.w, 8), divUp(bx.h, 8));
     r.cbar();
-    pc.maskX = bx.x; pc.maskY = bx.y; pc.maskW = bx.w; pc.maskH = bx.h; pc.maskStride = boxStride; pc.maskOff = 4; pc.gate = 0;
-    uiDispatch(*this, cb, U_BOX_MASK, boxSet, pc, divUp(boxStride, 8), divUp(bx.h, 8));
+    pc.maskX = wr.x; pc.maskY = wr.y; pc.maskW = wr.w; pc.maskH = wr.h; pc.maskStride = boxStride; pc.maskOff = 4; pc.gate = 0;
+    uiDispatch(*this, cb, U_BOX_MASK, boxSet, pc, divUp(boxStride, 8), divUp(wr.h, 8));
     // 3. whole screen: the full-resolution mask of the flagged tiles
     if (ws) {
         pc.maskX = pc.maskY = 0; pc.maskW = (int)W; pc.maskH = (int)H; pc.maskStride = fullStride;
@@ -1357,9 +1387,11 @@ bool Interpolator::Impl::uiObserveRecord(VkCommandBuffer cb, Frame view) {
         if (yuv) uiDispatch(*this, cb, U_INPAINT_C, wsSet, pc, divUp(((int)W + 1) / 2, 8), divUp(((int)H + 1) / 2, 8));   // the other plane: no hazard
     }
     r.cbar();
-    pc.maskX = bx.x; pc.maskY = bx.y; pc.maskW = bx.w; pc.maskH = bx.h; pc.maskStride = boxStride; pc.maskOff = 4; pc.gate = 0;
-    uiDispatch(*this, cb, U_INPAINT, boxSet, pc, divUp(bx.w, kUiInpTile), divUp(bx.h, kUiInpTile));
-    if (yuv) uiDispatch(*this, cb, U_INPAINT_C, boxSet, pc, chromaGroups(bx.x, bx.w), chromaGroups(bx.y, bx.h));
+    pc.maskX = wr.x; pc.maskY = wr.y; pc.maskW = wr.w; pc.maskH = wr.h; pc.maskStride = boxStride; pc.maskOff = 4; pc.gate = 0;
+    pc.open = boxMargin(set) > 0;   // the rectangle is the box plus a margin: beyond it is real, unmasked background (a valid walk end)
+    uiDispatch(*this, cb, U_INPAINT, boxSet, pc, divUp(wr.w, kUiInpTile), divUp(wr.h, kUiInpTile));
+    if (yuv) uiDispatch(*this, cb, U_INPAINT_C, boxSet, pc, chromaGroups(wr.x, wr.w), chromaGroups(wr.y, wr.h));
+    pc.open = 0;
     r.cbar();
     r.stamp("ui_inpaint");
 
@@ -1428,12 +1460,12 @@ void Interpolator::Impl::uiRecordPatch(VkCommandBuffer cb, Frame curr, Frame out
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
     }
     if (E.hasBox) {
-        pc.maskX = E.bx.x; pc.maskY = E.bx.y; pc.maskW = E.bx.w; pc.maskH = E.bx.h;
-        pc.maskStride = (E.bx.w + 3) / 4; pc.maskOff = 4; pc.gate = 0;
+        pc.maskX = E.wr.x; pc.maskY = E.wr.y; pc.maskW = E.wr.w; pc.maskH = E.wr.h;   // the work rectangle: the box plus its margin
+        pc.maskStride = (E.wr.w + 3) / 4; pc.maskOff = 4; pc.gate = 0;
         pc.binary = E.v2;   // CrosshairV2: only mask bytes of 255 (unchanged in this pair) are pasted
         VkDescriptorSet boxSet = takeUiSet(curr, out, uiBoxState, E.box);
-        uiDispatch(*this, cb, U_PATCH, boxSet, pc, divUp(pc.maskStride, 8), divUp(E.bx.h, 8));
-        if (yuv) uiDispatch(*this, cb, U_PATCH_C, boxSet, pc, chromaGroups(E.bx.x, E.bx.w), chromaGroups(E.bx.y, E.bx.h));
+        uiDispatch(*this, cb, U_PATCH, boxSet, pc, divUp(pc.maskStride, 8), divUp(E.wr.h, 8));
+        if (yuv) uiDispatch(*this, cb, U_PATCH_C, boxSet, pc, chromaGroups(E.wr.x, E.wr.w), chromaGroups(E.wr.y, E.wr.h));
     }
 }
 

@@ -10,10 +10,11 @@
 layout(set = 0, binding = 5, FG_FMTC) uniform writeonly image2D dstC;
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// pixel state: 0 unmasked, 1 masked, 2 outside the mask rectangle (unknown)
+// pixel state: 0 unmasked, 1 masked, 2 outside the mask rectangle (unknown; with pc.open: outside the frame)
 uint pxState(ivec2 q) {
     ivec2 rel = q - ivec2(pc.maskX, pc.maskY);
-    if (rel.x < 0 || rel.y < 0 || rel.x >= pc.maskW || rel.y >= pc.maskH) return 2u;
+    if (rel.x < 0 || rel.y < 0 || rel.x >= pc.maskW || rel.y >= pc.maskH)
+        return (pc.open != 0 && q.x >= 0 && q.y >= 0 && q.x < pc.W && q.y < pc.H) ? 0u : 2u;   // open: real background up to the frame edge
     if (pc.gate != 0 && !tileLive(q / TILE)) return 0u;
     return maskByte(rel) != 0u ? 1u : 0u;
 }
