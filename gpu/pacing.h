@@ -492,6 +492,11 @@ namespace framegen::pacing
 	// The time the next extra-timer output frame is painted for: one output
 	// interval after the previous one's, never in the past (a late wakeup does
 	// not make up lost slots with a burst), and at once when there is no previous.
+	// ulLastTarget is the previous TARGET (the presentNs the paint was given), NOT the
+	// time the paint ended: anchored to the target a paint shorter than the interval does
+	// not stretch the cadence (period o); anchored to the paint's end the period would be
+	// o + paint time (a user measured 1 / (o + 1.05 ms): 335 -> ~247 fps). Only a tick
+	// more than a whole interval late restarts the grid at now.
 	inline Ns NextExtraTargetNs( Ns ulLastTarget, Ns ulNow, double flOutputMs )
 	{
 		if ( ulLastTarget == 0 )

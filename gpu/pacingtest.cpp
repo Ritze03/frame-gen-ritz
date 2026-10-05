@@ -1358,6 +1358,138 @@ TEST_CASE( "pacing: the extra timer's next target is one output interval on, nev
 	CHECK( NextExtraTargetNs( 100 * MS, 130 * MS, 1.25 ) == 130 * MS );           // late: no burst of lost slots
 }
 
+// The extra timer's cadence reaches the target (2026-10-05). THE REPORT: in the user's session
+// (nested Wayland, Hyprland at 280 Hz, the output timer active above the refresh) the presented
+// rate was 1 / (o + ~1.05 ms), o = 1000 / target: target 335 gave ~247, 420 gave ~290, 1000
+// gave ~500-580, independent of blur samples, game load and fps. THE SUSPECT was that the next
+// tick is anchored to "now" after the paint (period = o + paint time). THE FINDING: it is not
+// in this header: NextExtraTargetNs() has anchored to the PREVIOUS TARGET (never to the time
+// the paint ended) since it was written, and the host (steamcompmgr.cpp FrameGen_ArmExtraTimer)
+// passes the previous tick's target (ulLastV = Inputs::presentNs) as it. These tests pin that
+// with a host that arms its timer AFTER a paint that takes 1.05 ms.
+
+namespace
+{
+	// Ticks per second of a host that arms the next tick after the paint, which takes flPaintMs.
+	// bAnchorNow models the suspected bug (the next tick is one interval after the paint's end).
+	double ExtraTickRate( double flTarget, double flPaintMs, bool bAnchorNow )
+	{
+		const double flOutMs = 1000.0 / flTarget;
+		Ns tTarget = 1 * MS;
+		int n = 0;
+		const Ns tEnd = 3000 * MS;
+		while ( tTarget < tEnd )
+		{
+			n++;
+			const Ns tPaintEnd = tTarget + Ns( flPaintMs * 1e6 );
+			tTarget = bAnchorNow ? tPaintEnd + Ns( flOutMs * 1e6 ) : NextExtraTargetNs( tTarget, tPaintEnd, flOutMs );
+		}
+		return double( n ) / 3.0;
+	}
+}
+
+TEST_CASE( "pacing: a paint that takes less than the output interval does not stretch the extra timer's cadence", "[pacing][extratimer]" )
+{
+	for ( double flTarget : { 335.0, 420.0, 600.0 } )
+	{
+		const double flRate = ExtraTickRate( flTarget, 1.05, false );
+		const double flOld = ExtraTickRate( flTarget, 1.05, true );
+		INFO( "target " << flTarget << ": anchored to the previous target " << flRate << "/s, anchored to the paint's end " << flOld << "/s" );
+		CHECK( std::fabs( flRate - flTarget ) <= 0.02 * flTarget );
+		CHECK( flOld < 0.85 * flTarget );        // the 1 / (o + 1.05 ms) of the report: the test has teeth
+	}
+	// a paint longer than the interval is the limit, as it must be: no catching up with a burst
+	const double flSlow = ExtraTickRate( 1000.0, 1.05, false );
+	CHECK( flSlow < 960.0 );
+	CHECK( flSlow > 900.0 );
+}
+
+TEST_CASE( "pacing: a late extra tick (more than an interval) restarts the grid and never bursts the lost slots", "[pacing][extratimer]" )
+{
+	const double flOutMs = 1000.0 / 335.0;
+	Ns tTarget = 100 * MS;
+	tTarget = NextExtraTargetNs( tTarget, tTarget + 1 * MS, flOutMs );               // on schedule
+	CHECK( tTarget == 100 * MS + Ns( flOutMs * 1e6 ) );
+	// the host stalls 20 ms (6 intervals) in this paint: the next target is "now", not 6 slots in the past
+	const Ns tLate = tTarget + 20 * MS;
+	Ns t1 = NextExtraTargetNs( tTarget, tLate, flOutMs );
+	CHECK( t1 == tLate );
+	// and from there the grid carries on one interval at a time: no tick closer than o
+	Ns t2 = NextExtraTargetNs( t1, t1 + 1 * MS, flOutMs );
+	CHECK( t2 - t1 == Ns( flOutMs * 1e6 ) );
+	// a slightly late one (under an interval) keeps the grid: the next target is still one o after it
+	const Ns t3 = t2 + Ns( flOutMs * 1e6 ) / 2;
+	CHECK( NextExtraTargetNs( t2, t3, flOutMs ) == t2 + Ns( flOutMs * 1e6 ) );
+}
+
+namespace
+{
+	// The pacer driven as steamcompmgr.cpp drives it on the extra timer: arrivals noticed at once,
+	// a paint per tick at V = the tick's target taking flPaintMs, the next tick armed after the
+	// paint (while the decision asks for one or a real frame arrived), one output interval after
+	// the previous TARGET. Outputs per second once settled.
+	double ExtraPacedOutputRate( int nTarget, double flGameFps, Priority ePriority, double flPaintMs )
+	{
+		Pacer pacer;
+		Pacer::Inputs in;
+		in.mode = Mode::Target;
+		in.targetFps = nTarget;
+		in.priority = ePriority;
+		in.refreshHz = 280.0;
+		in.pauseAtRefresh = false;
+		in.canExceedRefresh = true;
+		const Ns tEnd = 8000 * MS, tMeasure = 3000 * MS;
+		const double flIntervalMs = 1000.0 / flGameFps;
+		uint64_t id = 0;
+		Ns nextArr = 1 * MS, now = 1 * MS, lastV = 0, armedTarget = 0;
+		bool bArmed = false, bWantNext = false, bRepaint = false;
+		int nOut = 0;
+		while ( now < tEnd )
+		{
+			while ( nextArr <= now )
+			{
+				pacer.OnArrival( ++id, nextArr, 1, FrameFormat{ 1920, 1080, 87 } );
+				bRepaint = true;
+				nextArr += Ns( flIntervalMs * 1e6 );
+			}
+			if ( !bArmed && ( bRepaint || bWantNext ) )
+			{
+				armedTarget = pacer.ExtraTimer() ? NextExtraTargetNs( lastV, now, pacer.OutputMs() ) : now;
+				bArmed = true;
+			}
+			if ( !bArmed || nextArr < armedTarget )
+			{
+				now = std::max( now, nextArr );
+				continue;
+			}
+			now = std::max( now, armedTarget );
+			bArmed = false;
+			in.now = now;
+			in.presentNs = armedTarget;
+			const Pacer::Decision d = pacer.OnPaint( in, id, true, false );
+			if ( armedTarget > tMeasure && d.newOutput )
+				nOut++;
+			lastV = armedTarget;
+			bRepaint = false;
+			bWantNext = d.repaintNext;
+			now += Ns( flPaintMs * 1e6 );
+		}
+		return double( nOut ) / double( tEnd - tMeasure ) * 1e9;
+	}
+}
+
+TEST_CASE( "pacing: the pacer on the extra timer reaches its target with a 1.05 ms paint (335, 420, 600 at 177 and 100 fps)", "[pacing][extratimer]" )
+{
+	for ( Priority ePriority : { Priority::Smoothness, Priority::LowLatency } )
+		for ( int nTarget : { 335, 420, 600 } )
+			for ( double flFps : { 177.0, 100.0 } )
+			{
+				const double flRate = ExtraPacedOutputRate( nTarget, flFps, ePriority, 1.05 );
+				INFO( ( ePriority == Priority::Smoothness ? "smoothness" : "low latency" ) << " target " << nTarget << " game " << flFps << " fps: " << flRate << " outputs/s" );
+				CHECK( std::fabs( flRate - nTarget ) <= 0.02 * nTarget );
+			}
+}
+
 TEST_CASE( "pacing: only the extra timer paints while it paces the output", "[pacing]" )
 {
 	// Not generating: the loop as without frame generation.
