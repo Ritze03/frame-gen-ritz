@@ -303,11 +303,19 @@ namespace framegen::pacing
 	// value before it is clamped (a hitch counts as two frame times, not as 50 ms).
 	constexpr double kSteadyTauMs     = 300.0;
 	constexpr double kSteadyClamp     = 2.0;
-	// ExtraTimer() band: paint on its own timer once the output interval is more
-	// than 2% shorter than a tick, back to the tick timer once it is more
-	// than 2% longer (the same 2% the cadence in PaintGenerated() uses).
+	// ExtraTimer() band, as a ratio o / tick of the output interval o to the display tick:
+	// paint on its own timer once o is more than 2% SHORTER than a tick (o < 0.98 tick,
+	// the same 2% the cadence in PaintGenerated() uses), and go back to the tick timer
+	// once o is no longer clearly shorter, o >= 0.995 tick. Between the two the previous
+	// state holds, so an o hovering a hair under a tick does not flap. Both thresholds sit
+	// BELOW o == tick: equality, which is exactly what Target "display refresh" yields,
+	// must mean "not extra".
+	// Why: the leave threshold used to be 1.02 (above o == tick), so once the timer had
+	// been entered, e.g. by sweeping the Target slider above the refresh, `o < 1.02 tick`
+	// stayed true at o == tick and it never left: a user's journal showed
+	// "target display refresh ... (output timer)" for minutes in a Forza session.
 	constexpr double kExtraEnter      = 0.98;
-	constexpr double kExtraLeave      = 1.02;
+	constexpr double kExtraLeave      = 0.995;
 	// No output interval is shorter than this (2000 fps): a fixed 2x of a 1000 fps game, or any 4x+ of a 500+ fps one.
 	constexpr double kMinOutputMs     = 0.5;
 	// Generation (estimate + synths) may use at most this share of a game
@@ -1746,7 +1754,7 @@ namespace framegen::pacing
 			if ( !bCap && !bRealRate )
 			{
 				const double flTickMs = 1000.0 / std::max( in.refreshHz, 1.0 );
-				m_bExtra = flOutMs < flTickMs * ( m_bExtraPrev ? kExtraLeave : kExtraEnter );
+				m_bExtra = m_bExtraPrev ? flOutMs < flTickMs * kExtraLeave : flOutMs < flTickMs * kExtraEnter;
 			}
 			m_bExtraPrev = m_bExtra;
 		}

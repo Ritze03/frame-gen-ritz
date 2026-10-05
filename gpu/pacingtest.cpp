@@ -4455,3 +4455,59 @@ TEST_CASE( "status: generating is the steady signal, activeN the instantaneous o
 	CHECK_FALSE( r.fgActive );
 	CHECK_FALSE( r.generating );
 }
+
+// ---------------------------------------------------------------------------
+//  The extra timer's enter / leave band around o == tick
+// ---------------------------------------------------------------------------
+
+namespace
+{
+	// 100 Hz (10 ms tick), a 30 fps game, Target mode, the output timer allowed.
+	// Feeds a few seconds at the given target and returns ExtraTimer() afterwards.
+	bool ExtraAtTarget( Driver &drv, int nTarget )
+	{
+		drv.targetFps = nTarget;
+		drv.Run( 1500 * MS, 1000.0 / 30.0 );
+		return drv.pacer.ExtraTimer();
+	}
+
+	Driver ExtraBandDriver()
+	{
+		Driver drv;
+		drv.refreshHz = 100.0;
+		drv.mode = Mode::Target;
+		drv.pauseAtRefresh = false;
+		drv.canExceed = true;
+		return drv;
+	}
+}
+
+TEST_CASE( "pacing: the extra timer leaves when the target drops back to the display refresh", "[pacing]" )
+{
+	Driver drv = ExtraBandDriver();
+	CHECK( ExtraAtTarget( drv, 200 ) );          // o = 5 ms < 0.98 tick: entered
+	CHECK( std::fabs( drv.pacer.OutputMs() - 5.0 ) < 1e-6 );
+	CHECK_FALSE( ExtraAtTarget( drv, 0 ) );      // display refresh: o == tick, must leave
+	CHECK( std::fabs( drv.pacer.OutputMs() - 10.0 ) < 1e-6 );
+	CHECK_FALSE( ExtraAtTarget( drv, 100 ) );    // an explicit target of the refresh too
+}
+
+TEST_CASE( "pacing: o == tick from the start never enters the extra timer", "[pacing]" )
+{
+	Driver drv = ExtraBandDriver();
+	CHECK_FALSE( ExtraAtTarget( drv, 0 ) );
+	CHECK( std::fabs( drv.pacer.OutputMs() - 10.0 ) < 1e-6 );
+}
+
+TEST_CASE( "pacing: the extra timer's band does not flap for o a hair under a tick", "[pacing]" )
+{
+	// 101 fps -> o = 9.90 ms = 0.990 tick: inside the band (0.98 .. 0.995).
+	Driver fresh = ExtraBandDriver();
+	CHECK_FALSE( ExtraAtTarget( fresh, 101 ) );  // not entered from below the band's top edge
+	// 103 fps -> 0.971 tick: enters; then 101 stays in; then the refresh leaves.
+	Driver drv = ExtraBandDriver();
+	CHECK( ExtraAtTarget( drv, 103 ) );
+	CHECK( ExtraAtTarget( drv, 101 ) );
+	CHECK_FALSE( ExtraAtTarget( drv, 100 ) );
+	CHECK_FALSE( ExtraAtTarget( drv, 101 ) );    // and a hair under does not re-enter
+}
