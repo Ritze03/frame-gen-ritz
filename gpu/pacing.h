@@ -145,9 +145,13 @@
 // time is still inside the pair that ends at the late frame and the gap is filled with
 // generated frames instead of frozen. It is independent of the multiplier and of
 // blur; it adds to D and to nothing else.
-//   * DETECTION (OnArrival): an interval above kLagSpikeRatio (1.75) x the smoothed
-//     interval is a spike of size  interval - smoothed  ms ("missing frames x
-//     interval"). Kept in a ring of kLagSpikeMax (time, size).
+//   * DETECTION (OnArrival): an interval above kLagSpikeRatio (1.3; 1.75 until 2026-10-05) x
+//     the smoothed interval AND at least kLagSpikeMinMs (2 ms) longer is a spike of size
+//     interval - smoothed  ms ("missing frames x interval"). Kept in a ring of kLagSpikeMax
+//     (time, size). Why 1.3: the user wanted a hiccup shorter than a missing frame (14 ms at
+//     10 ms, 1.4x) to count and be bridged next time; ordinary jitter (60 fps +-4 ms peaks at
+//     1.24x) stays under it, and the 2 ms floor keeps a fast game's noise (a 240 fps game's
+//     4.2 ms interval x 1.3 is 1.2 ms) from being a spike. No jitter floor beyond that.
 //   * JUDGEMENT: a spike larger than maxBufferMs is an OUTLIER (a shader compile, a
 //     disk hitch: 10 fps): never sized for, only counted (Report::outliersIgnored).
 //   * RECENCY: weight w(age) = 0.3 + 0.7 x (1 + cos(pi x age / lookback)) / 2 for
@@ -158,9 +162,26 @@
 //     the base is at least kLagFloorFrac (0.5) x the session's EWMA of spike sizes
 //     (alpha 0.15), so history is not thrown away. Target = base x 1.10 + 1 ms, clamped
 //     to [0, maxBufferMs] (and to what kHistoryMax frames can hold at this game rate).
-//   * RAMP: D_buf never jumps. It moves toward the target by at most kLagRampEps (3 %)
+//   * STALL CREDIT (2026-10-05): a spike larger than the delay applied (m_flDelayMs, the
+//     total D of the last paint; 0 when passing through) and within maxBufferMs grows D_buf
+//     AT ONCE by the difference (NoteSpike notes it, UpdateBuffer spends it, never past the
+//     target and so never past the history cap, ForceMax, or the instant-off). Why: the
+//     display already stood still for the stall, so the content time may resume from where
+//     it stopped (tau = V - D_new lands on the held instant; the existing tau monotonic
+//     clamp keeps it from going back) instead of freezing again on the next spike. Measured
+//     with the ramp alone (100 fps, max 50, 60 ms stalls at 3, 3.5, 4, 5 s from nothing):
+//     freezes of 58, 42, 29 and 0 ms -- "it waits"; with the credit 58, 0, 0, 0. The user:
+//     "it should still detect lags and based on that determine the buffer size, but
+//     otherwise it should make sure that for example we have a buffer of 50 and usually we
+//     get a frame every 10 milliseconds, but then there isn't a frame for 14 milliseconds,
+//     then it should just generate the frames for that as soon as it can based on the next
+//     frame, if the lag spike was bigger than the buffer, then it obviously can't do that.
+//     But then it should increase the buffer and then it should start working again", and
+//     "We need to keep ignoring everything above max, since thats what max is for."
+//   * RAMP: D_buf otherwise never jumps. It moves toward the target by at most kLagRampEps (3 %)
 //     of real time, i.e. content time plays at 0.97x while it grows and 1.03x while it
-//     shrinks (tau stays monotonic). Shrinking starts only after the target has been
+//     shrinks (tau stays monotonic): the margin above the credited size, a raised max, the
+//     test modes and all shrinking. Shrinking starts only after the target has been
 //     more than 3 ms below D_buf for 2 s (the look-back decay, not a flicker).
 //     EXCEPTION: switching the buffer OFF (LagBufferSettings::enabled false) drops it to 0
 //     on the very next paint: one forward step of tau, which stays monotonic.
@@ -170,7 +191,8 @@
 //     interval) + 2, 3 with no delay: it grows AHEAD of the ramp and shrinks only
 //     after a 2 s dwell and only past frames the content time has left.
 // The buffer works because D >= spike: the late frame has arrived by the time the
-// content time needs the gap filled. The first hitch of a session always freezes.
+// content time needs the gap filled. The first hitch of a session always freezes, and so does
+// one larger than the delay then applied -- once: it grows the delay to its size on the spot.
 
 // THE GENERATE / PASS DECISION (Pacer::Evaluate; 2026-10-05, from a user report).
 // Whether the pacer generates or passes the game's frames through is decided on the ratio
@@ -210,9 +232,18 @@
 // later; a 50 ms or 90 ms hitch changes nothing (a stall of kGapResetNs or more is the gap
 // path, as before).
 // THE STEADY "GENERATING" SIGNAL (Report::generating, steadyMultiplier): fgActive / activeN
-// report the INSTANTANEOUS state, so a HUD fed by them said "generating" at an effective
-// 0.9x..1.2x too. See Report for the two fields (generated frames presented within ~1 s AND
-// >= 1.2x over the last ~1 s, with a 1.1x keep band).
+// report the INSTANTANEOUS state. generating = the pacer is in the Generate state AND a generated
+// frame (t < 1 from a pair) was presented within the last ~1 s: NO multiplier gate (2026-10-05).
+// Why: it first demanded an effective multiplier of >= 1.2x to turn on (>= 1.1x to stay), and
+// when the output was paint-limited (target 335, game ~177 fps, ~1.28x) the multiplier hovered
+// at the gate so a HUD's "game > output" separator flipped to the lone number while frame
+// generation was generating all along. The user: "If its generating any frames, it should show
+// the '>'. Otherwise that differentiation is useless." steadyMultiplier stays, informational
+// only (the real ratio, for a line like "1.28x"). A genuinely ~1x pass-through is not
+// Generate (the decision's own band, see THE GENERATE / PASS DECISION), so it reads false.
+// MEASURED (paint-limited extra-timer host, target 335, 177 fps game, steady multiplier 1.18 /
+// 1.13 / 1.09 / 1.05 / 1.01): the old signal read "generating" 40% / 0% / 0% / 0% / 0% of
+// the status samples while frames were being generated all along; the new one 100%.
 
 // VIDEO / TIMESTAMPS MODE (Pacer::OnFrame; the default stays arrival-timed, byte-identical).
 // A video's frames carry presentation timestamps (PTS) and the decoder has the next ones
@@ -294,13 +325,12 @@ namespace framegen::pacing
 	constexpr double kPtsSnap         = 1e-4;
 	// Status is worth publishing this often.
 	constexpr Ns     kStatusPeriodNs  = 250 * kNsPerMs;
-	// Report::generating (the steady "frame generation is visibly working" signal): generated
-	// frames must have been presented within kGeneratingRecentNs, and the multiplier over the
-	// last kGeneratingWindowNs of status windows must be at least kGeneratingMinMult.
+	// Report::generating (the steady "frame generation is visibly working" signal): the plan is
+	// Generate and a generated frame was presented within kGeneratingRecentNs (no multiplier gate).
+	// Report::steadyMultiplier (informational) is taken over the last kGeneratingWindowNs of status
+	// windows.
 	constexpr Ns     kGeneratingRecentNs = 1000 * kNsPerMs;
 	constexpr Ns     kGeneratingWindowNs = 1000 * kNsPerMs;
-	constexpr double kGeneratingMinMult  = 1.2;     // to turn on ...
-	constexpr double kGeneratingKeepMult = 1.1;     // ... and to stay on (a band: no flicker at the edge)
 	constexpr int    kStatusWindows      = 8;
 
 	// The largest fixed multiplier a host should offer (Inputs::multiplier is 2..kMaxN).
@@ -333,7 +363,8 @@ namespace framegen::pacing
 	constexpr double kDepthShrinkDwellMs = 2000.0;
 
 	// ---- the lag-spike buffer's constants (see LagBufferSettings and "LAG-SPIKE BUFFER") ----
-	constexpr double kLagSpikeRatio    = 1.75;    // an interval above this x the smoothed one is a spike
+	constexpr double kLagSpikeRatio    = 1.3;     // an interval above this x the smoothed one is a spike (1.75 until 2026-10-05) ...
+	constexpr double kLagSpikeMinMs    = 2.0;     // ... and at least this many ms longer than it (a 240 fps game's 4.2 ms x 1.3 is 1.2 ms of noise)
 	constexpr int    kLagSpikeMax      = 64;      // spikes remembered (the lowest-weighted is replaced when full)
 	constexpr double kLagWeightMin     = 0.3;     // a spike's weight at the end of the look-back window (1 when new, 0 beyond)
 	constexpr double kLagMarginFrac    = 0.10;    // target = size x (1 + this) + kLagMarginMs
@@ -469,6 +500,11 @@ namespace framegen::pacing
 	// The time the next extra-timer output frame is painted for: one output
 	// interval after the previous one's, never in the past (a late wakeup does
 	// not make up lost slots with a burst), and at once when there is no previous.
+	// ulLastTarget is the previous TARGET (the presentNs the paint was given), NOT the
+	// time the paint ended: anchored to the target a paint shorter than the interval does
+	// not stretch the cadence (period o); anchored to the paint's end the period would be
+	// o + paint time (a user measured 1 / (o + 1.05 ms): 335 -> ~247 fps). Only a tick
+	// more than a whole interval late restarts the grid at now.
 	inline Ns NextExtraTargetNs( Ns ulLastTarget, Ns ulNow, double flOutputMs )
 	{
 		if ( ulLastTarget == 0 )
@@ -846,14 +882,17 @@ namespace framegen::pacing
 			int    outliersIgnored = 0;        // spikes inside the window larger than maxBufferMs: ignored for sizing
 			int    historyFrames = kHistory;   // HistoryDepth(): real frames the host keeps (and UI-protection clean copies)
 			// THE STEADY "GENERATING" SIGNAL, for a HUD that must not flicker. fgActive / activeN
-			// follow the pacer's instantaneous state and say "generating" even at an effective
-			// 1.0x; these two say whether frame generation is visibly adding frames:
+			// follow the pacer's instantaneous state; these two say whether frame generation is
+			// adding frames:
+			//   generating       -- fgActive (the plan is Generate, frame generation on, not a
+			//                       pass-through) AND a generated frame (t < 1 from a pair) was
+			//                       presented within the last ~1 s (kGeneratingRecentNs). NO
+			//                       multiplier gate: any generated frame counts, so a paint-limited
+			//                       output at ~1.1x-1.3x does not flip. Never true while passing
+			//                       through; a blur window on a real frame is not a generated one.
 			//   steadyMultiplier -- presented outputs per real frame over the last ~1 s of status
 			//                       windows (kGeneratingWindowNs), 0 until a window has real frames.
-			//   generating       -- fgActive AND a generated frame was presented within the last
-			//                       ~1 s (kGeneratingRecentNs) AND steadyMultiplier >= 1.2
-			//                       (kGeneratingMinMult) to turn on, >= 1.1 (kGeneratingKeepMult) to
-			//                       stay on. Never true while passing through.
+			//                       Informational: it does not gate `generating`.
 			float  steadyMultiplier = 0.0f;
 			bool   generating = false;
 		};
@@ -1156,12 +1195,10 @@ namespace framegen::pacing
 						s.fgActive = true;
 						if ( s.gameFps > 0.0f )
 							s.activeN = std::max( 2, int( std::lround( s.effectiveMultiplier ) ) );
-						s.generating = m_bHaveSynth && ulNow >= m_ulLastSynthAt && ulNow - m_ulLastSynthAt <= kGeneratingRecentNs
-							&& s.steadyMultiplier >= float( m_bGenerating ? kGeneratingKeepMult : kGeneratingMinMult );
+						s.generating = m_bHaveSynth && ulNow >= m_ulLastSynthAt && ulNow - m_ulLastSynthAt <= kGeneratingRecentNs;
 					}
 				}
 			}
-			m_bGenerating = s.generating;
 			return s;
 		}
 
@@ -1262,6 +1299,7 @@ namespace framegen::pacing
 			m_flBufMs = 0.0;
 			m_flTargetMs = 0.0;
 			m_flLowMs = 0.0;
+			m_flStarveMs = 0.0;
 			m_ulExtraNs = 0;
 			m_ulLagLastAt = 0;
 			m_flLagShownMs = 0.0;
@@ -1283,12 +1321,18 @@ namespace framegen::pacing
 				return;
 			const double flSmooth = m_Est.IntervalMs();
 			const double flMs = double( ulIntervalNs ) / double( kNsPerMs );
-			if ( !( flMs > kLagSpikeRatio * flSmooth ) )
-				return;
 			const double flSize = flMs - flSmooth;
+			if ( !( flMs > kLagSpikeRatio * flSmooth ) || flSize < kLagSpikeMinMs )
+				return;
 			m_ulLagLastAt = tNs;
 			if ( flSize <= m_flLagMaxMs )
 			{
+				// STALL CREDIT: the display already stood still for this stall, so the delay may
+				// grow by what it was short -- at once -- and the content time resumes from where
+				// it stopped instead of freezing again on the next one. A spike above the max is
+				// an outlier and earns none.
+				if ( flSize > m_flDelayMs )
+					m_flStarveMs = std::max( m_flStarveMs, flSize - m_flDelayMs );
 				m_flSpikeEwma = m_nSpikesTotal == 0 ? flSize : m_flSpikeEwma + kLagEwmaAlpha * ( flSize - m_flSpikeEwma );
 				m_nSpikesTotal++;
 			}
@@ -1372,6 +1416,7 @@ namespace framegen::pacing
 				m_flDelayMs = std::max( 0.0, m_flDelayMs - m_flBufMs );
 				m_flBufMs = 0.0;
 				m_flLowMs = 0.0;
+				m_flStarveMs = 0.0;
 				m_flTargetMs = 0.0;
 				m_ulGapNs = kGapResetNs;
 				m_ulExtraNs = in.extraDelayNs;
@@ -1401,7 +1446,9 @@ namespace framegen::pacing
 			const double flStep = kLagRampEps * flDtMs;
 			if ( m_flTargetMs > m_flBufMs )
 			{
-				m_flBufMs = std::min( m_flBufMs + flStep, m_flTargetMs );
+				// Growth is the ramp's step, plus the stall credit when a spike just starved the
+				// display (NoteSpike), never past the target (which the history cap bounds).
+				m_flBufMs = std::min( m_flBufMs + flStep + m_flStarveMs, m_flTargetMs );
 				m_flLowMs = 0.0;
 			}
 			else if ( m_flBufMs > m_flTargetMs )
@@ -1430,6 +1477,7 @@ namespace framegen::pacing
 			{
 				m_flLowMs = 0.0;
 			}
+			m_flStarveMs = 0.0;
 			m_ulExtraNs = in.extraDelayNs + Ns( m_flBufMs * 1e6 );
 		}
 
@@ -2225,6 +2273,7 @@ namespace framegen::pacing
 		double   m_flBufMs = 0.0;              // D_buf: the live, ramped buffer
 		double   m_flTargetMs = 0.0;
 		double   m_flLowMs = 0.0;              // how long D_buf has been above its target by the shrink band
+		double   m_flStarveMs = 0.0;           // the stall credit: a spike's size beyond the delay applied, until the next UpdateBuffer
 		Ns       m_ulExtraNs = 0;              // the manual extra delay + D_buf, as of the last Evaluate
 		Ns       m_ulGapNs = kGapResetNs;      // a gap longer than this between real frames drops the history
 		double   m_flLagMaxMs = 50.0;          // the settings last read
@@ -2252,7 +2301,6 @@ namespace framegen::pacing
 		uint64_t m_nArrivalsWin = 0;
 		Ns       m_ulLastSynthAt = 0;
 		bool     m_bHaveSynth = false;
-		bool     m_bGenerating = false;     // Report::generating as last published (its band's memory)
 		uint64_t m_nOutputs = 0;
 		bool     m_bStatusStarted = false;
 		Ns       m_ulStatusAt = 0;
