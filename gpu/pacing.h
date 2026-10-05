@@ -172,6 +172,48 @@
 // The buffer works because D >= spike: the late frame has arrived by the time the
 // content time needs the gap filled. The first hitch of a session always freezes.
 
+// THE GENERATE / PASS DECISION (Pacer::Evaluate; 2026-10-05, from a user report).
+// Whether the pacer generates or passes the game's frames through is decided on the ratio
+// r = game interval / output interval: generating stops once r < kStopRatio (1.02, the game
+// reaches the output rate) and starts again once r > kStartRatio (1.10). THE REPORT: the HUD
+// in "Both" mode kept switching between "game > output" and the lone game number "for no
+// apparent reason". THE MEASUREMENT: a 4-minute CS2 session at 280 Hz (Target = display
+// refresh, Smoothness, Pause at refresh off) logged 246 alternating "generating" / "passing
+// through" lines in 246 s (median 1.0 s apart, every pass-through "GameTooFast"), the game's
+// measured rate wandering 210..330 fps around the 280 Hz target. THE CAUSE: r was taken from
+// the SAME interval the pacing uses, the median of the last kIntervalWindow (8) arrival
+// intervals: about 30 ms of history at 270 fps, which ordinary frame-time jitter swings by
+// +-50 fps, so the 20 fps band (254.5 .. 274.5 fps at 280 Hz) was crossed constantly. A
+// simulation driving this header (280 Hz, Target auto, 262 fps game, 10% jitter) generated
+// 62% of the time with 660 flips a minute; a 25% jitter 1300; the same with an explicit
+// target of 400 at 380 fps (900); a Fixed 3x with Pause at refresh on at 270 fps (500).
+// THE FIX, two parts that act only on the DECISION (the 8-sample median still drives the
+// pacing, tau, the margin, the cost guard and the blur: the output is as responsive as ever):
+//   1. The ratio is judged on a STEADY rate (SteadyRate): a frame-weighted exponential mean of
+//      the intervals, time constant kSteadyTauMs (300 ms), each interval clamped to
+//      [mean / 2, 2 x mean] first (one 50 ms hitch among 3.7 ms frames moves it ~1%). The
+//      band is kept: with 0.8% noise (10% jitter) instead of 15% it is now wider than the
+//      noise, so it neither needs widening nor flaps.
+//   2. A change of state must HOLD: the opposite condition continuously true for
+//      kStopDwellMs (1000) to stop, kStartDwellMs (300) to start; leaving the condition
+//      restarts the clock. Stopping late costs almost nothing (a generated frame the game
+//      did not need); starting late costs smoothness, so it is the quicker of the two.
+//   The first decision after a start or a change of settings uses the stop ratio alone, with
+//   no dwell, as before. Video (OnFrame) keeps its exact PTS interval and no dwell.
+// MEASURED, same simulation (mean of 10 seeds, 60 s each, flips per minute before -> after):
+// 262 fps j10% 649 -> 0; 270 j10% 483 -> 0; 270 j25% 1254 -> 0; 270 with a +-15% slow drift
+// 108 -> 1.5 (the drift genuinely crosses the band twice a period); Target 400 at 380 fps
+// 864 -> 0; Fixed 3x Pause on at 270 fps 483 -> 0; a game wandering 210..330 fps with 1..3 s
+// periods 137 -> 37 (a swing that fast and that wide is real, not noise; the dwell bounds it
+// at one change per 1.3 s, and it only changes when sustained). A game that really drops
+// 300 -> 150 fps starts generating 0.42 s later; one that really rises 150 -> 320 stops 1.40 s
+// later; a 50 ms or 90 ms hitch changes nothing (a stall of kGapResetNs or more is the gap
+// path, as before).
+// THE STEADY "GENERATING" SIGNAL (Report::generating, steadyMultiplier): fgActive / activeN
+// report the INSTANTANEOUS state, so a HUD fed by them said "generating" at an effective
+// 0.9x..1.2x too. See Report for the two fields (generated frames presented within ~1 s AND
+// >= 1.2x over the last ~1 s, with a 1.1x keep band).
+
 // VIDEO / TIMESTAMPS MODE (Pacer::OnFrame; the default stays arrival-timed, byte-identical).
 // A video's frames carry presentation timestamps (PTS) and the decoder has the next ones
 // ready, so nothing needs to be guessed from arrival times and no latency is at stake. The
@@ -213,6 +255,23 @@ namespace framegen::pacing
 	// back above kStartRatio. 98% .. 91% of the refresh at a fixed multiplier.
 	constexpr double kStopRatio       = 1.02;
 	constexpr double kStartRatio      = 1.10;
+	// ... but that ratio is judged on the STEADY RATE (SteadyRate below), not on the 8-sample
+	// median the pacing itself uses, and a change of state must also HOLD for a dwell. Why: a
+	// game hovering near the output rate (a 210..330 fps CS2 at a 280 Hz target) swings its
+	// 8-frame median (about 30 ms of history) by +-50 fps with ordinary frame-time jitter, which
+	// crossed the 20 fps band once a second: the user's journal for a 4-minute session has 246
+	// "generating" / "passing through" lines in 246 s (median 1.0 s apart, every pass-through
+	// GameTooFast), and the HUD's "Both" readout flipped between "game > output" and the lone
+	// game number "for no apparent reason". See "THE GENERATE / PASS DECISION".
+	// Dwell to STOP generating is longer than to START: starting late costs smoothness (a
+	// slow game shown unsmoothed), stopping late costs almost nothing (a generated frame in
+	// a game that no longer needs it).
+	constexpr double kStopDwellMs     = 1000.0;
+	constexpr double kStartDwellMs    = 300.0;
+	// The steady rate's time constant, and how far one interval may stray from the running
+	// value before it is clamped (a hitch counts as two frame times, not as 50 ms).
+	constexpr double kSteadyTauMs     = 300.0;
+	constexpr double kSteadyClamp     = 2.0;
 	// ExtraTimer() band: paint on its own timer once the output interval is more
 	// than 2% shorter than a tick, back to the tick timer once it is more
 	// than 2% longer (the same 2% the cadence in PaintGenerated() uses).
@@ -235,6 +294,14 @@ namespace framegen::pacing
 	constexpr double kPtsSnap         = 1e-4;
 	// Status is worth publishing this often.
 	constexpr Ns     kStatusPeriodNs  = 250 * kNsPerMs;
+	// Report::generating (the steady "frame generation is visibly working" signal): generated
+	// frames must have been presented within kGeneratingRecentNs, and the multiplier over the
+	// last kGeneratingWindowNs of status windows must be at least kGeneratingMinMult.
+	constexpr Ns     kGeneratingRecentNs = 1000 * kNsPerMs;
+	constexpr Ns     kGeneratingWindowNs = 1000 * kNsPerMs;
+	constexpr double kGeneratingMinMult  = 1.2;     // to turn on ...
+	constexpr double kGeneratingKeepMult = 1.1;     // ... and to stay on (a band: no flicker at the edge)
+	constexpr int    kStatusWindows      = 8;
 
 	// The largest fixed multiplier a host should offer (Inputs::multiplier is 2..kMaxN).
 	constexpr int    kMaxN            = 8;
@@ -603,6 +670,56 @@ namespace framegen::pacing
 		int m_nMin = kMinSamples;
 	};
 
+	// The STEADY game interval the generate / pass-through decision is made on (the pacing
+	// maths keeps IntervalEstimator's 8-sample median: it must follow the game frame to
+	// frame; the decision must not). An exponential mean of the real intervals with a time
+	// constant of kSteadyTauMs, i.e. about 0.3 s of frames, whatever the frame rate:
+	//   * it starts as the median of the first kIntervalWindow intervals (as robust as the
+	//     estimator), then each interval x moves it by  w = max( mean / tau, 1 / n ) :
+	//     a per-FRAME weight of "one tau's worth of frames" (n is the interval count: a
+	//     running mean while the history is young). Frame-weighted on purpose: the mean of
+	//     the intervals is the true frame rate's reciprocal, a time-weighted mean of them
+	//     over-reads the interval by 1 + cv^2 (6% at 25% jitter);
+	//   * x is first clamped to [mean / kSteadyClamp, mean x kSteadyClamp] (2): one 50 ms
+	//     hitch among 3.7 ms frames then moves it by about 1% (and it decays with tau), while
+	//     a game that really drops from 300 to 150 fps still pulls it all the way in ~0.1 s.
+	// Noise is about cv / sqrt( 2 tau / interval ): 0.8% at 10% jitter, 2% at 25% (270 fps).
+	// (An EMA rather than a median over a 0.5..1 s window: O(1) with no storage, where such a
+	// window holds up to ~1000 intervals at 1000 fps, and the clamp gives it the median's
+	// robustness to a hitch. See "THE GENERATE / PASS DECISION" for the measurements.)
+	class SteadyRate
+	{
+	public:
+		void Clear()
+		{
+			m_nN = 0;
+			m_flMs = 0.0;
+		}
+
+		void AddInterval( double flIntervalMs )
+		{
+			const double x = ClampIntervalMs( flIntervalMs );
+			if ( m_nN < kIntervalWindow )
+			{
+				m_flSeed[ m_nN++ ] = x;
+				m_flMs = MedianOf( m_flSeed, m_nN );
+				return;
+			}
+			m_nN = std::min( m_nN + 1, 1 << 20 );
+			const double xc = std::min( std::max( x, m_flMs / kSteadyClamp ), m_flMs * kSteadyClamp );
+			const double w = std::min( 1.0, std::max( m_flMs / kSteadyTauMs, 1.0 / double( m_nN ) ) );
+			m_flMs += w * ( xc - m_flMs );
+		}
+
+		bool   Valid() const { return m_nN >= kMinSamples; }
+		double IntervalMs() const { return m_nN == 0 ? 0.0 : ClampIntervalMs( m_flMs ); }
+
+	private:
+		double m_flSeed[ kIntervalWindow ] = {};
+		double m_flMs = 0.0;
+		int    m_nN = 0;
+	};
+
 	// ------------------------------------------------------------------
 	//  The pacer
 	// ------------------------------------------------------------------
@@ -728,6 +845,17 @@ namespace framegen::pacing
 			int    spikesInWindow = 0;         // spikes inside the window that size the buffer
 			int    outliersIgnored = 0;        // spikes inside the window larger than maxBufferMs: ignored for sizing
 			int    historyFrames = kHistory;   // HistoryDepth(): real frames the host keeps (and UI-protection clean copies)
+			// THE STEADY "GENERATING" SIGNAL, for a HUD that must not flicker. fgActive / activeN
+			// follow the pacer's instantaneous state and say "generating" even at an effective
+			// 1.0x; these two say whether frame generation is visibly adding frames:
+			//   steadyMultiplier -- presented outputs per real frame over the last ~1 s of status
+			//                       windows (kGeneratingWindowNs), 0 until a window has real frames.
+			//   generating       -- fgActive AND a generated frame was presented within the last
+			//                       ~1 s (kGeneratingRecentNs) AND steadyMultiplier >= 1.2
+			//                       (kGeneratingMinMult) to turn on, >= 1.1 (kGeneratingKeepMult) to
+			//                       stay on. Never true while passing through.
+			float  steadyMultiplier = 0.0f;
+			bool   generating = false;
 		};
 
 		// Is the output capped at the refresh rate under these inputs?
@@ -832,6 +960,7 @@ namespace framegen::pacing
 				const Ns ulInterval = tNs >= m_ulLastArrival ? tNs - m_ulLastArrival : 0;
 				NoteSpike( tNs, ulInterval );
 				m_Est.AddInterval( ulInterval );
+				m_Steady.AddInterval( double( ulInterval ) / double( kNsPerMs ) );
 				m_flLastIntervalMs = ClampIntervalMs( double( ulInterval ) / double( kNsPerMs ) );
 			}
 
@@ -842,6 +971,7 @@ namespace framegen::pacing
 			m_bHaveArrival = true;
 			m_ulNewestId = ulFrameId;
 			m_bPending = true;
+			m_nArrivalsWin++;
 		}
 
 		// A paint is about to happen. `ulNewestId` is the real frame the host would
@@ -925,7 +1055,14 @@ namespace framegen::pacing
 			}
 
 			if ( d.newOutput )
+			{
 				m_nOutputs++;
+				if ( d.t < 1.0f && d.prevId != 0 )
+				{
+					m_ulLastSynthAt = in.now;      // a generated frame (a blur window on a real frame has t = 1)
+					m_bHaveSynth = true;
+				}
+			}
 			if ( m_Plan.state == State::Generate )
 				m_Last = d;
 			return d;
@@ -955,7 +1092,31 @@ namespace framegen::pacing
 
 			if ( m_bStatusStarted && ulNow > m_ulStatusAt )
 				s.presentedFps = float( double( m_nOutputs ) * 1e9 / double( ulNow - m_ulStatusAt ) );
+			if ( m_bStatusStarted )
+			{
+				if ( m_nWin == kStatusWindows )
+				{
+					for ( int i = 1; i < m_nWin; i++ )
+						m_Win[ i - 1 ] = m_Win[ i ];
+					m_nWin--;
+				}
+				m_Win[ m_nWin++ ] = StatusWin{ ulNow, m_nOutputs, m_nArrivalsWin };
+			}
+			{
+				uint64_t ulOut = 0, ulArr = 0;
+				for ( int i = 0; i < m_nWin; i++ )
+				{
+					if ( m_Win[ i ].end + kGeneratingWindowNs >= ulNow )
+					{
+						ulOut += m_Win[ i ].outputs;
+						ulArr += m_Win[ i ].arrivals;
+					}
+				}
+				if ( ulArr > 0 )
+					s.steadyMultiplier = float( double( ulOut ) / double( ulArr ) );
+			}
 			m_nOutputs = 0;
+			m_nArrivalsWin = 0;
 			m_ulStatusAt = ulNow;
 			m_bStatusStarted = true;
 
@@ -995,9 +1156,12 @@ namespace framegen::pacing
 						s.fgActive = true;
 						if ( s.gameFps > 0.0f )
 							s.activeN = std::max( 2, int( std::lround( s.effectiveMultiplier ) ) );
+						s.generating = m_bHaveSynth && ulNow >= m_ulLastSynthAt && ulNow - m_ulLastSynthAt <= kGeneratingRecentNs
+							&& s.steadyMultiplier >= float( m_bGenerating ? kGeneratingKeepMult : kGeneratingMinMult );
 					}
 				}
 			}
+			m_bGenerating = s.generating;
 			return s;
 		}
 
@@ -1065,6 +1229,8 @@ namespace framegen::pacing
 		void DropHistory( Cause cause, bool bNewGame )
 		{
 			m_Est.Clear();
+			m_Steady.Clear();
+			m_bFlipPend = false;
 			m_flLastIntervalMs = 0.0;
 			ClearPlayState();
 			m_bNeedReset = true;
@@ -1342,6 +1508,7 @@ namespace framegen::pacing
 				// hysteresis memory and adopt the new target at once.
 				m_uCfgKey = uKey;
 				m_bGenInit = false;
+				m_bFlipPend = false;
 				m_bTauValid = false;
 				m_nNextDue = 0;
 				m_bExpectPaint = false;
@@ -1397,24 +1564,42 @@ namespace framegen::pacing
 
 			const double flInterval = m_Est.IntervalMs();
 			const double flBaseMs = OutputIntervalMs( in.mode, in.multiplier, in.targetFps, flInterval, in.refreshHz, bCap );
-			const double flRatio = OutputRatio( flInterval, flBaseMs );
 
-			// The game reaches the output rate: nothing to generate. Hysteresis is a
-			// ratio band, not a time hold (the first decision after a start or a
-			// change uses the stop ratio alone).
+			// The game reaches the output rate: nothing to generate. Judged on the STEADY rate
+			// (video: the exact PTS interval), as a ratio band (kStopRatio / kStartRatio) that must
+			// also HOLD for a dwell before the state changes (kStopDwellMs / kStartDwellMs; video:
+			// none). The first decision after a start or a change uses the stop ratio alone.
+			const double flSteadyMs = m_bPts ? flInterval : m_Steady.IntervalMs();
+			const double flRatio = OutputRatio( flSteadyMs,
+				OutputIntervalMs( in.mode, in.multiplier, in.targetFps, flSteadyMs, in.refreshHz, bCap ) );
+			const bool bWantFlip = m_bGen ? flRatio < kStopRatio : flRatio > kStartRatio;
 			if ( !m_bGenInit )
 			{
 				m_bGen = flRatio > kStopRatio;
 				m_bGenInit = true;
+				m_bFlipPend = false;
 			}
-			else if ( m_bGen )
+			else if ( !bWantFlip )
 			{
-				if ( flRatio < kStopRatio )
-					m_bGen = false;
+				m_bFlipPend = false;
 			}
-			else if ( flRatio > kStartRatio )
+			else if ( m_bPts )
 			{
-				m_bGen = true;
+				m_bGen = !m_bGen;
+			}
+			else
+			{
+				if ( !m_bFlipPend )
+				{
+					m_bFlipPend = true;
+					m_ulFlipSince = in.now;
+				}
+				const Ns ulDwell = Ns( ( m_bGen ? kStopDwellMs : kStartDwellMs ) * 1e6 );
+				if ( in.now >= m_ulFlipSince + ulDwell )
+				{
+					m_bGen = !m_bGen;
+					m_bFlipPend = false;
+				}
 			}
 			// Real-rate: no generated frames (off, or the game reaches the output rate),
 			// but blur and / or the buffer still want a pair for every real frame.
@@ -1992,6 +2177,7 @@ namespace framegen::pacing
 		uint64_t m_ulStreamKey = 0;
 		FrameFormat m_Format;
 		IntervalEstimator m_Est;
+		SteadyRate m_Steady;                 // the generate / pass decision's rate (see SteadyRate)
 
 		// -- video mode --
 		bool     m_bPts = false;             // the stream is timestamped (OnFrame)
@@ -2026,6 +2212,8 @@ namespace framegen::pacing
 		uint32_t m_uCfgKey = 0xFFFFFFFFu;
 		bool     m_bGenInit = false;
 		bool     m_bGen = false;
+		bool     m_bFlipPend = false;    // the opposite of m_bGen has held since m_ulFlipSince
+		Ns       m_ulFlipSince = 0;
 		bool     m_bExtra = false;       // ExtraTimer(), as of the last Evaluate
 		bool     m_bExtraPrev = false;   // its hysteresis memory (survives pass-through gaps)
 
@@ -2053,6 +2241,18 @@ namespace framegen::pacing
 		uint32_t m_uProbeSeq = 0;
 
 		// -- status --
+		struct StatusWin
+		{
+			Ns       end = 0;
+			uint64_t outputs = 0;
+			uint64_t arrivals = 0;
+		};
+		StatusWin m_Win[ kStatusWindows ];
+		int      m_nWin = 0;
+		uint64_t m_nArrivalsWin = 0;
+		Ns       m_ulLastSynthAt = 0;
+		bool     m_bHaveSynth = false;
+		bool     m_bGenerating = false;     // Report::generating as last published (its band's memory)
 		uint64_t m_nOutputs = 0;
 		bool     m_bStatusStarted = false;
 		Ns       m_ulStatusAt = 0;
