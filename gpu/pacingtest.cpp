@@ -4346,6 +4346,50 @@ TEST_CASE( "decision: the pacing still follows the 8-frame median, only the deci
 	CHECK( p.Planning() );
 }
 
+TEST_CASE( "status: generating does not flip while the multiplier hovers near 1.1x-1.3x (no multiplier gate)", "[steady][status]" )
+{
+	// The report: a paint-limited output (target 335, game ~177 fps: ~1.28x) kept flipping the HUD's
+	// "game > output" separator because `generating` demanded >= 1.2x to turn on, >= 1.1x to stay. At
+	// 280 Hz Target auto a game of 218 / 233 / 250 / 262 fps is 1.28x / 1.2x / 1.12x / 1.07x; add the
+	// jitter of a real game (+-8 %) and the multiplier wanders across both old gates.
+	for ( double flFps : { 218.0, 233.0, 250.0, 262.0 } )
+	{
+		const Ns tEnd = 40000 * MS;
+		Driver live = FlapDriver();         // driven in 250 ms steps so a status can be taken between them
+		int nFlips = 0, nSamples = 0, nOff = 0;
+		bool bPrev = false;
+		float flMin = 1e9f, flMax = 0.0f;
+		const std::vector<Ns> arr = JitteredArrivals( 1000.0 / flFps, 0.08 * 1000.0 / flFps, tEnd );
+		size_t i = 0;
+		for ( Ns t = 0; t < tEnd; t += 250 * MS )
+		{
+			std::vector<Ns> chunk;
+			while ( i < arr.size() && arr[ i ] < t + 250 * MS )
+				chunk.push_back( arr[ i++ ] );
+			live.RunArrivals( chunk, t + 250 * MS );
+			const Pacer::Report r = live.Status();
+			if ( t < 5000 * MS )
+			{
+				bPrev = r.generating;
+				continue;
+			}
+			nSamples++;
+			nOff += r.generating ? 0 : 1;
+			nFlips += r.generating != bPrev ? 1 : 0;
+			bPrev = r.generating;
+			if ( r.steadyMultiplier > 0.0f )
+			{
+				flMin = std::min( flMin, r.steadyMultiplier );
+				flMax = std::max( flMax, r.steadyMultiplier );
+			}
+		}
+		INFO( "game " << flFps << " fps: steady multiplier " << flMin << " .. " << flMax << ", flips " << nFlips << ", off in " << nOff << " of " << nSamples << " samples" );
+		CHECK( nSamples > 100 );
+		CHECK( nFlips == 0 );
+		CHECK( nOff == 0 );
+	}
+}
+
 TEST_CASE( "status: generating is the steady signal, activeN the instantaneous one", "[steady][status]" )
 {
 	// Clearly generating: Fixed 2x of a 60 fps game on 125 Hz is 2x.
@@ -4377,8 +4421,10 @@ TEST_CASE( "status: generating is the steady signal, activeN the instantaneous o
 	CHECK_FALSE( r.fgActive );
 	CHECK_FALSE( r.generating );
 
-	// The pacer says Generate (a 262 fps game on 280 Hz: ratio 1.07, inside the hold band) but the
-	// effective multiplier is ~1.07: fgActive / activeN claim generation, `generating` does not.
+	// The pacer says Generate (a 262 fps game on 280 Hz: ratio 1.07, inside the hold band) and the
+	// effective multiplier is only ~1.07, but frames ARE being generated: `generating` is true (no
+	// multiplier gate: the user, "If its generating any frames, it should show the '>'. Otherwise
+	// that differentiation is useless."); steadyMultiplier stays the informational ratio.
 	Driver c = FlapDriver();
 	c.Run( 1000 * MS, 1000.0 / 262.0 );
 	for ( int i = 0; i < 6; i++ )
@@ -4389,7 +4435,8 @@ TEST_CASE( "status: generating is the steady signal, activeN the instantaneous o
 	CHECK( r.fgActive );
 	CHECK( r.activeN >= 2 );
 	CHECK( r.steadyMultiplier < 1.2f );
-	CHECK_FALSE( r.generating );
+	CHECK( r.steadyMultiplier > 1.0f );
+	CHECK( r.generating );
 
 	// A game that stops needing generation clears it as soon as the pacer stops (fgActive false),
 	// and a long run of real frames never turns it on again.

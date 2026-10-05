@@ -232,9 +232,18 @@
 // later; a 50 ms or 90 ms hitch changes nothing (a stall of kGapResetNs or more is the gap
 // path, as before).
 // THE STEADY "GENERATING" SIGNAL (Report::generating, steadyMultiplier): fgActive / activeN
-// report the INSTANTANEOUS state, so a HUD fed by them said "generating" at an effective
-// 0.9x..1.2x too. See Report for the two fields (generated frames presented within ~1 s AND
-// >= 1.2x over the last ~1 s, with a 1.1x keep band).
+// report the INSTANTANEOUS state. generating = the pacer is in the Generate state AND a generated
+// frame (t < 1 from a pair) was presented within the last ~1 s: NO multiplier gate (2026-10-05).
+// Why: it first demanded an effective multiplier of >= 1.2x to turn on (>= 1.1x to stay), and
+// when the output was paint-limited (target 335, game ~177 fps, ~1.28x) the multiplier hovered
+// at the gate so a HUD's "game > output" separator flipped to the lone number while frame
+// generation was generating all along. The user: "If its generating any frames, it should show
+// the '>'. Otherwise that differentiation is useless." steadyMultiplier stays, informational
+// only (the real ratio, for a line like "1.28x"). A genuinely ~1x pass-through is not
+// Generate (the decision's own band, see THE GENERATE / PASS DECISION), so it reads false.
+// MEASURED (paint-limited extra-timer host, target 335, 177 fps game, steady multiplier 1.18 /
+// 1.13 / 1.09 / 1.05 / 1.01): the old signal read "generating" 40% / 0% / 0% / 0% / 0% of
+// the status samples while frames were being generated all along; the new one 100%.
 
 // VIDEO / TIMESTAMPS MODE (Pacer::OnFrame; the default stays arrival-timed, byte-identical).
 // A video's frames carry presentation timestamps (PTS) and the decoder has the next ones
@@ -316,13 +325,12 @@ namespace framegen::pacing
 	constexpr double kPtsSnap         = 1e-4;
 	// Status is worth publishing this often.
 	constexpr Ns     kStatusPeriodNs  = 250 * kNsPerMs;
-	// Report::generating (the steady "frame generation is visibly working" signal): generated
-	// frames must have been presented within kGeneratingRecentNs, and the multiplier over the
-	// last kGeneratingWindowNs of status windows must be at least kGeneratingMinMult.
+	// Report::generating (the steady "frame generation is visibly working" signal): the plan is
+	// Generate and a generated frame was presented within kGeneratingRecentNs (no multiplier gate).
+	// Report::steadyMultiplier (informational) is taken over the last kGeneratingWindowNs of status
+	// windows.
 	constexpr Ns     kGeneratingRecentNs = 1000 * kNsPerMs;
 	constexpr Ns     kGeneratingWindowNs = 1000 * kNsPerMs;
-	constexpr double kGeneratingMinMult  = 1.2;     // to turn on ...
-	constexpr double kGeneratingKeepMult = 1.1;     // ... and to stay on (a band: no flicker at the edge)
 	constexpr int    kStatusWindows      = 8;
 
 	// The largest fixed multiplier a host should offer (Inputs::multiplier is 2..kMaxN).
@@ -874,14 +882,17 @@ namespace framegen::pacing
 			int    outliersIgnored = 0;        // spikes inside the window larger than maxBufferMs: ignored for sizing
 			int    historyFrames = kHistory;   // HistoryDepth(): real frames the host keeps (and UI-protection clean copies)
 			// THE STEADY "GENERATING" SIGNAL, for a HUD that must not flicker. fgActive / activeN
-			// follow the pacer's instantaneous state and say "generating" even at an effective
-			// 1.0x; these two say whether frame generation is visibly adding frames:
+			// follow the pacer's instantaneous state; these two say whether frame generation is
+			// adding frames:
+			//   generating       -- fgActive (the plan is Generate, frame generation on, not a
+			//                       pass-through) AND a generated frame (t < 1 from a pair) was
+			//                       presented within the last ~1 s (kGeneratingRecentNs). NO
+			//                       multiplier gate: any generated frame counts, so a paint-limited
+			//                       output at ~1.1x-1.3x does not flip. Never true while passing
+			//                       through; a blur window on a real frame is not a generated one.
 			//   steadyMultiplier -- presented outputs per real frame over the last ~1 s of status
 			//                       windows (kGeneratingWindowNs), 0 until a window has real frames.
-			//   generating       -- fgActive AND a generated frame was presented within the last
-			//                       ~1 s (kGeneratingRecentNs) AND steadyMultiplier >= 1.2
-			//                       (kGeneratingMinMult) to turn on, >= 1.1 (kGeneratingKeepMult) to
-			//                       stay on. Never true while passing through.
+			//                       Informational: it does not gate `generating`.
 			float  steadyMultiplier = 0.0f;
 			bool   generating = false;
 		};
@@ -1184,12 +1195,10 @@ namespace framegen::pacing
 						s.fgActive = true;
 						if ( s.gameFps > 0.0f )
 							s.activeN = std::max( 2, int( std::lround( s.effectiveMultiplier ) ) );
-						s.generating = m_bHaveSynth && ulNow >= m_ulLastSynthAt && ulNow - m_ulLastSynthAt <= kGeneratingRecentNs
-							&& s.steadyMultiplier >= float( m_bGenerating ? kGeneratingKeepMult : kGeneratingMinMult );
+						s.generating = m_bHaveSynth && ulNow >= m_ulLastSynthAt && ulNow - m_ulLastSynthAt <= kGeneratingRecentNs;
 					}
 				}
 			}
-			m_bGenerating = s.generating;
 			return s;
 		}
 
@@ -2292,7 +2301,6 @@ namespace framegen::pacing
 		uint64_t m_nArrivalsWin = 0;
 		Ns       m_ulLastSynthAt = 0;
 		bool     m_bHaveSynth = false;
-		bool     m_bGenerating = false;     // Report::generating as last published (its band's memory)
 		uint64_t m_nOutputs = 0;
 		bool     m_bStatusStarted = false;
 		Ns       m_ulStatusAt = 0;
