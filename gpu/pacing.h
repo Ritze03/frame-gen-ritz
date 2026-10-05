@@ -145,9 +145,13 @@
 // time is still inside the pair that ends at the late frame and the gap is filled with
 // generated frames instead of frozen. It is independent of the multiplier and of
 // blur; it adds to D and to nothing else.
-//   * DETECTION (OnArrival): an interval above kLagSpikeRatio (1.75) x the smoothed
-//     interval is a spike of size  interval - smoothed  ms ("missing frames x
-//     interval"). Kept in a ring of kLagSpikeMax (time, size).
+//   * DETECTION (OnArrival): an interval above kLagSpikeRatio (1.3; 1.75 until 2026-10-05) x
+//     the smoothed interval AND at least kLagSpikeMinMs (2 ms) longer is a spike of size
+//     interval - smoothed  ms ("missing frames x interval"). Kept in a ring of kLagSpikeMax
+//     (time, size). Why 1.3: the user wanted a hiccup shorter than a missing frame (14 ms at
+//     10 ms, 1.4x) to count and be bridged next time; ordinary jitter (60 fps +-4 ms peaks at
+//     1.24x) stays under it, and the 2 ms floor keeps a fast game's noise (a 240 fps game's
+//     4.2 ms interval x 1.3 is 1.2 ms) from being a spike. No jitter floor beyond that.
 //   * JUDGEMENT: a spike larger than maxBufferMs is an OUTLIER (a shader compile, a
 //     disk hitch: 10 fps): never sized for, only counted (Report::outliersIgnored).
 //   * RECENCY: weight w(age) = 0.3 + 0.7 x (1 + cos(pi x age / lookback)) / 2 for
@@ -158,9 +162,26 @@
 //     the base is at least kLagFloorFrac (0.5) x the session's EWMA of spike sizes
 //     (alpha 0.15), so history is not thrown away. Target = base x 1.10 + 1 ms, clamped
 //     to [0, maxBufferMs] (and to what kHistoryMax frames can hold at this game rate).
-//   * RAMP: D_buf never jumps. It moves toward the target by at most kLagRampEps (3 %)
+//   * STALL CREDIT (2026-10-05): a spike larger than the delay applied (m_flDelayMs, the
+//     total D of the last paint; 0 when passing through) and within maxBufferMs grows D_buf
+//     AT ONCE by the difference (NoteSpike notes it, UpdateBuffer spends it, never past the
+//     target and so never past the history cap, ForceMax, or the instant-off). Why: the
+//     display already stood still for the stall, so the content time may resume from where
+//     it stopped (tau = V - D_new lands on the held instant; the existing tau monotonic
+//     clamp keeps it from going back) instead of freezing again on the next spike. Measured
+//     with the ramp alone (100 fps, max 50, 60 ms stalls at 3, 3.5, 4, 5 s from nothing):
+//     freezes of 58, 42, 29 and 0 ms -- "it waits"; with the credit 58, 0, 0, 0. The user:
+//     "it should still detect lags and based on that determine the buffer size, but
+//     otherwise it should make sure that for example we have a buffer of 50 and usually we
+//     get a frame every 10 milliseconds, but then there isn't a frame for 14 milliseconds,
+//     then it should just generate the frames for that as soon as it can based on the next
+//     frame, if the lag spike was bigger than the buffer, then it obviously can't do that.
+//     But then it should increase the buffer and then it should start working again", and
+//     "We need to keep ignoring everything above max, since thats what max is for."
+//   * RAMP: D_buf otherwise never jumps. It moves toward the target by at most kLagRampEps (3 %)
 //     of real time, i.e. content time plays at 0.97x while it grows and 1.03x while it
-//     shrinks (tau stays monotonic). Shrinking starts only after the target has been
+//     shrinks (tau stays monotonic): the margin above the credited size, a raised max, the
+//     test modes and all shrinking. Shrinking starts only after the target has been
 //     more than 3 ms below D_buf for 2 s (the look-back decay, not a flicker).
 //     EXCEPTION: switching the buffer OFF (LagBufferSettings::enabled false) drops it to 0
 //     on the very next paint: one forward step of tau, which stays monotonic.
@@ -170,7 +191,8 @@
 //     interval) + 2, 3 with no delay: it grows AHEAD of the ramp and shrinks only
 //     after a 2 s dwell and only past frames the content time has left.
 // The buffer works because D >= spike: the late frame has arrived by the time the
-// content time needs the gap filled. The first hitch of a session always freezes.
+// content time needs the gap filled. The first hitch of a session always freezes, and so does
+// one larger than the delay then applied -- once: it grows the delay to its size on the spot.
 
 // THE GENERATE / PASS DECISION (Pacer::Evaluate; 2026-10-05, from a user report).
 // Whether the pacer generates or passes the game's frames through is decided on the ratio
@@ -333,7 +355,8 @@ namespace framegen::pacing
 	constexpr double kDepthShrinkDwellMs = 2000.0;
 
 	// ---- the lag-spike buffer's constants (see LagBufferSettings and "LAG-SPIKE BUFFER") ----
-	constexpr double kLagSpikeRatio    = 1.75;    // an interval above this x the smoothed one is a spike
+	constexpr double kLagSpikeRatio    = 1.3;     // an interval above this x the smoothed one is a spike (1.75 until 2026-10-05) ...
+	constexpr double kLagSpikeMinMs    = 2.0;     // ... and at least this many ms longer than it (a 240 fps game's 4.2 ms x 1.3 is 1.2 ms of noise)
 	constexpr int    kLagSpikeMax      = 64;      // spikes remembered (the lowest-weighted is replaced when full)
 	constexpr double kLagWeightMin     = 0.3;     // a spike's weight at the end of the look-back window (1 when new, 0 beyond)
 	constexpr double kLagMarginFrac    = 0.10;    // target = size x (1 + this) + kLagMarginMs
@@ -1262,6 +1285,7 @@ namespace framegen::pacing
 			m_flBufMs = 0.0;
 			m_flTargetMs = 0.0;
 			m_flLowMs = 0.0;
+			m_flStarveMs = 0.0;
 			m_ulExtraNs = 0;
 			m_ulLagLastAt = 0;
 			m_flLagShownMs = 0.0;
@@ -1283,12 +1307,18 @@ namespace framegen::pacing
 				return;
 			const double flSmooth = m_Est.IntervalMs();
 			const double flMs = double( ulIntervalNs ) / double( kNsPerMs );
-			if ( !( flMs > kLagSpikeRatio * flSmooth ) )
-				return;
 			const double flSize = flMs - flSmooth;
+			if ( !( flMs > kLagSpikeRatio * flSmooth ) || flSize < kLagSpikeMinMs )
+				return;
 			m_ulLagLastAt = tNs;
 			if ( flSize <= m_flLagMaxMs )
 			{
+				// STALL CREDIT: the display already stood still for this stall, so the delay may
+				// grow by what it was short -- at once -- and the content time resumes from where
+				// it stopped instead of freezing again on the next one. A spike above the max is
+				// an outlier and earns none.
+				if ( flSize > m_flDelayMs )
+					m_flStarveMs = std::max( m_flStarveMs, flSize - m_flDelayMs );
 				m_flSpikeEwma = m_nSpikesTotal == 0 ? flSize : m_flSpikeEwma + kLagEwmaAlpha * ( flSize - m_flSpikeEwma );
 				m_nSpikesTotal++;
 			}
@@ -1372,6 +1402,7 @@ namespace framegen::pacing
 				m_flDelayMs = std::max( 0.0, m_flDelayMs - m_flBufMs );
 				m_flBufMs = 0.0;
 				m_flLowMs = 0.0;
+				m_flStarveMs = 0.0;
 				m_flTargetMs = 0.0;
 				m_ulGapNs = kGapResetNs;
 				m_ulExtraNs = in.extraDelayNs;
@@ -1401,7 +1432,9 @@ namespace framegen::pacing
 			const double flStep = kLagRampEps * flDtMs;
 			if ( m_flTargetMs > m_flBufMs )
 			{
-				m_flBufMs = std::min( m_flBufMs + flStep, m_flTargetMs );
+				// Growth is the ramp's step, plus the stall credit when a spike just starved the
+				// display (NoteSpike), never past the target (which the history cap bounds).
+				m_flBufMs = std::min( m_flBufMs + flStep + m_flStarveMs, m_flTargetMs );
 				m_flLowMs = 0.0;
 			}
 			else if ( m_flBufMs > m_flTargetMs )
@@ -1430,6 +1463,7 @@ namespace framegen::pacing
 			{
 				m_flLowMs = 0.0;
 			}
+			m_flStarveMs = 0.0;
 			m_ulExtraNs = in.extraDelayNs + Ns( m_flBufMs * 1e6 );
 		}
 
@@ -2225,6 +2259,7 @@ namespace framegen::pacing
 		double   m_flBufMs = 0.0;              // D_buf: the live, ramped buffer
 		double   m_flTargetMs = 0.0;
 		double   m_flLowMs = 0.0;              // how long D_buf has been above its target by the shrink band
+		double   m_flStarveMs = 0.0;           // the stall credit: a spike's size beyond the delay applied, until the next UpdateBuffer
 		Ns       m_ulExtraNs = 0;              // the manual extra delay + D_buf, as of the last Evaluate
 		Ns       m_ulGapNs = kGapResetNs;      // a gap longer than this between real frames drops the history
 		double   m_flLagMaxMs = 50.0;          // the settings last read

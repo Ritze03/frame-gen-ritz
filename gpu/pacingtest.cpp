@@ -2416,6 +2416,25 @@ namespace
 		return v;
 	}
 
+	// Real frames on a grid of intervalMs from 3 ms; at each gap {sec, gapMs} the frame after the
+	// gap comes gapMs after the one before it (a late frame, not missing ones), and the grid
+	// carries on from it. For a stall of an exact length.
+	std::vector<Ns> StallArrivals( double intervalMs, double endSec, const std::vector<std::pair<double, double>> &gaps )
+	{
+		std::vector<Ns> v;
+		double t = 3.0;
+		size_t g = 0;
+		while ( t < endSec * 1000.0 )
+		{
+			v.push_back( Ns( t * 1e6 ) );
+			double step = intervalMs;
+			if ( g < gaps.size() && t + intervalMs > gaps[ g ].first * 1000.0 )
+				step = gaps[ g++ ].second;
+			t += step;
+		}
+		return v;
+	}
+
 	Driver LagDriver( double flMaxMs = 50.0, double flLookbackSec = 300.0 )
 	{
 		Driver drv;
@@ -2569,40 +2588,49 @@ TEST_CASE( "lag buffer: a single spike decays to nothing after the look-back win
 	CHECK( drv.Status().spikesInWindow == 0 );
 }
 
-TEST_CASE( "lag buffer: the delay is ramped, the content time is monotonic, the output has no jump", "[lagbuffer]" )
+TEST_CASE( "lag buffer: a stall grows the delay at once, everything else by the ramp, the content time never goes back", "[lagbuffer]" )
 {
 	Driver drv = LagDriver();
 	const double flI = 1000.0 / 60.0;
 	const Ns tEnd = 25 * 1000 * MS;
 	drv.RunArrivals( SpikeArrivals( flI, tEnd, { { 10.0, 2 } } ), tEnd );
 	double flMaxRate = 0.0;
-	int nGrowth = 0;
+	double flJump = 0.0;
+	int nJumps = 0, nGrowth = 0;
 	for ( size_t i = 1; i < drv.log.size(); i++ )
 	{
 		const Painted &a = drv.log[ i - 1 ], &b = drv.log[ i ];
 		if ( b.t <= a.t )
 			continue;
-		const double flRate = std::fabs( b.bufMs - a.bufMs ) / ( double( b.t - a.t ) / 1e6 );
-		flMaxRate = std::max( flMaxRate, flRate );
+		const double flRate = ( b.bufMs - a.bufMs ) / ( double( b.t - a.t ) / 1e6 );
+		if ( flRate > kLagRampEps * 1.001 )
+		{
+			nJumps++;                               // growth beyond the ramp: only the stall credit
+			flJump = b.bufMs - a.bufMs;
+			CHECK( b.t > Ns( 10e9 ) );
+			CHECK( b.t < Ns( 10.2e9 ) );            // on the paint that follows the late frame
+		}
+		else
+		{
+			flMaxRate = std::max( flMaxRate, std::fabs( flRate ) );
+		}
 		if ( b.bufMs > a.bufMs )
 			nGrowth++;
 		if ( a.tau != 0 && b.tau != 0 )
 			CHECK( b.tau >= a.tau );                // never backwards
 	}
-	INFO( "fastest change of the buffer: " << flMaxRate * 100.0 << " % of real time" );
+	INFO( "the jump " << flJump << " ms, the fastest other change " << flMaxRate * 100.0 << " % of real time" );
+	// Why: the display stood still for the stall, so the buffer is credited what it was short
+	// by (the spike's size, 33.3 ms from nothing) on the very paint, and the ramp only
+	// finishes the margin (spike x 1.1 + 1 ms = 37.7 ms) at 3 % of real time.
+	CHECK( nJumps == 1 );
+	CHECK( flJump > 33.0 );
+	CHECK( flJump < 36.0 );
 	CHECK( flMaxRate <= kLagRampEps * 1.001 );
-	CHECK( nGrowth > 100 );                        // it did grow, a little per paint
-	// the ramp to ~37.7 ms at 3 % takes about 1.26 s
-	double flAt = 0.0;
-	for ( const Painted &p : drv.log )
-		if ( p.t > Ns( 10.2e9 ) && p.bufMs >= drv.pacer.BufferMs() - 1e-9 )
-		{
-			flAt = double( p.t ) / 1e9 - 10.0;
-			break;
-		}
-	CHECK( flAt > 1.0 );
-	CHECK( flAt < 2.5 );
-	// no output jump while it grows (the first spike's own freeze is before the ramp)
+	CHECK( nGrowth > 20 );                         // the margin did ramp, a little per paint
+	CHECK( drv.pacer.BufferMs() > 37.0 );
+	CHECK( drv.pacer.BufferMs() < 38.5 );
+	// no output jump after the stall (the first spike's own freeze is the stall itself)
 	CHECK( LongestGap( drv, 11.5, 24.0 ) <= 1.5 * flI );
 	// shown frames never go back
 	uint64_t ulShown = 0;
@@ -2613,6 +2641,44 @@ TEST_CASE( "lag buffer: the delay is ramped, the content time is monotonic, the 
 		const uint64_t ulHi = p.d.prevId != 0 ? p.d.currId : p.d.showId;
 		CHECK( ulHi >= ulShown );
 		ulShown = std::max( ulShown, ulHi );
+	}
+}
+
+TEST_CASE( "lag buffer: growth with no stall is still the 3 % ramp (test mode, a raised max)", "[lagbuffer]" )
+{
+	const double flI = 1000.0 / 60.0;
+	// ForceMax from nothing: no spike, so no credit: never faster than 3 %, tau monotonic
+	{
+		Driver drv = LagDriver();
+		drv.lag.testMode = LagTestMode::ForceMax;
+		drv.Run( 5 * 1000 * MS, flI );
+		double flMaxRate = 0.0;
+		int nGrowth = 0;
+		for ( size_t i = 1; i < drv.log.size(); i++ )
+		{
+			const Painted &a = drv.log[ i - 1 ], &b = drv.log[ i ];
+			if ( b.t <= a.t )
+				continue;
+			flMaxRate = std::max( flMaxRate, ( b.bufMs - a.bufMs ) / ( double( b.t - a.t ) / 1e6 ) );
+			nGrowth += b.bufMs > a.bufMs ? 1 : 0;
+			if ( a.tau != 0 && b.tau != 0 )
+				CHECK( b.tau >= a.tau );
+		}
+		INFO( "fastest growth " << flMaxRate * 100.0 << " %" );
+		CHECK( flMaxRate <= kLagRampEps * 1.001 );
+		CHECK( nGrowth > 100 );
+		CHECK( drv.pacer.BufferMs() == 50.0 );
+		CHECK( LongestGap( drv, 0.5, 5.0 ) <= 1.5 * flI );
+	}
+	// a raised max after a spike sized the buffer at the old cap: the rest of the way is the ramp
+	{
+		Driver drv = LagDriver( 20.0 );
+		drv.RunArrivals( SpikeArrivals( flI, 8 * 1000 * MS, { { 3.0, 3 } } ), 8 * 1000 * MS );   // 50 ms: above the 20 ms max, an outlier
+		CHECK( drv.pacer.BufferMs() == 0.0 );
+		drv.lag.maxBufferMs = 100.0;
+		drv.lag.testMode = LagTestMode::ForceMax;
+		drv.Run( 100 * MS, flI );
+		CHECK( drv.pacer.BufferMs() < 5.0 );                // not a jump to the new cap
 	}
 }
 
@@ -2781,6 +2847,307 @@ TEST_CASE( "lag buffer: a new stream forgets the spikes, a stall does not", "[la
 	drv.ArriveAndPaint( drv.now + 16 * MS );
 	CHECK( drv.pacer.BufferMs() == 0.0 );
 	CHECK( drv.Status().spikesInWindow == 0 );
+}
+
+// ---------------------------------------------------------------------------
+//  The stall credit: a spike the buffer was too small for grows it at once; a smaller
+//  hitch is bridged; a lower detection threshold; the limits that stay
+// ---------------------------------------------------------------------------
+//
+// The user: "it should still detect lags and based on that determine the buffer size, but
+// otherwise it should make sure that for example we have a buffer of 50 and usually we get
+// a frame every 10 milliseconds, but then there isn't a frame for 14 milliseconds, then it
+// should just generate the frames for that as soon as it can based on the next frame, if
+// the lag spike was bigger than the buffer, then it obviously can't do that. But then it
+// should increase the buffer and then it should start working again". Measured before
+// the credit (100 fps, max 50, 60 ms stalls at 3, 3.5, 4 and 5 s from no buffer): the
+// output froze for 58, 42, 29 and 0 ms -- the 3 % ramp had not caught up -- so the buffer
+// "waited". The first stall's freeze is unavoidable (nothing was known); the rest are not.
+
+namespace
+{
+	// The first paint at or after tSec.
+	const Painted *PaintAtOrAfter( const Driver &drv, double tSec )
+	{
+		for ( const Painted &p : drv.log )
+			if ( p.t >= Ns( tSec * 1e9 ) )
+				return &p;
+		return nullptr;
+	}
+
+	// The paint before the first one at or after tSec.
+	const Painted *PaintBefore( const Driver &drv, double tSec )
+	{
+		const Painted *pPrev = nullptr;
+		for ( const Painted &p : drv.log )
+		{
+			if ( p.t >= Ns( tSec * 1e9 ) )
+				return pPrev;
+			pPrev = &p;
+		}
+		return nullptr;
+	}
+}
+
+TEST_CASE( "lag buffer: a hiccup shorter than the buffer is bridged by generated frames, t about 0.71", "[lagbuffer][stall]" )
+{
+	// 100 fps, a 50 ms buffer (test mode, settled), then one frame 14 ms after the last
+	Driver drv = LagDriver();
+	drv.lag.testMode = LagTestMode::ForceMax;
+	drv.RunArrivals( StallArrivals( 10.0, 8.0, { { 6.0, 14.0 } } ), 8000 * MS );
+	REQUIRE( drv.pacer.BufferMs() == 50.0 );
+	// the 4 ms hiccup is detected, and (4 ms < D) earns no credit
+	CHECK( drv.Status().spikesInWindow == 1 );
+	CHECK( drv.pacer.BufferMs() == 50.0 );
+	INFO( "longest gap " << LongestGap( drv, 5.95, 6.2 ) << " ms" );
+	CHECK( LongestGap( drv, 5.95, 6.2 ) <= 1.5 * 10.0 );
+	// a synth sits at 10/14 of the pair that brackets the hiccup, and then the real frame
+	bool bT71 = false;
+	for ( const Painted &p : drv.log )
+		if ( p.t > Ns( 5.99e9 ) && p.t < Ns( 6.2e9 ) && p.d.newOutput && p.d.prevId != 0 && std::fabs( p.d.t - 0.714f ) < 0.03f )
+			bT71 = true;
+	CHECK( bT71 );
+	// the content time and the shown frames stay monotonic
+	int64_t tauPrev = 0;
+	uint64_t ulShown = 0;
+	for ( const Painted &p : drv.log )
+	{
+		if ( p.t < Ns( 5.0e9 ) )
+			continue;
+		if ( p.tau != 0 )
+		{
+			CHECK( p.tau >= tauPrev );
+			tauPrev = p.tau;
+		}
+		if ( p.d.newOutput )
+		{
+			const uint64_t ulHi = p.d.prevId != 0 ? p.d.currId : p.d.showId;
+			CHECK( ulHi >= ulShown );
+			ulShown = std::max( ulShown, ulHi );
+		}
+	}
+}
+
+TEST_CASE( "lag buffer: a spike larger than the buffer stalls once, grows it at once, and the repeat is covered", "[lagbuffer][stall]" )
+{
+	// a 40 ms interval at 2 s (size 30) sizes the buffer at 34 ms; a 60 ms one at 5 s (size 50)
+	// then finds D = 34: it stalls for about (size - D) + one interval, and the buffer is at 50
+	// (the max) on the very paint after it, not 1.7 s later
+	Driver drv = LagDriver();
+	drv.RunArrivals( StallArrivals( 10.0, 8.0, { { 2.0, 40.0 }, { 5.0, 60.0 }, { 5.5, 60.0 } } ), 8000 * MS );
+	const Painted *pBefore = PaintBefore( drv, 5.0 );
+	REQUIRE( pBefore );
+	INFO( "D before the spike " << pBefore->bufMs << " ms" );
+	CHECK( pBefore->bufMs > 32.0 );
+	CHECK( pBefore->bufMs < 35.0 );
+	const double flStall = LongestGap( drv, 4.99, 5.2 );
+	INFO( "stall " << flStall << " ms" );
+	CHECK( flStall > 15.0 );                       // it did stall: nothing was known to cover 50 ms
+	CHECK( flStall < 31.0 );                       // for (60 - 34) = 26 ms, not the 60 ms of the gap
+	// the paint after the late frame: D is already at the spike's size or more
+	const Painted *pAfter = PaintAtOrAfter( drv, 5.06 );
+	REQUIRE( pAfter );
+	CHECK( pAfter->bufMs >= 49.9 );
+	CHECK( pAfter->bufMs <= 50.0 );
+	// the repeat 0.5 s later: no gap above 1.5 intervals (the 240 Hz tick rounds 10 ms to 12.5)
+	INFO( "repeat " << LongestGap( drv, 5.49, 5.7 ) << " ms" );
+	CHECK( LongestGap( drv, 5.49, 5.7 ) <= 1.5 * 10.0 );
+	CHECK( CountRenderedSynths( drv, Ns( 5.55e9 ), Ns( 5.65e9 ) ) >= 2 );
+}
+
+TEST_CASE( "lag buffer: 60 ms stalls at 3, 3.5, 4 and 5 s from nothing: only the first freezes", "[lagbuffer][stall]" )
+{
+	Driver drv = LagDriver();
+	drv.RunArrivals( StallArrivals( 10.0, 7.0, { { 3.0, 60.0 }, { 3.5, 60.0 }, { 4.0, 60.0 }, { 5.0, 60.0 } } ), 7000 * MS );
+	// before: 58 / 42 / 29 / 0 ms of freeze (the buffer ramped at 3 % and was never there in time)
+	CHECK( LongestGap( drv, 2.99, 3.3 ) > 40.0 );
+	for ( double flAt : { 3.5, 4.0, 5.0 } )
+	{
+		INFO( "stall at " << flAt << " s: longest gap " << LongestGap( drv, flAt - 0.01, flAt + 0.2 ) << " ms" );
+		CHECK( LongestGap( drv, flAt - 0.01, flAt + 0.2 ) <= 1.5 * 10.0 );
+	}
+	CHECK( drv.pacer.BufferMs() == 50.0 );
+}
+
+TEST_CASE( "lag buffer: a 14 ms gap at 100 fps is a spike (1.3x) and is bridged next time; ordinary jitter and a fast game's noise are not", "[lagbuffer][stall][threshold]" )
+{
+	Driver drv = LagDriver();
+	drv.RunArrivals( StallArrivals( 10.0, 8.0, { { 2.0, 14.0 }, { 3.0, 14.0 }, { 4.0, 14.0 }, { 5.0, 14.0 }, { 6.0, 14.0 } } ), 8000 * MS );
+	const Pacer::Report r = drv.Status();
+	CHECK( r.spikesInWindow == 5 );
+	CHECK( r.outliersIgnored == 0 );
+	INFO( "buffer " << drv.pacer.BufferMs() );
+	CHECK( drv.pacer.BufferMs() > 5.0 );           // 4 ms x 1.1 + 1 ms = 5.4
+	CHECK( drv.pacer.BufferMs() < 6.0 );
+	CHECK( LongestGap( drv, 5.99, 6.1 ) <= 1.5 * 10.0 );
+	// the first one's buffer came at once (a 4 ms stall, credited 4 ms)
+	const Painted *pFirst = PaintAtOrAfter( drv, 2.02 );
+	REQUIRE( pFirst );
+	CHECK( pFirst->bufMs >= 3.9 );
+
+	// no jitter floor (the user's choice): the jitter that is NOT a spike is excluded by the
+	// ratio and the minimum excess alone. 60 fps +-4 ms peaks at 1.24x ("ordinary jitter ..."
+	// above); a 240 fps game's 4.2 ms interval with a 5.6 ms one is 1.34x but only 1.4 ms over
+	{
+		Driver fast = LagDriver();
+		std::vector<Ns> v;
+		Ns t = 3 * MS;
+		for ( int k = 0; k < 6000; k++ )
+		{
+			v.push_back( t );
+			t += Ns( ( k % 10 == 5 ? 5.6 : 4.17 ) * double( MS ) );
+		}
+		fast.RunArrivals( v, v.back() + MS );
+		CHECK( fast.Status().spikesInWindow == 0 );
+		CHECK( fast.pacer.BufferMs() == 0.0 );
+	}
+	// ... while 2 ms over IS one: the same game with a 6.4 ms interval
+	{
+		Driver fast = LagDriver();
+		std::vector<Ns> v;
+		Ns t = 3 * MS;
+		for ( int k = 0; k < 6000; k++ )
+		{
+			v.push_back( t );
+			t += Ns( ( k % 100 == 50 ? 6.4 : 4.17 ) * double( MS ) );
+		}
+		fast.RunArrivals( v, v.back() + MS );
+		CHECK( fast.Status().spikesInWindow >= 1 );
+	}
+}
+
+TEST_CASE( "lag buffer: a spike above the max is still an outlier: no credit, no buffer, counted", "[lagbuffer][stall]" )
+{
+	Driver drv = LagDriver( 50.0 );
+	// a 40 ms interval sizes D at ~34; a 70 ms one (size 60 > 50) must not move it
+	drv.RunArrivals( StallArrivals( 10.0, 8.0, { { 2.0, 40.0 }, { 5.0, 70.0 } } ), 8000 * MS );
+	const Painted *pBefore = PaintBefore( drv, 5.0 );
+	REQUIRE( pBefore );
+	const Painted *pAfter = PaintAtOrAfter( drv, 5.1 );
+	REQUIRE( pAfter );
+	INFO( "before " << pBefore->bufMs << " after " << pAfter->bufMs );
+	CHECK( pAfter->bufMs <= pBefore->bufMs + 0.1 );
+	for ( const Painted &p : drv.log )
+		if ( p.t > Ns( 5.0e9 ) && p.t < Ns( 5.2e9 ) )
+			CHECK( p.bufMs <= pBefore->bufMs + 0.1 );
+	const Pacer::Report r = drv.Status();
+	CHECK( r.outliersIgnored == 1 );
+	CHECK( r.spikesInWindow == 1 );
+	// from nothing too: D stays 0
+	Driver none = LagDriver( 50.0 );
+	none.RunArrivals( StallArrivals( 10.0, 6.0, { { 3.0, 70.0 } } ), 6000 * MS );
+	CHECK( none.pacer.BufferMs() == 0.0 );
+	CHECK( none.Status().outliersIgnored == 1 );
+}
+
+TEST_CASE( "lag buffer: a spike inside the look-back that has faded is credited again, up to its size", "[lagbuffer][stall]" )
+{
+	// a 40 ms interval (size 30) at 10 s in a 300 s window: by 170 s the weight has fallen to
+	// 0.6 and the buffer shrank with it; the same stall at 180 s finds D too small and grows it at once
+	Driver drv = LagDriver( 50.0, 300.0 );
+	drv.RunArrivals( StallArrivals( 10.0, 190.0, { { 10.0, 40.0 }, { 180.0, 40.0 } } ), 190000 * MS );
+	const Painted *pBefore = PaintBefore( drv, 180.0 );
+	REQUIRE( pBefore );
+	INFO( "D before the repeat " << pBefore->bufMs );
+	CHECK( pBefore->bufMs < 28.0 );                // decayed below the spike's size
+	CHECK( pBefore->bufMs > 10.0 );                // but inside the window it is never dropped
+	const Painted *pAfter = PaintAtOrAfter( drv, 180.05 );
+	REQUIRE( pAfter );
+	INFO( "D after " << pAfter->bufMs );
+	CHECK( pAfter->bufMs >= 29.9 );                // back to the spike's size at once
+	CHECK( pAfter->bufMs <= 35.0 );
+}
+
+TEST_CASE( "lag buffer: with frame generation the credit counts the whole delay and never over-grows", "[lagbuffer][stall][combine]" )
+{
+	const double flI = 1000.0 / 60.0;
+	for ( int nMode = 0; nMode < 3; nMode++ )
+	{
+		Driver drv = LagDriver();
+		drv.frameGen = true;
+		drv.multiplier = 2;
+		if ( nMode == 1 )
+		{
+			drv.mode = Mode::Target;
+			drv.targetFps = 120;
+		}
+		if ( nMode == 2 )
+			drv.priority = Priority::Smoothness;
+		// a 50 ms interval at 3 s: size 50 - 16.7 = 33.3
+		drv.RunArrivals( StallArrivals( flI, 6.0, { { 3.0, 50.0 } } ), 6000 * MS );
+		const double flSize = 50.0 - flI;
+		const Painted *pBefore = PaintBefore( drv, 3.0 );
+		REQUIRE( pBefore );
+		// on the first paint that grows it, the buffer grows by (size - the whole delay), plus at most
+		// one ramp step (3 % of a capped 100 ms paint): the credit counts the base delay too, so it
+		// does not put a whole size on top of a delay that already covers part of it
+		const Painted *pGrown = nullptr;
+		for ( const Painted &p : drv.log )
+			if ( p.t > Ns( 3.0e9 ) && p.bufMs > pBefore->bufMs + 0.01 )
+			{
+				pGrown = &p;
+				break;
+			}
+		REQUIRE( pGrown );
+		const double flGrowth = pGrown->bufMs - pBefore->bufMs;
+		INFO( "mode " << nMode << ": D before " << pBefore->delayMs << " (buffer " << pBefore->bufMs << "), buffer after " << pGrown->bufMs
+			<< ", growth " << flGrowth << ", size " << flSize );
+		CHECK( flGrowth <= flSize - pBefore->delayMs + kLagRampEps * 100.0 + 0.1 );
+		CHECK( flGrowth >= 0.5 * ( flSize - pBefore->delayMs ) );
+		// the history follows it
+		for ( const Painted &p : drv.log )
+			if ( p.t > Ns( 2.9e9 ) )
+				CHECK( p.depth >= int( std::ceil( p.bufMs / flI - 0.05 ) ) + kHistoryMargin );
+		// settled, the buffer is the target the spike always sized (x 1.1 + 1 ms), not more
+		const Painted *pLate = PaintAtOrAfter( drv, 4.0 );
+		REQUIRE( pLate );
+		INFO( "settled buffer " << pLate->bufMs );
+		CHECK( pLate->bufMs <= flSize * ( 1.0 + kLagMarginFrac ) + kLagMarginMs + 0.01 );
+		CHECK( pLate->bufMs >= flSize * ( 1.0 + kLagMarginFrac ) + kLagMarginMs - 0.5 );
+		CHECK( drv.pacer.Generating() );
+	}
+}
+
+TEST_CASE( "lag buffer: switching it off drops the buffer at once even with a stall credit pending", "[lagbuffer][stall][instantoff]" )
+{
+	Driver drv = LagDriver();
+	drv.RunArrivals( StallArrivals( 10.0, 5.0, { { 2.0, 40.0 } } ), 5000 * MS );
+	REQUIRE( drv.pacer.BufferMs() > 30.0 );
+	// the late frame arrives (the credit is noted) and the buffer is off on the paint that follows
+	drv.lag.enabled = false;
+	drv.ArriveAndPaint( drv.now + 80 * MS );
+	CHECK( drv.log.back().bufMs == 0.0 );
+	CHECK( drv.log.back().delayMs == 0.0 );
+	drv.Run( 300 * MS, 10.0 );
+	CHECK( drv.pacer.BufferMs() == 0.0 );
+	// switched back on: from zero, by the ramp -- the discarded credit does not come back
+	drv.lag.enabled = true;
+	drv.Run( 100 * MS, 10.0 );
+	INFO( "buffer " << drv.pacer.BufferMs() );
+	CHECK( drv.pacer.BufferMs() < 5.0 );
+}
+
+TEST_CASE( "lag buffer: a stall at 400 fps is credited only up to what the history can hold", "[lagbuffer][stall][highfps]" )
+{
+	// 2.5 ms interval, max 250: the history caps the buffer at (65 - 3 - 2) x 2.5 = 150 ms. A 200 ms
+	// stall (size 197.5, within the max, above the cap) jumps the buffer to the cap and no further.
+	Driver drv = LagDriver( 250.0 );
+	drv.RunArrivals( StallArrivals( 2.5, 8.0, { { 4.0, 200.0 } } ), 8000 * MS );
+	double flMax = 0.0;
+	int nDepthMax = 0;
+	for ( const Painted &p : drv.log )
+	{
+		flMax = std::max( flMax, p.bufMs );
+		nDepthMax = std::max( nDepthMax, p.depth );
+	}
+	const double flCap = double( kHistoryMax - kHistory - kHistoryMargin ) * 2.5;
+	INFO( "peak buffer " << flMax << " cap " << flCap << ", peak depth " << nDepthMax );
+	CHECK( flMax <= flCap + 1e-6 );
+	CHECK( flMax >= flCap - 1.0 );
+	CHECK( nDepthMax <= kHistoryMax );
+	const Painted *pAfter = PaintAtOrAfter( drv, 4.3 );
+	REQUIRE( pAfter );
+	CHECK( pAfter->bufMs >= flCap - 1.0 );
 }
 
 // ======================================================================
