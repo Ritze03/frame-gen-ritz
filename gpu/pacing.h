@@ -94,8 +94,8 @@
 //
 // PASS-THROUGH (the real frame, shown at once, renderer inert) only when:
 //   - the game's rate already reaches the output rate (interval <= o, with a
-//     ratio band for hysteresis: stop generating below 1.02, start again above
-//     1.10 -- NOT a time hold);
+//     ratio band for hysteresis: stop generating below 1.005, start again above
+//     1.04, and a change must also hold for a dwell: see "THE GENERATE / PASS DECISION");
 //   - the renderer is unavailable (Inputs::rendererOk false -- it is still
 //     driven, so it re-checks);
 //   - the cost guard trips (below).
@@ -196,8 +196,9 @@
 
 // THE GENERATE / PASS DECISION (Pacer::Evaluate; 2026-10-05, from a user report).
 // Whether the pacer generates or passes the game's frames through is decided on the ratio
-// r = game interval / output interval: generating stops once r < kStopRatio (1.02, the game
-// reaches the output rate) and starts again once r > kStartRatio (1.10). THE REPORT: the HUD
+// r = game interval / output interval: generating stops once r < kStopRatio (1.005, the game
+// reaches the output rate) and starts again once r > kStartRatio (1.04; it was 1.02 / 1.10
+// until 2026-10-06, see "THE BAND" below). THE REPORT: the HUD
 // in "Both" mode kept switching between "game > output" and the lone game number "for no
 // apparent reason". THE MEASUREMENT: a 4-minute CS2 session at 280 Hz (Target = display
 // refresh, Smoothness, Pause at refresh off) logged 246 alternating "generating" / "passing
@@ -214,8 +215,9 @@
 //   1. The ratio is judged on a STEADY rate (SteadyRate): a frame-weighted exponential mean of
 //      the intervals, time constant kSteadyTauMs (300 ms), each interval clamped to
 //      [mean / 2, 2 x mean] first (one 50 ms hitch among 3.7 ms frames moves it ~1%). The
-//      band is kept: with 0.8% noise (10% jitter) instead of 15% it is now wider than the
-//      noise, so it neither needs widening nor flaps.
+//      band was kept at first (1.02 / 1.10): with 0.8% noise (10% jitter) instead of 15% it
+//      was wider than the noise, so it neither needed widening nor flapped. It was TOO wide,
+//      see "THE BAND" below.
 //   2. A change of state must HOLD: the opposite condition continuously true for
 //      kStopDwellMs (1000) to stop, kStartDwellMs (300) to start; leaving the condition
 //      restarts the clock. Stopping late costs almost nothing (a generated frame the game
@@ -231,6 +233,56 @@
 // 300 -> 150 fps starts generating 0.42 s later; one that really rises 150 -> 320 stops 1.40 s
 // later; a 50 ms or 90 ms hitch changes nothing (a stall of kGapResetNs or more is the gap
 // path, as before).
+// THE BAND (2026-10-06, from a second user report). THE REPORT, a CS2 player at 280 Hz, Target
+// auto: "the adaptive mode sometimes for some reason doesn't boost up to the target FPS, and
+// I don't get why, especially because [CS2] doesn't use any GPU basically". THE CAUSE, two
+// parts, both of them "stuck passed through while 2..9% under the target":
+//   1. The band above was sized for the old 8-sample median's 15% noise and kept after the steady
+//      rate cut the noise to 0.8% (2% at 25% jitter). A game that had passed through (above the
+//      target for a moment, or after a hitch) only started generating again once its steady rate
+//      fell below target / 1.10 = 254.5 fps, so a game wandering 255..274 fps stayed passed
+//      through at 255..274 fps on screen: no boost, with the GPU idle. A step 300 -> 260 fps
+//      never started at all.
+//   2. The FIRST decision (stop ratio alone, no dwell) was taken as soon as the estimate was
+//      valid, on the median of 4..8 intervals (about 6% noise). A 262 fps game whose young
+//      estimate read "reaches the target" (ratio <= 1.02) was passed through, and the band
+//      then held it there for the whole session: 76 of 300 simulated sessions at 10% jitter
+//      (79 at 25%) started stranded that way. That is the "sometimes".
+// THE FIX, three changes, the dwells unchanged:
+//   * kStartRatio 1.10 -> 1.04: start when the steady game rate is 4% below the target
+//     (269 fps at 280).
+//   * kStopRatio 1.02 -> 1.005: stop when the game reaches the target, not 2% before it. Why it
+//     moved too: with the stop at 1.02 every start <= 1.04 flapped (275 fps j25%: 3.5-4.5 flips
+//     a minute, up to 8, against the <= 3 the tests hold) because the band was only 1-2% wide
+//     against the 2% noise, and a start of 1.05 left a 272 fps game stranded (33% generating).
+//     With the stop at 1.005 a game at 275..278 fps keeps generating the missing 2..5 fps:
+//     the output reaches 280 where a pass-through at 275 fps j10% presents only 267 (a vblank
+//     latch drops frames that a generated one fills). Why 1.005 and not 1.0: video (OnFrame)
+//     and any exactly periodic game at the output rate have ratio 1.0 +- rounding, which must
+//     read "reaches it", not "just under"; 0.5% is also under the steady rate's own noise.
+//   * The first decision is re-taken at every paint (still on the stop ratio alone, no dwell)
+//     until the steady rate is mature (SteadyRate::Mature: past the seeding median and one
+//     kSteadyTauMs of frames, about 0.3 s), and only then committed to the band and the dwell.
+//     Why not just wait (Warming): nothing is lost by generating from the first valid estimate,
+//     and a config change (which also re-takes the first decision) has a mature estimate at once.
+// A generated frame at 1.01x is a real one in ~100 outputs: that is the point (output AT the
+// target); the game's own frames are shown as they are and the extra ones sit between them.
+// The band's limit: a steady rate inside it (269..278.6 fps at 280 Hz) keeps whichever state it
+// is in, so a game that falls from above the target to 272 fps stays passed through until
+// it drops below 269; a narrower band flaps (see above).
+// MEASURED (mean of 10 seeds, 60 s, 280 Hz Target auto, generating share / flips a minute /
+// presented fps), before (1.02 / 1.10, first decision on the young estimate) -> after:
+//   262 j10% 80% 0.0 276 -> 100% 0.0 280;   268 j10% 60% 0.0 273 -> 100% 0.0 280;
+//   272 j10% 30% 0.0 269 -> 100% 0.0 280;   275 j10% 5% 0.3 267 -> 100% 0.0 280;
+//   278 j10% 1% 0.0 268 -> 47% 0.6 273;     282 j10% 0% 270 -> 0% 270;  290 j10% 0% 273 -> 0% 273;
+//   268 j25% 30% 0.0 256 -> 100% 0.0 280;   272 j25% 27% 0.1 256 -> 100% 0.0 280;
+//   275 j25% 12% 0.3 253 -> 91% 0.4 277;    278 j25% 3% 0.3 252 -> 56% 1.2 267;
+//   290 j25% 0% 257 -> 0% 257 (passed through, as before);
+//   +-15% drift at 270 46% 1.5 276 -> 56% 2.0 278; Pause at refresh on, 270 j10%: 50% 272 -> 100% 280;
+//   Target 400 at 380 fps j10% 70% 280 -> 100% 280; wander 210..330 fps (1-3 s) 66% 37 268 -> 75% 35 272.
+//   A step 300 -> 260 fps never started -> starts after 0.75 s (the 0.3 s dwell plus the steady
+//   rate crossing 269); 300 -> 150 0.42 s -> 0.38 s; 260 -> 300 stops after 0.92 s -> 1.19 s;
+//   a 50 / 90 ms hitch still changes nothing.
 // THE STEADY "GENERATING" SIGNAL (Report::generating, steadyMultiplier): fgActive / activeN
 // report the INSTANTANEOUS state. generating = the pacer is in the Generate state AND a generated
 // frame (t < 1 from a pair) was presented within the last ~1 s: NO multiplier gate (2026-10-05).
@@ -283,9 +335,14 @@ namespace framegen::pacing
 	constexpr Ns     kGapResetNs      = 100 * kNsPerMs;
 	// Generation stops when game interval / output interval falls below
 	// kStopRatio (the game reaches the output rate) and starts again once it is
-	// back above kStartRatio. 98% .. 91% of the refresh at a fixed multiplier.
-	constexpr double kStopRatio       = 1.02;
-	constexpr double kStartRatio      = 1.10;
+	// back above kStartRatio: at 280 Hz it stops at 278.6 fps and starts below 269.2 fps.
+	// Why this narrow (2026-10-06): the old 1.02 / 1.10 left a game 2..9% under the
+	// target passed through once it had been there ("the adaptive mode doesn't boost up
+	// to the target FPS", a CS2 at 255..274 fps with the GPU idle); the steady rate's
+	// noise (0.8% at 10% jitter, 2% at 25%) no longer needs a band that wide. See
+	// "THE BAND" in the header comment.
+	constexpr double kStopRatio       = 1.005;
+	constexpr double kStartRatio      = 1.04;
 	// ... but that ratio is judged on the STEADY RATE (SteadyRate below), not on the 8-sample
 	// median the pacing itself uses, and a change of state must also HOLD for a dwell. Why: a
 	// game hovering near the output rate (a 210..330 fps CS2 at a 280 Hz target) swings its
@@ -738,11 +795,13 @@ namespace framegen::pacing
 		{
 			m_nN = 0;
 			m_flMs = 0.0;
+			m_flSpanMs = 0.0;
 		}
 
 		void AddInterval( double flIntervalMs )
 		{
 			const double x = ClampIntervalMs( flIntervalMs );
+			m_flSpanMs += x;
 			if ( m_nN < kIntervalWindow )
 			{
 				m_flSeed[ m_nN++ ] = x;
@@ -756,11 +815,16 @@ namespace framegen::pacing
 		}
 
 		bool   Valid() const { return m_nN >= kMinSamples; }
+		// Past the seeding median and covering one time constant of frames: noise of about
+		// 1% at 10% jitter, not the 4-sample median's ~6%. The first generate / pass
+		// decision is only committed once this holds (see "THE BAND").
+		bool   Mature() const { return m_nN > kIntervalWindow && m_flSpanMs >= kSteadyTauMs; }
 		double IntervalMs() const { return m_nN == 0 ? 0.0 : ClampIntervalMs( m_flMs ); }
 
 	private:
 		double m_flSeed[ kIntervalWindow ] = {};
 		double m_flMs = 0.0;
+		double m_flSpanMs = 0.0;             // the (clamped) intervals added since Clear, summed
 		int    m_nN = 0;
 	};
 
@@ -1624,15 +1688,20 @@ namespace framegen::pacing
 			// The game reaches the output rate: nothing to generate. Judged on the STEADY rate
 			// (video: the exact PTS interval), as a ratio band (kStopRatio / kStartRatio) that must
 			// also HOLD for a dwell before the state changes (kStopDwellMs / kStartDwellMs; video:
-			// none). The first decision after a start or a change uses the stop ratio alone.
+			// none). The first decision after a start or a change uses the stop ratio alone,
+			// re-taken at every paint until the steady rate is mature (SteadyRate::Mature).
 			const double flSteadyMs = m_bPts ? flInterval : m_Steady.IntervalMs();
 			const double flRatio = OutputRatio( flSteadyMs,
 				OutputIntervalMs( in.mode, in.multiplier, in.targetFps, flSteadyMs, in.refreshHz, bCap ) );
 			const bool bWantFlip = m_bGen ? flRatio < kStopRatio : flRatio > kStartRatio;
 			if ( !m_bGenInit )
 			{
+				// Follows the stop ratio at once, but is only COMMITTED (the band and the dwell
+				// take over) once the steady rate is mature: the first few intervals' median is
+				// 6% noisy, and a game at 262 fps whose young estimate read "reaches the target"
+				// stayed passed through for good (76 of 300 sessions started that way).
 				m_bGen = flRatio > kStopRatio;
-				m_bGenInit = true;
+				m_bGenInit = m_bPts || m_Steady.Mature();
 				m_bFlipPend = false;
 			}
 			else if ( !bWantFlip )
