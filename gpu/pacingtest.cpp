@@ -658,7 +658,9 @@ TEST_CASE( "pacing: pass-through only when the game reaches the output rate, wit
 	CHECK( drv.pacer.Generating() );
 	Phase( 58.5 );                                  // 1.026: still above the stop ratio
 	CHECK( drv.pacer.Generating() );
-	Phase( 59.4 );                                  // 1.0101: the game fills the display
+	Phase( 59.0 );                                  // 1.0169: a game 1.7% under the target still generates (the stop ratio is 1.005)
+	CHECK( drv.pacer.Generating() );
+	Phase( 59.8 );                                  // 1.0033: the game fills the display
 	CHECK_FALSE( drv.pacer.Generating() );
 	{
 		const Pacer::Report s = drv.Status();
@@ -666,9 +668,9 @@ TEST_CASE( "pacing: pass-through only when the game reaches the output rate, wit
 		CHECK( s.activeN == 0 );
 		CHECK( s.delayMs == 0.0f );
 	}
-	Phase( 57.0 );                                  // 1.0526: inside the band, stays off
+	Phase( 58.0 );                                  // 1.0345: inside the band (1.005 .. 1.04), stays off
 	CHECK_FALSE( drv.pacer.Generating() );
-	Phase( 54.0 );                                  // 1.111: above the start ratio
+	Phase( 57.0 );                                  // 1.0526: above the start ratio (1.04): a game 5% under the target starts
 	CHECK( drv.pacer.Generating() );
 
 	// A game above the refresh is plainly passed through.
@@ -3977,29 +3979,39 @@ TEST_CASE( "high fps: a 340 and a 450 fps game on 280 Hz with Pause at refresh o
 
 TEST_CASE( "high fps: a 260 fps game on 280 Hz generates, and the hysteresis holds from both sides", "[highfps]" )
 {
-	// 260 fps: ratio 1.077, between the stop (1.02) and start (1.10) ratios.
+	// 260 fps: ratio 1.077, above the start ratio (1.04); the band is 1.005 .. 1.04 (278.6 .. 269.2 fps).
 	Driver a = HighFpsDriver();
 	a.Run( 1500 * MS, 1000.0 / 260.0 );
 	CHECK( std::fabs( a.Status().gameFps - 260.0f ) < 8.0f );
-	// First decision uses the stop ratio alone: 1.077 > 1.02 -> generating.
+	// First decision uses the stop ratio alone: 1.077 > 1.005 -> generating.
 	CHECK( a.pacer.Generating() );
 
-	// ... a game that was passing through (340 fps) and drops to 260 stays passing: 1.077 < 1.10.
+	// ... a game that was passing through (340 fps) and drops to 260 (1.077 > 1.04) starts generating:
+	// it used to stay passed through until ~254 fps (start ratio 1.10), 9% under the target.
 	Driver b = HighFpsDriver();
 	b.Run( 1500 * MS, 1000.0 / 340.0 );
 	REQUIRE_FALSE( b.pacer.Generating() );
 	b.Run( 1500 * MS, 1000.0 / 260.0 );
-	CHECK_FALSE( b.pacer.Generating() );
-	// ... and starts only once the game is below ~254 fps (ratio > 1.10).
-	b.Run( 1500 * MS, 1000.0 / 250.0 );
 	CHECK( b.pacer.Generating() );
 
-	// From the other side: generating at 240, rising to 270 (ratio 1.037 > 1.02) keeps generating;
-	// 280 (1.0) stops it.
+	// ... but one that drops only to 272 (1.029, inside the band) stays passing, and starts once it is
+	// below ~269 fps (ratio > 1.04).
+	Driver b2 = HighFpsDriver();
+	b2.Run( 1500 * MS, 1000.0 / 340.0 );
+	REQUIRE_FALSE( b2.pacer.Generating() );
+	b2.Run( 1500 * MS, 1000.0 / 272.0 );
+	CHECK_FALSE( b2.pacer.Generating() );
+	b2.Run( 1500 * MS, 1000.0 / 266.0 );
+	CHECK( b2.pacer.Generating() );
+
+	// From the other side: generating at 240, rising to 270 (ratio 1.037) and to 276 (1.014, still above
+	// the stop ratio) keeps generating; 290 (0.966) stops it.
 	Driver c = HighFpsDriver();
 	c.Run( 1500 * MS, 1000.0 / 240.0 );
 	REQUIRE( c.pacer.Generating() );
 	c.Run( 1500 * MS, 1000.0 / 270.0 );
+	CHECK( c.pacer.Generating() );
+	c.Run( 1500 * MS, 1000.0 / 276.0 );
 	CHECK( c.pacer.Generating() );
 	c.Run( 1500 * MS, 1000.0 / 290.0 );
 	CHECK_FALSE( c.pacer.Generating() );
@@ -4169,12 +4181,12 @@ TEST_CASE( "steady rate: a hitch does not move it, a real step pulls it all the 
 		r.AddInterval( 3.7 );
 	CHECK( std::fabs( r.IntervalMs() / 3.7 - 1.0 ) < 0.005 );      // and it is gone again
 
-	// 300 -> 150 fps: within ~0.1 s the measure is above the 1.10 start ratio at 280 Hz (3.93 ms).
+	// 300 -> 150 fps: within ~0.1 s the measure is above the 1.04 start ratio at 280 Hz (3.71 ms).
 	SteadyRate s;
 	for ( int i = 0; i < 200; i++ )
 		s.AddInterval( 1000.0 / 300.0 );
 	double flT = 0.0;
-	while ( s.IntervalMs() < 3.93 && flT < 2000.0 )
+	while ( s.IntervalMs() < 3.71 && flT < 2000.0 )
 	{
 		s.AddInterval( 1000.0 / 150.0 );
 		flT += 1000.0 / 150.0;
@@ -4202,9 +4214,9 @@ TEST_CASE( "decision: a game hovering near the target does not flap (Target auto
 {
 	struct Case { double fps, sigma, drift; };
 	const Case cases[] = {
-		{ 255, 0.10, 0 }, { 262, 0.10, 0 }, { 270, 0.10, 0 }, { 275, 0.10, 0 },
-		{ 255, 0.25, 0 }, { 262, 0.25, 0 }, { 270, 0.25, 0 }, { 275, 0.25, 0 },
-		{ 262, 0.10, 0.15 }, { 270, 0.10, 0.15 },
+		{ 255, 0.10, 0 }, { 262, 0.10, 0 }, { 270, 0.10, 0 }, { 275, 0.10, 0 }, { 278, 0.10, 0 },
+		{ 255, 0.25, 0 }, { 262, 0.25, 0 }, { 270, 0.25, 0 }, { 275, 0.25, 0 }, { 278, 0.25, 0 },
+		{ 262, 0.10, 0.15 }, { 270, 0.10, 0.15 }, { 278, 0.10, 0.15 },
 	};
 	for ( const Case &c : cases )
 	{
@@ -4221,6 +4233,94 @@ TEST_CASE( "decision: a game hovering near the target does not flap (Target auto
 			CHECK( f.minGapMs >= kStartDwellMs - 1.0 );           // never a flip-flop inside the dwell
 		}
 	}
+}
+
+TEST_CASE( "decision: a game a few percent under the target is boosted to it (Target auto, 280 Hz)", "[steady][boost]" )
+{
+	// The report (2026-10-06): "the adaptive mode sometimes for some reason doesn't boost up to the
+	// target FPS", a CS2 at 255..274 fps with the GPU idle. The old start ratio (1.10) left a game
+	// that had passed through at 254..274 fps passed through; the first decision on a young estimate
+	// had the same effect from the start.
+	struct Case { double fps, sigma; };
+	const Case cases[] = {
+		{ 255, 0.10 }, { 262, 0.10 }, { 268, 0.10 }, { 272, 0.10 },
+		{ 255, 0.25 }, { 262, 0.25 }, { 268, 0.25 },
+		// 272 at 25% jitter is not asserted: its steady rate (about 1.029) sits inside the 1.005 .. 1.04
+		// band, where either state holds, and a noise swing past 278.6 fps for a second stops it.
+	};
+	for ( const Case &c : cases )
+	{
+		for ( uint64_t seed = 1; seed <= 3; seed++ )
+		{
+			Driver drv = FlapDriver();
+			const Ns tEnd = 30 * 1000 * MS;
+			drv.RunArrivals( Arrivals( 3 * MS, tEnd, [&]( double ) { return c.fps; }, c.sigma, seed ), tEnd );
+			int nGen = 0, nTot = 0, nOut = 0;
+			for ( const Painted &p : drv.log )
+				if ( p.t >= 2000 * MS )
+				{
+					nTot++;
+					nGen += p.gen ? 1 : 0;
+					nOut += p.d.newOutput ? 1 : 0;
+				}
+			const double flGenShare = double( nGen ) / double( nTot );
+			const double flPresented = double( nOut ) / 28.0;
+			INFO( "fps " << c.fps << " sigma " << c.sigma << " seed " << seed << " generating " << flGenShare << " presented " << flPresented );
+			CHECK( flGenShare >= 0.95 );
+			CHECK( flPresented >= 0.97 * 280.0 );           // the output is at the target (280 Hz), not at the game's rate
+		}
+	}
+	// A game at or above the target is passed through: at most the odd dip of a 25% jittery 282.
+	for ( double flFps : { 290.0, 300.0, 350.0 } )
+	{
+		for ( double flSigma : { 0.10, 0.25 } )
+		{
+			Driver drv = FlapDriver();
+			const Ns tEnd = 30 * 1000 * MS;
+			drv.RunArrivals( Arrivals( 3 * MS, tEnd, [&]( double ) { return flFps; }, flSigma ), tEnd );
+			int nGen = 0, nTot = 0;
+			for ( const Painted &p : drv.log )
+				if ( p.t >= 2000 * MS )
+				{
+					nTot++;
+					nGen += p.gen ? 1 : 0;
+				}
+			INFO( "fps " << flFps << " sigma " << flSigma << " generating " << double( nGen ) / double( nTot ) );
+			CHECK( nGen <= nTot / 50 );
+		}
+	}
+}
+
+TEST_CASE( "decision: the first decision waits for a mature steady rate, a young noisy one does not strand a game in pass-through", "[steady][boost]" )
+{
+	// A 262 fps game (ratio 1.069, plainly under the target) over 40 sessions with 25% jitter: the
+	// first decision used to be taken on the median of 4..8 intervals (6% noise), and a read of
+	// "reaches the target" kept the game passed through for good (76 of 300 sessions at 10% jitter,
+	// 79 at 25%). The decision is now re-taken at every paint until the steady rate covers
+	// kSteadyTauMs, then it commits.
+	int nStranded = 0;
+	for ( uint64_t seed = 1; seed <= 40; seed++ )
+	{
+		Driver drv = FlapDriver();
+		const Ns tEnd = 3 * 1000 * MS;
+		drv.RunArrivals( Arrivals( 3 * MS, tEnd, []( double ) { return 262.0; }, 0.25, seed ), tEnd );
+		nStranded += drv.pacer.Generating() ? 0 : 1;
+	}
+	CHECK( nStranded == 0 );
+	SteadyRate r;
+	CHECK_FALSE( r.Mature() );
+	for ( int i = 0; i < 8; i++ )
+		r.AddInterval( 3.7 );
+	CHECK_FALSE( r.Mature() );              // past kMinSamples but not past the seeding median
+	for ( int i = 0; i < 100; i++ )
+		r.AddInterval( 3.7 );
+	CHECK( r.Mature() );                    // 108 intervals, 400 ms
+	SteadyRate slow;                        // 20 fps: nine intervals are 450 ms
+	for ( int i = 0; i < 9; i++ )
+		slow.AddInterval( 50.0 );
+	CHECK( slow.Mature() );
+	r.Clear();
+	CHECK_FALSE( r.Mature() );
 }
 
 TEST_CASE( "decision: Target 400 and Fixed 3x near their own edges do not flap either", "[steady][flap]" )
@@ -4284,6 +4384,17 @@ TEST_CASE( "decision: a game that really drops starts generating within 0.5 s, o
 		CHECK( flOff - 5.0 < 1.5 );
 		CHECK( flOff - 5.0 >= kStopDwellMs / 1000.0 );   // the dwell: never sooner than 1 s
 		CHECK_FALSE( u.pacer.Generating() );
+
+		// 300 -> 260 fps (a game 7% under the target): it NEVER started with the old 1.10 start
+		// ratio (260 fps is above its 254.5 fps edge). Now: the steady rate must cross 269 fps
+		// (about 1.3 time constants) and hold for the 0.3 s dwell.
+		Driver e = FlapDriver();
+		e.RunArrivals( Arrivals( 3 * MS, tEnd, []( double t ) { return t < 5.0 ? 300.0 : 260.0; }, 0.10, seed ), tEnd );
+		const double flOn2 = FirstFlipAfter( e, 5.0 );
+		INFO( "seed " << seed << " 300 -> 260 starts at " << flOn2 );
+		CHECK( flOn2 > 5.0 );
+		CHECK( flOn2 - 5.0 < 1.0 );
+		CHECK( e.pacer.Generating() );
 	}
 }
 
@@ -4310,7 +4421,7 @@ TEST_CASE( "decision: the dwell is time, not frames: a steady change lands after
 	d.Run( 4 * 1000 * MS, 1000.0 / 300.0 );          // 0.93 -> passing through
 	REQUIRE_FALSE( d.pacer.Generating() );
 	const Ns tStep = d.now;
-	d.Run( 3 * 1000 * MS, 1000.0 / 240.0 );          // 1.167 > 1.10
+	d.Run( 3 * 1000 * MS, 1000.0 / 240.0 );          // 1.167 > 1.04
 	const double flOn = FirstFlipAfter( d, double( tStep ) / 1e9 ) - double( tStep ) / 1e9;
 	CHECK( flOn >= kStartDwellMs / 1000.0 );
 	CHECK( flOn < 1.0 );          // a mild change (300 -> 240 fps): the rate measure needs ~0.45 s to cross
