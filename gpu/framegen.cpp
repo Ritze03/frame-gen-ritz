@@ -203,6 +203,7 @@ enum BlurPipe { B_LOOKUP, B_ERROR, B_RESOLVE, B_COUNT_ };
 static const int kBlurCnt0 = 32;   // == CNT0 in blur_common.glsl: u[] words 32.. hold the per-sample untrusted counts
 
 struct UiBuf { VkBuffer b = VK_NULL_HANDLE; VkDeviceMemory m = VK_NULL_HANDLE; VkDeviceSize size = 0; };
+struct RejPair { VkBuffer a = VK_NULL_HANDLE, c = VK_NULL_HANDLE; };   // the V2 masks of prev / curr, bound to synth sets 11 / 12
 struct UiBox { int x, y, w, h; bool operator==(const UiBox& o) const { return x == o.x && y == o.y && w == o.w && h == o.h; } };
 // One observed real frame: the clean copy, the mask of the box (full res) and, whole screen, of the whole frame.
 struct UiEntry {
@@ -249,6 +250,12 @@ struct Interpolator::Impl {
     std::vector<UiBuf> blurGrave;
     bool growBlur(UiBuf& b, VkDeviceSize bytes);
     VkDescriptorPool pool = VK_NULL_HANDLE;
+    // The V2 masks of the pair, for the synth sets (bindings 11 / 12, shaders/ui_reject.glsl). A pair without V2 masks gets `rejNone`,
+    // a zeroed buffer whose empty rectangle makes the shaders reject nothing. Allocated once at init, zeroed by the first synth record.
+    static constexpr VkDeviceSize kRejNoneBytes = 16;
+    UiBuf rejNone;
+    bool rejNoneZero = false;
+    RejPair rejectMasks(VkCommandBuffer cb);
     // Two rings: synth sets (all 6 bindings) and estimate sets (binding 5, out, never written: no estimate
     // pass uses it, and no stale view of an earlier synth can linger in it).
     enum { R_SYNTH, R_EST };
@@ -328,7 +335,7 @@ struct Interpolator::Impl {
     std::vector<const char*> qnames;
     uint32_t qcount = 0;
 
-    VkDescriptorSet takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur = false);
+    VkDescriptorSet takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur = false, RejPair rej = {});
     bool framesOk(const Frame& a) const { return a.view && (!yuv || a.chroma); }
     bool createSizeDependent();
     bool rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force);
@@ -805,9 +812,9 @@ bool Interpolator::init(const InitInfo& ii) {
     if (m->CreateSampler(d, &sci, nullptr, &m->sampler) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
 
     // bindings 0-2 buffers, 3-4 prev/curr, 5 out; 6-7: motion-blur scratch (only the blur passes use them);
-    // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out
-    const uint32_t nb = m->yuv ? 11 : 8;
-    VkDescriptorSetLayoutBinding b[11]{};
+    // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out; 11-12 (synth sets): the V2 masks of prev / curr (ui_reject.glsl)
+    uint32_t nb = m->yuv ? 11 : 8;
+    VkDescriptorSetLayoutBinding b[13]{};
     VkDescriptorType types[11] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -820,6 +827,12 @@ bool Interpolator::init(const InitInfo& ii) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         if (i == 3 || i == 4 || i == 8 || i == 9) b[i].pImmutableSamplers = &m->sampler;
+    }
+    for (uint32_t k = 11; k <= 12; k++, nb++) {
+        b[nb].binding = k;
+        b[nb].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[nb].descriptorCount = 1;
+        b[nb].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dci.bindingCount = nb;
@@ -894,8 +907,14 @@ bool Interpolator::init(const InitInfo& ii) {
             if (!m->makePipe(bspv[i].sp, m->blurLayout, m->blurPipes[i], bspv[i].sc)) { destroy(); err_ = fail; return false; }
     }
 
-    const uint32_t nSamp = m->yuv ? 4 : 2, nImg = m->yuv ? 2 : 1;
-    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5 * 2 * kSetRing},
+    // one pool for the sets of both rings, sized by what the layout above holds (every set is allocated with all of it)
+    uint32_t nBuf = 0, nSamp = 0, nImg = 0;
+    for (uint32_t i = 0; i < nb; i++) {
+        nBuf += b[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        nSamp += b[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        nImg += b[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nBuf * 2 * kSetRing},
                                   {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSamp * 2 * kSetRing},
                                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, nImg * 2 * kSetRing}};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -910,6 +929,7 @@ bool Interpolator::init(const InitInfo& ii) {
     dsai.descriptorSetCount = 2 * kSetRing;
     dsai.pSetLayouts = layouts;
     if (m->AllocateDescriptorSets(d, &dsai, &m->sets[0][0]) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
+    if (!m->allocBuf(m->rejNone, Impl::kRejNoneBytes)) { destroy(); err_ = fail; return false; }
 
     // static-UI protection: own set layout (sampled frame, storage image, 2 storage buffers; YUV: + the CbCr planes),
     // push constants, pipelines and a ring of kUiSets sets. Created always (small); resources only when the mode needs them.
@@ -1051,7 +1071,7 @@ Settings Interpolator::settings() const {
 void Interpolator::destroy() {
     if (!m) return;
     VkDevice d = m->info.device;
-    if (m->DestroyBuffer) m->destroySizeDependent();
+    if (m->DestroyBuffer) { m->destroySizeDependent(); m->freeBuf(m->rejNone); }
     if (m->qpool) m->DestroyQueryPool(d, m->qpool, nullptr);
     if (m->pool) m->DestroyDescriptorPool(d, m->pool, nullptr);
     for (auto p : m->pipes) if (p) m->DestroyPipeline(d, p, nullptr);
@@ -1100,7 +1120,7 @@ bool Interpolator::readTimings(std::vector<const char*>& names, std::vector<uint
     return true;
 }
 
-VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur) {
+VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur, RejPair rej) {
     VkDescriptorSet set = sets[ring][setIdx[ring]];
     setIdx[ring] = (setIdx[ring] + 1) % kSetRing;
     frameSets[ring]++;
@@ -1111,7 +1131,8 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
                                    {VK_NULL_HANDLE, prev.chroma, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, curr.chroma, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, out.chroma, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet wr[11]{};
+    VkDescriptorBufferInfo rj[2] = {{rej.a ? rej.a : rejNone.b, 0, VK_WHOLE_SIZE}, {rej.c ? rej.c : rejNone.b, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wr[13]{};
     uint32_t n = 0;
     auto add = [&](uint32_t binding, VkDescriptorType t) -> VkWriteDescriptorSet& {
         VkWriteDescriptorSet& w = wr[n++];
@@ -1140,6 +1161,10 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
         add(8, SMP).pImageInfo = &ii[3];
         add(9, SMP).pImageInfo = &ii[4];
         if (synth) add(10, IMG).pImageInfo = &ii[5];
+    }
+    if (synth) {   // the V2 masks of the pair (warp tap rejection)
+        add(11, BUF).pBufferInfo = &rj[0];
+        add(12, BUF).pBufferInfo = &rj[1];
     }
     UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
     return set;
@@ -1191,6 +1216,24 @@ struct Rec {
     }
 };
 }  // namespace
+
+// The masks the synth passes of the latest estimate's pair reject warp taps with (CrosshairV2: the entries' own V2 masks). The first
+// call also records the one-time zeroing of `rejNone` (its barrier orders the fill before this record's passes).
+RejPair Interpolator::Impl::rejectMasks(VkCommandBuffer cb) {
+    if (!rejNoneZero) {
+        Rec r(*this, cb);
+        r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        CmdFillBuffer(cb, rejNone.b, 0, kRejNoneBytes, 0);
+        r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
+        rejNoneZero = true;
+    }
+    RejPair r{rejNone.b, rejNone.b};
+    if (estUi) {
+        const UiEntry &ep = uiE[estEnt[0]], &ec = uiE[estEnt[1]];
+        if (ep.v2 && ec.v2 && ep.hasBox && ec.hasBox) { r.a = ep.box.b; r.c = ec.box.b; }
+    }
+    return r;
+}
 
 // ---------------------------------------------------------------------------------------------------------
 // Static-UI protection: recording
@@ -1642,7 +1685,7 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
         if (I.uiFrameSets + 2 > kUiSets) return false;
         if (I.estClean) { srcP = ep.frame(); srcC = ec.frame(); }
     }
-    VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out);
+    VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out, false, I.rejectMasks(cb));
 
     Rec r(I, cb);
     // Serialises this synth after the estimate and after any earlier synth (shared field-at-t, mismatch and
@@ -1720,7 +1763,7 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     // scratch: n slots of the field at t (flow res) and of the packed mismatch (full res)
     const VkDeviceSize errWords = (VkDeviceSize)((I.W + 3) / 4) * I.H;
     if (!I.growBlur(I.blurField, (VkDeviceSize)n * I.fw * I.fh * 8) || !I.growBlur(I.blurErr, (VkDeviceSize)n * errWords * 4)) return false;
-    VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out, true);
+    VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out, true, I.rejectMasks(cb));
 
     Rec r(I, cb);
     // serialises this record after everything before it (shared scratch), then zeroes the per-sample counters

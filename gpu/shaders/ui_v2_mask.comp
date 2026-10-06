@@ -5,7 +5,8 @@
 //   255  confirmed AND unchanged in this pair (max channel |curr - prev| <= thr): ui_patch pastes the real pixel (the pair gate)
 //    64  confirmed but it changed in this pair: not pasted; still treated as UI by the motion estimate (ui_v2_lumafill.comp)
 //     0  not UI
-// One thread per 4 pixels (one mask word), the layout of ui_box_mask.comp.
+// One thread per 4 pixels (one mask word), the layout of ui_box_mask.comp. Thread (0, 0) also writes the rectangle into the header
+// words [1..3] (V2 never uses [0]): the synthesis passes read it to reject warp taps that land on the UI (ui_reject.glsl).
 // The mask rectangle (pc.mask*) is the box grown by 1 px (clamped to the frame), and the state is laid out over it (see
 // ui_v2_update.comp): only pixels inside the box are ever in the mask, so the 1 px ring around the box is exactly the grow of
 // a mask pixel on the box edge; its pair gate comes from the state the ring pixels keep.
@@ -33,4 +34,9 @@ void main() {
         word |= a << uint(8 * k);
     }
     mk[pc.maskOff + g.y * pc.maskStride + g.x] = word;
+    if (g == ivec2(0)) {   // the rectangle of the mask, for the warp passes' tap rejection (ui_reject.glsl)
+        mk[1] = uint(pc.maskX) | (uint(pc.maskY) << 16);
+        mk[2] = uint(pc.maskW) | (uint(pc.maskH) << 16);
+        mk[3] = uint(pc.maskStride);
+    }
 }

@@ -557,6 +557,79 @@ static bool formatSupported(Enc e) {
     return true;
 }
 
+
+// CrosshairV2 must not copy the crosshair along the background's pan (the "doubled crosshair", shaders/ui_reject.glsl): a small opaque
+// cyan plus (12x12 px, arms 2 px thick and aligned to the 2x2 chroma blocks, so its chroma is its own in 4:2:0 too; no HUD, no moving
+// objects) over a per-pixel-grain background panning 14, 6 px / frame. Artifact pixels = non-UI pixels within 40 px of the plus that
+// differ by more than 24 levels (decoded RGB) from the same run on the scene without it, in the t = 0.5 output and in the motion-blurred
+// one. Every format has its own shader variant of the warp (in 4:2:0 also the chroma warp, and the blur has its own), so each is judged
+// on its own. In 4:2:0 the pixels that share a 2x2 chroma block with a plus pixel are UI too (their chroma is the plus's).
+// A plus this size also casts a zero-vector vote in the optical-flow blocks around it, which is not what is judged here: the V2 runs
+// use the estimate fill, which takes it out of the estimate, so what is left is the copy through the warp.
+struct GhostRow { size_t art05 = 0, artBlur = 0, uiBad = 0; bool ok = true; };
+static void ghostFormat(Enc e, const Scene& base, GhostRow* off, GhostRow* v2) {
+    const int W = base.W, H = base.H;
+    Scene g = base;
+    g.objs.clear();
+    for (int y = 0; y < g.bgH; y++)
+        for (int x = 0; x < g.bgW; x++)
+            for (int c = 0; c < 3; c++) {
+                const float v = 60.0f + 120.0f * vnoise(x, y, 24, 5) + 40.0f * vnoise(x, y, 5, 6) + ((hash2(x, y, 7) & 255) / 255.0f - 0.5f) * 70.0f;
+                g.bg[((size_t)y * g.bgW + x) * 4 + c] = (uint8_t)std::min(255.0f, std::max(0.0f, v * (c == 2 ? 0.8f : 1.0f)));
+            }
+    std::fill(g.ui.begin(), g.ui.end(), 0);
+    std::fill(g.uiCol.begin(), g.uiCol.end(), 0);
+    const int cx0 = g.cx & ~1, cy0 = g.cy & ~1;
+    for (int y = cy0 - 6; y < cy0 + 6; y++)
+        for (int x = cx0 - 6; x < cx0 + 6; x++) {
+            if (!((x >= cx0 && x < cx0 + 2) || (y >= cy0 && y < cy0 + 2))) continue;
+            const size_t i = (size_t)y * W + x;
+            g.ui[i] = 1;
+            g.uiCol[i * 4 + 1] = g.uiCol[i * 4 + 2] = g.uiCol[i * 4 + 3] = 255;
+        }
+    Scene gn = g;
+    std::fill(gn.ui.begin(), gn.ui.end(), 0);
+    Settings so, sv;
+    so.blurSamples = sv.blurSamples = 3;
+    sv.uiProtection = UiProtection::CrosshairV2;
+    sv.uiBoxWidth = sv.uiBoxHeight = 16;
+    sv.uiEstimateFill = true;
+    const Result rr = runSequence(e, gn, so, true), ro = runSequence(e, g, so, true), rv = runSequence(e, g, sv, true);
+    if (!rr.ok || !ro.ok || !rv.ok) { off->ok = v2->ok = false; return; }
+    const auto real = decode(e, encode(e, g.frame(11), W, H), W, H), prev = decode(e, encode(e, g.frame(10), W, H), W, H);
+    const float tol = isYuv(e) ? 2.5f : 1.0f;
+    auto isUi = [&](int x, int y) {
+        if (!isYuv(e)) return g.ui[(size_t)y * W + x] == 1;
+        for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 2; i++) {
+                const int X = std::min((x & ~1) + i, W - 1), Y = std::min((y & ~1) + j, H - 1);
+                if (g.ui[(size_t)Y * W + X] == 1) return true;
+            }
+        return false;
+    };
+    for (int k : {0, 2}) {   // t = 0.5, blurred
+        const auto ref = decode(e, rr.out[k], W, H), dOff = decode(e, ro.out[k], W, H), dV2 = decode(e, rv.out[k], W, H);
+        for (int y = g.cy - 40; y <= g.cy + 40; y++)
+            for (int x = g.cx - 40; x <= g.cx + 40; x++) {
+                const size_t i = (size_t)y * W + x;
+                float d0 = 0, d2 = 0, dr = 0, dp = 0;
+                for (int c = 0; c < 3; c++) {
+                    d0 = std::max(d0, std::fabs(dOff[i * 3 + c] - ref[i * 3 + c]));
+                    d2 = std::max(d2, std::fabs(dV2[i * 3 + c] - ref[i * 3 + c]));
+                    dr = std::max(dr, std::fabs(dV2[i * 3 + c] - real[i * 3 + c]));
+                    dp = std::max(dp, std::fabs(real[i * 3 + c] - prev[i * 3 + c]));
+                }
+                if (g.ui[i] == 1) {   // the plus is exact in the t = 0.5 output (4:2:0: an edge pixel that changed in the pair is not pasted, by design)
+                    if (k == 0 && !(isYuv(e) && dp > 1.5f)) v2->uiBad += dr > tol;
+                    continue;
+                }
+                if (isUi(x, y)) continue;
+                (k == 0 ? off->art05 : off->artBlur) += d0 > 24;
+                (k == 0 ? v2->art05 : v2->artBlur) += d2 > 24;
+            }
+    }
+}
+
 static double blurRef8 = 0;   // Rgba8: PSNR of the blurred output vs the t = 0.5 output (the window is wider than it looks: the scene moves 15 px / frame)
 static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vector<float>& dec8out) {
     const int W = sc.W, H = sc.H;
@@ -722,6 +795,16 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
             printf("    UI %s, box %d px (smaller than the crosshair): crosshair wrong %zu/%zu (t=.25: %zu)\n", m == 1 ? "Crosshair" : "CrosshairV2", (int)t.uiBoxWidth, bad, n, bad2);
             expect(bad == 0 && bad2 == 0, m == 1 ? "Crosshair: a box 1 px short of the crosshair still protects all of it (margin)" : "CrosshairV2: a box 1 px short of the crosshair still protects all of it (margin)");
         }
+    }
+    {   // the doubled crosshair
+        GhostRow off, v2;
+        ghostFormat(e, sc, &off, &v2);
+        if (!off.ok || !v2.ok) { expect(false, "ghost scene init + sequence"); return; }
+        printf("    doubled crosshair (grain background, pan 14,6), artifact px around a small plus (t = 0.5 / blurred): Off %zu / %zu, CrosshairV2 + fill %zu / %zu (plus wrong: %zu)\n",
+               off.art05, off.artBlur, v2.art05, v2.artBlur, v2.uiBad);
+        expect(off.art05 >= 15 && off.artBlur >= 15, "(the scene copies the crosshair along the pan without protection: the check has teeth)");
+        expect(v2.art05 <= 8 && v2.artBlur <= 8, "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
+        expect(v2.uiBad == 0, "CrosshairV2: the plus is pixel-exact");
     }
     double pw = psnr(w05, truth, &near, false);
     expect(pw >= pOff - 0.5, "protection does not cost background quality (-0.5 dB)");

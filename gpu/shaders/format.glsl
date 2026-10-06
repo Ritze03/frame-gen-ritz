@@ -10,6 +10,8 @@
 // THE RGBA8 PATH MUST STAY EXACTLY WHAT IT WAS: with no define, every macro below expands to the token sequence the
 // shaders used to spell out by hand, and nothing else is declared, so the generated SPIR-V is identical to the one of
 // the library before formats existed (checked by cmp, see README.md "Formats"). Do not add anything to that path.
+// (Since the CrosshairV2 tap rejection the warp passes -- error, resolve, blur_error, blur_resolve -- also read the V2 masks
+// (ui_reject.glsl), so their SPIR-V is no longer cmp-identical; their OUTPUT still is: the other modes are checked by hash.)
 //
 // "Levels": every setting that is in 8-bit levels (trustLow/High, sceneCutSad, hudBonus, searchPenalty, uiStillThreshold,
 // ...) keeps that meaning in every format. The motion estimate runs on luma in levels, and the mismatch metric and the

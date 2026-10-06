@@ -12,6 +12,7 @@ layout(set = 0, binding = 8) uniform sampler2D texPrevC;                 // CbCr
 layout(set = 0, binding = 9) uniform sampler2D texCurrC;
 layout(set = 0, binding = 10, FG_FMTC) uniform writeonly image2D outImgC;  // CbCr plane of the output
 #endif
+#include "ui_reject.glsl"   // CrosshairV2: bindings 11 / 12 and the tap rejection of mismatch() / warpChroma()
 
 // One push-constant block for every pass; each pass documents which fields it reads. 128 bytes (full).
 layout(push_constant) uniform PC {
@@ -98,26 +99,32 @@ vec2 halfVec(ivec2 p) {
 // cv2.remap of a uint8 RGB frame at p (pixel-centre coords): bilinear, clamp to edge, rounded to 8 bit.
 // (Other formats: the same bilinear sample in the source's own space, see format.glsl.)
 #ifndef FG_YUV
-vec3 sampleRGB(sampler2D t, vec2 p) {
+vec3 sampleRGBRaw(sampler2D t, vec2 p) {
     p = roundEven(p * 32.0) * (1.0 / 32.0);
-    return FG_FETCH(textureLod(t, (p + 0.5) / vec2(pc.W, pc.H), 0.0).rgb);
+    return textureLod(t, (p + 0.5) / vec2(pc.W, pc.H), 0.0).rgb;
 }
 #endif
 #ifdef FG_YUV
-// (Y, Cb, Cr) levels at p: the chroma plane is sampled at the same normalised position (centre-sited chroma), which
+// (Y, Cb, Cr) samples (0..1) at p: the chroma plane is sampled at the same normalised position (centre-sited chroma), which
 // upsamples it bilinearly.
-vec3 sampleYUV(sampler2D ty, sampler2D tc, vec2 p) {
+vec3 sampleYUVRaw(sampler2D ty, sampler2D tc, vec2 p) {
     p = roundEven(p * 32.0) * (1.0 / 32.0);
     vec2 uv = (p + 0.5) / vec2(pc.W, pc.H);
-    return vec3(textureLod(ty, uv, 0.0).r, textureLod(tc, uv, 0.0).rg) * YU_SCALE;
+    return vec3(textureLod(ty, uv, 0.0).r, textureLod(tc, uv, 0.0).rg);
 }
-vec2 sampleC(sampler2D tc, vec2 p) {
+vec2 sampleCRaw(sampler2D tc, vec2 p) {
     p = roundEven(p * 32.0) * (1.0 / 32.0);
-    return textureLod(tc, (p + 0.5) / vec2(pc.W, pc.H), 0.0).rg * YU_SCALE;
+    return textureLod(tc, (p + 0.5) / vec2(pc.W, pc.H), 0.0).rg;
 }
-#define FG_SAMPLE(t, tc, p) sampleYUV(t, tc, p)
+// A warp tap in two steps, so the CrosshairV2 tap rejection (ui_reject.glsl) can sit between them: the raw texture sample, then the
+// format's scaling to levels. The rejection works on the raw samples, so everything after it compiles exactly as it does without it
+// and the other modes' output stays bit-identical (a select on the scaled values changes the floating-point contraction in the
+// unrounded formats).
+#define FG_RAW(t, tc, p) sampleYUVRaw(t, tc, p)
+#define FG_LEVELS(r) ((r) * YU_SCALE)
 #else
-#define FG_SAMPLE(t, tc, p) sampleRGB(t, p)
+#define FG_RAW(t, tc, p) sampleRGBRaw(t, p)
+#define FG_LEVELS(r) FG_FETCH(r)
 #endif
 
 uint mismatch(ivec2 p, out vec3 wa, out vec3 wc) {
@@ -126,8 +133,10 @@ uint mismatch(ivec2 p, out vec3 wa, out vec3 wc) {
     precise float ka = 2.0 * pc.wC, kc = 2.0 * pc.wA;   // exact: interp's float32(2t), float32(2(1 - t))
     precise vec2 pa = vec2(p) - ka * hv;
     precise vec2 pc_ = vec2(p) + kc * hv;
-    wa = FG_SAMPLE(texPrev, texPrevC, pa);
-    wc = FG_SAMPLE(texCurr, texCurrC, pc_);
+    vec3 ra = FG_RAW(texPrev, texPrevC, pa), rc = FG_RAW(texCurr, texCurrC, pc_);
+    uiReject(pa, pc_, ra, rc);
+    wa = FG_LEVELS(ra);
+    wc = FG_LEVELS(rc);
     vec3 d = FG_DIFF(wa, wc);
     return FG_PACKE(max(d.r, max(d.g, d.b)));
 }
@@ -141,7 +150,9 @@ void warpChroma(ivec2 p, out vec2 ca, out vec2 cc) {
     vec2 q = vec2(p) + 0.5;
     precise vec2 pa = q - ka * hv;
     precise vec2 pc_ = q + kc * hv;
-    ca = sampleC(texPrevC, pa);
-    cc = sampleC(texCurrC, pc_);
+    vec2 ra = sampleCRaw(texPrevC, pa), rc = sampleCRaw(texCurrC, pc_);
+    uiRejectC(pa, pc_, ra, rc);
+    ca = ra * YU_SCALE;
+    cc = rc * YU_SCALE;
 }
 #endif
