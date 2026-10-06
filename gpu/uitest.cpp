@@ -5,7 +5,8 @@
 //   uitest trackbench [W H]                  GPU cost of recordTrack vs recordObserve (default 1920x1080 and 2560x1440)
 //   uitest bench [W H]                       per-pass GPU times, moving and still scene (default 1920x1080 and 2560x1440)
 // check also covers CrosshairV2 (the V2 block at its end): pixel-exact crosshair, the shrinking / growing mask control against V1,
-// hysteresis, fast re-entry, the pair gate, mode switching, validation. deep and track run it too.
+// hysteresis, fast re-entry, the pair gate, mode switching, validation, and (ghostCheck) the "doubled crosshair": 1280x960 CS2-like
+// scenes with an absolute limit on the artifact pixels around a panned-over crosshair. deep and track run the V2 modes too.
 // check: a synthetic sequence of 12 frames: a textured background panning 14 px right / 6 px down per frame with 16 independently moving objects (some crossing the crosshair and the HUD), a static opaque crosshair
 // (plus-shaped arms, centre dot, 1 px black outline) and a static opaque HUD box in a corner. The last pair
 // (frames 10, 11) is interpolated at t = 0.5 and 0.25 with protection Off / Crosshair / WholeScreen (explicit
@@ -137,7 +138,7 @@ static std::vector<uint8_t> download(Img& img, uint32_t w, uint32_t h) {
 }
 
 // ---------------------------------------------------------------- synthetic scene
-static const int kPanX = 14, kPanY = 6;   // background pan per frame (even: the mid frame is an integer shift)
+static int kPanX = 14, kPanY = 6;   // background pan per frame (even: the mid frame is an integer shift); ghostCheck() varies it
 static uint32_t hash2(int x, int y, uint32_t seed) {
     uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u + seed * 2246822519u;
     h = (h ^ (h >> 13)) * 1274126177u;
@@ -584,16 +585,19 @@ static void marginCheck(int W, int H) {
         expect(w[0] == 0 && w[1] == 0 && w[2] == 22 && w[3] == 22, "workRect: a box in the frame corner is clamped on its outer sides only");
     }
 #endif
-    struct Case { const char* name; UiProtection mode; int box, ox, oy; bool movingRim; };
+    struct Case { const char* name; UiProtection mode; int box, ox, oy; bool movingRim; bool fill; };
     const Case cases[] = {
-        {"V1 box 11x11 (fits core + rim), static rim", UiProtection::Crosshair, 11, 0, 0, false},
-        {"V1 box 9x9 (rim right/bottom outside)", UiProtection::Crosshair, 9, 0, 0, false},
-        {"V1 box 9x9 shifted +1,+1 (rim left/top outside)", UiProtection::Crosshair, 9, 1, 1, false},
-        {"V1 box 11x11, AA rim (changes every frame)", UiProtection::Crosshair, 11, 0, 0, true},
-        {"V1 box 9x9, AA rim", UiProtection::Crosshair, 9, 0, 0, true},
-        {"V2 box 11x11, static rim", UiProtection::CrosshairV2, 11, 0, 0, false},
-        {"V2 box 9x9, static rim", UiProtection::CrosshairV2, 9, 0, 0, false},
-        {"V2 box 9x9 shifted +1,+1, static rim", UiProtection::CrosshairV2, 9, 1, 1, false},
+        {"V1 box 11x11 (fits core + rim), static rim", UiProtection::Crosshair, 11, 0, 0, false, false},
+        {"V1 box 9x9 (rim right/bottom outside)", UiProtection::Crosshair, 9, 0, 0, false, false},
+        {"V1 box 9x9 shifted +1,+1 (rim left/top outside)", UiProtection::Crosshair, 9, 1, 1, false, false},
+        {"V1 box 11x11, AA rim (changes every frame)", UiProtection::Crosshair, 11, 0, 0, true, false},
+        {"V1 box 9x9, AA rim", UiProtection::Crosshair, 9, 0, 0, true, false},
+        {"V2 box 11x11, static rim", UiProtection::CrosshairV2, 11, 0, 0, false, false},
+        {"V2 box 9x9, static rim", UiProtection::CrosshairV2, 9, 0, 0, false, false},
+        {"V2 box 9x9 shifted +1,+1, static rim", UiProtection::CrosshairV2, 9, 1, 1, false, false},
+        {"V2 + fill box 11x11, static rim", UiProtection::CrosshairV2, 11, 0, 0, false, true},
+        {"V2 + fill box 9x9, static rim", UiProtection::CrosshairV2, 9, 0, 0, false, true},
+        {"V2 + fill box 9x9 shifted +1,+1, static rim", UiProtection::CrosshairV2, 9, 1, 1, false, true},
     };
     for (int pass = 0; pass < 2; pass++) {
         const bool moving = pass == 1;
@@ -609,7 +613,7 @@ static void marginCheck(int W, int H) {
         printf(" %s rim, Off:%*sartifact px: t=0.5 %zu, blur %zu\n", moving ? "AA" : "static", 40, "", mo.art05, mo.artBlur);
         for (const Case& cs : cases) {
             if (cs.movingRim != moving) continue;
-            Settings s; s.uiProtection = cs.mode; s.uiBoxWidth = s.uiBoxHeight = cs.box; s.uiBoxOffsetX = cs.ox; s.uiBoxOffsetY = cs.oy;
+            Settings s; s.uiProtection = cs.mode; s.uiBoxWidth = s.uiBoxHeight = cs.box; s.uiBoxOffsetX = cs.ox; s.uiBoxOffsetY = cs.oy; s.uiEstimateFill = cs.fill;
             Settings sb = s; sb.blurSamples = 4;
             Result rp = runSequence(sc, s, true, nullptr), rb = runSequence(sc, sb, true, nullptr, nullptr, true);
             MarginRow m = marginMeasure(sc, rp, rb, real, refPlain, refBlur);
@@ -617,16 +621,124 @@ static void marginCheck(int W, int H) {
             char what[160];
             snprintf(what, sizeof what, "%s: every crosshair and rim pixel equals the real one (t = 0.5, 0.25 and blurred)", cs.name);
             expect(m.bad05 == 0 && m.bad025 == 0 && m.badBlur == 0, what);
-            // V1 removes the crosshair from the motion estimate, so nothing smears around it; V2 (no estimate fill) leaves the estimate
-            // exactly as Off has it, so it must only be never worse than Off
-            const bool v2 = cs.mode == UiProtection::CrosshairV2;
-            snprintf(what, sizeof what, "%s: artifact pixels around it %s (Off: %zu / %zu)", cs.name, v2 ? "no more than Off's" : "at most 4", mo.art05, mo.artBlur);
-            expect(m.art05 <= (v2 ? mo.art05 : 4) && m.artBlur <= (v2 ? mo.artBlur : 4), what);
+            // Absolute limits. V1 and V2 + fill take the crosshair out of the motion estimate, so nothing smears around it: at most 4.
+            // V2 without the fill still lets the crosshair vote in the estimate (a zero vector in the blocks around it: ~17 px on this
+            // smooth scene, Off has 21), which only the fill removes; its warp no longer copies the crosshair (ui_reject.glsl).
+            const bool noFillV2 = cs.mode == UiProtection::CrosshairV2 && !cs.fill;
+            const size_t lim05 = noFillV2 ? 20 : 4, limBlur = 4;
+            snprintf(what, sizeof what, "%s: artifact pixels around it at most %zu (Off: %zu / %zu)", cs.name, lim05, mo.art05, mo.artBlur);
+            expect(m.art05 <= lim05 && m.artBlur <= limBlur, what);
         }
     }
 }
 #endif
 
+
+// ---------------------------------------------------------------- the "doubled crosshair" (CrosshairV2 tap rejection)
+// A CS2-like scene: 1280x960, a tiny opaque cyan plus (8x7 px, 1 px thick, no rim) at the centre, a background that pans with fine
+// detail, no moving objects. Without a protection the warp copies the crosshair along the pan: every generated pixel blends a tap of
+// prev at p - 2t*h and one of curr at p + 2(1-t)*h, and a tap that lands on the crosshair carries it to crosshair +- pan*t (a second,
+// full-strength crosshair next to the real one). V1 inpaints it out of the warped frames; V2 hands the real frames to the warp and
+// instead rejects the taps that land on the UI (shaders/ui_reject.glsl). Measured as ARTIFACT PIXELS: non-UI pixels within 24 px of the
+// crosshair that differ by more than 24 levels from the same run on the scene WITHOUT the crosshair (protection Off), so the limits are
+// absolute: what must be left of the crosshair's effect on its surroundings, not "no more than Off".
+// Backgrounds: smooth value noise (the check scene's), hard 3x3 blocks of 20 / 235, and per-pixel grain (CS2-ish fine detail).
+// Settings profiles: the library defaults, and the ones the host runs with (hudBonus 2.5, trust 254..255, fallbacks off) where an
+// artifact is not hidden by the untrusted-pixel fallbacks.
+static void ghostCross(Scene& sc) {
+    std::fill(sc.ui.begin(), sc.ui.end(), 0);
+    std::fill(sc.uiCol.begin(), sc.uiCol.end(), 0);
+    for (int dy = -3; dy <= 3; dy++)
+        for (int dx = -4; dx <= 3; dx++) {
+            if (dy != 0 && dx != 0) continue;
+            const size_t i = (size_t)(sc.cy + dy) * sc.W + sc.cx + dx;
+            sc.ui[i] = 1;
+            uint8_t* p = &sc.uiCol[i * 4];
+            p[0] = 0; p[1] = 255; p[2] = 255; p[3] = 255;
+        }
+    sc.uiHook = nullptr;
+}
+static void ghostBackground(Scene& sc, int kind) {   // 0 = the scene's own smooth noise
+    for (int y = 0; y < sc.bgH; y++)
+        for (int x = 0; x < sc.bgW; x++)
+            for (int c = 0; c < 3; c++) {
+                uint8_t& v = sc.bg[((size_t)y * sc.bgW + x) * 4 + c];
+                if (kind == 1) v = (hash2(x / 3, y / 3, 91 + c) & 1) ? 235 : 20;
+                if (kind == 2) {
+                    const float base = 60.0f + 120.0f * vnoise(x, y, 24, 5) + 40.0f * vnoise(x, y, 5, 6);
+                    const float g = ((hash2(x, y, 7) & 255) / 255.0f - 0.5f) * 70.0f;
+                    v = (uint8_t)std::min(255.0f, std::max(0.0f, base * (c == 2 ? 0.8f : 1.0f) + g));
+                }
+            }
+}
+static void ghostCheck() {
+    const int W = 1280, H = 960;
+    printf("\nThe doubled crosshair (%dx%d, 8x7 px cyan plus, artifact px within 24 px of it vs the same run without the crosshair):\n", W, H);
+    const char* bgName[] = {"smooth noise", "hard 3x3 blocks", "fine grain"};
+    const int pans[][2] = {{14, 6}, {30, 0}};
+    const int oldPanX = kPanX, oldPanY = kPanY;
+    for (int bgk = 0; bgk < 3; bgk++)
+        for (const auto& pn : pans)
+            for (int prof = 0; prof < 2; prof++) {
+                kPanX = pn[0]; kPanY = pn[1];
+                Scene sc(W, H, 12, 0, 0, 7, 0);
+                ghostBackground(sc, bgk);
+                ghostCross(sc);
+                Scene sn = sc;
+                std::fill(sn.ui.begin(), sn.ui.end(), 0);
+                const auto real = sc.frame(11);
+                Settings base;
+                if (prof == 1) { base.hudBonus = 2.5f; base.trustLow = 254; base.trustHigh = 255; base.globalFallback = 1.0f; base.sceneCutSad = 255; }
+                const Result ref = runSequence(sn, base, true, nullptr);
+                struct Row { size_t art05 = 0, art025 = 0, uiBad = 0; };
+                auto measureRow = [&](const Settings& st) {
+                    const Result r = runSequence(sc, st, true, nullptr);
+                    Row m;
+                    for (int y = sc.cy - 24; y <= sc.cy + 24; y++)
+                        for (int x = sc.cx - 24; x <= sc.cx + 24; x++) {
+                            const size_t i = (size_t)y * W + x;
+                            int d05 = 0, d025 = 0, dr = 0;
+                            for (int c = 0; c < 3; c++) {
+                                d05 = std::max(d05, std::abs((int)r.out[0][i * 4 + c] - (int)ref.out[0][i * 4 + c]));
+                                d025 = std::max(d025, std::abs((int)r.out[1][i * 4 + c] - (int)ref.out[1][i * 4 + c]));
+                                dr = std::max(dr, std::abs((int)r.out[0][i * 4 + c] - (int)real[i * 4 + c]));
+                            }
+                            if (sc.ui[i]) { m.uiBad += dr > 1; continue; }
+                            m.art05 += d05 > 24;
+                            m.art025 += d025 > 24;
+                        }
+                    return m;
+                };
+                Settings off = base, v1 = base, v2 = base, v2f = base;
+                v1.uiProtection = UiProtection::Crosshair;
+                v2.uiProtection = v2f.uiProtection = UiProtection::CrosshairV2;
+                v2f.uiEstimateFill = true;
+                v1.uiBoxWidth = v1.uiBoxHeight = v2.uiBoxWidth = v2.uiBoxHeight = v2f.uiBoxWidth = v2f.uiBoxHeight = 11;
+                const Row mo = measureRow(off), m1 = measureRow(v1), m2 = measureRow(v2), mf = measureRow(v2f);
+                char name[160];
+                snprintf(name, sizeof name, "%s, pan %d,%d, %s settings", bgName[bgk], kPanX, kPanY, prof ? "host" : "default");
+                printf(" %-44s artifact px (t=0.5 / 0.25)  Off %3zu/%3zu  V1 %3zu/%3zu  V2 %3zu/%3zu  V2+fill %3zu/%3zu\n", name,
+                       mo.art05, mo.art025, m1.art05, m1.art025, m2.art05, m2.art025, mf.art05, mf.art025);
+                char what[256];
+                snprintf(what, sizeof what, "%s: V2 and V2 + fill keep the crosshair pixel-exact", name);
+                expect(m2.uiBad == 0 && mf.uiBad == 0, what);
+                // the fill takes the crosshair out of the estimate too: nothing of it is left around the crosshair
+                snprintf(what, sizeof what, "%s: V2 + fill leaves at most 1 artifact px (t = 0.5) and 2 (t = 0.25)", name);
+                expect(mf.art05 <= 1 && mf.art025 <= 2, what);
+                if (bgk == 0) {
+                    // smooth noise: the crosshair's vote in the estimate (not its warp) is what is left; only the fill removes it
+                    snprintf(what, sizeof what, "%s: V2 leaves no more artifact px than Off", name);
+                    expect(m2.art05 <= mo.art05 && m2.art025 <= mo.art025, what);
+                } else {
+                    // detailed backgrounds: the warp copy is the whole artifact; rejecting it leaves (almost) nothing, with or without the fill
+                    snprintf(what, sizeof what, "%s: V2 leaves at most 1 artifact px (t = 0.5) and 2 (t = 0.25)", name);
+                    expect(m2.art05 <= 1 && m2.art025 <= 2, what);
+                    snprintf(what, sizeof what, "%s: control, Off shows the doubled crosshair (>= 15 px, V2 %zu)", name, m2.art05);
+                    expect(mo.art05 >= 15, what);
+                }
+            }
+    kPanX = oldPanX; kPanY = oldPanY;
+}
 
 // ---------------------------------------------------------------- CrosshairV2
 #ifndef UITEST_NO_V2
@@ -712,27 +824,33 @@ static int v2Check(int W, int H) {
         expect(badLo == 0, "V2: uiContrastThreshold 0 (no gate): crosshair pixel-exact");
     }
 
-    // 1b. V2 without the estimate fill (the default) runs the estimate and the synthesis on the host's frames exactly as Off does:
-    //     the generated frame is bit-identical to Off everywhere outside the box (only pasted pixels differ); with the fill on
-    //     (uiEstimateFill) the crosshair stays exact and the error near a thick crosshair on a hard-edged moving background does
-    //     not grow (it falls: the crosshair no longer casts a zero-vector vote in the blocks around it).
+    // 1b. V2 without the estimate fill (the default) runs the estimate on the host's frames exactly as Off does, and the synthesis
+    //     differs from Off's only where a warp tap can land on the UI (ui_reject.glsl): the pixels within the motion reach of the work
+    //     rectangle. Outside that, the generated frames are bit-identical to Off's. With the fill on (uiEstimateFill) the crosshair
+    //     stays exact and the error near a thick crosshair on a hard-edged moving background does not grow (it falls: the crosshair no
+    //     longer casts a zero-vector vote in the blocks around it).
     {
         Scene sc(W, H, 12, 0, 0);
         Settings off;
         Result ro = runSequence(sc, off, true, nullptr), rv = runSequence(sc, v2, true, nullptr);
-        uint32_t bw, bh;
-        Interpolator::boxSize(v2, W, H, &bw, &bh);
-        const int bx0 = ((int)W - (int)bw) / 2, by0 = ((int)H - (int)bh) / 2;
+        int32_t wr[4];
+        Interpolator::workRect(v2, W, H, wr);
+        // reach of a tap: the scene's fastest object moves 20 px / frame, a tap at t = 0.25 is 2 * 0.75 = 1.5 half-vectors away
+        // (= 0.75 * 20 px), + 1 px of bilinear footprint + 3 px: the 7x7 trust box spreads a changed mismatch
+        const int reach = 15 + 1 + 3;
         size_t outside = 0, inside = 0;
+        int far = 0;   // distance (Chebyshev) of the farthest differing pixel from the work rectangle
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++) {
                 size_t i = (size_t)y * W + x;
                 bool differs = memcmp(&ro.out[0][i * 4], &rv.out[0][i * 4], 3) != 0 || memcmp(&ro.out[1][i * 4], &rv.out[1][i * 4], 3) != 0;
                 if (!differs) continue;
-                if (x >= bx0 && x < bx0 + (int)bw && y >= by0 && y < by0 + (int)bh) inside++; else outside++;
+                const int d = std::max(std::max(wr[0] - x, x - (wr[0] + wr[2] - 1)), std::max(wr[1] - y, y - (wr[1] + wr[3] - 1)));
+                far = std::max(far, d);
+                if (d > reach) outside++; else inside++;
             }
-        printf(" V2 vs Off (t = 0.5 and 0.25): %zu pixels differ inside the %ux%u box, %zu outside it\n", inside, bw, bh, outside);
-        expect(inside > 0 && outside == 0, "V2 (no estimate fill): the generated frames are bit-identical to Off everywhere outside the box");
+        printf(" V2 vs Off (t = 0.5 and 0.25): %zu pixels differ within %d px of the %dx%d work rectangle, %zu beyond (farthest %d px)\n", inside, reach, wr[2], wr[3], outside, far);
+        expect(inside > 0 && outside == 0, "V2 (no estimate fill): the generated frames are bit-identical to Off beyond the work rectangle plus the motion reach");
         for (int arm : {7, 16}) {
             Scene sh(W, H, 12, 0, 0, arm, 0);
             harshBackground(sh);
@@ -961,6 +1079,7 @@ static int v2Check(int W, int H) {
         bad = Settings{}; bad.uiProtection = UiProtection::CrosshairV2; expect(Interpolator::validate(bad), "validate accepts CrosshairV2");
         bad.uiProtection = (UiProtection)4; expect(!Interpolator::validate(bad), "validate rejects mode 4");
     }
+    ghostCheck();
     return fails ? 1 : 0;
 }
 #endif
@@ -1398,7 +1517,7 @@ int main(int argc, char** argv) {
 #endif
     } else if (pos[0] == "check") {
         int W = pos.size() >= 3 ? atoi(pos[1].c_str()) : 1280, H = pos.size() >= 3 ? atoi(pos[2].c_str()) : 720;
-        initStaging((size_t)W * H * 4);
+        initStaging(std::max((size_t)W * H, (size_t)1280 * 960) * 4);   // ghostCheck() runs its own 1280x960 scenes
         rc = check(W, H, hash);
         printf(rc ? "RESULT: FAIL (%d)\n" : "RESULT: PASS\n", fails);
     } else {

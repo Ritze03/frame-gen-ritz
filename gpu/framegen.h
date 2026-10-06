@@ -17,7 +17,8 @@ enum class UiProtection : uint32_t {
     Crosshair = 1,    // full-resolution protection of one box (default: the centre): crosshair, reticle, hit marker
     WholeScreen = 2,  // the box at full resolution, plus every solid static HUD element elsewhere (reduced-res detection)
     CrosshairV2 = 3,  // the crosshair box only, without inpaint or clean copy: contrast-gated detection with hysteresis and fast
-                      // re-entry, and a pixel is pasted back only if it did not change in the pair being synthesised (optionally
+                      // re-entry, a pixel is pasted back only if it did not change in the pair being synthesised, and a warp tap
+                      // that lands on the UI is rejected so the crosshair is not copied along the background's motion (optionally
                       // the UI is also hidden from the motion estimate: uiEstimateFill). Next to Crosshair (V1, unchanged).
                       // See "CrosshairV2" below.
 };
@@ -177,15 +178,19 @@ struct Settings {
     //   instead of after uiStillFrames more still frames: the crosshair is back after a disruption (a flash, a muzzle effect, a
     //   scope) within [0 = off, 255] frames. 2 default.
     uint32_t uiReentryFrames = 2;
-    //   uiEstimateFill: also hide the UI from the MOTION ESTIMATE. Off (default): the estimate and the whole synthesis run on the
-    //   host's frames exactly as with protection Off, so the generated frame is bit-identical to Off everywhere except on the
-    //   pasted UI pixels (never worse than Off elsewhere). On: the flow-resolution luma of every cell that holds a UI pixel is
-    //   re-averaged over the cell's non-UI pixels (a wider window where all are UI), so a static crosshair casts no vote for the
-    //   zero vector in the blocks around it. The fill exists only in the estimate's luma buffer, never in a colour pass, so it
-    //   cannot reach an output pixel. Measured on the user's CS2 footage it is a wash (see INTEGRATION.md): it lowers the
-    //   error near a THICK crosshair on a hard-edged moving background (synthetic scene: 125 -> 110) but re-rolls the vectors of
-    //   neighbouring blocks, which on the thin real crosshair worsens as many pixels as it improves (+2.3 px/frame worse than Off,
-    //   +2.0 better) and shows as sporadic artifacts away from the crosshair. Costs ~0.03 ms per pair at 1440p (RX 7900 XTX) and 2 sets of the kUiSets ring per estimate.
+    //   uiEstimateFill: also hide the UI from the MOTION ESTIMATE. Off (default): the estimate runs on the host's frames exactly as
+    //   with protection Off. On: the flow-resolution luma of every cell that holds a UI pixel is re-averaged over the cell's non-UI
+    //   pixels (a wider window where all are UI), so a static crosshair casts no vote for the zero vector in the blocks around it.
+    //   The fill exists only in the estimate's luma buffer, never in a colour pass, so it cannot reach an output pixel. The warp's
+    //   copy of the crosshair along the background's motion (the "doubled crosshair") is removed by the tap rejection, with or
+    //   without the fill; the fill only fixes the flow around the crosshair. Measured on the user's CS2 footage WITH the rejection
+    //   (INTEGRATION.md): per frame, 18.4 pixels better than Off and 1.7 worse without the fill, 20.5 better and 3.6 worse with it,
+    //   and the same mean error near the crosshair (6.30 / 6.29, Off 6.37): it nets the same (better minus worse: 16.9 and 16.7
+    //   px/frame) but doubles the visible defects, some far from the crosshair (re-rolled vectors: in 4 of 1173 frames 80-643
+    //   worse pixels there), so the default stays off. On synthetic scenes it
+    //   removes what is left of the crosshair's flow vote: smooth background 26 -> 0 artifact pixels around the crosshair; mean
+    //   error within 24 px of a thin / thick crosshair on a hard-edged moving background 56.9 / 125.2 for Off, 32.9 / 70.5 with the
+    //   fill. Costs ~0.03 ms per pair at 1440p (RX 7900 XTX) and 2 sets of the kUiSets ring per estimate.
     bool uiEstimateFill = false;
 
     // Interpolation-based motion blur (recordSynthBlur()): one output = the weighted average of blurSamples
@@ -379,15 +384,26 @@ public:
     // ---- CrosshairV2 (Settings::uiProtection = CrosshairV2) ----
     // The crosshair box only (no WholeScreen variant), same API and host contract as Crosshair (explicit / implicit observe, recordTrack,
     // uiHistory, the box settings), a different algorithm. V1 stays unchanged next to it. Built from what V1 gets wrong on the user's CS2
-    // recordings (white specks and patterns that move with the picture inside the protected area; measurements in INTEGRATION.md):
+    // recordings (white specks and patterns that move with the picture inside the protected area; measurements in INTEGRATION.md), and
+    // from the "doubled crosshair" that a first version of V2 (and Off) still showed (point 4):
     //   1. it READS THE INPAINTED CLEAN COPY IN THE COLOUR WARP (~61 % of V1's artifact pixels): a pixel inpainted in prev's copy but real
     //      in curr (a mask that shrinks) is warped as 8-direction streaks. V2 has no inpaint and no clean copy: the estimate and every
-    //      colour pass read the host's own frames, so the generated frame is bit-identical to Off everywhere but the pasted pixels.
+    //      colour pass read the host's own frames (and, but for point 4, the generated frame would be bit-identical to Off everywhere but
+    //      the pasted pixels).
     //   2. it PASTES curr'S PIXELS ONTO PIXELS THAT CHANGED IN THE PAIR (~37 %): the half-alpha ring and the hard grow. V2 pastes a pixel
     //      only if max channel |curr - prev| <= uiStillThreshold for the pair being synthesised (the pair gate), at full strength.
     //   3. its MASK FLICKERS (879-3378 px flip per frame with a 249 px box, ~20 with 27 px): a pixel that was masked for 8 frames drops
     //      out on one noisy frame. V2 enters a pixel after uiStillFrames still AND contrasty frames, but leaves it only after
     //      uiLeaveFrames consecutive changed frames, and re-enters at once (uiReentryFrames) when it shows its confirmed colour again.
+    //   4. THE WARP COPIES THE CROSSHAIR ("doubled crosshair", also in Off and in the first V2). A generated pixel blends a tap of prev at
+    //      p - 2t*h with a tap of curr at p + 2(1-t)*h (h = the half-vector); where the background pans, a tap that lands on the static
+    //      crosshair carries it to crosshair +- motion*t: a second, full-strength crosshair next to the real one (the user's CS2 report:
+    //      "major artifacting ... doubled crosshair", a copy ~16 px to the side). The paste only restores the real crosshair at its own
+    //      place. V1 avoids it by warping inpainted copies. V2 REJECTS THE TAP: when a tap lands on a UI pixel of ITS OWN frame (the V2
+    //      mask of that frame, bilinear footprint; in 4:2:0 the footprint of the chroma taps) and the other tap does not, both take the other
+    //      frame's tap (shaders/ui_reject.glsl, in mismatch() and warpChroma(), also in the blur passes); both on UI or neither: unchanged.
+    //      The library binds the pair's masks itself; a host does nothing. Outside the work rectangle plus the motion reach, the generated
+    //      frame is still bit-identical to Off (without the fill). Cost: ~0.005 ms per pair at 1280x960 (RX 7900 XTX).
     // Per observed frame, per box pixel (full resolution, one state machine, 4 state words per pixel, no per-frame mask history; the
     // 1 px ring around the box keeps only the previous original and the pair-gate flag, so it can be pasted but never detected):
     //   still      = max channel |new - previous original| <= uiStillThreshold            (the V1 test, in the format's 8-bit-equivalent levels)
@@ -410,7 +426,8 @@ public:
     // crosshair that changes shape every frame (a spread that follows movement or recoil) stay unprotected while it changes: its changed
     // pixels are never pasted, by design, and it re-enters uiReentryFrames / uiStillFrames frames after it settles. In 4:2:0 formats
     // (Nv12, P010) the chroma of an edge pixel is shared with the moving background, so a few edge pixels count as changed. No clean copy
-    // also means nothing hides the crosshair from the optical-flow vote of the blocks around it unless uiEstimateFill is on.
+    // also means nothing hides the crosshair from the optical-flow vote of the blocks around it unless uiEstimateFill is on (what that
+    // leaves is flow noise near the crosshair, not a copy of it: the tap rejection removes the copy).
     // Host: add the enum value, set the settings you expose (the defaults are the tuned ones), keep calling recordObserve / recordTrack.
 
     // recordTrack(cb, frame): the cheap sibling of recordObserve for a real frame the host passes THROUGH without

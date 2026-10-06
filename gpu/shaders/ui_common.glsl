@@ -8,7 +8,8 @@
 // binding 3: M = per-frame mask buffer. Header words [0..3]: [0] = number of still cells (whole screen);
 //            then, whole screen only, one flag word per 32x32 tile; then the mask at maskOff: 4 pixels per word
 //            (byte k = pixel 4x + k, 0 = none, 255 = full, 128 = feather), maskStride words per row, covering the
-//            rectangle (maskX, maskY, maskW, maskH) of the frame.
+//            rectangle (maskX, maskY, maskW, maskH) of the frame. CrosshairV2 also keeps the rectangle in header words [1..3]
+//            (maskX | maskY << 16, maskW | maskH << 16, maskStride), which the warp passes read (ui_reject.glsl).
 
 #include "format.glsl"
 
