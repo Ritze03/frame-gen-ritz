@@ -120,11 +120,18 @@ struct Settings {
     // for a later raise; releaseUnusedUi() frees it. With protection Off, or at the default, memory and output are
     // exactly as before.
     uint32_t uiHistory = 3;
-    // The crosshair box: always protected at FULL resolution, in both modes (a crosshair is the most noticeable
-    // thing if it breaks). Size it so the whole reticle fits with a little room for its spread and outline: make it
-    // slightly LARGER than the crosshair, not 2-3x. Everything inside the box is held to the real frame, so a box that
-    // is much bigger than the reticle catches background too, and moving background inside it shows up as small
-    // white speckles. A host can draw the box as a preview while the user adjusts the slider.
+    // The crosshair box: the region where the library LOOKS FOR static UI, at FULL resolution, in all modes (a crosshair is the
+    // most noticeable thing if it breaks). What it protects reaches a few pixels past it: Crosshair (V1) and CrosshairV2 treat
+    // the box grown by boxMargin() (2 px for V1, 1 px for V2; clamped to the frame) as their working rectangle (workRect()). A
+    // pixel can only be DETECTED as UI inside the box, but the anti-aliased rim of what was detected, V1's mask feather, the
+    // inpaint's source pixels and the paste-back all extend into that margin. So the box needs to cover the crosshair's own
+    // stable pixels, not its whole rim: a box that just fits the reticle works. Sizing it bigger than that has a cost, not a
+    // benefit: every box pixel is a candidate for "still", so a box much bigger than the reticle judges background still
+    // too, and moving background there shows up as small white speckles. (Why this changed: a user sized the box to "just
+    // big enough for the whole crosshair", 11 px at 960 high, around an 8x7 px crosshair; the 2 px mask dilation, the inpaint
+    // source and the paste were all clipped at the box edge, so the crosshair's rim was smeared by frame generation and
+    // worse by motion blur. With a 192 px box it had been protected.) A host can draw boxRect() / workRect() as a preview
+    // while the user adjusts the slider.
     //   uiBoxHeightFrac: (0, 1], the side of the square box as a fraction of the FRAME HEIGHT: side =
     //   round(frameHeight * uiBoxHeightFrac), clamped to [8, min(w, h)]. 0.025 = 24 px at 960, 27 at 1080, 36 at 1440,
     //   54 at 2160. 0 = legacy: take the side from uiCrosshairArea instead (below).
@@ -251,6 +258,16 @@ public:
     // square from uiBoxHeightFrac (or the legacy uiCrosshairArea). The same numbers the library protects; for a host
     // preview. Does not check validity.
     static void boxSize(const Settings&, uint32_t w, uint32_t h, uint32_t* boxW, uint32_t* boxH);
+    // The box rectangle {x, y, w, h} in the frame: boxSize() centred on the frame centre plus uiBoxOffsetX/Y, clamped into the frame.
+    // The only place UI can be DETECTED. Does not check validity.
+    static void boxRect(const Settings&, uint32_t w, uint32_t h, int32_t rect[4]);
+    // How many pixels past the box the active mode protects: 2 (Crosshair), 1 (CrosshairV2), 0 (Off, WholeScreen). Depends only on
+    // Settings::uiProtection.
+    static uint32_t boxMargin(const Settings&);
+    // The working rectangle {x, y, w, h}: boxRect() grown by boxMargin() on every side and clamped to the frame. Everything
+    // the box protects lies inside it (the mask, the inpaint, the paste-back); detection stays inside boxRect(). For a host
+    // preview of the area that is actually protected. Does not check validity.
+    static void workRect(const Settings&, uint32_t w, uint32_t h, int32_t rect[4]);
     // Runtime change: applies the runtime fields (the UI-protection ones too) to every record*() recorded after this call (each record
     // copies them into its own push constants, so in-flight and already-recorded work keeps its values;
     // no retire needed). Returns false and changes nothing if the object is not initialised, the settings
@@ -371,20 +388,22 @@ public:
     //   3. its MASK FLICKERS (879-3378 px flip per frame with a 249 px box, ~20 with 27 px): a pixel that was masked for 8 frames drops
     //      out on one noisy frame. V2 enters a pixel after uiStillFrames still AND contrasty frames, but leaves it only after
     //      uiLeaveFrames consecutive changed frames, and re-enters at once (uiReentryFrames) when it shows its confirmed colour again.
-    // Per observed frame, per box pixel (full resolution, one state machine, 4 state words per pixel, no per-frame mask history):
+    // Per observed frame, per box pixel (full resolution, one state machine, 4 state words per pixel, no per-frame mask history; the
+    // 1 px ring around the box keeps only the previous original and the pair-gate flag, so it can be pasted but never detected):
     //   still      = max channel |new - previous original| <= uiStillThreshold            (the V1 test, in the format's 8-bit-equivalent levels)
     //   contrasty  = max channel |I - median7x7(I)| >= uiContrastThreshold                (a crosshair has an edge, a flat background does not)
     //   out of the mask: counts consecutive still-and-contrasty frames, enters at uiStillFrames; or enters at once after
     //                    uiReentryFrames consecutive (contrasty) frames in the colour it was last confirmed in
     //   in the mask:     counts consecutive changed frames, leaves at uiLeaveFrames; while still it refreshes the confirmed colour
-    //   mask = the pixels in the mask plus a hard 1 px grow (8-neighbourhood, binary). Each mask pixel is PASTED (out = real curr pixel)
+    //   mask = the pixels in the mask plus a hard 1 px grow (8-neighbourhood, binary; the grow may reach 1 px past the box: see
+    //   boxMargin()). Each mask pixel is PASTED (out = real curr pixel)
     //   only if it is unchanged in this pair, else it is left to the interpolation (and still counts as UI for the optional fill).
     // The previous original is the frame observed (or tracked) just before, so the pair gate compares each frame with its predecessor in
     // observe order: call recordObserve / recordTrack for every real frame, as always. recordSynthBlur pastes after the average with the
     // same gate. recordTrack runs the very same state-machine pass and nothing else: the state after N tracked frames is the state after N
     // observed ones, hysteresis counters and confirmed colours included. Works for every Format: the thresholds are 8-bit-equivalent levels
     // (YUV: the contrast difference is converted to R'G'B' levels like the mismatch metric; stillness is on the Y/Cb/Cr codes as in V1).
-    // Memory: no clean copy (V1: 4 B/px per kept frame); one mask per kept frame (1 B per box pixel) and 16 B per box pixel of shared state.
+    // Memory: no clean copy (V1: 4 B/px per kept frame); one mask per kept frame (1 B per work-rectangle pixel, workRect()) and 16 B per work-rectangle pixel of shared state.
     // Cost: observe = one pass over the box (a 7x7 median per candidate pixel, only where it can matter) + the mask pass; no inpaint, no
     // whole-frame copy. With uiEstimateFill: two more tiny passes in recordEstimate.
     // Limits: the crosshair must be opaque and static. A semi-transparent crosshair (its pixels change with the background behind it) and a

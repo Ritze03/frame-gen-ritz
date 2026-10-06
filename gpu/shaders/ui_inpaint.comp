@@ -6,6 +6,9 @@
 // unmasked pixel (at most `reach` steps) and average those REAL pixels weighted 1/distance^2 - the nearest wins, so a
 // thin line is filled from just above and below it. A pixel with no unmasked neighbour within reach (the inside of a
 // big solid box) is left as the real pixel. Only masked pixels are written.
+// pc.open (box protection with a margin): the mask rectangle is the box grown by its margin, and everything beyond it
+// is real, unmasked background - so a pixel of the frame outside the rectangle is a valid walk end (0), and only the
+// frame's own edge stops a walk. Without it (whole screen, margin 0) the rectangle edge is a wall, as before.
 // One workgroup = one 16x16 tile of the mask rectangle, one thread per pixel (a thread's walks are a dependent chain,
 // so more pixels per thread would serialise them); the mask of the tile plus a `reach` halo is staged in shared
 // memory so the walks cost no memory reads, and the 8 texture fetches are issued after all walks, independently.
@@ -18,7 +21,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 const int T = 16;
 const int RMAX = 16;
 const int LS = T + 2 * RMAX;
-shared uint ms[LS * LS];   // 0 unmasked, 1 masked, 2 outside the mask rectangle (stop)
+shared uint ms[LS * LS];   // 0 unmasked, 1 masked, 2 outside the mask rectangle (stop; with pc.open: outside the frame)
 shared uint sAny;
 shared uint sOpen;   // some staged pixel is not masked (so some walk can end)
 
@@ -44,6 +47,8 @@ void main() {
         if (rel.x >= 0 && rel.y >= 0 && rel.x < pc.maskW && rel.y < pc.maskH) {
             v = 0u;
             if (pc.gate == 0 || tileLive(q / TILE)) v = maskByte(rel) != 0u ? 1u : 0u;
+        } else if (pc.open != 0 && q.x >= 0 && q.y >= 0 && q.x < pc.W && q.y < pc.H) {
+            v = 0u;
         }
         ms[i] = v;
         if (v != 1u) atomicOr(sOpen, 1u);

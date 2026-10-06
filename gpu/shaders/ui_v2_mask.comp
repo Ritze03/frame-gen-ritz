@@ -6,21 +6,24 @@
 //    64  confirmed but it changed in this pair: not pasted; still treated as UI by the motion estimate (ui_v2_lumafill.comp)
 //     0  not UI
 // One thread per 4 pixels (one mask word), the layout of ui_box_mask.comp.
+// The mask rectangle (pc.mask*) is the box grown by 1 px (clamped to the frame), and the state is laid out over it (see
+// ui_v2_update.comp): only pixels inside the box are ever in the mask, so the 1 px ring around the box is exactly the grow of
+// a mask pixel on the box edge; its pair gate comes from the state the ring pixels keep.
 #include "ui_common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
 uint flagsAt(ivec2 p) {
-    if (p.x < 0 || p.y < 0 || p.x >= pc.boxW || p.y >= pc.boxH) return 0u;
-    return st[(p.y * pc.boxW + p.x) * 4 + 1] >> 24;
+    if (p.x < 0 || p.y < 0 || p.x >= pc.maskW || p.y >= pc.maskH) return 0u;
+    return st[(p.y * pc.maskW + p.x) * 4 + 1] >> 24;
 }
 
 void main() {
     ivec2 g = ivec2(gl_GlobalInvocationID.xy);
-    if (g.x >= pc.maskStride || g.y >= pc.boxH) return;
+    if (g.x >= pc.maskStride || g.y >= pc.maskH) return;
     uint word = 0u;
     for (int k = 0; k < 4; k++) {
         ivec2 p = ivec2(g.x * 4 + k, g.y);
-        if (p.x >= pc.boxW) break;
+        if (p.x >= pc.maskW) break;
         bool near = false;
         for (int y = -1; y <= 1; y++)
             for (int x = -1; x <= 1; x++)

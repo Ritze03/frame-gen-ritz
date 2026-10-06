@@ -697,6 +697,32 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         expect(xhf == 0, "CrosshairV2 + estimate fill: crosshair exact");
         expect(pf >= pOff - 0.5, "CrosshairV2 + estimate fill does not cost background quality (-0.5 dB)");
     }
+    {   // the box margin (every format): a 34 px box is 1 px too small for the 35 px crosshair (its outline's outermost pixels at the
+        // right / bottom lie outside it), and both modes still protect all of it: Crosshair's mask dilation (2 px) and CrosshairV2's
+        // grow (1 px) reach past the box. (A pixel 2 px past the last still one gets only V1's half-strength feather: not exact.)
+        auto prevDec2 = decode(e, encode(e, sc.frame(10), W, H), W, H);
+        for (int m = 1; m <= 2; m++) {
+            Settings t; t.uiProtection = m == 1 ? UiProtection::Crosshair : UiProtection::CrosshairV2;
+            t.uiBoxWidth = t.uiBoxHeight = 34;
+            Result rt = runSequence(e, sc, t, false);
+            if (!rt.ok) { expect(false, "box-margin init + sequence"); return; }
+            auto t05 = decode(e, rt.out[0], W, H), t025 = decode(e, rt.out[1], W, H);
+            size_t bad = 0, bad2 = 0, n = 0;
+            for (size_t i = 0; i < (size_t)W * H; i++) {
+                if (sc.ui[i] != 1) continue;
+                float dp = 0, d5 = 0, d25 = 0;
+                for (int c = 0; c < 3; c++) {
+                    dp = std::max(dp, std::fabs(real[i * 3 + c] - prevDec2[i * 3 + c]));
+                    d5 = std::max(d5, std::fabs(t05[i * 3 + c] - real[i * 3 + c]));
+                    d25 = std::max(d25, std::fabs(t025[i * 3 + c] - real[i * 3 + c]));
+                }
+                if (m == 2 && isYuv(e) && dp > 1.5f) continue;   // V2 never pastes a pixel that changed in the pair (see above)
+                n++; bad += d5 > tol; bad2 += d25 > tol;
+            }
+            printf("    UI %s, box %d px (smaller than the crosshair): crosshair wrong %zu/%zu (t=.25: %zu)\n", m == 1 ? "Crosshair" : "CrosshairV2", (int)t.uiBoxWidth, bad, n, bad2);
+            expect(bad == 0 && bad2 == 0, m == 1 ? "Crosshair: a box 1 px short of the crosshair still protects all of it (margin)" : "CrosshairV2: a box 1 px short of the crosshair still protects all of it (margin)");
+        }
+    }
     double pw = psnr(w05, truth, &near, false);
     expect(pw >= pOff - 0.5, "protection does not cost background quality (-0.5 dB)");
 }

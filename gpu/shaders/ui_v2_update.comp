@@ -16,6 +16,9 @@
 //     while still it refreshes the stored colour
 // The median is computed only where its result can matter (a pixel that is out of the mask and still or matching), so a
 // moving scene pays for none of it. Levels are the 8-bit-equivalent ones of every format (FG_STILL / fgStillYuv).
+// The state covers the WORK rectangle (pc.mask*: the box plus a margin of 1 px, clamped to the frame). Detection runs only
+// inside the box (pc.box*): a margin pixel never enters the mask, it keeps just w0 (the previous original) and the
+// "still in this pair" flag, which is all the pair gate of ui_v2_mask.comp needs to paste the grown ring around the box.
 #extension GL_EXT_control_flow_attributes : require
 #include "ui_common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -62,10 +65,19 @@ float contrastAt(ivec2 p, vec3 v) {
 
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    if (p.x >= pc.boxW || p.y >= pc.boxH) return;
-    ivec2 sp = ivec2(pc.boxX, pc.boxY) + p;
+    if (p.x >= pc.maskW || p.y >= pc.maskH) return;
+    ivec2 sp = ivec2(pc.maskX, pc.maskY) + p;
     vec3 now = pixAt(sp);
-    int i = (p.y * pc.boxW + p.x) * 4;
+    int i = (p.y * pc.maskW + p.x) * 4;
+    ivec2 inBox = sp - ivec2(pc.boxX, pc.boxY);
+    if (inBox.x < 0 || inBox.y < 0 || inBox.x >= pc.boxW || inBox.y >= pc.boxH) {   // the margin ring: the pair gate only
+        uint ringFlags = 0u;
+        if (pc.reset == 0 && maxAbs(now - unpack(st[i])) <= pc.thr) ringFlags = 4u;
+        st[i] = packRgb(now);
+        st[i + 1] = ringFlags << 24;
+        st[i + 2] = 0u;
+        return;
+    }
     uint cnt = 0u, flags = 0u, leave = 0u, match = 0u;
     vec3 stored = vec3(0.0);
     if (pc.reset == 0) {

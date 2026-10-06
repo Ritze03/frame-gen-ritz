@@ -351,6 +351,8 @@ static void expect(bool ok, const char* what) {
 
 #ifndef UITEST_NO_V2
 static int v2Check(int W, int H);
+static void marginCheck(int W, int H);
+static const char* dumpDir = nullptr;   // --dump DIR: raw RGBA of the t = 0.5 output of the large-box cases (to diff two library builds)
 #endif
 static int check(int W, int H, bool hash) {
     Scene sc(W, H, 12, 0, 0);
@@ -385,13 +387,20 @@ static int check(int W, int H, bool hash) {
     Settings c1; c1.uiProtection = UiProtection::Crosshair; c1.uiBoxHeightFrac = kFitFrac;
     Settings w1; w1.uiProtection = UiProtection::WholeScreen; w1.uiBoxHeightFrac = kFitFrac;
     if (hash) {   // the same for the two older modes: compare against a build of the library before CrosshairV2 (-DUITEST_NO_V2)
-        const std::pair<const char*, Settings> modes[2] = {{"CROSSHAIR", c1}, {"WHOLESCREEN", w1}};
+        Settings v1x = c1; v1x.uiProtection = (UiProtection)3;   // CrosshairV2, same 43 px box
+        const std::pair<const char*, Settings> modes[3] = {{"CROSSHAIR", c1}, {"WHOLESCREEN", w1}, {"CROSSHAIRV2", v1x}};
         for (const auto& md : modes) {
             std::vector<uint64_t> h;
-            runSequence(sc, md.second, true, &h);
+            Result r = runSequence(sc, md.second, true, &h);
             printf("HASHES-%s", md.first);
             for (uint64_t x : h) printf(" %016llx", (unsigned long long)x);
             printf("\n");
+            if (dumpDir) {
+                for (int k = 0; k < 2; k++) {
+                    std::string fn = std::string(dumpDir) + "/" + md.first + (k ? "_t025.rgba" : "_t05.rgba");
+                    if (FILE* f = fopen(fn.c_str(), "wb")) { fwrite(r.out[k].data(), 1, r.out[k].size(), f); fclose(f); }
+                }
+            }
         }
     }
     Result rc = run("Crosshair", c1, true, true, false);
@@ -490,12 +499,133 @@ static int check(int W, int H, bool hash) {
         expect(Interpolator::validate(Settings{}), "defaults valid");
     }
 #ifndef UITEST_NO_V2
+    marginCheck(W, H);
     return v2Check(W, H);
 #else
     return fails ? 1 : 0;
 #endif
 #endif
 }
+
+#ifndef UITEST_NO_V2
+// ---------------------------------------------------------------- the box margin (what a box that just fits the crosshair protects)
+// A tiny crosshair (a 1 px plus: 8 px wide, 7 px tall, 14 px) with a 1 px rim around it, centred, over a panning background, in a
+// box that is exactly as big as the crosshair plus rim (11x11), one px too small for it (9x9: the rim's right / bottom pixel is
+// outside) or 9x9 and shifted so its left / top rim pixel is outside. Reported: UI pixels (core and rim) that differ from the real
+// frame, in the t = 0.5 output, the t = 0.25 output and the motion-blurred output; and the artifact pixels around it: pixels that are
+// not UI and differ by more than 24 levels from the same run on a scene without the crosshair (Off), within 48 px of it.
+// The rim is either a static outline (opaque black: both modes can see it) or an anti-aliased one (50 % black over the moving
+// background, so it changes every frame: only V1's dilation covers it; V2 pastes a pixel only if it did not change in the pair, by design).
+static void tinyCrosshair(Scene& sc, bool movingRim) {
+    std::fill(sc.ui.begin(), sc.ui.end(), 0);
+    std::fill(sc.uiCol.begin(), sc.uiCol.end(), 0);
+    auto core = [](int dx, int dy) { return (dy == 0 && dx >= -4 && dx <= 3) || (dx == 0 && dy >= -3 && dy <= 3); };
+    for (int dy = -8; dy <= 8; dy++)
+        for (int dx = -8; dx <= 8; dx++) {
+            bool rim = false;
+            for (int y = -1; y <= 1; y++)
+                for (int x = -1; x <= 1; x++) rim = rim || core(dx + x, dy + y);
+            if (!rim) continue;
+            const size_t i = (size_t)(sc.cy + dy) * sc.W + sc.cx + dx;
+            const bool c = core(dx, dy);
+            sc.ui[i] = c ? 1 : 3;
+            uint8_t* p = &sc.uiCol[i * 4];
+            p[0] = c ? 255 : 0; p[1] = 0; p[2] = c ? 255 : 0; p[3] = 255;
+        }
+    sc.uiHook = nullptr;
+    if (movingRim)
+        sc.uiHook = [&sc](int, int x, int y, uint8_t* px, const uint8_t* under) {
+            if (sc.ui[(size_t)y * sc.W + x] == 3) for (int c = 0; c < 3; c++) px[c] = (uint8_t)(under[c] / 2);
+        };
+}
+struct MarginRow { size_t uiN = 0, bad05 = 0, bad025 = 0, badBlur = 0, art05 = 0, artBlur = 0; };
+static MarginRow marginMeasure(const Scene& sc, const Result& plain, const Result& blur, const std::vector<uint8_t>& real, const Result& refPlain, const Result& refBlur) {
+    MarginRow m;
+    auto maxd = [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, size_t i) {
+        int d = 0;
+        for (int c = 0; c < 3; c++) d = std::max(d, std::abs((int)a[i * 4 + c] - (int)b[i * 4 + c]));
+        return d;
+    };
+    for (int y = std::max(sc.cy - 48, 0); y <= std::min(sc.cy + 48, sc.H - 1); y++)
+        for (int x = std::max(sc.cx - 48, 0); x <= std::min(sc.cx + 48, sc.W - 1); x++) {
+            const size_t i = (size_t)y * sc.W + x;
+            if (sc.ui[i]) {
+                m.uiN++;
+                m.bad05 += maxd(plain.out[0], real, i) > 1;
+                m.bad025 += maxd(plain.out[1], real, i) > 1;
+                m.badBlur += maxd(blur.out[1], real, i) > 1;
+            } else {
+                m.art05 += maxd(plain.out[0], refPlain.out[0], i) > 24;
+                m.artBlur += maxd(blur.out[1], refBlur.out[1], i) > 24;
+            }
+        }
+    return m;
+}
+static void marginCheck(int W, int H) {
+    printf("\nBox margin (tiny crosshair: 8x7 px core + 1 px rim, boxes that just fit it):\n");
+    Settings off;
+    Settings offBlur = off; offBlur.blurSamples = 4;
+#ifndef UITEST_NO_MARGIN_API
+    {   // the work rectangle API
+        Settings s; s.uiProtection = UiProtection::Crosshair; s.uiBoxWidth = s.uiBoxHeight = 11;
+        int32_t b[4], w[4];
+        Interpolator::boxRect(s, W, H, b); Interpolator::workRect(s, W, H, w);
+        expect(Interpolator::boxMargin(s) == 2 && w[0] == b[0] - 2 && w[1] == b[1] - 2 && w[2] == b[2] + 4 && w[3] == b[3] + 4, "workRect: V1 box grown by 2 px on every side");
+        s.uiProtection = UiProtection::CrosshairV2;
+        Interpolator::workRect(s, W, H, w);
+        expect(Interpolator::boxMargin(s) == 1 && w[0] == b[0] - 1 && w[2] == b[2] + 2, "workRect: V2 box grown by 1 px on every side");
+        s.uiProtection = UiProtection::WholeScreen; Interpolator::workRect(s, W, H, w);
+        expect(Interpolator::boxMargin(s) == 0 && w[0] == b[0] && w[2] == b[2], "workRect: WholeScreen keeps its box");
+        s.uiProtection = UiProtection::Crosshair; s.uiBoxWidth = s.uiBoxHeight = 9999; s.uiBoxOffsetX = 5000;
+        Interpolator::workRect(s, W, H, w);
+        expect(w[0] == 0 && w[1] == 0 && w[2] == W && w[3] == H, "workRect: clamped to the frame");
+        s.uiBoxWidth = s.uiBoxHeight = 20; s.uiBoxOffsetX = -5000; s.uiBoxOffsetY = -5000;
+        Interpolator::workRect(s, W, H, w);
+        expect(w[0] == 0 && w[1] == 0 && w[2] == 22 && w[3] == 22, "workRect: a box in the frame corner is clamped on its outer sides only");
+    }
+#endif
+    struct Case { const char* name; UiProtection mode; int box, ox, oy; bool movingRim; };
+    const Case cases[] = {
+        {"V1 box 11x11 (fits core + rim), static rim", UiProtection::Crosshair, 11, 0, 0, false},
+        {"V1 box 9x9 (rim right/bottom outside)", UiProtection::Crosshair, 9, 0, 0, false},
+        {"V1 box 9x9 shifted +1,+1 (rim left/top outside)", UiProtection::Crosshair, 9, 1, 1, false},
+        {"V1 box 11x11, AA rim (changes every frame)", UiProtection::Crosshair, 11, 0, 0, true},
+        {"V1 box 9x9, AA rim", UiProtection::Crosshair, 9, 0, 0, true},
+        {"V2 box 11x11, static rim", UiProtection::CrosshairV2, 11, 0, 0, false},
+        {"V2 box 9x9, static rim", UiProtection::CrosshairV2, 9, 0, 0, false},
+        {"V2 box 9x9 shifted +1,+1, static rim", UiProtection::CrosshairV2, 9, 1, 1, false},
+    };
+    for (int pass = 0; pass < 2; pass++) {
+        const bool moving = pass == 1;
+        Scene sc(W, H, 12, 0, 0, 7, 0);
+        tinyCrosshair(sc, moving);
+        Scene sn = sc;
+        std::fill(sn.ui.begin(), sn.ui.end(), 0);
+        sn.uiHook = nullptr;
+        auto real = sc.frame(11);
+        Result refPlain = runSequence(sn, off, true, nullptr), refBlur = runSequence(sn, offBlur, true, nullptr, nullptr, true);
+        Result oPlain = runSequence(sc, off, true, nullptr), oBlur = runSequence(sc, offBlur, true, nullptr, nullptr, true);
+        MarginRow mo = marginMeasure(sc, oPlain, oBlur, real, refPlain, refBlur);
+        printf(" %s rim, Off:%*sartifact px: t=0.5 %zu, blur %zu\n", moving ? "AA" : "static", 40, "", mo.art05, mo.artBlur);
+        for (const Case& cs : cases) {
+            if (cs.movingRim != moving) continue;
+            Settings s; s.uiProtection = cs.mode; s.uiBoxWidth = s.uiBoxHeight = cs.box; s.uiBoxOffsetX = cs.ox; s.uiBoxOffsetY = cs.oy;
+            Settings sb = s; sb.blurSamples = 4;
+            Result rp = runSequence(sc, s, true, nullptr), rb = runSequence(sc, sb, true, nullptr, nullptr, true);
+            MarginRow m = marginMeasure(sc, rp, rb, real, refPlain, refBlur);
+            printf("  %-52s UI wrong %zu/%zu (t=0.25 %zu, blur %zu), artifact px: t=0.5 %zu, blur %zu\n", cs.name, m.bad05, m.uiN, m.bad025, m.badBlur, m.art05, m.artBlur);
+            char what[160];
+            snprintf(what, sizeof what, "%s: every crosshair and rim pixel equals the real one (t = 0.5, 0.25 and blurred)", cs.name);
+            expect(m.bad05 == 0 && m.bad025 == 0 && m.badBlur == 0, what);
+            // V1 removes the crosshair from the motion estimate, so nothing smears around it; V2 (no estimate fill) leaves the estimate
+            // exactly as Off has it, so it must only be never worse than Off
+            const bool v2 = cs.mode == UiProtection::CrosshairV2;
+            snprintf(what, sizeof what, "%s: artifact pixels around it %s (Off: %zu / %zu)", cs.name, v2 ? "no more than Off's" : "at most 4", mo.art05, mo.artBlur);
+            expect(m.art05 <= (v2 ? mo.art05 : 4) && m.artBlur <= (v2 ? mo.artBlur : 4), what);
+        }
+    }
+}
+#endif
 
 
 // ---------------------------------------------------------------- CrosshairV2
@@ -1198,6 +1328,7 @@ int main(int argc, char** argv) {
     bool hash = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bgra")) bgra = true;
+        else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dumpDir = argv[++i];
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
