@@ -17,8 +17,6 @@ from pathlib import Path
 
 import numpy as np
 
-CPUS = {6, 7, 8, 9, 16, 17, 18, 19}
-os.sched_setaffinity(0, CPUS)          # inherited by every ffmpeg / fgtest / ninja child
 os.environ["OMP_NUM_THREADS"] = "8"
 
 HERE = Path(__file__).resolve().parent

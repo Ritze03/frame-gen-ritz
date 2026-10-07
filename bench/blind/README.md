@@ -7,7 +7,7 @@ same clips, the page shows them in pairs without names, and the last screen prod
 ## Build a session
 
 ```sh
-taskset -c 6-9,16-19 python3 bench/blind/build_session.py \
+python3 bench/blind/build_session.py \
   --contestant 'v1: algo=v1' --contestant 'v2: algo=v2' \
   --source footage/battlefield.mp4,genre=fps \
   --source footage/cuts/racing_forza_1.mp4,start=12.5 \
