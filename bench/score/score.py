@@ -590,7 +590,7 @@ def main():
         groups += [("**all**", rr)]
         L += ["", "## Reference clips: paired deltas against v1", "",
               "PSNR = absolute mean (context only). d* = contestant - v1 per triple. flicker / missing / harm: lower is better; "
-              "dPSNR / dSSIM: higher is better. fallback% / cut%: would-fire rates over all scored pairs (dups included).", ""]
+              "dPSNR / dSSIM: higher is better. fallback% / cut% / identical: over all scored pairs, dup-dropped ones included.", ""]
         L += ref_table(groups, cons)
     if nr:
         groups = [(c["name"], [r for r in nr if r["clip"] == c["name"]]) for c in nrc]
@@ -601,7 +601,7 @@ def main():
         L += nr_table(groups, cons)
     L += ["", "## Worst-spot crops", "", "Strips are prev | v1 | contestant | real | next, 256x256 at full resolution. "
           "`error`: worst local (~64 px) luma error of that contestant; `delta`: worst local error minus v1's "
-          "(only sites where the contestant is worse). One site per triple.", "",
+          "(only sites where the contestant is worse). At most one site per window.", "",
           "| contestant | ranking | # | clip | real frame | site | value | file |", "|---|---|---|---|---|---|---|---|"]
     L += crop_lines or ["| (none) | | | | | | | |"]
     L += ["", "## Definitions", "", DEFINITIONS]
