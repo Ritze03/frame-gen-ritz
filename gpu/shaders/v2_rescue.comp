@@ -95,7 +95,7 @@ void main() {
         ivec2 y = clamp(c0 + o[lid], ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
         cand[lid] = field[pc.fE + y.y * pc.fw + y.x];
     } else if (lid == 5) {
-        cand[5] = v2SeedValid() ? v2VT(c0) : cand[0];   // (no valid seed: a duplicate, skipped; the result is a fresh instance's)
+        cand[5] = v2SeedValid() ? v2VT(c0) : field[pc.fE + c0.y * pc.fw + c0.x];   // (no valid seed: a duplicate of cand[0], read directly (lane 0 writes it before the barrier), skipped; the result is a fresh instance's)
     } else if (lid == 6) {
         cand[6] = vec2(uintBitsToFloat(u[4]), uintBitsToFloat(u[5]));
     }

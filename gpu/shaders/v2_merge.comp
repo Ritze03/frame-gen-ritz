@@ -4,7 +4,7 @@
 // field hE. At a flow pixel m that won a vote (v2_rescue.comp), the winner's half-vector u replaces hE(m) if it explains m well
 // enough: its 3x3 mean |a(y - u) - c(y + u)| at most the rescue knob (the match quality the vote accepted; a fast object's match is
 // rarely exact: perspective, aperture) or at most 4 levels above hE's. Both frames see the object there and the field's vector
-// // merely maps the background around it, so the object (in front) wins; a vector that explains m far better stays. An unvoted pixel
+// merely maps the background around it, so the object (in front) wins; a vector that explains m far better stays. An unvoted pixel
 // with at least 3 votes in its 5x5 tries the best of them the same way (the votes of an object are sparse: perspective, flat parts;
 // the test keeps the vector to where it explains the content). Each pixel writes only itself (its field vector and its coverage
 // word, bit 2 = rescued): the result does not depend on the order.
@@ -38,7 +38,7 @@ void main() {
         ivec2 y = t0 + ivec2(i % TK, i / TK);
         uint k = all(greaterThanEqual(y, ivec2(0))) && all(lessThan(y, ivec2(pc.fw, pc.fh))) ? v2b[ro + n + y.y * pc.fw + y.x] : 0u;
         sk[i] = k;
-        if (k != 0u) anyKey = 1u;
+        if (k != 0u) atomicOr(anyKey, 1u);
     }
     barrier();
     if (anyKey == 0u) return;   // (uniform)

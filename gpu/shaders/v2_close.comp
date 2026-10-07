@@ -27,10 +27,11 @@ void main() {
     ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - REACH;
     for (int i = lid; i < TC * TC; i += TS * TS) {
         ivec2 y = t0 + ivec2(i % TC, i / TC);
+        // (the apron overlaps other workgroups' |= 8u below: a benign race, bit 2, the one read here, never changes in this pass)
         uint r = all(greaterThanEqual(y, ivec2(0))) && all(lessThan(y, ivec2(pc.fw, pc.fh))) ?
                  (v2b[v2ROff() + y.y * pc.fw + y.x] >> 2) & 1u : 0u;
         sr[i] = r;
-        if (r != 0u) anyRes = 1u;
+        if (r != 0u) atomicOr(anyRes, 1u);
     }
     barrier();
     if (anyRes == 0u) return;   // (uniform)

@@ -625,9 +625,10 @@ static void blurOut(Ctx& c, int i, float t0, float t1) {
 // Edge profile of the object's right edge: c(x) = object share of column x (G channel, rows well inside the object's
 // height), for x from xr10 - 10 to xr10 + kObjV + 10 (the object covers everything left of it). From it: the mean
 // position mu of the edge (every sample's edge e_k weighted by w_k: mu = sum_x c(x) + x_start), its standard deviation
-// sigma, and the extent of the columns with 0.02 < c < 0.98. The profile of a blur is the weighted sum of its samples'
-// steps, so the moments are exactly those of the sample positions (sub-pixel, antialiasing-proof).
-struct Edge { double mu, sigma, ext; };
+// sigma, and the extent of the columns with 0.02 < c < 0.98 (first / last such column: lo, hi; an image without one, a sharp
+// step, has the step's column as both). The profile of a blur is the weighted sum of its samples' profiles, so its moments
+// follow from theirs (a mixture: mean sum w_k mu_k, variance sum w_k (sigma_k^2 + (mu_k - mu)^2); sub-pixel, antialiasing-proof).
+struct Edge { double mu, sigma, ext, lo, hi; };
 static Edge measureEdge(const BScene& bs, const std::vector<uint8_t>& img) {
     int x0 = bs.xr10 - 10, x1 = bs.xr10 + kObjV + 10;
     std::vector<double> c;
@@ -645,6 +646,8 @@ static Edge measureEdge(const BScene& bs, const std::vector<uint8_t>& img) {
     double a = -1, b = -1;
     for (size_t i = 0; i < c.size(); i++) if (c[i] > 0.02 && c[i] < 0.98) { if (a < 0) a = (double)i; b = (double)i; }
     e.ext = a < 0 ? 0 : b - a + 1;
+    if (a < 0) a = b = std::floor(m1);   // a sharp step: the column where the object ends
+    e.lo = x0 + a; e.hi = x0 + b;
     return e;
 }
 // The same on the ideal model: object edges at xr10 + kObjV t_k, coverage min(max(e - x, 0), 1) per pixel
@@ -820,19 +823,18 @@ static int check(int W, int H) {
         synthOut(c, 0, 0.75f);
         Edge e0 = measureEdge(c.bs, c.get(0));
         bool xhOk = true, muOk = true, sigOk = true, extOk = true;
-        double worstMu = 0, worstSig = 0, worstExt = 0;
+        double worstMu = 0, worstSig = 0, worstExt = -1e9, worstIdealSig = 0;
         for (int N : {2, 3, 4, 5, 6, 7, 8})
             for (auto& wd : std::vector<std::array<float, 2>>{{0.5f, 1.0f}, {0.25f, 0.75f}, {0.0f, 1.0f}}) {
                 auto t = sampleTimes(N, wd[0], wd[1]);
-                // the edge softness of the single interpolated frames this window is made of (each one's own spread)
-                std::vector<double> sig(N);
-                double singleExt = 0;
+                // the edges of the single frames this window is made of, measured (their own position, spread and extent:
+                // an interpolated frame's edge need not sit at the ideal xr10 + speed t, e.g. V2's soft hold edge, preset B,
+                // spreads a semi-transparent strip on both sides of it, biased toward the nearer real frame)
+                std::vector<Edge> se(N);
                 for (int k = 0; k < N; k++) {
-                    Edge e;
-                    if (t[k] <= 0.0f) e = measureEdge(c.bs, c.real10);
-                    else if (t[k] >= 1.0f) e = measureEdge(c.bs, c.real11);
-                    else { synthOut(c, 2, t[k]); e = measureEdge(c.bs, c.get(2)); singleExt = std::max(singleExt, e.ext); }
-                    sig[k] = e.sigma;
+                    if (t[k] <= 0.0f) se[k] = measureEdge(c.bs, c.real10);
+                    else if (t[k] >= 1.0f) se[k] = measureEdge(c.bs, c.real11);
+                    else { synthOut(c, 2, t[k]); se[k] = measureEdge(c.bs, c.get(2)); }
                 }
                 for (int wi = 0; wi < 2; wi++) {
                     BlurWeights bw = wi ? BlurWeights::Gaussian : BlurWeights::Even;
@@ -841,23 +843,33 @@ static int check(int W, int H) {
                     auto img = c.get(1);
                     auto w = sampleWeights(N, bw);
                     Edge m = measureEdge(c.bs, img), r = modelEdge(c.bs, t, w);
-                    double var = r.sigma * r.sigma;   // spread of the ideal edges + the softness of each interpolated frame
-                    for (int k = 0; k < N; k++) var += w[k] * sig[k] * sig[k];
+                    // the prediction from the sub-frames' measured moments: the blur's profile is their weighted mixture
+                    double muP = 0, var = 0;
+                    for (int k = 0; k < N; k++) muP += w[k] * se[k].mu;
+                    for (int k = 0; k < N; k++) var += w[k] * (se[k].sigma * se[k].sigma + (se[k].mu - muP) * (se[k].mu - muP));
                     double sigPred = std::sqrt(var);
+                    double idealVar = r.sigma * r.sigma;   // (info: the ideal model + each frame's softness, exact only for edges at xr10 + speed t)
+                    for (int k = 0; k < N; k++) idealVar += w[k] * se[k].sigma * se[k].sigma;
                     double dMu = std::fabs(m.mu - r.mu), dSig = std::fabs(m.sigma - sigPred);
                     worstMu = std::max(worstMu, dMu); worstSig = std::max(worstSig, dSig);
+                    worstIdealSig = std::max(worstIdealSig, std::fabs(m.sigma - std::sqrt(idealVar)));
                     muOk = muOk && dMu <= 2.0;
-                    sigOk = sigOk && dSig <= 1.0;
-                    if (dMu > 2.0 || dSig > 1.0)
-                        printf("   N=%d [%g,%g] %s: mean edge %.2f (model %.2f), sigma %.2f (model %.2f + softness: %.2f)\n", N, wd[0], wd[1], wn[wi], m.mu, r.mu, m.sigma, r.sigma, sigPred);
+                    sigOk = sigOk && dSig <= 0.1;
+                    if (dMu > 2.0 || dSig > 0.1)
+                        printf("   N=%d [%g,%g] %s: mean edge %.2f (model %.2f), sigma %.2f (from the sub-frames: %.2f)\n", N, wd[0], wd[1], wn[wi], m.mu, r.mu, m.sigma, sigPred);
                     if (wi == 0) {
-                        // even weights: the outermost samples are the midpoints of the first / last slice, so the
-                        // sample span is speed x (t1 - t0) x (N - 1)/N; the smear extent is that span + ~1 px of
-                        // antialiasing + the softness of one interpolated frame (no sample is a sharp real frame any more)
-                        double D = kObjV * (wd[1] - wd[0]) * (N - 1) / (double)N;
-                        bool ok = m.ext >= D - 1.0 && m.ext <= D + 1.0 + singleExt;
-                        worstExt = std::max(worstExt, std::fabs(m.ext - (D + 1.0)));
-                        if (!ok) { extOk = false; printf("   N=%d [%g,%g] even: extent %.1f px, speed x (t1 - t0) x (N-1)/N = %.1f px (single interpolated frame %.1f px)\n", N, wd[0], wd[1], m.ext, D, singleExt); }
+                        // even weights (each >= 1/8: every sub-frame's transition shows in the blur's): the smear extent
+                        // spans at least the sub-frames' mean edges (max mu_k - min mu_k, the measured counterpart of
+                        // speed x (t1 - t0) x (N - 1)/N) and lies within the union of their transitions [min lo_k, max hi_k]
+                        double muLo = 1e9, muHi = -1e9, uLo = 1e9, uHi = -1e9;
+                        for (int k = 0; k < N; k++) {
+                            muLo = std::min(muLo, se[k].mu); muHi = std::max(muHi, se[k].mu);
+                            uLo = std::min(uLo, se[k].lo); uHi = std::max(uHi, se[k].hi);
+                        }
+                        double D = muHi - muLo, U = uHi - uLo + 1;
+                        bool ok = m.ext >= D - 1.0 && m.lo >= uLo - 1.0 && m.hi <= uHi + 1.0;
+                        worstExt = std::max(worstExt, std::max(D - 1.0 - m.ext, std::max(uLo - 1.0 - m.lo, m.hi - uHi - 1.0)));
+                        if (!ok) { extOk = false; printf("   N=%d [%g,%g] even: extent %.1f px [%g, %g], sub-frame mean edges span %.1f px, union of their transitions [%g, %g] (%.0f px)\n", N, wd[0], wd[1], m.ext, m.lo, m.hi, D, uLo, uHi, U); }
                     }
                     if (pm != UiProtection::Off) {
                         size_t bad = 0;
@@ -872,10 +884,10 @@ static int check(int W, int H) {
                     }
                 }
             }
-        printf("   plain recordSynth(0.75): edge sigma %.2f px; worst |mean - model| %.2f px, worst |sigma - (model + softness)| %.2f px, worst |extent - (D + 1)|, D = speed x window x (N-1)/N, %.2f px\n", e0.sigma, worstMu, worstSig, worstExt);
+        printf("   plain recordSynth(0.75): edge sigma %.2f px; worst |mean - model| %.2f px, worst |sigma - from sub-frames| %.3f px (vs the ideal model + softness: %.2f px), worst extent bound violation %.2f px (<= 0: inside)\n", e0.sigma, worstMu, worstSig, worstIdealSig, worstExt);
         expect(muOk, "mean edge position within 2 px of the ideal model (N = 2..8, even + gaussian, 3 windows)");
-        expect(sigOk, "edge spread (sigma) within 1 px of the ideal model's (+ the softness of the interpolated frames it is made of)");
-        expect(extOk, "even weights: smear extent within [D-1, D+1+single frame softness], D = speed x (t1 - t0) x (N-1)/N (midpoint samples)");
+        expect(sigOk, "edge spread (sigma) within 0.1 px of the mixture of the measured sub-frame edges: sqrt(sum w_k (sigma_k^2 + (mu_k - mu)^2))");
+        expect(extOk, "even weights: smear extent >= sub-frame mean-edge span - 1 px, within the union of the sub-frame transitions +- 1 px");
         if (pm != UiProtection::Off) expect(xhOk, "crosshair pixels equal the real frame (<= 1 level) in every blurred output");
     }
     // ---- 4b. midpoint rule: windows that tile (100 % blur) share no sample, and the weights cover the interval uniformly
