@@ -1,11 +1,14 @@
-// Motion version 2 of the motion-blur passes (recordSynthBlur): the push constants and helpers of v2_blur_lookup.comp,
-// v2_blur_error.comp and v2_blur_resolve.comp. Included after blur_common.glsl. All three push this block over the same 128-byte
-// range as V1's blur passes push theirs. Rgba8 only. The helpers are those of motion_v2.glsl reading the per-sample field from the
-// blur scratch (bf[], one slot of rw x rh per sample: V2's refined field at t_k), so a sub-frame is the computation of V2's
-// recordSynth at its t (v2_lookup, v2_error, v2_resolve_core.glsl).
+// Motion version 2 of the motion-blur passes (recordSynthBlur): the push constants and helpers of v2_blur_error.comp and
+// v2_blur_resolve.comp. Included after blur_common.glsl. Both push this block over the same 128-byte range as V1's blur passes push
+// theirs. Rgba8 only. The helpers are those of motion_v2.glsl with the field at t_k computed on the fly from the refined midpoint
+// field (halfVecT: v2_lookup.comp's code), so a sub-frame is the computation of V2's recordSynth at its t (v2_lookup, v2_error,
+// v2_resolve_core.glsl) and V2 needs no per-sample field scratch (bf[], binding 6, is V1's only; I10: at 16 samples and 100 %
+// refinement it was 16 x 8 B per pixel, 265 MB at 1080p).
 
 layout(set = 0, binding = 13, std430) buffer V2Buf { uint v2b[]; };   // motion_v2.glsl: the occlusion map (class map: not written here)
-layout(set = 0, binding = 14, std430) buffer V2Field { vec2 rf[]; };  // motion_v2.glsl: the refined midpoint field at offset 0
+layout(set = 0, binding = 14, std430) buffer V2Field { uint rf[]; };  // motion_v2.glsl: the refined midpoint field at offset 0 (packed)
+#define V2_RF(i) rf[(i)]
+#include "v2_pack.glsl"
 
 layout(push_constant) uniform BPC2 {
     int wh;            // full resolution W | H << 16
@@ -38,20 +41,20 @@ int eStride() { return (P_W + 3) >> 2; }
 int eWords() { return eStride() * P_H; }
 const int CNT0 = 32;      // u[CNT0 + k]: untrusted-pixel count of sample k (== blur_motion_v1.glsl)
 
-vec2 BF(int slot, int off) { return bf[slot * P_RW * P_RH + off]; }
-
-// == motion_v2.glsl halfVec, the refined field of sample `slot`
-vec2 halfVec(int slot, ivec2 p) {
+// == motion_v2.glsl halfVec of the field at time t (v2_lookup.comp's field, computed here on the fly with the same code: v2_pack.glsl
+// v2LookupT): at 100 % refinement the grid point of p itself, else bilinear between the four grid points around p
+vec2 halfVecT(float t, ivec2 p) {
     int rw = P_RW, rh = P_RH;
-    if (rw == P_W && rh == P_H)   // 100 %: one read (== motion_v2.glsl)
-        return BF(slot, clamp(p.y, 0, rh - 1) * rw + clamp(p.x, 0, rw - 1));
-    vec2 s =(vec2(p) + 0.5) * (vec2(rw, rh) / vec2(P_W, P_H)) - 0.5;
-    vec2 fl = floor(s);
-    vec2 f = s - fl;
+    float s = 2.0 * t - 1.0;   // exact in float32, like the library's double computation rounded
+    if (rw == P_W && rh == P_H)   // 100 %: one grid point (== motion_v2.glsl)
+        return v2LookupT(clamp(p, ivec2(0), ivec2(rw - 1, rh - 1)), s, rw, rh, P_W, P_H);
+    vec2 sp =(vec2(p) + 0.5) * (vec2(rw, rh) / vec2(P_W, P_H)) - 0.5;
+    vec2 fl = floor(sp);
+    vec2 f = sp - fl;
     ivec2 i0 = clamp(ivec2(fl), ivec2(0), ivec2(rw - 1, rh - 1));
     ivec2 i1 = clamp(ivec2(fl) + 1, ivec2(0), ivec2(rw - 1, rh - 1));
-    vec2 v00 = BF(slot, i0.y * rw + i0.x), v01 = BF(slot, i0.y * rw + i1.x);
-    vec2 v10 = BF(slot, i1.y * rw + i0.x), v11 = BF(slot, i1.y * rw + i1.x);
+    vec2 v00 = v2LookupT(i0, s, rw, rh, P_W, P_H), v01 = v2LookupT(ivec2(i1.x, i0.y), s, rw, rh, P_W, P_H);
+    vec2 v10 = v2LookupT(ivec2(i0.x, i1.y), s, rw, rh, P_W, P_H), v11 = v2LookupT(i1, s, rw, rh, P_W, P_H);
     return mix(mix(v00, v01, f.x), mix(v10, v11, f.x), f.y);
 }
 

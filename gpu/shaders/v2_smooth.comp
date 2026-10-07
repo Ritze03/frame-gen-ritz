@@ -12,9 +12,19 @@
 // replaces q's own only if it explains q clearly better (3x3 mean |a - c| at flow res lower by 2 levels): a vector that explains q
 // stays, however its neighbours vote (between two motions a median can pick an in-between vector that neither side has; next to a
 // static UI the votes are the UI's).
-// Reads field[pf] (the pixel field), writes field[fE].
+// Temporal prior (D19, I10): then the previous pair's field, motion-compensated to this midpoint (vT, v2_seed.comp), replaces the
+// result where it differs by a jitter-sized amount (more than 1/4, at most 1 flow px), at least 2 of the 8 neighbouring pixel-field
+// vectors share it (within 1/4 px), and it explains q about as well: its 3x3 mean |a - c| at most tBonus levels above the result's.
+// Where the content does not decide (flat or repetitive texture, noise) the field then keeps last pair's motion instead of re-rolling
+// it every pair (vector jitter between generated frames: -11 % on a racing clip at tBonus 2); where it does, the content wins.
+// Why the limits: a larger change is a different motion hypothesis, not jitter (a thin fast object, e.g. a pole, whose midpoint the
+// background vector "explains" as well as its own: the prior made it vanish), and a vector no neighbour backs is a speck (next to a
+// static crosshair the prior put the pan back into single pixels the crosshair had pulled: artifacts at the arm ends, uitest).
+// Only with a valid seed (v2SeedValid(): the pair continues the last one); the measurement runs either way (the same work).
+// Reads field[pf] (the pixel field) and vT, writes field[fE].
 #include "common.glsl"
 #include "motion_v2.glsl"
+#include "v2_temporal.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const int TS = 16, R = 2, D = 2 * R + 1, TT = TS + 2 * R;
@@ -69,6 +79,23 @@ void main() {
             eb += abs(sampleL(pc.offA, y - best, pc.fw, pc.fh) - sampleL(pc.offC, y + best, pc.fw, pc.fh));
         }
         if (eb + 9.0 * 2.0 >= eo) best = v[12];   // not better by 2 levels on the mean: keep
+    }
+    // the temporal prior
+    vec2 vt = v2VT(q);
+    vec2 dt = abs(vt - best);
+    int sup = 0;   // pixel-field neighbours (the inner 3x3 but the centre) that share vT (within 1/4 px)
+    for (int i = 1; i < NC; i++) {
+        vec2 dn = abs(v[cand[i]] - vt);
+        sup += max(dn.x, dn.y) <= 0.25 ? 1 : 0;
+    }
+    if (max(dt.x, dt.y) > 0.25 && max(dt.x, dt.y) <= 1.0 && sup >= 2) {
+        float er = 0.0, et = 0.0;
+        for (int j = 0; j < 9; j++) {
+            vec2 y = vec2(q + ivec2(j % 3 - 1, j / 3 - 1));
+            er += abs(sampleL(pc.offA, y - best, pc.fw, pc.fh) - sampleL(pc.offC, y + best, pc.fw, pc.fh));
+            et += abs(sampleL(pc.offA, y - vt, pc.fw, pc.fh) - sampleL(pc.offC, y + vt, pc.fw, pc.fh));
+        }
+        if (v2SeedValid() && et <= er + 9.0 * pc.tBonus) best = vt;
     }
     field[pc.fE + q.y * pc.fw + q.x] = best;
 }

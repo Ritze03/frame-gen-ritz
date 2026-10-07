@@ -110,7 +110,7 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         }
         ut = max(ut, clamp(0.5 * float(4 - agree), 0.0, 1.0));
     }
-    vec2 hv = V2R_HV(p);
+    vec2 hv = thv[(l.y + 1) * TB + l.x + 1];   // == V2R_HV(p) (read once above: the field at t of the blur is computed on the fly)
     vec3 wa, wc;
     V2R_MIS(p, hv, wa, wc);
     vec3 m0 = v2Blend(wa, wc);

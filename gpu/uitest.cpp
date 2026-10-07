@@ -463,10 +463,15 @@ static int check(int W, int H, bool hash) {
         Metrics m = measure(sc, r.out[0], real11, &truth);
         printf(" Runtime Off -> Crosshair (frame 1) -> WholeScreen (frame 3): crosshair wrong %zu, hud wrong %zu\n", m.xhBad, m.hudBad);
         expect(m.xhBad == 0 && m.hudBad == 0, "runtime switch to WholeScreen mid-stream protects crosshair and HUD");
-        Result r2 = runSequence(sc, w1, true, nullptr, [&](Interpolator& fg, int f) {
-            if (f == 9) { if (!fg.setSettings(algo(Settings{}))) { printf("setSettings failed\n"); exit(1); } }
+        // (MotionVersion::V2's temporal seed is off in both runs: the WholeScreen frames before the switch estimate on the clean copies,
+        // so with it the estimate history, and through it the later fields, would differ by design)
+        Settings offN; offN.v2Temporal = 0.0f;
+        Settings w1N = w1; w1N.v2Temporal = 0.0f;
+        Result rOffN = runSequence(sc, offN, true, nullptr);
+        Result r2 = runSequence(sc, w1N, true, nullptr, [&](Interpolator& fg, int f) {
+            if (f == 9) { if (!fg.setSettings(algo(offN))) { printf("setSettings failed\n"); exit(1); } }
         });
-        expect(r2.out[0] == rOff.out[0] && r2.out[1] == rOff.out[1], "runtime switch WholeScreen -> Off: later output bit-identical to an Off run");
+        expect(r2.out[0] == rOffN.out[0] && r2.out[1] == rOffN.out[1], "runtime switch WholeScreen -> Off: later output bit-identical to an Off run");
     }
     // box sizing: Interpolator::boxSize (pure arithmetic, same numbers the library protects)
     {
@@ -1482,8 +1487,9 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const c
 }
 static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : "V1"; }
 // The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes;
-// V2 = the same plus its edge-aware field, occlusion analysis and refinement (v2_smooth / v2_occl / v2_refine.comp; its lookup,
-// mismatch, resolve and the three blur passes replace V1's, they do not add).
+// V2 = the same plus its temporal seed, edge-aware field, occlusion analysis and refinement (v2_seed / v2_smooth / v2_occl /
+// v2_refine.comp; its search, lookup, mismatch, resolve and two blur passes replace V1's, they do not add) and minus the blur lookup
+// (V2's blur computes the field at t_k on the fly): 15 + 2.
 static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 17 : 14; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
@@ -1631,6 +1637,58 @@ static void motionCheck(const Scene& sc) {
     expect(gLivePipes == p0, "release after switching back: the other version freed");
     fg.destroy();
     expect(gLivePipes == 0, "destroy frees every pipeline");
+
+    // V2's temporal seed (Settings::v2Temporal, D19): an estimate uses the previous V2 estimate's field only when its pair continues
+    // that one (its prev is the last estimate's curr) and nothing dropped the estimate since. Frames 9, 10, 11 (images c, a, b).
+    // Every case below must give exactly a fresh instance's output of the same pair: the first pair after init, after a switch of
+    // the motion version (and back), after a resize (and back), after reconfigure, and a pair that does not continue the last one
+    // (a skipped frame); a continuing pair uses the seed (informational: whether it changes this scene's output).
+    {
+        Img c = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        begin();
+        imgBarrier(c.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+        submit();
+        upload(sc.frame(9), c, W, H);
+        Settings s2; s2.motionVersion = MotionVersion::V2;
+        InitInfo inf;
+        inf.phys = phys; inf.device = dev; inf.gdpa = vkGetDeviceProcAddr; inf.width = W; inf.height = H;
+        inf.viewFormat = fmt(); inf.getMemProps = vkGetPhysicalDeviceMemoryProperties; inf.settings = s2;
+        // estimate p -> q (+ synth at 0.5 into o, downloaded into *out)
+        auto est = [&](Interpolator& f, Img& p, Img& q, std::vector<uint8_t>* out) {
+            begin();
+            f.beginFrame();
+            bool ok = f.recordEstimate(cb, p.view, q.view) && (!out || f.recordSynth(cb, p.view, q.view, o.view, 0.5f));
+            submit();
+            if (ok && out) *out = download(o, W, H);
+            return ok;
+        };
+        std::vector<uint8_t> fresh, freshSkip, x;
+        Interpolator f;
+        bool ok = f.init(inf) && est(f, a, b, &fresh);   // the first pair after init: no seed
+        f.destroy();
+        ok = ok && f.init(inf) && est(f, c, b, &freshSkip);   // (9, 11), fresh
+        expect(ok && est(f, c, a, nullptr) && est(f, a, b, &x), "V2 seed: estimates of consecutive pairs");
+        expect(x != fresh, "V2 seed: the continuing pair (10, 11) after (9, 10) uses it (its output differs from a fresh instance's: the check has teeth)");
+        const std::vector<uint8_t> seeded = x;
+        Settings s1 = s2; s1.motionVersion = MotionVersion::V1;
+        expect(est(f, c, a, nullptr) && f.setSettings(s1) && f.setSettings(s2) && est(f, a, b, &x) && x == fresh,
+               "V2 seed: dropped by a switch of the motion version (V2 -> V1 -> V2): output == a fresh instance's");
+        expect(est(f, c, a, nullptr) && f.setSettings(s2) && est(f, a, b, &x) && x == seeded,
+               "V2 seed: setSettings without a switch keeps it (the continuing pair's output as before)");
+        vkDeviceWaitIdle(dev);
+        expect(f.resize(W + 16, H, fmt()) && f.resize(W, H, fmt()) && est(f, a, b, &x) && x == fresh,
+               "V2 seed: dropped by a resize (and back): output == a fresh instance's");
+        expect(est(f, c, a, nullptr) && f.reconfigure(s2) && est(f, a, b, &x) && x == fresh,
+               "V2 seed: dropped by reconfigure: output == a fresh instance's");
+        expect(est(f, c, a, nullptr) && est(f, c, b, &x) && x == freshSkip,
+               "V2 seed: a pair that does not continue the last one (9, 11 after 9, 10: a skipped frame) == a fresh instance's");
+        Settings s0 = s2; s0.v2Temporal = 0.0f;
+        expect(f.setSettings(s0) && est(f, c, a, nullptr) && est(f, a, b, &x) && x == fresh,
+               "V2 seed: v2Temporal = 0 never uses it (a continuing pair == a fresh instance's)");
+        vkDeviceWaitIdle(dev);
+        f.destroy();
+        vkDestroyImageView(dev, c.view, nullptr); vkDestroyImage(dev, c.img, nullptr); vkFreeMemory(dev, c.mem, nullptr);
+    }
     for (Img* i : {&a, &b, &o}) { vkDestroyImageView(dev, i->view, nullptr); vkDestroyImage(dev, i->img, nullptr); vkFreeMemory(dev, i->mem, nullptr); }
 }
 #endif

@@ -1,0 +1,26 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2, estimate (each pyramid level; replaces search.comp in V2's group, D19): search.comp with the previous pair's field as one more
+// seed candidate. Per block the compensated previous field vT (v2_seed.comp, v2_temporal.glsl) at the block centre, scaled to the
+// level and rounded, is a 7th candidate of the seed choice (with LAMBDA like every candidate but the own parent; it wins only if its
+// block SAD is strictly lower, so ties keep V1's pick), and at the coarsest level (V1: seed 0) it competes with zero the same way.
+// The +-radius search then runs around the chosen seed as before: steady motion beyond the pyramid's reach (+-6 at the top level,
+// +-2 per finer level) is found again from where the last pair found it. Invalid seed (no previous pair, a skipped or out-of-order
+// pair, Settings::v2Temporal off): the candidate is measured but never picked, so the result is search.comp's.
+#include "common.glsl"
+#include "motion_v1.glsl"
+layout(set = 0, binding = 13, std430) buffer V2Buf { uint v2b[]; };
+#include "v2_pack.glsl"
+#include "v2_temporal.glsl"
+layout(local_size_x = 64) in;
+
+// the temporal seed of block blk of this level: vT at the block centre (flow pixel of the level position), in level units, rounded
+ivec2 v2SeedAt(ivec2 blk) {
+    vec2 lf = vec2(pc.fw, pc.fh) / vec2(pc.w, pc.h);   // flow pixels per level pixel
+    ivec2 c = min(blk * BLOCK + 4, ivec2(pc.w - 1, pc.h - 1));
+    vec2 v = v2VT(ivec2((vec2(c) + 0.5) * lf));
+    return ivec2(roundEven(v / lf));
+}
+
+#define V2_SEED 1
+#include "search_core.glsl"

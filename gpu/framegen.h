@@ -227,8 +227,9 @@ struct Settings {
     // "shutter" than a single instant. 0 or 1 = off (recordSynthBlur then equals recordSynth at the window's end t1).
     // 2..kBlurMaxSamples; any value works: the sub-frames sit at the MIDPOINTS of N equal slices of the window,
     // t_k = t0 + (t1 - t0)(k + 0.5)/N, k = 0..N-1 (a box-filter shutter; no sample on a window end), with the weights of blurWeights. Runtime: setSettings() at any time; the scratch it needs (per sample one
-    // field at t and one mismatch image: ~3 B per pixel at flowScale 2, 9 B at flowScale 1) is allocated by the first
-    // blurred record and only grows. Off = byte-identical to a library without it.
+    // field at t and one mismatch image: ~3 B per pixel at flowScale 2, 9 B at flowScale 1; MotionVersion::V2 keeps no field, only the
+    // mismatch: 1 B per pixel per sample) is allocated by the first blurred record and only grows. Off = byte-identical to a library
+    // without it.
     // Cost (RX 7900 XTX, per output, on top of the pair's estimate): see "Motion blur" in INTEGRATION.md.
     uint32_t blurSamples = 0;
     BlurWeights blurWeights = BlurWeights::Gaussian;
@@ -238,12 +239,14 @@ struct Settings {
     // return false (out untouched, the host shows the real frame, as with no estimate since init/resize) until the next
     // recordEstimate, which runs the new version; an estimate of one version is never synthesised by the other. The first switch to a
     // version creates its pipelines and buffers at once, no GPU wait (false from setSettings if that fails, nothing changed);
-    // switching away keeps them for a later switch back, releaseUnusedMotion() frees them. V2's buffers: 16 B per flow-resolution
-    // pixel (the occlusion map) + 1 B per pixel (the class map), ~10.4 MB at 1080p, flowScale 2, plus the refined fields, 16 B per
-    // pixel of the refinement grid (v2RefineRes: ~33 MB at 1080p and 100 %, ~8.3 MB at 50 %). Cost of V2 (RX 7900 XTX, 1080p 2x,
-    // preset A at 100 % refinement): ~0.54 ms per pair against V1's ~0.33 (estimate: edge-aware field ~0.060 ms, occlusion pass
-    // ~0.036, refinement ~0.050; synth: mismatch ~0.046 instead of ~0.028, resolve ~0.066 instead of ~0.031).
-    // V2 reads only prev and curr: the same latency as V1.
+    // switching away keeps them for a later switch back, releaseUnusedMotion() frees them. V2's buffers: 28 B per flow-resolution
+    // pixel (the occlusion map, the temporal store of v2Temporal) + 1 B per pixel (the class map), ~16.7 MB at 1080p, flowScale 2, plus
+    // the refined fields, 8 B per pixel of the refinement grid (v2RefineRes: ~16.6 MB at 1080p and 100 %, ~4.1 MB at 50 %): ~33 MB in
+    // all at 1080p (I9: ~43.5 MB, and its motion blur kept a further 8 B per pixel per sample: 265 MB at 16 samples, now none). Cost
+    // of V2 (RX 7900 XTX, 1080p 2x, preset A at 100 % refinement): ~0.54 ms per pair against V1's ~0.33 (estimate: the temporal
+    // seed ~0.005 ms, edge-aware field ~0.068, occlusion pass ~0.042, refinement ~0.046; synth: mismatch ~0.034 instead of ~0.028,
+    // resolve ~0.064 instead of ~0.031). V2 reads only prev and curr: the same latency as V1 (v2Temporal reuses the previous pair's
+    // field, which already exists).
     MotionVersion motionVersion = MotionVersion::V1;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
@@ -282,20 +285,36 @@ struct Settings {
     //   taps per candidate), and every full-resolution pass reads its vector from that grid (bilinear between grid points; at 100 %
     //   each pixel has its own refined vector). Every preset uses 100 %. Cost and memory scale with the grid's pixel count (1080p 2x,
     //   RX 7900 XTX, preset A: ~0.54 ms per pair at 100 %, ~0.49 at 50 %, ~0.48 at 25 %); on the bench (fps reference clips, PSNR
-    //   against V1) 50 % gains about half of what 100 % gains. Memory: 16 B per grid pixel (the refined midpoint field and the field
-    //   at t, grown at the first estimate that needs more; a motion-blurred output's scratch holds blurSamples x 8 B per grid pixel).
+    //   against V1) 50 % gains about half of what 100 % gains. Memory: 8 B per grid pixel (the refined midpoint field and the field
+    //   at t, 2 x 16-bit fixed point in 1/32 px each, grown at the first estimate that needs more; the motion blur computes its fields at
+    //   t_k on the fly and keeps none).
     float v2RefineRes = -1.0f;
     //   v2EdgeSigma: [1, 255] levels. The strength of the edge awareness (D17): the range scale of the guide (the midpoint image the
     //   field predicts) in the edge-aware vector median of the flow field and of the candidate costs (mismatch + guide difference) in
     //   the refinement's soft pick. Smaller = vectors follow image edges more strictly (and the pick is harder); larger = closer to a
     //   plain median and a plain bilinear upsample.
     float v2EdgeSigma = -1.0f;
+    //   v2Temporal: 0 or 1 (>= 0.5 = on). The previous pair's field (D19): V2 keeps the edge-aware field of each estimate and the next
+    //   estimate uses it, motion-compensated to its own midpoint, (1) as one more seed candidate of the block search at every pyramid
+    //   level (reach: steady fast motion beyond the search's +-6 / +-2 per level is found again from where the last pair found it),
+    //   (2) as a temporal prior of the edge-aware field (v2TemporalBonus) and (3) to tell which side of a clean occlusion is the
+    //   background (a motion boundary moves with the foreground; else the side nearer the global median, as before). No latency (the
+    //   previous field already exists) and no host call: it applies only when the pair continues the last estimated one (its prev is
+    //   the last estimate's curr, which the library checks on the GPU by content: a skipped, repeated or out-of-order pair, or a cut
+    //   between pairs, drops it for that estimate) and never to the first estimate after init, resize, reconfigure or a switch of
+    //   motionVersion. Every preset: on. 0 = the estimate of I9 (the field is still stored, and the same work done).
+    float v2Temporal = -1.0f;
+    //   v2TemporalBonus: [0, 255] levels. The temporal prior: where the compensated previous vector differs from the edge-aware field's
+    //   (by more than 1/4 flow px) it replaces it if its 3x3 mean |a - c| (flow res) is at most this much higher. Higher = steadier
+    //   field from pair to pair (less vector jitter where the content does not decide), lower = the content decides more often.
+    float v2TemporalBonus = -1.0f;
 };
 
 // The effective V2 knobs of a Settings (Interpolator::v2Knobs(): the preset with the v2* overrides applied).
 struct V2Knobs {
     float occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow, trustHigh;
     float refineRes, edgeSigma;   // refineRes rounded to an integer percentage
+    float temporal, temporalBonus;   // temporal 0 / 1
 };
 
 struct InitInfo {
@@ -594,8 +613,9 @@ public:
     // 2 clean occlusion with the field's vector, 3 with the background vector, 4 with the foreground vector, 5 with zero; bit 3 = the one-sided side
     // is curr (else prev); bits 4-7 = weight x 15 of the held frame (0-1) or of the one-sided warp (2-4)). V1: clsOff = 0, no class map.
     // MotionVersion::V2 also adds its fields: the edge-aware field (fw x fh vec2, flow-resolution half-vector units, like the per-pixel
-    // field) at edgeOff and the refined midpoint field (rw x rh vec2, the refinement grid of the settings at layout time, full-resolution
-    // half-vector units) at refOff; recordDebugMaps fails if the latest estimate used another grid. V1: edgeOff = refOff = 0, rw = rh = 0.
+    // field) at edgeOff and the refined midpoint field (rw x rh uint32, the refinement grid of the settings at layout time, full-resolution
+    // half-vector units, packed: x and y as int16 in 1/32 px, x in the low half) at refOff; recordDebugMaps fails if the latest estimate
+    // used another grid. V1: edgeOff = refOff = 0, rw = rh = 0.
     // Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
     struct DebugMapLayout {
         uint32_t W, H, fw, fh, bw, bh, fscale, eStride;   // eStride in uint32 words

@@ -36,7 +36,8 @@
 #include "v2_refine_spv.h"
 #include "v2_lookup_spv.h"
 #include "v2_error_spv.h"
-#include "v2_blur_lookup_spv.h"
+#include "v2_seed_spv.h"
+#include "v2_search_spv.h"
 #include "v2_blur_error_spv.h"
 
 // The colour shaders of the formats other than Rgba8 (shaders/format.glsl), when built.
@@ -194,7 +195,10 @@ struct PC2 {
     float s, wA, wC, trust0, trustScale, occ0, occScale, pickBias, edgeMin, confMax, zeroBonus;
     int32_t rw, rh, rpf, rfOut, fE;
     float edgeK;
-    int32_t pad_[5];
+    int32_t tFlags;   // the temporal store: bit 0 parity of this estimate, bit 1 the previous estimate is usable (v2_temporal.glsl)
+    float tBonus;
+    int32_t lw, lh;   // v2_seed: the coarsest pyramid level
+    int32_t pad_;
 };
 static_assert(sizeof(PC2) == sizeof(PC), "PC2 is pushed over PC's range");
 
@@ -254,6 +258,7 @@ struct UiEntry {
 
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
             P_V2OCCL, P_V2SMOOTH, P_V2REFINE,   // V2 only: v2_occl / v2_smooth / v2_refine.comp (V1's group leaves them null)
+            P_V2SEED,                           // V2 only: v2_seed.comp (the temporal store, D19)
             P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
@@ -261,9 +266,10 @@ struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 // The resources of one motion version (Settings::motionVersion): created by motionEnsure() the first time the version is selected
 // (init, setSettings, reconfigure), kept while another one is selected, freed by releaseUnusedMotion() / destroy(). V1: the pipelines
 // of the estimate / synth passes and of the motion-blur passes over the shared layouts, set rings and scratch buffers. V2: its own
-// pipelines (of V1's shaders for the passes it shares, of v2_*.comp for its own: P_V2OCCL, P_V2SMOOTH, P_V2REFINE, P_LOOKUP,
-// P_ERROR, P_RESOLVE, B_LOOKUP, B_ERROR, B_RESOLVE) and its buffers (bufs[0], binding 13: the occlusion map + the class map; bufs[1],
-// binding 14: the refined fields; motion_v2.glsl; created by motionSized(), bufs[1] grown by recordEstimate()).
+// pipelines (of V1's shaders for the passes it shares, of v2_*.comp for its own: P_V2SEED, P_SEARCH (v2_search), P_V2OCCL, P_V2SMOOTH,
+// P_V2REFINE, P_LOOKUP, P_ERROR, P_RESOLVE, B_ERROR, B_RESOLVE; no B_LOOKUP: its blur computes the field at t_k on the fly) and its
+// buffers (bufs[0], binding 13: the occlusion map + the class map + the temporal store, v2_temporal.glsl; bufs[1], binding 14: the
+// refined fields, packed (v2_pack.glsl); motion_v2.glsl; created by motionSized(), bufs[1] grown by recordEstimate()).
 static const int kMotionVersions = 2;   // MotionVersion::V1, V2
 struct MotionGroup {
     VkPipeline pipes[P_COUNT]{};
@@ -324,6 +330,12 @@ struct Interpolator::Impl {
     bool haveEst = false;
     VkImageView estPrev = VK_NULL_HANDLE, estCurr = VK_NULL_HANDLE;   // the Y / only views of the estimate's pair
     int estRw = 0, estRh = 0;          // V2: the refinement grid of the latest estimate (its synths read that grid)
+    // V2's temporal store (D19, shaders/v2_temporal.glsl): the field of the previous V2 estimate is kept in bufs[0] for the next one.
+    // v2SeedOk: a V2 estimate was recorded since the store was last invalidated (init, resize, reconfigure, a switch of the motion
+    // version: everything that drops the estimate); the shaders also check on the GPU that the new pair continues the last one.
+    // v2Par: the parity of the next V2 estimate (its store slot; the previous one's is the other).
+    bool v2SeedOk = false;
+    uint32_t v2Par = 0;
 
     // size dependent
     uint32_t W = 0, H = 0;
@@ -398,6 +410,11 @@ struct Interpolator::Impl {
     // V2's buffer (binding 13) when V2 is selected and sized, else null (V1's sets leave binding 13 unwritten: no V1 shader declares it)
     VkBuffer v2Buf() { MotionGroup& g = mg(); return set.motionVersion == MotionVersion::V2 && !g.bufs.empty() ? g.bufs[0].b : VK_NULL_HANDLE; }
     VkDeviceSize v2OccWords() const { return (VkDeviceSize)4 * fw * fh; }   // V2's occlusion map, in words; the class map follows
+    // all of V2's buffer (binding 13), in words: the occlusion map, the class map, the temporal store (v2_temporal.glsl: two field slots,
+    // the compensated field, two slots of the coarsest pyramid level)
+    VkDeviceSize v2Words() const {
+        return v2OccWords() + (VkDeviceSize)((W + 3) / 4) * H + (VkDeviceSize)3 * fw * fh + (VkDeviceSize)2 * lv.back().w * lv.back().h;
+    }
     // V2's refined-field buffer (binding 14) when V2 is selected and sized, else null
     VkBuffer v2Field() { MotionGroup& g = mg(); return set.motionVersion == MotionVersion::V2 && g.bufs.size() > 1 ? g.bufs[1].b : VK_NULL_HANDLE; }
     // V2's refinement grid for the current settings (V2Knobs refineRes % of W x H per axis, at least 1)
@@ -1065,6 +1082,7 @@ bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool forc
     destroySizeDependent();
     W = H = 0;
     haveEst = false;
+    v2SeedOk = false;
     if (!ok) return false;
     info.viewFormat = fmt;
     W = w; H = h;
@@ -1099,12 +1117,12 @@ bool Interpolator::validate(const Settings& s) {
 
 // MotionVersion::V2: the knob values of each preset (MotionPreset A-D, in order). -1 for the trust ramp = Settings::trustLow / trustHigh,
 // -1 for the occlusion ramp = the effective trust ramp. Fields: occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow,
-// trustHigh, refineRes, edgeSigma (V2Knobs).
+// trustHigh, refineRes, edgeSigma, temporal, temporalBonus (V2Knobs).
 static const V2Knobs kV2Presets[4] = {
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f},   // A balanced
-    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f},   // B strict
-    {1.0f, 6.0f, 30.0f, -1.0f, -1.0f, 0.5f, -1.0f, -1.0f, 100.0f, 5.0f},    // C wide
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f},   // D soft (wider trust ramp)
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f, 1.0f, 2.0f},   // A balanced
+    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f, 1.0f, 1.0f},   // B strict
+    {1.0f, 6.0f, 30.0f, -1.0f, -1.0f, 0.5f, -1.0f, -1.0f, 100.0f, 5.0f, 1.0f, 3.0f},    // C wide
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f, 1.0f, 2.0f},   // D soft (wider trust ramp)
 };
 
 V2Knobs Interpolator::v2Knobs(const Settings& s) {
@@ -1114,12 +1132,14 @@ V2Knobs Interpolator::v2Knobs(const Settings& s) {
     ov(k.occLow, s.v2OccLow); ov(k.occHigh, s.v2OccHigh); ov(k.pickBias, s.v2PickBias);
     ov(k.trustLow, s.v2TrustLow); ov(k.trustHigh, s.v2TrustHigh);
     ov(k.refineRes, s.v2RefineRes); ov(k.edgeSigma, s.v2EdgeSigma);
+    ov(k.temporal, s.v2Temporal); ov(k.temporalBonus, s.v2TemporalBonus);
     if (k.trustLow == -1.0f) k.trustLow = s.trustLow;
     if (k.trustHigh == -1.0f) k.trustHigh = s.trustHigh;
     if (k.occLow == -1.0f) k.occLow = k.trustLow;
     if (k.occHigh == -1.0f) k.occHigh = k.trustHigh;
     k.reach = std::nearbyint(k.reach);
     k.refineRes = std::nearbyint(k.refineRes);
+    k.temporal = k.temporal >= 0.5f ? 1.0f : 0.0f;
     return k;
 }
 
@@ -1130,7 +1150,7 @@ static bool v2Valid(const Settings& s) {
     if (!in(s.v2OcclWidth, 0.5f, 64.0f) || !in(s.v2Reach, 1.0f, 16.0f) || !in(s.v2Confidence, 1.0f, 255.0f) ||
         !in(s.v2OccLow, 0.0f, 255.0f) || !in(s.v2OccHigh, 0.0f, 255.0f) || !in(s.v2PickBias, 0.0f, 255.0f) ||
         !in(s.v2TrustLow, 0.0f, 255.0f) || !in(s.v2TrustHigh, 0.0f, 255.0f) || !in(s.v2RefineRes, 1.0f, 100.0f) ||
-        !in(s.v2EdgeSigma, 1.0f, 255.0f))
+        !in(s.v2EdgeSigma, 1.0f, 255.0f) || !in(s.v2Temporal, 0.0f, 1.0f) || !in(s.v2TemporalBonus, 0.0f, 255.0f))
         return false;
     const V2Knobs k = Interpolator::v2Knobs(s);
     return k.trustHigh - k.trustLow >= 1.0f && k.occHigh - k.occLow >= 1.0f;
@@ -1154,7 +1174,7 @@ bool Interpolator::setSettings(const Settings& s) {
     m->uiAdopted(old);
     // A switch of the motion version drops the estimate, the way the library already has for "no estimate" (after init/resize):
     // recordSynth / recordSynthBlur return false until the next recordEstimate, which runs the new version.
-    if (s.motionVersion != old.motionVersion) m->haveEst = false;
+    if (s.motionVersion != old.motionVersion) m->haveEst = m->v2SeedOk = false;
     return true;
 }
 
@@ -1169,6 +1189,7 @@ bool Interpolator::reconfigure(const Settings& s) {
     if (!m->uiEnsure()) { m->set = old; return false; }
     m->uiAdopted(old);
     if (s.motionVersion != old.motionVersion) m->haveEst = false;   // as in setSettings
+    m->v2SeedOk = false;   // V2's temporal seed: reconfigure always starts a new frame stream
     return true;
 }
 
@@ -1196,23 +1217,25 @@ bool Interpolator::Impl::motionEnsure() {
     struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
         {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
         {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
-        {SPV(lookup), nullptr}, {Spv{}, nullptr}, {Spv{}, nullptr}, {Spv{}, nullptr}};
+        {SPV(lookup), nullptr}, {Spv{}, nullptr}, {Spv{}, nullptr}, {Spv{}, nullptr}, {Spv{}, nullptr}};
     struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
     if (set.motionVersion == MotionVersion::V2) {
         spv[P_V2OCCL] = {SPV(v2_occl), nullptr};
         spv[P_V2SMOOTH] = {SPV(v2_smooth), nullptr};
         spv[P_V2REFINE] = {SPV(v2_refine), nullptr};
+        spv[P_V2SEED] = {SPV(v2_seed), nullptr};
+        spv[P_SEARCH] = {SPV(v2_search), nullptr};   // search.comp + the temporal seed
         spv[P_LOOKUP] = {SPV(v2_lookup), nullptr};
         spv[P_ERROR] = {SPV(v2_error), nullptr};
         spv[P_RESOLVE] = {SPV(v2_resolve), nullptr};
-        bspv[B_LOOKUP] = {SPV(v2_blur_lookup), nullptr};
+        bspv[B_LOOKUP] = {Spv{}, nullptr};   // none: V2's blur passes compute the field at t_k on the fly (blur_motion_v2.glsl)
         bspv[B_ERROR] = {SPV(v2_blur_error), nullptr};
         bspv[B_RESOLVE] = {SPV(v2_blur_resolve), nullptr};
     }
     bool ok = true;
     for (int i = 0; ok && i < P_COUNT; i++) ok = !spv[i].sp.code || makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
-    for (int i = 0; ok && i < B_COUNT_; i++) ok = makePipe(bspv[i].sp, blurLayout, g.blurPipes[i], bspv[i].sc);
+    for (int i = 0; ok && i < B_COUNT_; i++) ok = !bspv[i].sp.code || makePipe(bspv[i].sp, blurLayout, g.blurPipes[i], bspv[i].sc);
     ok = ok && (!W || motionSized(g));
     if (!ok) { motionFree(g); return false; }
     g.live = true;
@@ -1227,8 +1250,8 @@ bool Interpolator::Impl::motionSized(MotionGroup& g) {
     UiBuf b, f;
     int rw, rh;
     refineDims(rw, rh);
-    if (!allocBuf(b, (v2OccWords() + (VkDeviceSize)((W + 3) / 4) * H) * 4)) return false;
-    if (!allocBuf(f, (VkDeviceSize)2 * rw * rh * 8)) { freeBuf(b); return false; }
+    if (!allocBuf(b, v2Words() * 4)) return false;
+    if (!allocBuf(f, (VkDeviceSize)2 * rw * rh * 4)) { freeBuf(b); return false; }
     g.bufs.push_back(b);
     g.bufs.push_back(f);
     return true;
@@ -1344,7 +1367,7 @@ bool Interpolator::debugMapLayout(DebugMapLayout& l) const {
         I.refineDims(rw, rh);
         l.rw = (uint32_t)rw; l.rh = (uint32_t)rh;
         l.refOff = l.size;
-        l.size += (VkDeviceSize)rw * rh * 8;
+        l.size += (VkDeviceSize)rw * rh * 4;
     }
     return true;
 }
@@ -1370,7 +1393,7 @@ bool Interpolator::recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSiz
         if (!fb || I.estRw != (int)L.rw || I.estRh != (int)L.rh) return false;
         VkBufferCopy ce{(VkDeviceSize)I.fieldT * 8, dstOffset + L.edgeOff, (VkDeviceSize)L.fw * L.fh * 8};
         I.CmdCopyBuffer(cb, I.buf[1], dst, 1, &ce);
-        VkBufferCopy cr{0, dstOffset + L.refOff, (VkDeviceSize)L.rw * L.rh * 8};
+        VkBufferCopy cr{0, dstOffset + L.refOff, (VkDeviceSize)L.rw * L.rh * 4};
         I.CmdCopyBuffer(cb, fb, dst, 1, &cr);
     }
     return true;
@@ -1380,7 +1403,8 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
     VkDescriptorSet set = sets[ring][setIdx[ring]];
     setIdx[ring] = (setIdx[ring] + 1) % kSetRing;
     frameSets[ring]++;
-    VkDescriptorBufferInfo bi[3], bb[2] = {{blurField.b, 0, VK_WHOLE_SIZE}, {blurErr.b, 0, VK_WHOLE_SIZE}};
+    // (V2's blur keeps no field scratch: binding 6 gets a placeholder its shaders never read)
+    VkDescriptorBufferInfo bi[3], bb[2] = {{blurField.b ? blurField.b : rejNone.b, 0, VK_WHOLE_SIZE}, {blurErr.b, 0, VK_WHOLE_SIZE}};
     VkDescriptorImageInfo ii[6] = {{VK_NULL_HANDLE, prev.view, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, curr.view, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -1854,7 +1878,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     if (mv2) {
         I.refineDims(rw, rh);
         MotionGroup& g = I.mg();
-        if (g.bufs.size() < 2 || !I.growBlur(g.bufs[1], (VkDeviceSize)2 * rw * rh * 8)) return false;
+        if (g.bufs.size() < 2 || !I.growBlur(g.bufs[1], (VkDeviceSize)2 * rw * rh * 4)) return false;
     }
 
     if (!I.profPending) {
@@ -1921,7 +1945,19 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         r.cbar();
     }
     r.stamp("pyramid");
-    // 3-5. per level, coarse -> fine
+    // V2: the previous pair's field for this estimate (v2_seed.comp: compensated to this midpoint; is this pair the continuation?)
+    const V2Knobs k2 = Interpolator::v2Knobs(I.set);
+    const int32_t tFlags = (int32_t)(I.v2Par & 1) | (I.v2SeedOk && k2.temporal >= 0.5f ? 2 : 0);
+    if (mv2) {
+        PC2 p2 = r.pc2();
+        const Level& lt = I.lv.back();
+        p2.offA = lt.offA; p2.offC = lt.offC; p2.lw = lt.w; p2.lh = lt.h;
+        p2.tFlags = tFlags;
+        r.run2(P_V2SEED, p2, divUp(I.fw, 16), divUp(I.fh, 16));
+        r.cbar();
+        r.stamp("v2 seed");
+    }
+    // 3-5. per level, coarse -> fine (V2: v2_search.comp, with the temporal seed)
     static const char* lvNames[] = {"level 0 (finest)", "level 1", "level 2", "level 3", "level 4", "level 5", "level 6", "level 7"};
     int n = (int)I.lv.size();
     for (int i = n - 1; i >= 0; i--) {
@@ -1965,6 +2001,8 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     if (mv2) {
         PC2 p2 = r.pc2();
         p2.offA = l0.offA; p2.offC = l0.offC;
+        p2.tFlags = tFlags;
+        p2.tBonus = k2.temporalBonus;
         // V2: the edge-aware field (v2_smooth.comp: pixel field -> fieldT, the slot V1's field at t uses; V2 never needs that)
         p2.pf = I.fieldPF;
         r.run2(P_V2SMOOTH, p2, divUp(I.fw, 16), divUp(I.fh, 16));
@@ -1980,6 +2018,8 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         r.run2(P_V2REFINE, p2, divUp(rw, 8), divUp(rh, 8));
         r.cbar();
         r.stamp("v2 refine");
+        I.v2SeedOk = true;   // the next V2 estimate may use this one's field (v2_occl.comp stored it in slot v2Par)
+        I.v2Par ^= 1u;
     }
     return true;
 }
@@ -2098,8 +2138,8 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     // (V2: the field at t_k on the estimate's refinement grid)
     const bool v2 = I.set.motionVersion == MotionVersion::V2;
     const VkDeviceSize errWords = (VkDeviceSize)((I.W + 3) / 4) * I.H;
-    const VkDeviceSize fieldPx = v2 ? (VkDeviceSize)I.estRw * I.estRh : (VkDeviceSize)I.fw * I.fh;
-    if (!I.growBlur(I.blurField, (VkDeviceSize)n * fieldPx * 8) || !I.growBlur(I.blurErr, (VkDeviceSize)n * errWords * 4)) return false;
+    // V2 keeps no field scratch: its blur passes compute the field at t_k on the fly from the refined midpoint field
+    if ((!v2 && !I.growBlur(I.blurField, (VkDeviceSize)n * I.fw * I.fh * 8)) || !I.growBlur(I.blurErr, (VkDeviceSize)n * errWords * 4)) return false;
     VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out, true, I.rejectMasks(cb));
 
     Rec r(I, cb);
@@ -2136,10 +2176,11 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
         I.CmdDispatch(cb, gx, gy, gz);
     };
     if (nInt > 0) {
-        if (v2) run(B_LOOKUP, divUp(I.estRw, 8), divUp(I.estRh, 8), (uint32_t)nInt);
-        else run(B_LOOKUP, divUp(I.fw, 8), divUp(I.fh, 8), (uint32_t)nInt);
-        r.cbar();
-        r.stamp("blur lookup");
+        if (!v2) {   // (V2: none, see above)
+            run(B_LOOKUP, divUp(I.fw, 8), divUp(I.fh, 8), (uint32_t)nInt);
+            r.cbar();
+            r.stamp("blur lookup");
+        }
         run(B_ERROR, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8), (uint32_t)nInt);
         r.cbar();
         r.stamp("blur mismatch");

@@ -10,18 +10,23 @@
 //     z = side: 0 = no clean occlusion, 1 = covered (take prev), 2 = uncovered (take curr), w = 0 (reserved).
 //   words [clsOff, clsOff + eStride H): the class map of the latest synth (debug, recordDebugMaps), one byte per pixel, 4 per
 //     word, low byte first: bits 0-2 class (V2_CLS_*: 0 trusted, 1 held, clean occlusion with 2 the field's vector, 3 vB, 4 vF, 5 zero), bit 3 = side curr, bits 4-7 = weight of the hold / one-sided output x 15.
+//   then the temporal store (D19, I10: the previous pair's field, v2_temporal.glsl; written by v2_seed / v2_occl, read by v2_seed,
+//     v2_search, v2_smooth, v2_occl).
 //
 // V2's fields (D17, D13). The estimate adds two passes after the pixel field:
 //   v2_smooth.comp (flow res): the edge-aware field hE, a guided weighted vector median of the pixel field (written to field[] at the
 //     slot V1 uses for its field at t, which V2 never needs: framegen.cpp fieldT).
 //   v2_refine.comp (the refinement grid rw x rh, Settings::v2RefineRes % of the frame): the edge-preserving upsample of hE, written
-//     to rf[] (binding 14, framegen.cpp MotionGroup::bufs[1]) at offset 0 in FULL-RESOLUTION half-vector units.
+//     to rf[] (binding 14, framegen.cpp MotionGroup::bufs[1]) at offset 0 in FULL-RESOLUTION half-vector units, packed (one uint per
+//     grid point, v2_pack.glsl: 1/32 px fixed point; I10, half the memory of vec2, and at t = 0.5 exactly the taps of the unrounded
+//     vector).
 // Every full-resolution pass of V2 (v2_error, v2_resolve, the blur passes) reads its half-vector from rf[] with halfVec() below:
 // bilinear on the refinement grid, i.e. the refined field itself at 100 %. The field at t != 0.5 (v2_lookup.comp) is looked up on the
-// same grid, into rf[] at offset rw * rh.
+// same grid, into rf[] at offset rw * rh (the blur passes compute the same values on the fly: blur_motion_v2.glsl halfVecT).
 
 layout(set = 0, binding = 13, std430) buffer V2Buf { uint v2b[]; };
-layout(set = 0, binding = 14, std430) buffer V2Field { vec2 rf[]; };   // refined fields (full-resolution half-vector units)
+layout(set = 0, binding = 14, std430) buffer V2Field { uint rf[]; };   // refined fields (full-resolution half-vector units, packed:
+                                                                        // v2_pack.glsl)
 
 layout(push_constant) uniform PC2 {
     int W, H;          // full resolution
@@ -45,7 +50,16 @@ layout(push_constant) uniform PC2 {
     int rfOut;                  // v2_refine / v2_lookup: offset in rf[] written
     int fE;                     // offset in field[] of the edge-aware flow-resolution field (v2_smooth writes it)
     float edgeK;                // 1 / V2Knobs edgeSigma (levels): the range weight of the guide
+    int tFlags;                 // the temporal store (v2_temporal.glsl): bit 0 = parity of this estimate (slot written; the
+                                // previous pair's is the other), bit 1 = the host's "a previous V2 estimate exists" (v2_seed.comp)
+    float tBonus;               // v2_smooth: V2Knobs temporalBonus (levels, 3x3 mean): how much worse the compensated previous
+                                // vector may explain a pixel and still replace its own
+    int lw, lh;                 // v2_seed: the coarsest pyramid level's size (its luma at offA / offC)
+    int pad_;
 } pc;
+
+#define V2_RF(i) rf[(i)]
+#include "v2_pack.glsl"
 
 const int E_OFF = 64;          // packed mismatch in u[] (== motion_v1.glsl)
 #define E_STRIDE ((pc.W + 3) >> 2)
@@ -73,14 +87,14 @@ float sampleL(int off, vec2 p, int w, int h) {
 // cv2.resize). At 100 % refinement the grid is the frame: the refined vector of p itself (fraction 0, exact).
 vec2 halfVec(ivec2 p) {
     if (pc.rw == pc.W && pc.rh == pc.H)   // 100 %: one read (the bilinear weights below would be 1, 0, 0, 0)
-        return rf[pc.rpf + clamp(p.y, 0, pc.H - 1) * pc.rw + clamp(p.x, 0, pc.W - 1)];
+        return unpackV(rf[pc.rpf + clamp(p.y, 0, pc.H - 1) * pc.rw + clamp(p.x, 0, pc.W - 1)]);
     vec2 s =(vec2(p) + 0.5) * (vec2(pc.rw, pc.rh) / vec2(pc.W, pc.H)) - 0.5;
     vec2 fl = floor(s);
     vec2 f = s - fl;
     ivec2 i0 = clamp(ivec2(fl), ivec2(0), ivec2(pc.rw - 1, pc.rh - 1));
     ivec2 i1 = clamp(ivec2(fl) + 1, ivec2(0), ivec2(pc.rw - 1, pc.rh - 1));
-    vec2 v00 = rf[pc.rpf + i0.y * pc.rw + i0.x], v01 = rf[pc.rpf + i0.y * pc.rw + i1.x];
-    vec2 v10 = rf[pc.rpf + i1.y * pc.rw + i0.x], v11 = rf[pc.rpf + i1.y * pc.rw + i1.x];
+    vec2 v00 = unpackV(rf[pc.rpf + i0.y * pc.rw + i0.x]), v01 = unpackV(rf[pc.rpf + i0.y * pc.rw + i1.x]);
+    vec2 v10 = unpackV(rf[pc.rpf + i1.y * pc.rw + i0.x]), v11 = unpackV(rf[pc.rpf + i1.y * pc.rw + i1.x]);
     return mix(mix(v00, v01, f.x), mix(v10, v11, f.x), f.y);
 }
 
