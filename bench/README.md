@@ -12,6 +12,6 @@ Blind-test page. A session builder plus a static local HTML "scoring prompt buil
 
 ## Rules
 
-- CPU-heavy work runs under `taskset -c 6-9,16-19` with at most 8 threads (`ffmpeg -threads 8`, `OMP_NUM_THREADS=8`, `ninja -j8`).
+- The core mask is enforced system-wide; the tools cap threads at 8 (`ffmpeg -threads 8`, `OMP_NUM_THREADS=8`, `ninja -j8`).
 - Work dirs live under `bench/` on /home, never /tmp (it is a 16 GB RAM disk).
 - Footage lives in `footage/` (gitignored). `work/`, `out/` and `blind/sessions/` are gitignored too.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Numeric frame-gen bench: scores contestants (a motion version + settings) against v1 on every clip in footage/.
 
-  taskset -c 6-9,16-19 python3 bench/score/score.py [-c 'name: set-string' ...] [--contestants FILE] [--triples N] ...
+  python3 bench/score/score.py [-c 'name: set-string' ...] [--contestants FILE] [--triples N] ...
 
 See bench/score/README.md. Metric definitions are written into every report (DEFINITIONS below).
 """
@@ -19,13 +19,6 @@ import subprocess
 import sys
 import time
 
-CPUS = {6, 7, 8, 9, 16, 17, 18, 19}
-CPUSTR = "6-9,16-19"
-if not os.sched_getaffinity(0) <= CPUS:   # a subset is fine (a cgroup cpuset may narrow it further)
-    if os.environ.get("FG_BENCH_REEXEC"):
-        sys.exit(f"refusing to run: CPU affinity {sorted(os.sched_getaffinity(0))} is not within {CPUSTR}")
-    os.environ["FG_BENCH_REEXEC"] = "1"
-    os.execvp("taskset", ["taskset", "-c", CPUSTR, sys.executable] + sys.argv)
 os.environ["OMP_NUM_THREADS"] = "8"
 
 import cv2  # noqa: E402

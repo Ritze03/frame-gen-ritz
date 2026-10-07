@@ -1,6 +1,6 @@
 # bench/score
 
-`taskset -c 6-9,16-19 python3 bench/score/score.py [-c 'v2: algo=v2' ...] [--contestants FILE] [--triples 200] [--test60]`
+`python3 bench/score/score.py [-c 'v2: algo=v2' ...] [--contestants FILE] [--triples 200] [--test60]`
 rebuilds `gpu/build/fgtest` (CCACHE_DISABLE=1) and records its git hash, then scores every contestant (`name: fgtest --set string`,
 one per line in FILE or per `-c`; `v1: algo=v1` is always added as the paired reference) on every clip of the main checkout's
 `footage/`: clips of >= 90 fps (genre `fps` at the top level, else from the `<genre>_<game>_<x>` name) hold out every other
