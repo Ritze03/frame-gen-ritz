@@ -1,30 +1,15 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// V2, synth (t != 0.5 only, the refinement grid): lookup.comp on V2's refined field. The refined field h (rf[rpf], full-resolution
+// V2, synth (t != 0.5 only, the refinement grid): lookup.comp on V2's refined field. The refined field h (rf[0], full-resolution
 // half-vector units) lives on the midpoint grid; content at midpoint p sits at q = p + (2t - 1) h(p) at time t, so
 // g(q) = h(q - (2t - 1) g(q)): 2 bilinear fixed-point steps started from h(q), in grid coordinates (the vector scaled by the grid's
-// resolution). Writes g to rf[rfOut].
+// resolution; v2_pack.glsl v2LookupT, which the blur passes share). Writes g to rf[rfOut] (packed).
 #include "common.glsl"
 #include "motion_v2.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
-vec2 RF(int x, int y) { return rf[pc.rpf + clamp(y, 0, pc.rh - 1) * pc.rw + clamp(x, 0, pc.rw - 1)]; }
-vec2 sampleRF(vec2 p) {   // == motion_v1.glsl sampleF on the refinement grid
-    ivec2 X = ivec2(roundEven(p * 32.0));
-    ivec2 i = X >> 5;
-    vec2 f = vec2(X & 31) * (1.0 / 32.0);
-    vec2 p00 = RF(i.x, i.y), p01 = RF(i.x + 1, i.y);
-    vec2 p10 = RF(i.x, i.y + 1), p11 = RF(i.x + 1, i.y + 1);
-    return p00 * ((1.0 - f.y) * (1.0 - f.x)) + p01 * ((1.0 - f.y) * f.x)
-         + p10 * (f.y * (1.0 - f.x)) + p11 * (f.y * f.x);
-}
-
 void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy);
     if (q.x >= pc.rw || q.y >= pc.rh) return;
-    vec2 sc = vec2(pc.rw, pc.rh) / vec2(pc.W, pc.H);   // grid pixels per full-resolution pixel
-    vec2 g = rf[pc.rpf + q.y * pc.rw + q.x];
-    for (int k = 0; k < 2; k++)   // LOOKUP_ITERS
-        g = sampleRF(vec2(q) - pc.s * (g * sc));
-    rf[pc.rfOut + q.y * pc.rw + q.x] = g;
+    rf[pc.rfOut + q.y * pc.rw + q.x] = packV(v2LookupT(q, pc.s, pc.rw, pc.rh, pc.W, pc.H));   // (reads the midpoint field at rf[0])
 }

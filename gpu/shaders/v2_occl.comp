@@ -20,8 +20,17 @@
 // map (main()). Background = the side vector nearer the global median vector (the camera motion; u[4..5], medhist.comp of the finest
 // level, the same units): which side of the edge the background is on cannot be told from one symmetric field (both hypotheses
 // produce the same field and mismatch), so the dominant motion decides. Foreground = the other side vector.
+// Unless the previous pair's field tells (D19, I10; valid seed only, v2_temporal.glsl): a motion boundary moves with the FOREGROUND,
+// so the field near it now is the previous field shifted by one frame of the foreground's motion, C(y) ~ P(y - 2 vF). Both hypotheses
+// (vp or vm is the foreground) are scored by sum |C(y) - P(y - 2 v)|_1 over 9 points y on the normal through q, spanning the side
+// distance plus the boundary's possible shift; the wrong one misplaces the boundary by 2 (vp - vm) and mismatches the points in
+// between. A clear winner (lower by at least 3/4 of |vp - vm|_1, i.e. about one mismatched point) decides; else the median rule.
+// (An object moving across a static view: the median is the static background's, so the rule picks right; a pan following a moving
+// object: the median is the object's, and the median rule picks the object as background - the case this fixes.)
+// Also stores this estimate's edge-aware field for the next one (v2_temporal.glsl, P slot parity).
 #include "common.glsl"
 #include "motion_v2.glsl"
+#include "v2_temporal.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
 const int TQ = 16, TR = TQ + 2;   // tile, tile + 1
 
@@ -62,6 +71,22 @@ uvec4 analyse(ivec2 q) {
     if (sideCost(q + bo, vp) > pc.confMax || sideCost(q - bo, vm) > pc.confMax) return uvec4(0u);
     vec2 med = vec2(uintBitsToFloat(u[4]), uintBitsToFloat(u[5]));
     bool pBg = distance(vp, med) <= distance(vm, med);
+    {   // the previous field: which side's motion did the boundary follow? (measured whether the seed is valid or not: the same work)
+        int old = 1 - (pc.tFlags & 1);
+        vec2 n = normalize(vec2(bo));
+        float span = length(vec2(bo)) + 2.0 * abs(best) + 1.0;
+        float eP = 0.0, eM = 0.0;
+        for (int k = -4; k <= 4; k++) {
+            vec2 y = vec2(q) + roundEven(n * (span * float(k) * 0.25));
+            vec2 c = Fq(ivec2(y));
+            vec2 a = c - v2PAt(old, y - 2.0 * vp), b = c - v2PAt(old, y - 2.0 * vm);
+            eP += abs(a.x) + abs(a.y);
+            eM += abs(b.x) + abs(b.y);
+        }
+        vec2 dv = abs(vp - vm);
+        float margin = 0.75 * (dv.x + dv.y);
+        if (v2SeedValid() && abs(eP - eM) >= margin) pBg = eM < eP;   // vm's motion explains the boundary: vm is the foreground
+    }
     vec2 vB = pBg ? vp : vm, vF = pBg ? vm : vp;
     return uvec4(packHalf2x16(vB), packHalf2x16(vF), best < 0.0 ? 1u : 2u, 0u);
 }
@@ -101,4 +126,5 @@ void main() {
     }
     int i = 4 * (q.y * pc.fw + q.x);
     v2b[i] = res.x; v2b[i + 1] = res.y; v2b[i + 2] = res.z; v2b[i + 3] = res.w;
+    v2b[v2POff(pc.tFlags & 1) + q.y * pc.fw + q.x] = packV(Fq(q));   // the temporal store: this pair's field for the next estimate
 }

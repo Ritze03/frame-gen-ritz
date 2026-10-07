@@ -11,7 +11,7 @@
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill;
 // MotionVersion::V2: preset=a|b|c|d = v2Preset, and the single-knob overrides v2OcclWidth v2Reach v2Confidence v2OccLow v2OccHigh
-// v2PickBias v2TrustLow v2TrustHigh v2RefineRes v2EdgeSigma (-1 = the preset's value)), passed to init. Keys apply in order, later ones win.
+// v2PickBias v2TrustLow v2TrustHigh v2RefineRes v2EdgeSigma v2Temporal v2TemporalBonus (-1 = the preset's value)), passed to init. Keys apply in order, later ones win.
 // UI protection (ui != off in --set or --then): every real frame is recordObserve'd once, in pair order, into a ring of 3 input
 // images; consecutive pairs (pair k+1's prev path == pair k's curr path) form one frame stream, as a host sees it. A fresh
 // Interpolator (start, --window) has to warm up: CrosshairV2 / Crosshair mask a pixel only after uiStillFrames (8) still frames,
@@ -26,9 +26,9 @@
 // header (uint32 magic 'FGMP', version 1, W, H, fw, fh, bw, bh, fscale, eStride, float trustLow, trustHigh, smoothBonus, hudBonus,
 // 2 x 0; version 3: rw, rh), then the block field (bw*bh vec2 f32), the per-pixel half-vector field (fw*fh vec2 f32, midpoint grid) and
 // the packed mismatch e (eStride*H uint32, 4 px per word, low byte first) of the pair's last record. With algo=v2 the header says
-// version 3 and V2's class map follows (eStride*H uint32, same packing; Interpolator::DebugMapLayout::clsOff), then V2's edge-aware
-// field (fw*fh vec2 f32, flow units) and its refined midpoint field (rw*rh vec2 f32, full-resolution units; header words 14-15 = rw,
-// rh). gpu/fgmaps.py turns it into PNG maps.
+// version 4 and V2's class map follows (eStride*H uint32, same packing; Interpolator::DebugMapLayout::clsOff), then V2's edge-aware
+// field (fw*fh vec2 f32, flow units) and its refined midpoint field (rw*rh uint32, full-resolution units, packed: two int16 in 1/32 px,
+// x low (shaders/v2_pack.glsl; version 3 had vec2 f32); header words 14-15 = rw, rh). gpu/fgmaps.py turns it into PNG maps.
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
 
@@ -106,6 +106,8 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         else if (k == "v2TrustHigh") s.v2TrustHigh = (float)v;
         else if (k == "v2RefineRes") s.v2RefineRes = (float)v;
         else if (k == "v2EdgeSigma") s.v2EdgeSigma = (float)v;
+        else if (k == "v2Temporal") s.v2Temporal = (float)v;
+        else if (k == "v2TemporalBonus") s.v2TemporalBonus = (float)v;
         else { fprintf(stderr, "unknown setting %s\n", tok); return false; }
     }
     return true;
@@ -426,7 +428,7 @@ int main(int argc, char** argv) {
             snprintf(path, sizeof path, "%s/pair_%04zu.fgmaps", dumpDir, pairIdx);
             FILE* f = fopen(path, "wb");
             if (!f) { fprintf(stderr, "cannot write %s\n", path); return 1; }
-            uint32_t hdr[16]{0x504d4746u, dl.clsOff ? 3u : 1u, dl.W, dl.H, dl.fw, dl.fh, dl.bw, dl.bh, dl.fscale, dl.eStride};
+            uint32_t hdr[16]{0x504d4746u, dl.clsOff ? 4u : 1u, dl.W, dl.H, dl.fw, dl.fh, dl.bw, dl.bh, dl.fscale, dl.eStride};
             float hf[4]{setB.trustLow, setB.trustHigh, setB.smoothBonus, setB.hudBonus};   // the settings of the last record
             memcpy(hdr + 10, hf, sizeof hf);
             hdr[14] = dl.rw; hdr[15] = dl.rh;

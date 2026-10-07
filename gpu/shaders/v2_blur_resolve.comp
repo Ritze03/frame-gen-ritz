@@ -1,6 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// V2, motion blur pass 3 (+ 4) (replaces blur_resolve.comp): out = round(sum_k w_k * frame_k), where frame_k is the 8-bit result
+// V2, motion blur pass 2 (+ 3) (replaces blur_resolve.comp): out = round(sum_k w_k * frame_k), where frame_k is the 8-bit result
 // V2's recordSynth(t_k) would have produced (v2_resolve_core.glsl per sample, then fallback.comp's whole-frame decisions), and a sample
 // with t <= 0 / t >= 1 is the real frame prev / curr. Structure, weights, counting and the fix-up pass as blur_resolve.comp (see there).
 #include "blur_common.glsl"
@@ -10,7 +10,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 int gSlot = 0;     // the sample the core is resolving
 float gT = 0.5;    // its time
 #define V2R_E(p) eAt(gSlot, p)
-#define V2R_HV(p) halfVec(gSlot, p)
+#define V2R_HV(p) halfVecT(gT, p)
 #define V2R_MIS(p, hv, wa, wc) mismatchV(gT, p, hv, wa, wc)
 #define V2R_S (2.0 * gT - 1.0)
 #define V2R_WA (1.0 - gT)

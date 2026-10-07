@@ -4,7 +4,8 @@
   fgmaps.py DUMP.fgmaps OUTPREFIX   -> OUTPREFIX_u.png (trust u, 0..255), _e.png (raw mismatch e), _cand.png (pixfield candidate,
                                        colour coded), _flow.png (per-pixel half-vector, HSV coded); a V2 dump (header version 2)
                                        also _class.png (V2's class map, see CLASS_RGB); version 3 also _flowE.png (V2's
-                                       edge-aware field) and _flowR.png (V2's refined field), on the scale of _flow.png
+                                       edge-aware field) and _flowR.png (V2's refined field), on the scale of _flow.png; version 4 (I10) stores the
+                                       refined field packed (2 x int16 in 1/32 px)
 
 Layout (fgtest.cpp, Interpolator::recordDebugMaps): 64-byte header, block field (bw*bh vec2 f32), per-pixel half-vector field
 (fw*fh vec2 f32, midpoint grid), packed mismatch e (eStride*H uint32, 4 px per word, low byte first); version 2 (algo=v2): then
@@ -33,7 +34,7 @@ def load(path):
     raw = open(path, "rb").read()
     h = np.frombuffer(raw[:64], np.uint32)
     hf = np.frombuffer(raw[40:56], np.float32)
-    assert h[0] == 0x504D4746 and h[1] in (1, 2, 3), "not an fgmaps v1 / v2 / v3 file"
+    assert h[0] == 0x504D4746 and h[1] in (1, 2, 3, 4), "not an fgmaps v1 - v4 file"
     W, H, fw, fh, bw, bh, fscale, es = (int(x) for x in h[2:10])
     o = 64
     block = np.frombuffer(raw, np.float32, bw * bh * 2, o).reshape(bh, bw, 2); o += bw * bh * 8
@@ -49,7 +50,10 @@ def load(path):
         rw, rh = int(h[14]), int(h[15])
         o += es * H * 4
         pfE = np.frombuffer(raw, np.float32, fw * fh * 2, o).reshape(fh, fw, 2); o += fw * fh * 8
-        pfR = np.frombuffer(raw, np.float32, rw * rh * 2, o).reshape(rh, rw, 2)
+        if h[1] >= 4:   # packed: two int16 in 1/32 px per uint32, x low (shaders/v2_pack.glsl)
+            pfR = (np.frombuffer(raw, np.int16, rw * rh * 2, o).reshape(rh, rw, 2) / 32.0).astype(np.float32)
+        else:
+            pfR = np.frombuffer(raw, np.float32, rw * rh * 2, o).reshape(rh, rw, 2)
     return dict(W=W, H=H, fw=fw, fh=fh, bw=bw, bh=bh, fscale=fscale, block=block, pf=pf, e=e, cls=cls, pfE=pfE, pfR=pfR,
                 trustLow=float(hf[0]), trustHigh=float(hf[1]))
 

@@ -2,7 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 // V2, estimate (the refinement grid rw x rh = Settings::v2RefineRes % of the frame; D17 + D13): the edge-preserving upsample of the
 // edge-aware field hE (field[pf], flow res) to the refinement grid, with a per-pixel re-pick at full-resolution detail. Writes rf[rfOut]
-// (full-resolution half-vector units).
+// (full-resolution half-vector units, packed: v2_pack.glsl).
 //
 // At grid point x (full-resolution position P), the candidates are the vectors of the four flow pixels bilinear interpolation would
 // blend (v_k, bilinear weight b_k) and their bilinear blend v_b (prior weight 1, so a smooth field stays smooth). Each candidate v is
@@ -52,7 +52,7 @@ void main() {
     pr[4] = 1.0;
     // the four vectors agree (within 1/4 px): nothing to pick, the bilinear vector (most of a frame; no taps)
     if (spread < 0.25) {
-        rf[pc.rfOut + x.y * pc.rw + x.x] = v[4];
+        rf[pc.rfOut + x.y * pc.rw + x.x] = packV(v[4]);
         return;
     }
     g[4] = 0.0;
@@ -76,5 +76,5 @@ void main() {
         acc += w * v[k];
         ws += w;
     }
-    rf[pc.rfOut + x.y * pc.rw + x.x] = ws > 1e-30 ? acc / ws : v[4];   // (all weights underflowed: only with a tiny edgeSigma)
+    rf[pc.rfOut + x.y * pc.rw + x.x] = packV(ws > 1e-30 ? acc / ws : v[4]);   // (all weights underflowed: only with a tiny edgeSigma)
 }

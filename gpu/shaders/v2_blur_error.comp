@@ -1,8 +1,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// V2, motion blur pass 2 (full res; blur_error.comp with V2's field): v2_error.comp for every interior sample k in one dispatch
-// (z = sample): e = max-channel |wa - wc| of the two warps with sample k's refined half-vector, 4 pixels per thread packed as bytes
-// into be[k].
+// V2, motion blur pass 1 (full res; blur_error.comp with V2's field): v2_error.comp for every interior sample k in one dispatch
+// (z = sample): e = max-channel |wa - wc| of the two warps with sample k's refined half-vector (the field at t_k, computed on the fly:
+// blur_motion_v2.glsl halfVecT), 4 pixels per thread packed as bytes into be[k].
 #include "blur_common.glsl"
 #include "blur_motion_v2.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -16,7 +16,7 @@ void main() {
     for (int i = 0; i < 4; i++) {
         ivec2 p = ivec2(g.x * 4 + i, g.y);
         if (p.x < P_W) {
-            packed |= mismatchE(t, p, halfVec(k, p)) << (8 * i);
+            packed |= mismatchE(t, p, halfVecT(t, p)) << (8 * i);
         }
     }
     be[k * eWords() + g.y * eStride() + g.x] = packed;
