@@ -219,7 +219,7 @@ function finish() {
   L.push(`Blind test results for frame-gen session ${S.id}: ${T.length} pairwise trials, voted ${new Date().toISOString().slice(0, 16).replace("T", " ")}.`);
   L.push(`The voter saw each pair unlabelled as Left/Right (sides randomised per trial); contestant names were revealed only after the last vote.`);
   L.push("");
-  L.push(`Builder: fgtest ${S.fgtest}; base set "${S.base_set}" applied before each contestant's set; seed ${S.seed}; clips ${S.clip_len} s at ${S.fps} fps (real 60 fps frames interleaved with generated in-betweens).`);
+  L.push(`Builder: fgtest ${S.fgtest}; base set "${S.base_set}" applied before each contestant's set; ${S.warm ?? 0} unscored warm-up pairs before each clip, one continuous fgtest run per clip; seed ${S.seed}; clips ${S.clip_len} s at ${S.fps} fps (real 60 fps frames interleaved with generated in-betweens).`);
   L.push(`Encode (identical for every clip, real included): ${S.encode}. Stills: lossless PNG.`);
   L.push("Contestants:");
   rev.forEach(r => L.push(`- ${r.name}: ${r.set}`));

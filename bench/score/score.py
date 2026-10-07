@@ -32,7 +32,10 @@ GPU = os.path.join(REPO, "gpu")
 FGTEST = os.path.join(GPU, "build", "fgtest")
 GENRES = ("fps", "racing", "minecraft", "indie", "realworld")
 REF = "v1"
-FORCED = "globalFallback=1"      # the global fallback off, as the user plays; its would-fire rate is still measured
+# Applied BEFORE every contestant's own set string (a contestant may override a key, e.g. ui=off), as the user plays:
+# the global fallback off (its would-fire rate is still measured) and CrosshairV2 UI protection on (fgtest drives it like a host).
+BASE_SET = "globalFallback=1,ui=crosshairv2"
+WARM = 2                         # default warm-up pairs per window without UI protection
 DEF_GLOBAL_FRAC, DEF_CUT_SAD = 0.15, 30.0   # library defaults: the "would have fired" thresholds
 DUP_BMAX = 1.0                   # footage report: max 16x16-block mean abs diff at 640 px wide, gray
 HARM_MARGIN = 24                 # proto/harness.py
@@ -59,7 +62,7 @@ DEFINITIONS = f"""\
   sum_all G_real. Lost edges inside wrong regions count; added edges (ghosts) do not (harm% covers those).
 - **fallback%**: share of scored pairs where the global fallback would have fired with the default threshold
   (untrusted pixels > {DEF_GLOBAL_FRAC:.0%} of the frame; untrusted = trust ramp past its midpoint), read from the
-  library's own counters (Interpolator::recordDebugCounters) while every contestant runs with `{FORCED}` (off).
+  library's own counters (Interpolator::recordDebugCounters) while every contestant runs with `globalFallback=1` (off; base set).
   **cut%**: the scene cut (finest-level mean block SAD > {DEF_CUT_SAD:g}); NOT disabled (it is the separate
   `sceneCutSad` setting), so a cut pair shows the nearer real frame in every contestant.
 - **identical**: triples whose output bytes equal {REF}'s exactly.
@@ -262,9 +265,21 @@ def parse_contestants(args):
     return {REF: out[REF], **{k: v for k, v in out.items() if k != REF}}
 
 
+def ui_warm(setstrs):
+    """Warm-up pairs a fresh Interpolator (window start) needs before UI protection acts, 0 if no set string turns it on.
+    fgtest observes every real frame once; a pixel enters the mask after uiStillFrames (default 8) consecutive still frames,
+    and a run of k pairs has observed k + 1 frames, so pair uiStillFrames - 1 (0-based) is the first protected one."""
+    need = 0
+    for st in setstrs:
+        kv = dict(x.split("=", 1) for x in st.replace(" ", "").split(",") if "=" in x)   # later keys win, as in fgtest
+        if kv.get("ui", "off") != "off":
+            need = max(need, int(float(kv.get("uiStillFrames", 8))) - 1)
+    return need
+
+
 def run_fgtest(clip, setstr, triples, window, work, state):
     """triples: [(prev_path, curr_path, out_path)]. Returns per-pair (untrusted_frac, mean_sad)."""
-    cmd = [FGTEST, "--stats", "--window", str(window), "--set", setstr + "," + FORCED, str(clip["w"]), str(clip["h"])]
+    cmd = [FGTEST, "--stats", "--window", str(window), "--set", setstr, str(clip["w"]), str(clip["h"])]
     for t in triples:
         cmd += list(t)
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -505,7 +520,9 @@ def main():
     ap.add_argument("--triples", type=int, default=200, help="scored (non-dup) triples per >=90 fps clip (default 200)")
     ap.add_argument("--nr-pairs", type=int, default=None, help="scored pairs per 60 fps clip (default = --triples)")
     ap.add_argument("--pairs", type=int, default=10, help="scored consecutive pairs per window (default 10)")
-    ap.add_argument("--warm", type=int, default=2, help="unscored warm-up pairs at each window start (default 2)")
+    ap.add_argument("--warm", type=int, default=None,
+                    help=f"unscored warm-up pairs at each window start (default {WARM}, or uiStillFrames - 1 = 7 when UI protection is on)")
+    ap.add_argument("--base-set", default=BASE_SET, help=f"set string applied before every contestant's own (default {BASE_SET})")
     ap.add_argument("--batch", type=int, default=100, help="pairs per fgtest call (default 100)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--crops", type=int, default=8, help="worst-spot crops per contestant and ranking")
@@ -517,6 +534,12 @@ def main():
     args.nr_pairs = args.nr_pairs or args.triples
     t0 = time.time()
     cons = parse_contestants(args)
+    cons = {n: ",".join(x for x in (args.base_set, s) if x) for n, s in cons.items()}   # the effective fgtest --set strings
+    uw = ui_warm(cons.values())
+    if args.warm is None:
+        args.warm = max(WARM, uw)
+    elif args.warm < uw:
+        print(f"warning: --warm {args.warm} < {uw}: UI protection is not warm in the first scored pairs of each window", flush=True)
     fghash, binhash, dirty = build_and_hash()
     footage = args.footage or default_footage()
     only = set(args.clips.split(",")) if args.clips else None
@@ -566,10 +589,11 @@ def main():
          f"- seed {args.seed}; windows of {args.warm} warm-up + {args.pairs} scored consecutive pairs, a fresh Interpolator "
          f"per window (fgtest --window); <= {args.batch} pairs per fgtest call; target {args.triples} kept triples per "
          f"reference clip, {args.nr_pairs} pairs per no-reference clip",
-         f"- every contestant runs with `{FORCED}` appended (global fallback off)",
+         f"- **base set**: `{args.base_set}`, applied before every contestant's own settings (global fallback off; UI protection as "
+         f"the user plays); UI protection warm-up needs {uw} pairs per window, {args.warm} used",
          f"- footage: `{footage}`", f"- runtime {time.time() - t0:.0f} s; peak work dir {state['peak'] / 1e9:.2f} GB", "",
          "## Contestants", "", "| name | settings |", "|---|---|"]
-    L += [f"| {n}{' (reference)' if n == REF else ''} | `{s},{FORCED}` |" for n, s in cons.items()]
+    L += [f"| {n}{' (reference)' if n == REF else ''} | `{s}` |" for n, s in cons.items()]
     L += ["", "## Clips", "", "| clip | genre | fps | kind | windows | triples kept | dup-dropped |", "|---|---|---|---|---|---|---|"]
     L += [f"| {c['name']} | {c['genre']} | {c['fps']:g} | {'reference (held-out middle frame)' if c['ref'] else 'no-reference 60->120'} "
           f"| {c['windows']} | {c['kept']} | {c['dropped']} |" for c in refc + nrc]
