@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blind Frame Test</title>
+<style>
+:root { --bg:#111214; --panel:#1b1d21; --line:#2c2f35; --fg:#e6e6e6; --dim:#8b9099; --acc:#6aa8ff; --ok:#5cc98a; --warn:#e0a84a; }
+* { box-sizing: border-box; }
+html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, sans-serif; }
+#app { display:flex; flex-direction:column; height:100vh; }
+header { display:flex; gap:16px; align-items:center; padding:6px 12px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+header b { font-weight:600; }
+header .dim, .dim { color:var(--dim); }
+#modes span { padding:1px 6px; border:1px solid var(--line); border-radius:4px; margin-left:4px; color:var(--dim); }
+#modes span.on { color:var(--bg); background:var(--acc); border-color:var(--acc); }
+#view { flex:1; display:flex; gap:4px; min-height:0; padding:4px; }
+.pane { flex:1; position:relative; overflow:hidden; background:#000; min-width:0; }
+.pane .tag { position:absolute; top:6px; left:8px; z-index:2; background:rgba(0,0,0,.65); padding:2px 8px; border-radius:4px; font-weight:600; }
+.pane video, .pane img { position:absolute; left:0; top:0; display:block; image-rendering:auto; }
+.flip .pane.hide { display:none; }
+.zoom .pane video, .zoom .pane img { image-rendering:pixelated; }
+footer { display:flex; gap:8px; align-items:center; padding:8px 12px; background:var(--panel); border-top:1px solid var(--line); flex-wrap:wrap; }
+button { background:#2a2e35; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 14px; font:inherit; cursor:pointer; }
+button:hover { border-color:var(--acc); }
+button.vote { min-width:130px; }
+button.sel { background:var(--acc); color:#000; border-color:var(--acc); }
+input#note { flex:1; min-width:200px; background:#0d0e10; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 10px; font:inherit; }
+#help { color:var(--dim); font-size:12px; padding:2px 12px 6px; background:var(--panel); }
+#end { display:none; padding:24px; max-width:1100px; margin:0 auto; overflow:auto; height:100vh; }
+#end textarea { width:100%; height:55vh; background:#0d0e10; color:var(--fg); border:1px solid var(--line); border-radius:6px; font:12px/1.4 ui-monospace, monospace; padding:10px; }
+#end table { border-collapse:collapse; margin:8px 0 16px; }
+#end td, #end th { border:1px solid var(--line); padding:3px 10px; text-align:left; }
+#copied { color:var(--ok); margin-left:8px; }
+kbd { border:1px solid var(--line); border-radius:3px; padding:0 4px; font:11px ui-monospace, monospace; color:var(--fg); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <b id="title">Trial</b>
+    <span id="info" class="dim"></span>
+    <span id="clock" class="dim"></span>
+    <span id="modes"><span id="mZoom">1:1</span><span id="mFlip">flip</span><span id="mLoop">loop</span><span id="mSlow">¼×</span></span>
+    <span id="saveWarn" style="color:var(--warn)"></span>
+  </header>
+  <div id="view">
+    <div class="pane" id="pL"><div class="tag">Left</div></div>
+    <div class="pane" id="pR"><div class="tag">Right</div></div>
+  </div>
+  <footer>
+    <button id="back">◀ Back</button>
+    <button class="vote" data-v="L">Left better <kbd>1</kbd></button>
+    <button class="vote" data-v="=">Can't tell <kbd>2</kbd></button>
+    <button class="vote" data-v="R">Right better <kbd>3</kbd></button>
+    <input id="note" placeholder="optional note (N to focus, Esc to leave)" maxlength="300">
+  </footer>
+  <div id="help"><kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> vote · <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> step 1/120 s (paused) · <kbd>Home</kbd> to start · <kbd>L</kbd> loop · <kbd>S</kbd> ¼ speed · <kbd>Z</kbd> 1:1 pixels (mouse pans both) · <kbd>F</kbd> flip view (one side full size) · <kbd>X</kbd>/<kbd>Tab</kbd> swap side in flip · <kbd>B</kbd> back · <kbd>N</kbd> note</div>
+</div>
+<div id="end"></div>
+<script src="session.js"></script>
+<script>
+"use strict";
+const S = window.SESSION;
+const FPS = S.fps;
+const KEY = "blindtest:" + S.id;
+const clips = Object.fromEntries(S.clips.map(c => [c.id, c]));
+const T = S.trials;
+let st = { cur: 0, votes: {} };           // votes[n] = {v: "L"|"R"|"=", note}
+let canSave = true;
+try { const j = JSON.parse(localStorage.getItem(KEY) || "null"); if (j && j.votes) st = j; } catch (e) { canSave = false; }
+function save() {
+  try { localStorage.setItem(KEY, JSON.stringify(st)); } catch (e) { canSave = false; }
+  document.getElementById("saveWarn").textContent = canSave ? "" : "progress is not saved (storage unavailable)";
+}
+const ui = { zoom: false, flip: false, side: "L", loop: true, slow: false, fx: 0.5, fy: 0.5 };
+let media = { L: null, R: null }, trial = null, clip = null;
+const $ = id => document.getElementById(id);
+
+function nFrames() { return Math.round(clip.len * FPS) + 1; }
+
+function show() {
+  if (st.cur >= T.length) return finish();
+  trial = T[st.cur]; clip = clips[trial.clip];
+  for (const side of ["L", "R"]) {
+    const pane = $("p" + side);
+    if (media[side]) { if (media[side].pause) media[side].pause(); media[side].remove(); }
+    const c = trial[side];
+    let el;
+    if (trial.type === "clip") {
+      el = document.createElement("video");
+      el.src = clip.clip[c]; el.muted = true; el.loop = ui.loop; el.preload = "auto"; el.playsInline = true;
+      el.addEventListener("loadedmetadata", layout);
+      el.addEventListener("loadeddata", () => { if (side === "L") seekFrame(0); });
+    } else {
+      el = document.createElement("img");
+      el.src = clip.stills[trial.still].img[c]; el.decoding = "sync";
+      el.addEventListener("load", layout);
+    }
+    el.draggable = false;
+    pane.appendChild(el); media[side] = el;
+  }
+  const vt = st.votes[trial.n];
+  $("title").textContent = `Trial ${st.cur + 1} / ${T.length}`;
+  const where = trial.type === "still" ? `still at ${clip.stills[trial.still].t.toFixed(3)} s` : `clip ${clip.start}–${(clip.start + clip.len).toFixed(2)} s, 120 fps`;
+  $("info").textContent = `${trial.type} · ${clip.genre} · ${clip.source} · ${where}`;
+  $("clock").textContent = "";
+  $("note").value = vt ? vt.note || "" : "";
+  document.querySelectorAll("button.vote").forEach(b => b.classList.toggle("sel", !!vt && vt.v === b.dataset.v));
+  $("back").disabled = st.cur === 0;
+  layout(); modes();
+}
+
+function layout() {
+  const dpr = window.devicePixelRatio || 1;
+  $("view").classList.toggle("flip", ui.flip);
+  $("view").classList.toggle("zoom", ui.zoom);
+  $("pL").classList.toggle("hide", ui.flip && ui.side !== "L");
+  $("pR").classList.toggle("hide", ui.flip && ui.side !== "R");
+  for (const side of ["L", "R"]) {
+    const el = media[side]; if (!el) continue;
+    const pane = $("p" + side), pw = pane.clientWidth, ph = pane.clientHeight;
+    const iw = clip.w, ih = clip.h;
+    let w, h, x, y;
+    if (ui.zoom) {                       // 1 image pixel = 1 device pixel, shared pan position
+      w = iw / dpr; h = ih / dpr;
+      x = w > pw ? -(w - pw) * ui.fx : (pw - w) / 2;
+      y = h > ph ? -(h - ph) * ui.fy : (ph - h) / 2;
+    } else {
+      const s = Math.min(pw / iw, ph / ih); w = iw * s; h = ih * s; x = (pw - w) / 2; y = (ph - h) / 2;
+    }
+    el.style.width = w + "px"; el.style.height = h + "px";
+    el.style.transform = `translate(${x}px, ${y}px)`;
+  }
+}
+
+function modes() {
+  $("mZoom").classList.toggle("on", ui.zoom); $("mFlip").classList.toggle("on", ui.flip);
+  $("mLoop").classList.toggle("on", ui.loop); $("mSlow").classList.toggle("on", ui.slow);
+  $("mFlip").textContent = ui.flip ? "flip: " + (ui.side === "L" ? "Left" : "Right") : "flip";
+}
+
+// ---- video sync: left is the clock, right follows ----
+function vids() { return trial && trial.type === "clip" ? [media.L, media.R] : null; }
+function playing() { const v = vids(); return v && !v[0].paused; }
+function togglePlay() {
+  const v = vids(); if (!v) return;
+  if (v[0].paused) { v[1].currentTime = v[0].currentTime; v.forEach(e => { e.playbackRate = ui.slow ? 0.25 : 1; e.play().catch(() => {}); }); }
+  else { v.forEach(e => e.pause()); seekFrame(curFrame()); }
+}
+function curFrame() { return Math.max(0, Math.min(nFrames() - 1, Math.floor(media.L.currentTime * FPS + 1e-3))); }
+function seekFrame(f) {
+  const v = vids(); if (!v) return;
+  f = Math.max(0, Math.min(nFrames() - 1, f));
+  const t = (f + 0.5) / FPS;              // middle of the frame's display interval
+  v.forEach(e => { e.currentTime = t; });
+  $("clock").textContent = `frame ${f} / ${nFrames() - 1}`;
+}
+function step(d) { const v = vids(); if (!v) return; if (!v[0].paused) v.forEach(e => e.pause()); seekFrame(curFrame() + d); }
+(function tick() {
+  const v = vids();
+  if (v && !v[0].paused) {
+    if (Math.abs(v[1].currentTime - v[0].currentTime) > 0.5 / FPS * 3) v[1].currentTime = v[0].currentTime;
+    if (v[1].paused) v[1].play().catch(() => {});
+    $("clock").textContent = `frame ${curFrame()} / ${nFrames() - 1}`;
+  }
+  requestAnimationFrame(tick);
+})();
+
+// ---- votes ----
+function vote(v) {
+  st.votes[trial.n] = { v, note: $("note").value.trim() };
+  st.cur++; save(); show();
+}
+function back() { if (st.cur > 0) { st.cur--; save(); show(); } }
+
+document.querySelectorAll("button.vote").forEach(b => b.onclick = () => vote(b.dataset.v));
+$("back").onclick = back;
+$("note").addEventListener("input", () => { if (st.votes[trial.n]) { st.votes[trial.n].note = $("note").value.trim(); save(); } });
+for (const p of ["pL", "pR"]) $(p).addEventListener("mousemove", e => {
+  if (!ui.zoom) return;
+  const r = e.currentTarget.getBoundingClientRect();
+  ui.fx = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  ui.fy = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+  layout();
+});
+window.addEventListener("resize", layout);
+document.addEventListener("keydown", e => {
+  if (st.cur >= T.length) return;
+  if (e.target.id === "note") { if (e.key === "Escape" || e.key === "Enter") e.target.blur(); return; }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  const act = {
+    "1": () => vote("L"), "2": () => vote("="), "3": () => vote("R"),
+    " ": togglePlay, "arrowleft": () => step(-1), "arrowright": () => step(1), "home": () => seekFrame(0),
+    "l": () => { ui.loop = !ui.loop; (vids() || []).forEach(v => v.loop = ui.loop); },
+    "s": () => { ui.slow = !ui.slow; (vids() || []).forEach(v => v.playbackRate = ui.slow ? 0.25 : 1); },
+    "z": () => { ui.zoom = !ui.zoom; layout(); },
+    "f": () => { ui.flip = !ui.flip; layout(); },
+    "x": () => { ui.side = ui.side === "L" ? "R" : "L"; layout(); }, "tab": () => { ui.side = ui.side === "L" ? "R" : "L"; layout(); },
+    "b": back, "n": () => $("note").focus(),
+  }[k];
+  if (act) { e.preventDefault(); act(); modes(); }
+});
+
+// ---- end screen: the reveal and the prompt ----
+function finish() {
+  for (const s of ["L", "R"]) if (media[s] && media[s].pause) media[s].pause();
+  const rev = JSON.parse(atob(S.reveal));
+  const nm = i => rev[i].name;
+  const res = T.map(t => {
+    const v = st.votes[t.n] || { v: "?", note: "" };
+    const winner = v.v === "L" ? nm(t.L) : v.v === "R" ? nm(t.R) : v.v === "=" ? "tie" : "?";
+    return { t, v, winner };
+  });
+  const byN = Object.fromEntries(res.map(r => [r.t.n, r]));
+  const clean = s => (s || "").replace(/[|\r\n]+/g, " ").trim();
+  const L = [];
+  L.push(`Blind test results for frame-gen session ${S.id}: ${T.length} pairwise trials, voted ${new Date().toISOString().slice(0, 16).replace("T", " ")}.`);
+  L.push(`The voter saw each pair unlabelled as Left/Right (sides randomised per trial); contestant names were revealed only after the last vote.`);
+  L.push("");
+  L.push(`Builder: fgtest ${S.fgtest}; base set "${S.base_set}" applied before each contestant's set; seed ${S.seed}; clips ${S.clip_len} s at ${S.fps} fps (real 60 fps frames interleaved with generated in-betweens).`);
+  L.push(`Encode (identical for every clip, real included): ${S.encode}. Stills: lossless PNG.`);
+  L.push("Contestants:");
+  rev.forEach(r => L.push(`- ${r.name}: ${r.set}`));
+  L.push("Clips:");
+  S.clips.forEach(c => L.push(`- ${c.id}: ${c.source}, genre ${c.genre}, ${c.src_fps} fps source, start ${c.start} s, ${c.len} s, contestants ${c.contestants.map(nm).join(", ")}${c.has_real ? "" : " (no ground truth)"}`));
+  L.push("");
+  L.push(`Trials (vote: L = left better, R = right better, = = can't tell; winner = contestant behind the chosen side):`);
+  L.push("| # | type | clip | genre | time s | left | right | vote | winner | repeat of | note |");
+  L.push("|---|---|---|---|---|---|---|---|---|---|---|");
+  for (const { t, v, winner } of res) {
+    const c = clips[t.clip];
+    const time = t.type === "still" ? c.stills[t.still].t.toFixed(3) : `${c.start}-${(c.start + c.len).toFixed(2)}`;
+    L.push(`| ${t.n} | ${t.type} | ${t.clip} | ${c.genre} | ${time} | ${nm(t.L)} | ${nm(t.R)} | ${v.v} | ${winner} | ${t.repeat_of || ""} | ${clean(v.note)} |`);
+  }
+  // tallies over first showings only (repeats measure consistency, they are not extra evidence)
+  const firsts = res.filter(r => !r.t.repeat_of);
+  const tally = {}, h2h = {};
+  rev.forEach(r => tally[r.name] = { w: 0, l: 0, d: 0 });
+  for (const { t, winner } of firsts) {
+    const a = nm(t.L), b = nm(t.R), key = [a, b].sort().join(" vs ");
+    h2h[key] = h2h[key] || { [[a, b].sort()[0]]: 0, [[a, b].sort()[1]]: 0, tie: 0 };
+    if (winner === "tie" || winner === "?") { tally[a].d++; tally[b].d++; h2h[key].tie++; }
+    else { const loser = winner === a ? b : a; tally[winner].w++; tally[loser].l++; h2h[key][winner]++; }
+  }
+  L.push("");
+  L.push("Tally over first showings (wins-losses-ties): " + rev.map(r => `${r.name} ${tally[r.name].w}-${tally[r.name].l}-${tally[r.name].d}`).join("; "));
+  L.push("Head to head: " + Object.entries(h2h).map(([k, o]) => `${k}: ` + Object.entries(o).map(([n, x]) => `${n} ${x}`).join(", ")).join("; "));
+  const reps = res.filter(r => r.t.repeat_of);
+  const agree = reps.filter(r => r.winner === byN[r.t.repeat_of].winner);
+  L.push(`Repeat consistency (repeats show the same pair with sides swapped): ${agree.length} of ${reps.length} agreed.`);
+  reps.forEach(r => L.push(`- #${r.t.n} repeats #${r.t.repeat_of}: winner ${byN[r.t.repeat_of].winner} then ${r.winner} -> ${r.winner === byN[r.t.repeat_of].winner ? "agree" : "DISAGREE"}`));
+  const prompt = L.join("\n");
+
+  $("app").style.display = "none";
+  const end = $("end"); end.style.display = "block";
+  end.innerHTML = `<h2>Done: ${T.length} trials</h2>
+    <p class="dim">Session ${S.id}. Copy the prompt below and paste it to the lead.</p>
+    <h3>Reveal</h3><table><tr><th>contestant</th><th>set</th><th>W-L-T (first showings)</th></tr>${rev.map(r => `<tr><td>${r.name}</td><td>${r.set}</td><td>${tally[r.name].w}-${tally[r.name].l}-${tally[r.name].d}</td></tr>`).join("")}</table>
+    <h3>Prompt</h3><textarea id="prompt" readonly></textarea>
+    <p><button id="copy">Copy prompt</button><span id="copied"></span> <button id="reopen">◀ Back to last trial</button></p>`;
+  $("prompt").value = prompt;
+  $("copy").onclick = async () => {
+    const ta = $("prompt"); let ok = false;
+    try { await navigator.clipboard.writeText(prompt); ok = true; } catch (e) {}
+    if (!ok) { ta.focus(); ta.select(); try { ok = document.execCommand("copy"); } catch (e) {} }
+    $("copied").textContent = ok ? "copied" : "select the text and copy it by hand";
+  };
+  $("reopen").onclick = () => { st.cur = T.length - 1; save(); end.style.display = "none"; $("app").style.display = "flex"; show(); };
+}
+
+if (st.cur > T.length) st.cur = T.length;
+save(); show();
+</script>
+</body>
+</html>
