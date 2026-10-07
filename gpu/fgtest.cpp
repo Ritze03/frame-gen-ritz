@@ -9,6 +9,10 @@
 // smoothBonus searchPenalty subpixel flowScale; algo=v1|v2 = motionVersion), passed to init. --then k=v[,..]: per pair, in the
 // same command buffer as record(t[0]) -> out.rgba.0, setSettings(--set + these) then record(t[0]) -> out.rgba.1 (runtime-change
 // test; --then algo=.. switches the motion version between the two records).
+// --stats: after each pair print "STATS <pair> <untrusted px> <SAD sum x256> <SAD blocks> <W*H>" to stdout (the inputs of the
+// whole-frame fallback / scene-cut decisions of the pair's last synth, via Interpolator::recordDebugCounters; read-only).
+// --window N: destroy + init the Interpolator before every N-th pair (pair 0, N, 2N, ..): independent windows of consecutive
+// pairs in one call, no state carried across (bench/score). Neither changes any output.
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
 
@@ -103,7 +107,8 @@ static void imgBarrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkAc
 int main(int argc, char** argv) {
     bool bgra = false;
     int bench = 0, mult = 2;
-    bool split = false;
+    bool split = false, stats = false;
+    int window = 0;
     std::vector<float> ts{0.5f};
     framegen::Settings setA;
     char* thenArg = nullptr;
@@ -113,6 +118,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mult") && i + 1 < argc) mult = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--split")) split = true;
+        else if (!strcmp(argv[i], "--stats")) stats = true;
+        else if (!strcmp(argv[i], "--window") && i + 1 < argc) window = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--set") && i + 1 < argc) { if (!parseSettings(argv[++i], setA)) return 2; }
         else if (!strcmp(argv[i], "--then") && i + 1 < argc) thenArg = argv[++i];
         else if (!strcmp(argv[i], "--t") && i + 1 < argc) {
@@ -122,7 +129,7 @@ int main(int argc, char** argv) {
         else pos.push_back(argv[i]);
     }
     if (pos.size() < 5 || (pos.size() - 2) % 3) {
-        fprintf(stderr, "usage: fgtest [--bgra] [--bench N] W H prev.rgba curr.rgba out.rgba [...]\n");
+        fprintf(stderr, "usage: fgtest [--bgra] [--split] [--t ..] [--set ..] [--then ..] [--stats] [--window N] [--bench N] W H prev.rgba curr.rgba out.rgba [...]\n");
         return 2;
     }
     framegen::Settings setB = setA;
@@ -211,6 +218,19 @@ int main(int argc, char** argv) {
     CK(vkBindBufferMemory(dev, stg, stgMem, 0));
     uint8_t* map;
     CK(vkMapMemory(dev, stgMem, 0, bytes, 0, (void**)&map));
+    // --stats: 8 bytes of host-visible counters
+    bci.size = 8;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBuffer dbg;
+    CK(vkCreateBuffer(dev, &bci, nullptr, &dbg));
+    vkGetBufferMemoryRequirements(dev, dbg, &req);
+    VkMemoryAllocateInfo dmai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size,
+                              memType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+    VkDeviceMemory dbgMem;
+    CK(vkAllocateMemory(dev, &dmai, nullptr, &dbgMem));
+    CK(vkBindBufferMemory(dev, dbg, dbgMem, 0));
+    uint32_t* dbgMap;
+    CK(vkMapMemory(dev, dbgMem, 0, 8, 0, (void**)&dbgMap));
 
     Img prev = makeImage(W, H, fmt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     Img curr = makeImage(W, H, fmt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
@@ -252,6 +272,11 @@ int main(int argc, char** argv) {
     };
 
     for (size_t p = 2; p + 2 < pos.size(); p += 3) {
+        size_t pairIdx = (p - 2) / 3;
+        if (window > 0 && pairIdx > 0 && pairIdx % window == 0) {   // a fresh Interpolator: nothing carried over
+            vkDeviceWaitIdle(dev);
+            if (!fg.init(info)) { fprintf(stderr, "fg.init (--window) failed\n"); return 1; }
+        }
         upload(pos[p], prev);
         upload(pos[p + 1], curr);
         begin();
@@ -267,7 +292,13 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < ts.size(); k++)
                 if (!fg.recordSynth(cb, prev.view, curr.view, outs[k].view, ts[k])) { fprintf(stderr, "fg.recordSynth failed\n"); return 1; }
         }
+        if (stats) {
+            if (!fg.recordDebugCounters(cb, dbg, 0)) { fprintf(stderr, "recordDebugCounters failed\n"); return 1; }
+            VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
+        }
         submit();
+        if (stats) printf("STATS %zu %u %u %u %zu\n", pairIdx, dbgMap[0], dbgMap[1], fg.debugSadBlocks(), (size_t)W * H);
         for (size_t k = 0; k < ts.size(); k++) {
             begin();
             imgBarrier(cb, outs[k].img, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -356,6 +387,8 @@ int main(int argc, char** argv) {
         vkFreeMemory(dev, i->mem, nullptr);
     }
     vkDestroyBuffer(dev, stg, nullptr);
+    vkDestroyBuffer(dev, dbg, nullptr);
+    vkFreeMemory(dev, dbgMem, nullptr);
     vkFreeMemory(dev, stgMem, nullptr);
     vkDestroyFence(dev, fence, nullptr);
     vkDestroyCommandPool(dev, cpool, nullptr);

@@ -505,6 +505,15 @@ public:
     // (the average of all samples) and "blur fixup" (the whole-frame fallback check, a no-op in the normal case), then "ui_patch".
     bool readTimings(std::vector<const char*>& names, std::vector<uint64_t>& ticks);
 
+    // Debug / test only (bench/score), read-only: changes no output and no state. Records a copy of the latest recordSynth's
+    // (or record's) whole-frame decision inputs into dst (TRANSFER_DST usage) at dstOffset: 2 uint32 = [untrusted pixels (trust
+    // ramp past its midpoint), finest-level SAD sum x 256 (from the estimate)]. Preceded by a COMPUTE write -> TRANSFER read
+    // barrier; the caller adds its own TRANSFER -> HOST barrier. The global fallback fires when untrusted > globalFallback x W x H,
+    // the scene cut when sadSum / 256 / debugSadBlocks() > sceneCutSad. Both counts are computed whatever those settings are.
+    // Not meaningful after recordSynthBlur. False if not initialised.
+    bool recordDebugCounters(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
+    uint32_t debugSadBlocks() const;   // the scene-cut mean's block count (finest pyramid level); 0 if not initialised
+
     static constexpr uint32_t kSetRing = 32;
     static constexpr uint32_t kUiSets = 64;    // descriptor sets of the UI-protection passes (see above)
     static constexpr uint32_t kBlurMaxSamples = 16;   // Settings::blurSamples upper bound
