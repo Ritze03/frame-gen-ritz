@@ -1,8 +1,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 // V2, synth (full res, replaces resolve.comp): the three-class resolve of v2_resolve_core.glsl, the untrusted count for fallback.comp
-// (V1's rule), and the class map of this synth (debug, motion_v2.glsl). Reads e from error.comp (shared with V1) and the field at t
-// (the midpoint field, or lookup.comp's at t != 0.5).
+// (V1's rule), and the class map of this synth (debug, motion_v2.glsl). Reads e from v2_error.comp and the refined field at t
+// (the refined midpoint field, or v2_lookup.comp's at t != 0.5; motion_v2.glsl halfVec).
 #include "common.glsl"
 #include "motion_v2.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;

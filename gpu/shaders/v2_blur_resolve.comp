@@ -21,9 +21,9 @@ float gT = 0.5;    // its time
 #define V2R_OCCSCALE pc.occScale
 #define V2R_PICKBIAS pc.pickBias
 #define V2R_ZEROBONUS pc.zeroBonus
-#define W_ pc.W
-#define H_ pc.H
-#define FSCALE_ pc.fscale
+#define W_ P_W
+#define H_ P_H
+#define FSCALE_ P_FSCALE
 #include "v2_resolve_core.glsl"
 
 shared float wk[16];
@@ -33,11 +33,11 @@ shared uint cnt[16];
 void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
     int lid = int(gl_LocalInvocationIndex);
     ivec2 p = tile * TS + ivec2(gl_LocalInvocationID.xy);
-    bool inside = p.x < pc.W && p.y < pc.H;
+    bool inside = p.x < P_W && p.y < P_H;
     vec3 acc = vec3(0.0);
     float accA = 0.0;
-    float untrustedLimit = pc.globalFrac * float(pc.W) * float(pc.H);
-    for (int k = 0; k < pc.n; k++) {
+    float untrustedLimit = pc.globalFrac * float(P_W) * float(P_H);
+    for (int k = 0; k < P_N; k++) {
         float t = pc.t[k];
         vec3 v = vec3(0.0);
         float a = 0.0;
@@ -73,36 +73,36 @@ void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
     if (inside) imageStore(outImg, p, FG_STORE(acc / wsum, accA / wsum));
     if (counting) {
         barrier();
-        if (lid < pc.n && cnt[lid] > 0u) atomicAdd(u[CNT0 + lid], cnt[lid]);
+        if (lid < P_N && cnt[lid] > 0u) atomicAdd(u[CNT0 + lid], cnt[lid]);
     }
 }
 
 void main() {
     int lid = int(gl_LocalInvocationIndex);
-    if (lid < pc.n) {
-        float x = (2.0 * float(lid) + 1.0 - float(pc.n)) / float(pc.n);
-        wk[lid] = (pc.flags & 1) != 0 ? exp(-2.0 * x * x) : 1.0;
+    if (lid < P_N) {
+        float x = (2.0 * float(lid) + 1.0 - float(P_N)) / float(P_N);
+        wk[lid] = P_GAUSS ? exp(-2.0 * x * x) : 1.0;
     }
     if (lid < 16) cnt[lid] = 0u;
     barrier();
     float wsum = 0.0;
-    for (int k = 0; k < pc.n; k++) wsum += wk[k];
+    for (int k = 0; k < P_N; k++) wsum += wk[k];
     float meanSad = float(u[1]) * (1.0 / 256.0) / float(pc.blocks);   // U_SADSUM
     bool cut = meanSad > pc.cutSad;
 
-    if ((pc.flags & 2) == 0) {
+    if (!P_FIX) {
         tileOut(ivec2(gl_WorkGroupID.xy), true, cut, wsum);
         return;
     }
     if (cut) return;
     bool flicked = false;
-    float untrustedLimit = pc.globalFrac * float(pc.W) * float(pc.H);
-    for (int k = 0; k < pc.n; k++)
+    float untrustedLimit = pc.globalFrac * float(P_W) * float(P_H);
+    for (int k = 0; k < P_N; k++)
         if (pc.t[k] > 0.0 && pc.t[k] < 1.0 && float(u[CNT0 + k]) > untrustedLimit) flicked = true;
     if (!flicked) return;
     for (int j = 0; j < 4; j++)
         for (int i = 0; i < 4; i++) {
             ivec2 tile = ivec2(gl_WorkGroupID.xy) * 4 + ivec2(i, j);
-            if (tile.x * TS < pc.W && tile.y * TS < pc.H) tileOut(tile, false, false, wsum);
+            if (tile.x * TS < P_W && tile.y * TS < P_H) tileOut(tile, false, false, wsum);
         }
 }

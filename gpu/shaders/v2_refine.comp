@@ -1,0 +1,80 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2, estimate (the refinement grid rw x rh = Settings::v2RefineRes % of the frame; D17 + D13): the edge-preserving upsample of the
+// edge-aware field hE (field[pf], flow res) to the refinement grid, with a per-pixel re-pick at full-resolution detail. Writes rf[rfOut]
+// (full-resolution half-vector units).
+//
+// At grid point x (full-resolution position P), the candidates are the vectors of the four flow pixels bilinear interpolation would
+// blend (v_k, bilinear weight b_k) and their bilinear blend v_b (prior weight 1, so a smooth field stays smooth). Each candidate v is
+// scored at P from the two full-resolution RGB taps it takes, wa = a(P - v), wc = c(P + v):
+//   data   d = max-channel |wa - wc|                       does v explain P?
+//   range  r = |luma(0.5 (wa + wc)) - G_k|                 does the content v puts at P look like the content of the flow pixel the
+//                                                          vector comes from (G_k = hE's midpoint luma there; the blend: the
+//                                                          bilinear blend of the G_k) -- the joint-bilateral term, decisive on flat
+//                                                          content where every vector explains P
+//   weight w = prior * exp(-(d + r - min over the candidates) / edgeSigma)
+// and the refined vector is sum w v / sum w: a soft pick, sharp where one side clearly wins (a motion edge: the taps are taken with
+// the side's own vector, not a blend of both), smooth where the candidates tie (no hard per-pixel specks). Where the four vectors
+// agree within 1/4 px (most of a frame) the bilinear vector is written without any tap.
+// Why one pixel and not a window for the data term: on the bench a 3x3 window of taps per candidate was both slower (~2x) and worse
+// (a window that straddles the edge blurs the very decision the pick is for); the soft weights and the edge-aware field below it
+// keep the single-pixel pick stable.
+#include "common.glsl"
+#include "motion_v2.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+float lumaOf(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+void main() {
+    ivec2 x = ivec2(gl_GlobalInvocationID.xy);
+    if (x.x >= pc.rw || x.y >= pc.rh) return;
+    vec2 P = (vec2(x) + 0.5) * (vec2(pc.W, pc.H) / vec2(pc.rw, pc.rh)) - 0.5;   // full-resolution position
+    float S = float(pc.fscale);
+    vec2 s = (P + 0.5) * (1.0 / S) - 0.5;   // flow-resolution position (halfVec's alignment)
+    vec2 fl = floor(s);
+    vec2 f = s - fl;
+    ivec2 i0 = clamp(ivec2(fl), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    ivec2 i1 = clamp(ivec2(fl) + 1, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    ivec2 qs[4] = ivec2[4](i0, ivec2(i1.x, i0.y), ivec2(i0.x, i1.y), i1);
+    float bw[4] = float[4]((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+    vec2 v[5], h[4];
+    float g[5], c[5], pr[5];
+    v[4] = vec2(0.0);
+    float spread = 0.0;
+    for (int k = 0; k < 4; k++) {
+        h[k] = field[pc.pf + qs[k].y * pc.fw + qs[k].x];
+        v[k] = S * h[k];
+        pr[k] = bw[k];
+        v[4] += bw[k] * v[k];
+        vec2 dv = abs(v[k] - v[0]);
+        spread = max(spread, max(dv.x, dv.y));
+    }
+    pr[4] = 1.0;
+    // the four vectors agree (within 1/4 px): nothing to pick, the bilinear vector (most of a frame; no taps)
+    if (spread < 0.25) {
+        rf[pc.rfOut + x.y * pc.rw + x.x] = v[4];
+        return;
+    }
+    g[4] = 0.0;
+    for (int k = 0; k < 4; k++) {
+        g[k] = 0.5 * (sampleL(pc.offA, vec2(qs[k]) - h[k], pc.fw, pc.fh) + sampleL(pc.offC, vec2(qs[k]) + h[k], pc.fw, pc.fh));
+        g[4] += pr[k] * g[k];
+    }
+    float cmin = 1e30;
+    for (int k = 0; k < 5; k++) {
+        vec2 pa = P - v[k], pc_ = P + v[k];
+        vec3 ra = sampleRGBRaw(texPrev, pa), rc = sampleRGBRaw(texCurr, pc_);
+        vec3 wa = FG_FETCH(ra), wc = FG_FETCH(rc);
+        vec3 dd = abs(wa - wc);
+        c[k] = max(dd.r, max(dd.g, dd.b)) + abs(lumaOf(0.5 * (wa + wc)) - g[k]);
+        cmin = min(cmin, c[k]);
+    }
+    vec2 acc = vec2(0.0);
+    float ws = 0.0;
+    for (int k = 0; k < 5; k++) {
+        float w = pr[k] * exp(-(c[k] - cmin) * pc.edgeK);
+        acc += w * v[k];
+        ws += w;
+    }
+    rf[pc.rfOut + x.y * pc.rw + x.x] = ws > 1e-30 ? acc / ws : v[4];   // (all weights underflowed: only with a tiny edgeSigma)
+}
