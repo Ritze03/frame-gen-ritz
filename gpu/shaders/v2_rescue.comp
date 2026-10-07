@@ -18,7 +18,7 @@
 //      of the 3x3 around x + D shown, bit 1), it votes for the half-vector D / 2 at its midpoint m = x + D / 2 (atomicMax of a key:
 //      the better match wins, then the lower x; the result does not depend on the order) and stores it (per x: one writer).
 // A covered strip (seen in prev only) has no copy in curr: nothing to find; content shown on either side is left alone. v2_merge.comp
-// writes the winners into hE.
+// writes the winners into hE, v2_close.comp closes the holes of the rescued objects.
 // Reads the coverage bits, field[fE], vT, luma; writes the keys and the vectors (v2_temporal.glsl v2ROff()).
 #include "common.glsl"
 #include "motion_v2.glsl"
@@ -121,8 +121,10 @@ void main() {
         for (int r = 0; r < 9; r++) {
             bool dup = false;
             for (int i = 0; i < k; i++) dup = dup || ivec2(roundEven(2.0 * cand[k])) == ivec2(roundEven(2.0 * cand[i]));
-            if (!dup)
-            if (sums[k * 9 + r] < bs) { bs = sums[k * 9 + r]; bD = ivec2(roundEven(2.0 * cand[k])) + 3 * ivec2(r % 3 - 1, r / 3 - 1); }
+            if (!dup && sums[k * 9 + r] < bs) {
+                bs = sums[k * 9 + r];
+                bD = ivec2(roundEven(2.0 * cand[k])) + 3 * ivec2(r % 3 - 1, r / 3 - 1);
+            }
         }
     if (float(bs) * (1.0 / 16.0) / float(n) > 2.0 * pc.rescue) return;
     // each orphan's own match: +-2 around the block's displacement

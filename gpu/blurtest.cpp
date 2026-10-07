@@ -245,7 +245,8 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
 // --algo: the motion version every Interpolator of the run is created and set with
 #ifndef BLURTEST_NO_MOTION
 static MotionVersion gAlgo = MotionVersion::V1;
-static Settings algo(Settings s) { s.motionVersion = gAlgo; return s; }
+static MotionPreset gPreset = MotionPreset::A;   // --preset (V2's tuning: B exercises the soft hold edge's per-sample maps)
+static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Preset = gPreset; return s; }
 #else
 static Settings algo(Settings s) { return s; }
 #endif
@@ -990,10 +991,15 @@ int main(int argc, char** argv) {
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
             else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
         }
+        else if (!strcmp(argv[i], "--preset") && i + 1 < argc) {
+            const char c = argv[++i][0];
+            if (c < 'a' || c > 'd') { fprintf(stderr, "--preset a|b|c|d\n"); return 2; }
+            gPreset = (MotionPreset)(c - 'a');
+        }
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2] [--preset a|b|c|d] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

@@ -1,6 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// V2, estimate (flow res, after v2_smooth; the content rescue, step 1 of 3, I11): which pixels of prev and of curr does the generated
+// V2, estimate (flow res, after v2_smooth; the content rescue, step 1 of 4, I11): which pixels of prev and of curr does the generated
 // frame show? Every flow pixel q of the midpoint grid shows, with its edge-aware vector h = hE(q):
 //   two-sided (its 3x3 mean |a(y - h) - c(y + h)| (nearest taps) below the middle of the trust ramp): a(q - h) and c(q + h)
 //   held (above it: the resolve will show the nearer real frame there): a(q) and c(q) (either, by t; both count as shown)

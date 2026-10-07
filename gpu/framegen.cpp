@@ -1129,10 +1129,10 @@ bool Interpolator::validate(const Settings& s) {
 // -1 for the occlusion ramp = the effective trust ramp. Fields: occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow,
 // trustHigh, refineRes, edgeSigma, temporal, temporalBonus, rescue, holdFeather, occSoft (V2Knobs).
 static const V2Knobs kV2Presets[4] = {
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 0.0f},   // A balanced
-    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f, 1.0f, 1.0f, 12.0f, 0.0f, 0.0f},   // B strict
-    {1.0f, 6.0f, 30.0f, -1.0f, -1.0f, 0.5f, -1.0f, -1.0f, 100.0f, 5.0f, 1.0f, 3.0f, 12.0f, 0.0f, 0.0f},    // C wide
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 0.0f},   // D soft (wider trust ramp)
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f},     // A balanced
+    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f, 1.0f, 1.0f, 12.0f, 12.0f, 4.0f},   // B safe (soft hold edge)
+    {1.0f, 6.0f, 30.0f, -1.0f, -1.0f, 0.5f, 16.0f, 48.0f, 100.0f, 5.0f, 1.0f, 3.0f, 24.0f, 0.0f, 4.0f},    // C bold
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f},    // D = A + trust 16 / 48
 };
 
 V2Knobs Interpolator::v2Knobs(const Settings& s) {

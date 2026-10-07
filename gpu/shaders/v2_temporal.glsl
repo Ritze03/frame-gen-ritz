@@ -3,7 +3,8 @@
 // have W, H, fw, fh) and with v2b[] (binding 13) and u[] declared.
 //
 // Layout in v2b[] (words), after the occlusion map (4 fw fh), the class map (E_STRIDE H) and the content rescue's scratch (3 fw fh,
-// v2_rescue.comp: rOff = 4 fw fh + ((W + 3) / 4) H; [rOff, + fw fh) the coverage bits, [rOff + fw fh, + fw fh) the rescue keys,
+// v2_rescue.comp: rOff = 4 fw fh + ((W + 3) / 4) H; [rOff, + fw fh) the coverage bits (0: a shown, 1: c shown, 2:
+// rescued by v2_merge, 3: filled by v2_close), [rOff + fw fh, + fw fh) the rescue keys,
 // [rOff + 2 fw fh, + fw fh) the rescued vectors per source pixel) and the soft hold edge's map of the latest synth (v2_hold.comp,
 // hOff = rOff + 3 fw fh, one float per 4 x 4 px cell: ceil(W / 4) x ceil(H / 4)): tOff = hOff + ceil(W / 4) ceil(H / 4),
 //   [tOff + s fw fh, + fw fh)    s = 0, 1: the edge-aware field of an estimate (packed, v2_pack.glsl, flow units), ping-pong: the

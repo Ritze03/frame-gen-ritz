@@ -13,31 +13,44 @@
 #include "v2_temporal.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
 
-const int REACH = 6;
+const int REACH = 6, TS = 16, TC = TS + 2 * REACH;
+shared uint sr[TC * TC];   // rescued (bit 2) of the tile + REACH
+shared uint anyRes;
 
-int rescuedAt(ivec2 y) {   // 1 if y is in the frame and rescued
-    if (any(lessThan(y, ivec2(0))) || any(greaterThanEqual(y, ivec2(pc.fw, pc.fh)))) return 0;
-    return int((v2b[v2ROff() + y.y * pc.fw + y.x] >> 2) & 1u);
-}
+int rescuedAt(ivec2 l) { return int(sr[(l.y + REACH) * TC + l.x + REACH]); }   // l: tile-local, may lie in the apron
 
 void main() {
-    if (u[V2_U_RESCUED] == 0u) return;
+    if (u[V2_U_RESCUED] == 0u) return;   // (uniform)
+    int lid = int(gl_LocalInvocationIndex);
+    if (lid == 0) anyRes = 0u;
+    barrier();
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - REACH;
+    for (int i = lid; i < TC * TC; i += TS * TS) {
+        ivec2 y = t0 + ivec2(i % TC, i / TC);
+        uint r = all(greaterThanEqual(y, ivec2(0))) && all(lessThan(y, ivec2(pc.fw, pc.fh))) ?
+                 (v2b[v2ROff() + y.y * pc.fw + y.x] >> 2) & 1u : 0u;
+        sr[i] = r;
+        if (r != 0u) anyRes = 1u;
+    }
+    barrier();
+    if (anyRes == 0u) return;   // (uniform)
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
     ivec2 m = ivec2(gl_GlobalInvocationID.xy);
     if (m.x >= pc.fw || m.y >= pc.fh) return;
-    if (rescuedAt(m) != 0) return;
+    if (rescuedAt(l) != 0) return;
     const ivec2 ax[4] = ivec2[4](ivec2(1, 0), ivec2(0, 1), ivec2(1, 1), ivec2(1, -1));
     int bestD = 1000;
     ivec2 bestY = ivec2(0);
     for (int a = 0; a < 4; a++) {
         int dn = 0, dp = 0;
-        for (int k = 1; k <= REACH && dn == 0; k++) dn = rescuedAt(m - k * ax[a]) != 0 ? k : 0;
+        for (int k = 1; k <= REACH && dn == 0; k++) dn = rescuedAt(l - k * ax[a]) != 0 ? k : 0;
         if (dn == 0) continue;
-        for (int k = 1; k <= REACH && dp == 0; k++) dp = rescuedAt(m + k * ax[a]) != 0 ? k : 0;
+        for (int k = 1; k <= REACH && dp == 0; k++) dp = rescuedAt(l + k * ax[a]) != 0 ? k : 0;
         if (dp == 0) continue;
         if (dn < bestD) { bestD = dn; bestY = m - dn * ax[a]; }
         if (dp < bestD) { bestD = dp; bestY = m + dp * ax[a]; }
     }
     if (bestD == 1000) return;
     field[pc.fE + m.y * pc.fw + m.x] = field[pc.fE + bestY.y * pc.fw + bestY.x];
-    atomicOr(v2b[v2ROff() + m.y * pc.fw + m.x], 8u);
+    v2b[v2ROff() + m.y * pc.fw + m.x] |= 8u;
 }
