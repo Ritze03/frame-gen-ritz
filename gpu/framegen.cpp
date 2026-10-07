@@ -373,7 +373,7 @@ bool Interpolator::Impl::makeBuffer(int i, VkDeviceSize size) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    if (i == 2) bci.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // the counters: recordDebugCounters() copies them out
+    if (i >= 1) bci.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // fields / counters + mismatch: recordDebugCounters() / recordDebugMaps() copy them out
     if (CreateBuffer(info.device, &bci, nullptr, &buf[i]) != VK_SUCCESS) { buf[i] = VK_NULL_HANDLE; return false; }
     VkMemoryRequirements req;
     GetBufferMemoryRequirements(info.device, buf[i], &req);
@@ -1211,6 +1211,34 @@ bool Interpolator::recordDebugCounters(VkCommandBuffer cb, VkBuffer dst, VkDevic
 
 uint32_t Interpolator::debugSadBlocks() const {
     return m && !m->lv.empty() ? (uint32_t)(m->lv[0].bw * m->lv[0].bh) : 0;
+}
+
+bool Interpolator::debugMapLayout(DebugMapLayout& l) const {
+    if (!m || !m->W || m->lv.empty()) return false;
+    const Impl& I = *m;
+    l.W = I.W; l.H = I.H; l.fw = (uint32_t)I.fw; l.fh = (uint32_t)I.fh;
+    l.bw = (uint32_t)I.lv[0].bw; l.bh = (uint32_t)I.lv[0].bh; l.fscale = I.set.flowScale;
+    l.eStride = (I.W + 3) / 4;
+    l.blockOff = 0;
+    l.pixOff = (VkDeviceSize)l.bw * l.bh * 8;
+    l.eOff = l.pixOff + (VkDeviceSize)l.fw * l.fh * 8;
+    l.size = l.eOff + (VkDeviceSize)l.eStride * l.H * 4;
+    return true;
+}
+
+bool Interpolator::recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset) {
+    DebugMapLayout L;
+    if (!debugMapLayout(L) || !m->buf[1] || !m->buf[2]) return false;
+    Impl& I = *m;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    int blockIn = I.set.subpixel ? I.fieldSub : I.lv[0].fM;   // == pc.fIn of the pixel-field pass
+    VkBufferCopy f[2] = {{(VkDeviceSize)blockIn * 8, dstOffset + L.blockOff, L.pixOff - L.blockOff},
+                         {(VkDeviceSize)I.fieldPF * 8, dstOffset + L.pixOff, L.eOff - L.pixOff}};
+    I.CmdCopyBuffer(cb, I.buf[1], dst, 2, f);
+    VkBufferCopy e{(VkDeviceSize)kEOff * 4, dstOffset + L.eOff, L.size - L.eOff};
+    I.CmdCopyBuffer(cb, I.buf[2], dst, 1, &e);
+    return true;
 }
 
 VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur, RejPair rej) {

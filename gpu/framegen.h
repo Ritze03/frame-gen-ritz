@@ -513,6 +513,17 @@ public:
     // Not meaningful after recordSynthBlur. False if not initialised.
     bool recordDebugCounters(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
     uint32_t debugSadBlocks() const;   // the scene-cut mean's block count (finest pyramid level); 0 if not initialised
+    // Debug / test only (fgtest --dump), read-only like recordDebugCounters: copies the latest record's / recordSynth's maps into dst at
+    // dstOffset, laid out as debugMapLayout() says: the block field the per-pixel choice read (bw x bh vec2, finest level after
+    // sub-pixel), the per-pixel half-vector field on the midpoint grid (fw x fh vec2) and the packed full-res mismatch e (one byte per
+    // pixel, eStride words per row, 4 pixels per word, low byte first; e of the latest synth, before the 7x7 box). Preceded by a
+    // COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
+    struct DebugMapLayout {
+        uint32_t W, H, fw, fh, bw, bh, fscale, eStride;   // eStride in uint32 words
+        VkDeviceSize blockOff, pixOff, eOff, size;          // byte offsets in dst (relative to dstOffset) and the total size
+    };
+    bool debugMapLayout(DebugMapLayout& l) const;
+    bool recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
 
     static constexpr uint32_t kSetRing = 32;
     static constexpr uint32_t kUiSets = 64;    // descriptor sets of the UI-protection passes (see above)
