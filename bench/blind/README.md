@@ -14,8 +14,9 @@ python3 bench/blind/build_session.py \
   --trials 24 --clip-len 4 --seed 1
 ```
 
-- `--contestant 'name: set-string'`: fgtest `--set` keys (`algo`, `trustLow`, ...). The base set
-  `globalFallback=1` (whole-frame fallback off, as the user plays) goes first; `--base-set` changes it.
+- `--contestant 'name: set-string'`: fgtest `--set` keys (`algo`, `trustLow`, `ui`, ...). The base set
+  `globalFallback=1,ui=crosshairv2` (whole-frame fallback off and CrosshairV2 UI protection, as the user plays) goes
+  first, so a contestant can override a key (`ui=off`); `--base-set` changes it. The page's prompt header prints it.
 - `--source PATH[,start=S][,genre=G]`: without `start`, a seeded pick among the 3 highest-motion windows.
   The genre defaults to the `<genre>_` prefix of the file name.
   - Sources at 90 fps or more: the even frames are the 60 fps base, and the original frames take part as
@@ -24,10 +25,17 @@ python3 bench/blind/build_session.py \
   - Sources under 50 fps are skipped.
 - `--trials N` (fixed per session; about 10% are side-swapped repeats, `--repeat-frac`), `--still-frac`
   (0.5), `--stills` (instants per clip, 3), `--clip-len` (3-5 s), `--seed`, `--out` (default
-  `bench/blind/sessions/`, gitignored).
+  `bench/blind/sessions/`, gitignored). Every clip gets at least one clip (video) trial and one still trial when
+  N >= 2 x the number of clips (repeats are cut to make room); a smaller N prints a warning and places one clip trial
+  per clip first. The builder prints the trial mix per clip.
+- `--warm N`: unscored warm-up pairs rendered before each clip's start (default 2, or `uiStillFrames - 1` = 7 when UI
+  protection is on: a fresh Interpolator masks a static crosshair only after 8 still frames). Fewer fit when the clip
+  starts within N base frames of the file start (warning).
 
 The builder rebuilds `gpu/build/fgtest` (`CCACHE_DISABLE=1`), records its git hash, and runs it once per
-contestant per clip, with pairs in time order in batches of up to 100. Every clip, `real` included, gets the
+contestant per clip: ONE call with the warm-up pairs and then all clip pairs in time order, so the Interpolator's state
+(v2's motion history, the UI protection counters) runs continuously through the clip, as in game. That keeps all
+outputs of a clip on disk at once (about 8 MB per 1080p pair: 2-2.5 GB of outputs plus as much input for 4-5 s). Every clip, `real` included, gets the
 same x264 encode (`-preset slow -crf 10 -g 60 -keyint_min 60 -sc_threshold 0`, yuv420p, bt709, 120 fps).
 Stills are lossless PNG. Work files go under `bench/blind/work/` and are deleted afterwards. A 4 s
 1080p session with two clips and three contestants takes about 7 minutes, mostly x264.
