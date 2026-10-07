@@ -3,6 +3,7 @@
 // Pass 1: luma (cv2 BGR2GRAY, rounded to uint8) + INTER_AREA 1/fscale downsample of a and c to flow res
 // (mean of the valid pixels of each fscale x fscale cell, as cv2's integer-scale area path).
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
 #if defined(FG_YUV)

@@ -4,6 +4,7 @@
 // counted once per fine block that maps to it), per component. Vectors are integers below the finest
 // level, so an exact weighted histogram replaces the sort. Writes 2 * median to u[medIdx..+1].
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 256) in;
 shared uint hx[256], hy[256];
 

@@ -6,8 +6,9 @@
 // --bench N --mult M: per real pair one estimate + M-1 synths at t = k/M (M = 2: record(0.5)). --bgra uses B8G8R8A8_UNORM images/views for
 // inputs and output (the file data stays RGBA; channels are swizzled on upload/readback).
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
-// smoothBonus searchPenalty subpixel flowScale), passed to init. --then k=v[,..]: per pair, in the same command buffer
-// as record(t[0]) -> out.rgba.0, setSettings(--set + these) then record(t[0]) -> out.rgba.1 (runtime-change test).
+// smoothBonus searchPenalty subpixel flowScale; algo=v1|v2 = motionVersion), passed to init. --then k=v[,..]: per pair, in the
+// same command buffer as record(t[0]) -> out.rgba.0, setSettings(--set + these) then record(t[0]) -> out.rgba.1 (runtime-change
+// test; --then algo=.. switches the motion version between the two records).
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
 
@@ -28,7 +29,13 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         *eq = 0;
         double v = atof(eq + 1);
         std::string k = tok;
-        if (k == "trustLow") s.trustLow = (float)v;
+        if (k == "algo") {   // the motion version: v1 | v2
+            std::string a = eq + 1;
+            if (a == "v1") s.motionVersion = framegen::MotionVersion::V1;
+            else if (a == "v2") s.motionVersion = framegen::MotionVersion::V2;
+            else { fprintf(stderr, "algo=v1|v2, not %s\n", eq + 1); return false; }
+        }
+        else if (k == "trustLow") s.trustLow = (float)v;
         else if (k == "trustHigh") s.trustHigh = (float)v;
         else if (k == "globalFallback") s.globalFallback = (float)v;
         else if (k == "sceneCutSad") s.sceneCutSad = (float)v;

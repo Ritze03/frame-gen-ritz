@@ -6,6 +6,7 @@
 // Bilateral: a sampled at q - v, c at q + v. All vectors here are integers -> exact texel taps.
 // sadAcc (finest level with sub-pixel refinement off): also adds the winning SAD to the scene-cut sum.
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 64) in;
 
 const int MAXR = 6, MAXT = 8 + 2 * MAXR, MAXC = (2 * MAXR + 1) * (2 * MAXR + 1);

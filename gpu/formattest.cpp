@@ -3,6 +3,10 @@
 //                               (the last pair interpolated at t = 0.5 / 0.25 / blurred), with and without UI protection
 //   formattest time [W H]       one estimate + one synth per format, GPU time per pass group (default 1920 1080)
 //   options: --separate-planes  YUV: two single-plane images instead of one multi-planar image with plane views
+//            --algo v1|v2       the motion version (Settings::motionVersion), default v1. V2 is Rgba8 only: with v2, check runs
+//                               Rgba8 in V2 and checks that every other format refuses V2 (init and setSettings, with a reason)
+//            --hash             check: print an FNV-1a hash of every output of each format's Off run (t = 0.5, 0.25, blur) and
+//                               WholeScreen run (t = 0.5, 0.25), raw bytes of both planes: diff two library builds
 //
 // The scene is the panning, noisy background with moving objects, a static crosshair and a static HUD box of uitest.cpp,
 // generated as 8-bit RGB and converted to each format (Rgb10 codes, half floats, linear scRGB-like floats, BT.709 limited
@@ -32,6 +36,17 @@ static VkCommandBuffer cb;
 static VkFence fence;
 static double tsPeriodMs = 0;
 static bool separatePlanes = false;
+static bool hashOut = false;   // --hash
+#ifndef FORMATTEST_NO_MOTION   // define it to build against a library without Settings::motionVersion
+static MotionVersion gAlgo = MotionVersion::V1;   // --algo
+static bool algoV2() { return gAlgo == MotionVersion::V2; }
+#else
+static bool algoV2() { return false; }
+#endif
+static uint64_t fnv(const std::vector<uint8_t>& v, uint64_t h = 1469598103934665603ull) {
+    for (uint8_t b : v) { h ^= b; h *= 1099511628211ull; }
+    return h;
+}
 static int fails = 0;
 static void expect(bool ok, const char* what) {
     printf("    %s %s\n", ok ? "PASS" : "FAIL", what);
@@ -465,6 +480,9 @@ static InitInfo baseInfo(Enc e, int W, int H, const Settings& s) {
     info.getMemProps = vkGetPhysicalDeviceMemoryProperties;
     info.getFormatProps = vkGetPhysicalDeviceFormatProperties;
     info.settings = s;
+#ifndef FORMATTEST_NO_MOTION
+    info.settings.motionVersion = gAlgo;
+#endif
     if (e == Enc::F16Lin) { info.transfer = Transfer::Linear; info.linearWhiteNits = 80.0f; }
     return info;
 }
@@ -635,6 +653,27 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     const int W = sc.W, H = sc.H;
     printf("\n== %s ==\n", encName(e));
     if (!formatSupported(e)) { printf("    SKIP: the device cannot sample + store this format\n"); return; }
+#ifndef FORMATTEST_NO_MOTION
+    if (algoV2() && e != Enc::Rgba8) {   // V2 is Rgba8 only: refused at init and by setSettings, with a reason; nothing else runs
+        Interpolator fg;
+        InitInfo info = baseInfo(e, W, H, Settings{});
+        Format f;
+        formatOf(info.viewFormat, &f);
+        const char* why = Interpolator::settingsError(info.settings, f);
+        const bool initOk = fg.init(info);
+        expect(!initOk && why && fg.initError() && !strcmp(fg.initError(), why), "init refuses MotionVersion::V2, initError = settingsError()");
+        printf("      reason: %s\n", fg.initError() ? fg.initError() : "(none)");
+        fg.destroy();
+        info.settings.motionVersion = MotionVersion::V1;
+        Settings v2 = info.settings;
+        v2.motionVersion = MotionVersion::V2;
+        expect(fg.init(info) && !fg.setSettings(v2) && !fg.reconfigure(v2) && fg.settings().motionVersion == MotionVersion::V1,
+               "a V1 instance refuses setSettings / reconfigure to V2 and keeps V1");
+        fg.destroy();
+        printf("    SKIP the rest: V2 is Rgba8 only\n");
+        return;
+    }
+#endif
     if (isYuv(e)) { destroyPic(*std::make_unique<Pic>(makePic(e, 16, 16)).get()); printf("    images: %s\n", mpUsed ? "one multi-planar image, plane views" : "separate plane images (multi-planar not usable here)"); }
     auto realRaw = encode(e, sc.frame(11), W, H);
     auto real = decode(e, realRaw, W, H);
@@ -652,6 +691,11 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     Result r = runSequence(e, sc, off, true);
     if (!r.ok) { if (r.notBuilt) printf("    SKIP: this format's shader variants are not built (meson option 'formats')\n"); else expect(false, "init + sequence"); return; }
     auto o05 = decode(e, r.out[0], W, H), o025 = decode(e, r.out[1], W, H), oBlur = decode(e, r.out[2], W, H);
+    if (hashOut) {
+        printf("    HASHES Off");
+        for (int i = 0; i < 3; i++) printf(" %016llx", (unsigned long long)fnv(r.out[i].p1, fnv(r.out[i].p0)));
+        printf("\n");
+    }
     double pOff = psnr(o05, truth, &near, false);
     printf("    Off: PSNR vs the format's own true mid frame (away from the UI): %.2f dB   (Rgba8: %.2f dB)\n", pOff, psnrRgba8);
     double pRef = e == Enc::Rgba8 ? 99.0 : psnr(o05, dec8out, &near, false);
@@ -699,6 +743,11 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     Result rw = runSequence(e, sc, w, false);
     if (!rw.ok) { expect(false, "WholeScreen init + sequence"); return; }
     auto w05 = decode(e, rw.out[0], W, H), w025 = decode(e, rw.out[1], W, H);
+    if (hashOut) {
+        printf("    HASHES WholeScreen");
+        for (int i = 0; i < 2; i++) printf(" %016llx", (unsigned long long)fnv(rw.out[i].p1, fnv(rw.out[i].p0)));
+        printf("\n");
+    }
     uiWrong(sc, w05, real, tol, xh, hud, xhN, hudN);
     size_t xh2, hud2, a, b;
     uiWrong(sc, w025, real, tol, xh2, hud2, a, b);
@@ -863,7 +912,7 @@ static size_t gradientLevels(Enc e) {
 // linear float input above 1.0: the highlights of a scRGB-like frame survive (no clamp), and are still a sane picture
 static void checkHdr(const Scene& sc) {
     printf("\n== RgbaF16 linear: values above 1.0 ==\n");
-    if (!formatSupported(Enc::F16Lin)) { printf("    SKIP\n"); return; }
+    if (!formatSupported(Enc::F16Lin) || algoV2()) { printf("    SKIP%s\n", algoV2() ? " (V2 is Rgba8 only)" : ""); return; }
     Settings off;
     Result r = runSequence(Enc::F16Lin, sc, off, false);
     if (!r.ok) { expect(false, "sequence"); return; }
@@ -932,6 +981,9 @@ static void apiChecks(int W, int H) {
     expect(fg.resize(W, H, VK_FORMAT_R8G8B8A8_UNORM) || true, "(resize within the format class is allowed)");
     fg.destroy();
     InitInfo yuvNoChroma = baseInfo(Enc::Nv12, W, H, Settings{});
+#ifndef FORMATTEST_NO_MOTION
+    yuvNoChroma.settings.motionVersion = MotionVersion::V1;   // (Nv12: V1 in every run)
+#endif
     if (formatSupported(Enc::Nv12) && fg.init(yuvNoChroma)) {
         Pic a = makePic(Enc::Nv12, W, H);
         begin();
@@ -948,9 +1000,18 @@ int main(int argc, char** argv) {
     std::vector<std::string> pos;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--separate-planes")) separatePlanes = true;
+        else if (!strcmp(argv[i], "--hash")) hashOut = true;
+#ifndef FORMATTEST_NO_MOTION
+        else if (!strcmp(argv[i], "--algo") && i + 1 < argc) {
+            const char* a = argv[++i];
+            if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
+            else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
+            else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
+        }
+#endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [--hash] [--algo v1|v2] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -1000,7 +1061,7 @@ int main(int argc, char** argv) {
         vkDeviceWaitIdle(dev);
         return 0;
     }
-    printf("formattest %dx%d on %s (YUV: %s)\n", W, H, props.deviceName, separatePlanes ? "separate plane images" : "multi-planar image + plane views, falling back to separate images");
+    printf("formattest %dx%d on %s, motion version %s (YUV: %s)\n", W, H, props.deviceName, algoV2() ? "V2" : "V1", separatePlanes ? "separate plane images" : "multi-planar image + plane views, falling back to separate images");
     apiChecks(W, H);
     Scene sc(W, H, 12);
     // reference: the Rgba8 path of the same scene
@@ -1023,11 +1084,13 @@ int main(int argc, char** argv) {
         checkFormat(e, sc, p8, dec8);
     checkHdr(sc);
     printf("\n== precision (a smooth 0.2..0.3 gradient moving 2 px; distinct values on one output row) ==\n");
-    size_t g8 = gradientLevels(Enc::Rgba8), g10 = gradientLevels(Enc::Rgb10), gf = gradientLevels(Enc::F16Enc);
-    printf("    Rgba8 %zu, Rgb10 %zu, RgbaF16 %zu distinct values\n", g8, g10, gf);
+    size_t g8 = gradientLevels(Enc::Rgba8), g10 = algoV2() ? 0 : gradientLevels(Enc::Rgb10), gf = algoV2() ? 0 : gradientLevels(Enc::F16Enc);
+    printf("    Rgba8 %zu, Rgb10 %zu, RgbaF16 %zu distinct values%s\n", g8, g10, gf, algoV2() ? " (V2: Rgba8 only)" : "");
     expect(g8 <= 27, "Rgba8: at most the ~26 levels of 8 bits in that range (control)");
-    expect(g10 >= 70, "Rgb10: about 4x as many values (>= 70 of ~100)");
-    expect(gf >= 70, "RgbaF16: at least as many as Rgb10");
+    if (!algoV2()) {
+        expect(g10 >= 70, "Rgb10: about 4x as many values (>= 70 of ~100)");
+        expect(gf >= 70, "RgbaF16: at least as many as Rgb10");
+    }
     printf("\nRESULT: %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     vkDeviceWaitIdle(dev);
     return fails ? 1 : 0;

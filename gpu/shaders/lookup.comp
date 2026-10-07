@@ -4,6 +4,7 @@
 // sits at q = p + (2t - 1) h(p) at time t, so g(q) = h(q - (2t - 1) g(q)): 2 bilinear fixed-point steps
 // started from h(q) (interp.field_at). Reads the field at fIn, writes g to fOut.
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
 void main() {

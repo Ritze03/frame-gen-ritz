@@ -3,6 +3,7 @@
 // Global decisions: mean finest-level SAD > CUT_SAD (scene cut) or untrusted share > GLOBAL_FRAC
 // -> present the nearer real frame (a for t <= 0.5, c after). Every workgroup exits immediately in the normal case.
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
 void main() {
