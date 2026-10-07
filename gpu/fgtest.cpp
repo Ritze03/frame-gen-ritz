@@ -9,7 +9,9 @@
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
 // smoothBonus searchPenalty subpixel flowScale; algo=v1|v2 = motionVersion; ui=off|crosshair|wholescreen|crosshairv2 =
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
-// uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill), passed to init.
+// uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill;
+// MotionVersion::V2: preset=a|b|c|d = v2Preset, and the single-knob overrides v2OcclWidth v2Reach v2Confidence v2OccLow v2OccHigh
+// v2PickBias v2TrustLow v2TrustHigh (-1 = the preset's value)), passed to init. Keys apply in order, later ones win.
 // UI protection (ui != off in --set or --then): every real frame is recordObserve'd once, in pair order, into a ring of 3 input
 // images; consecutive pairs (pair k+1's prev path == pair k's curr path) form one frame stream, as a host sees it. A fresh
 // Interpolator (start, --window) has to warm up: CrosshairV2 / Crosshair mask a pixel only after uiStillFrames (8) still frames,
@@ -23,7 +25,8 @@
 // --dump DIR (created if missing): after each pair write DIR/pair_NNNN.fgmaps (Interpolator::recordDebugMaps, read-only, output unchanged): a 64-byte
 // header (uint32 magic 'FGMP', version 1, W, H, fw, fh, bw, bh, fscale, eStride, float trustLow, trustHigh, smoothBonus, hudBonus,
 // 2 x 0), then the block field (bw*bh vec2 f32), the per-pixel half-vector field (fw*fh vec2 f32, midpoint grid) and the packed
-// mismatch e (eStride*H uint32, 4 px per word, low byte first) of the pair's last record. gpu/fgmaps.py turns it into PNG maps.
+// mismatch e (eStride*H uint32, 4 px per word, low byte first) of the pair's last record. With algo=v2 the header says version 2 and
+// V2's class map follows (eStride*H uint32, same packing; Interpolator::DebugMapLayout::clsOff). gpu/fgmaps.py turns it into PNG maps.
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
 
@@ -83,6 +86,22 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         else if (k == "uiLeaveFrames") s.uiLeaveFrames = (uint32_t)v;
         else if (k == "uiReentryFrames") s.uiReentryFrames = (uint32_t)v;
         else if (k == "uiEstimateFill") s.uiEstimateFill = v != 0;
+        else if (k == "preset") {   // Settings::v2Preset: a | b | c | d
+            std::string a = eq + 1;
+            if (a == "a" || a == "A") s.v2Preset = framegen::MotionPreset::A;
+            else if (a == "b" || a == "B") s.v2Preset = framegen::MotionPreset::B;
+            else if (a == "c" || a == "C") s.v2Preset = framegen::MotionPreset::C;
+            else if (a == "d" || a == "D") s.v2Preset = framegen::MotionPreset::D;
+            else { fprintf(stderr, "preset=a|b|c|d, not %s\n", eq + 1); return false; }
+        }
+        else if (k == "v2OcclWidth") s.v2OcclWidth = (float)v;
+        else if (k == "v2Reach") s.v2Reach = (float)v;
+        else if (k == "v2Confidence") s.v2Confidence = (float)v;
+        else if (k == "v2OccLow") s.v2OccLow = (float)v;
+        else if (k == "v2OccHigh") s.v2OccHigh = (float)v;
+        else if (k == "v2PickBias") s.v2PickBias = (float)v;
+        else if (k == "v2TrustLow") s.v2TrustLow = (float)v;
+        else if (k == "v2TrustHigh") s.v2TrustHigh = (float)v;
         else { fprintf(stderr, "unknown setting %s\n", tok); return false; }
     }
     return true;
@@ -403,7 +422,7 @@ int main(int argc, char** argv) {
             snprintf(path, sizeof path, "%s/pair_%04zu.fgmaps", dumpDir, pairIdx);
             FILE* f = fopen(path, "wb");
             if (!f) { fprintf(stderr, "cannot write %s\n", path); return 1; }
-            uint32_t hdr[16]{0x504d4746u, 1, dl.W, dl.H, dl.fw, dl.fh, dl.bw, dl.bh, dl.fscale, dl.eStride};
+            uint32_t hdr[16]{0x504d4746u, dl.clsOff ? 2u : 1u, dl.W, dl.H, dl.fw, dl.fh, dl.bw, dl.bh, dl.fscale, dl.eStride};
             float hf[4]{setB.trustLow, setB.trustHigh, setB.smoothBonus, setB.hudBonus};   // the settings of the last record
             memcpy(hdr + 10, hf, sizeof hf);
             fwrite(hdr, 1, sizeof hdr, f);

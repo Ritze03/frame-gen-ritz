@@ -2,10 +2,13 @@
 """Reads fgtest --dump files (pair_NNNN.fgmaps) and derives v1's per-pixel debug maps.
 
   fgmaps.py DUMP.fgmaps OUTPREFIX   -> OUTPREFIX_u.png (trust u, 0..255), _e.png (raw mismatch e), _cand.png (pixfield candidate,
-                                       colour coded), _flow.png (per-pixel half-vector, HSV coded)
+                                       colour coded), _flow.png (per-pixel half-vector, HSV coded); a V2 dump (header version 2)
+                                       also _class.png (V2's class map, see CLASS_RGB)
 
 Layout (fgtest.cpp, Interpolator::recordDebugMaps): 64-byte header, block field (bw*bh vec2 f32), per-pixel half-vector field
-(fw*fh vec2 f32, midpoint grid), packed mismatch e (eStride*H uint32, 4 px per word, low byte first).
+(fw*fh vec2 f32, midpoint grid), packed mismatch e (eStride*H uint32, 4 px per word, low byte first); version 2 (algo=v2): then
+V2's class map (eStride*H uint32, same packing; Interpolator::DebugMapLayout::clsOff: bits 0-2 class, bit 3 one-sided side = curr,
+bits 4-7 weight x 15). u here is V1's ramp of the dump header's trustLow / trustHigh (V2's held class may use its preset's ramp).
 u = ramp(7x7 box of e (replicate border), trustLow..trustHigh) as resolve.comp computes it; the candidate index is recovered by
 matching the stored per-pixel vector against the 7 candidates of pixfield.comp (first match wins, as the first candidate wins ties):
 0 bilinear block field, 1 own block, 2 above, 3 below, 4 left, 5 right, 6 zero.
@@ -16,6 +19,10 @@ import numpy as np
 
 CAND_NAMES = ["bilinear", "own", "up", "down", "left", "right", "zero"]
 # colours of the candidate map: bilinear dark grey (the smooth default), own white, neighbours saturated, zero black-blue
+# V2 class map: trusted black, held red, clean occlusion with the field's vector green, with the background vector blue, with the
+# foreground vector magenta; brightness = weight of the held / one-sided output (dim = mostly blended); one-sided from curr: whitened
+CLASS_NAMES = ["trusted", "held", "occ-field", "occ-bg", "occ-fg"]
+CLASS_RGB = np.array([[0, 0, 0], [255, 0, 0], [0, 200, 0], [0, 120, 255], [255, 0, 255]], np.float32)
 CAND_RGB = np.array([[60, 60, 60], [255, 255, 255], [255, 60, 60], [60, 255, 60], [60, 120, 255], [255, 220, 0], [0, 0, 140]],
                     np.uint8)
 
@@ -24,15 +31,30 @@ def load(path):
     raw = open(path, "rb").read()
     h = np.frombuffer(raw[:64], np.uint32)
     hf = np.frombuffer(raw[40:56], np.float32)
-    assert h[0] == 0x504D4746 and h[1] == 1, "not an fgmaps v1 file"
+    assert h[0] == 0x504D4746 and h[1] in (1, 2), "not an fgmaps v1 / v2 file"
     W, H, fw, fh, bw, bh, fscale, es = (int(x) for x in h[2:10])
     o = 64
     block = np.frombuffer(raw, np.float32, bw * bh * 2, o).reshape(bh, bw, 2); o += bw * bh * 8
     pf = np.frombuffer(raw, np.float32, fw * fh * 2, o).reshape(fh, fw, 2); o += fw * fh * 8
     ew = np.frombuffer(raw, np.uint32, es * H, o).reshape(H, es)
     e = np.stack([(ew >> (8 * i)) & 255 for i in range(4)], -1).reshape(H, es * 4)[:, :W].astype(np.float32)
-    return dict(W=W, H=H, fw=fw, fh=fh, bw=bw, bh=bh, fscale=fscale, block=block, pf=pf, e=e,
+    cls = None
+    if h[1] == 2:
+        o += es * H * 4
+        cw = np.frombuffer(raw, np.uint32, es * H, o).reshape(H, es)
+        cls = np.stack([(cw >> (8 * i)) & 255 for i in range(4)], -1).reshape(H, es * 4)[:, :W].astype(np.uint8)
+    return dict(W=W, H=H, fw=fw, fh=fh, bw=bw, bh=bh, fscale=fscale, block=block, pf=pf, e=e, cls=cls,
                 trustLow=float(hf[0]), trustHigh=float(hf[1]))
+
+
+def class_rgb(c):
+    """V2 class-map bytes -> RGB"""
+    k = np.minimum(c & 7, 4)
+    w = ((c >> 4) & 15).astype(np.float32) / 15.0
+    img = CLASS_RGB[k] * (0.35 + 0.65 * w[..., None])
+    sc = ((c & 8) != 0) & (k >= 2)
+    img[sc] = img[sc] * 0.6 + 255 * 0.4
+    return img.astype(np.uint8)
 
 
 def box(img, r):
@@ -105,6 +127,10 @@ def main():
     idx, _ = cand_index(d)
     Image.fromarray(CAND_RGB[np.minimum(idx, 6)]).save(pre + "_cand.png")
     Image.fromarray(flow_rgb(d["pf"])).save(pre + "_flow.png")
+    if d["cls"] is not None:
+        Image.fromarray(class_rgb(d["cls"])).save(pre + "_class.png")
+        k = np.minimum(d["cls"] & 7, 4)
+        print("class share:", {CLASS_NAMES[i]: round(float((k == i).mean()), 4) for i in range(5)})
     print("candidate share:", {CAND_NAMES[k]: round(float((idx == k).mean()), 4) for k in range(7)},
           "unmatched", float((idx == 7).mean()))
 
