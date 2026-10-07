@@ -19,6 +19,8 @@ layout(local_size_x = 16, local_size_y = 16) in;
 #define V2R_OCCSCALE pc.occScale
 #define V2R_PICKBIAS pc.pickBias
 #define V2R_ZEROBONUS pc.zeroBonus
+#define V2R_FEATHER pc.edgeMin   // (synth: PC2 edgeMin / confMax carry V2Knobs holdFeather / occSoft, motion_v2.glsl)
+#define V2R_OCCSOFT pc.confMax
 #define W_ pc.W
 #define H_ pc.H
 #define FSCALE_ pc.fscale

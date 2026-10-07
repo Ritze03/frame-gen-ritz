@@ -20,7 +20,8 @@ shaders = shader_gen.process(
   # MotionVersion::V2's own passes (Rgba8 only: no per-format variants); every other V2 pass is V1's shader
   'shaders/v2_occl.comp', 'shaders/v2_resolve.comp', 'shaders/v2_blur_resolve.comp',
   'shaders/v2_smooth.comp', 'shaders/v2_refine.comp', 'shaders/v2_lookup.comp', 'shaders/v2_error.comp',
-  'shaders/v2_blur_error.comp', 'shaders/v2_seed.comp', 'shaders/v2_search.comp')
+  'shaders/v2_blur_error.comp', 'shaders/v2_seed.comp', 'shaders/v2_search.comp',
+  'shaders/v2_cover.comp', 'shaders/v2_rescue.comp', 'shaders/v2_merge.comp', 'shaders/v2_close.comp')
 
 # Per-format variants of the colour shaders (README.md "Formats"): the same sources, compiled once per format with
 # -DFG_FORMAT_<FMT>=1 into <name>_<fmt>_spv.h / <name>_<fmt>_spv. Rgba8 is the plain build above and keeps its names.

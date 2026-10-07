@@ -21,7 +21,8 @@ layout(push_constant) uniform BPC2 {
     float cutSad, trust0, trustScale, globalFrac;   // runtime settings (trust: V2Knobs trustLow / trustHigh)
     float occ0, occScale, pickBias, zeroBonus;      // V2Knobs: the occlusion ramp, pickBias; Settings::hudBonus
     float t[16];       // time of each sample, in [0, 1]; <= 0 / >= 1 = the real frame prev / curr
-} pc;                  // (3 words free)
+    float feather, occSoft;   // V2Knobs holdFeather, occSoft
+} pc;                  // (1 word free)
 
 #define P_W (pc.wh & 0xFFFF)
 #define P_H (pc.wh >> 16)
@@ -37,6 +38,7 @@ layout(push_constant) uniform BPC2 {
 
 const uint V2_E_UNKNOWN = 255u;   // == motion_v2.glsl
 const uint V2_CLS_TRUSTED = 0u, V2_CLS_HELD = 1u, V2_CLS_OCC_FIELD = 2u, V2_CLS_OCC_BG = 3u, V2_CLS_OCC_FG = 4u, V2_CLS_OCC_ZERO = 5u;
+const uint V2_CLS_RESCUED = 6u;
 int eStride() { return (P_W + 3) >> 2; }
 int eWords() { return eStride() * P_H; }
 const int CNT0 = 32;      // u[CNT0 + k]: untrusted-pixel count of sample k (== blur_motion_v1.glsl)

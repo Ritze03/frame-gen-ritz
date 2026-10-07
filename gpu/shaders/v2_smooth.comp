@@ -21,7 +21,7 @@
 // background vector "explains" as well as its own: the prior made it vanish), and a vector no neighbour backs is a speck (next to a
 // static crosshair the prior put the pan back into single pixels the crosshair had pulled: artifacts at the arm ends, uitest).
 // Only with a valid seed (v2SeedValid(): the pair continues the last one); the measurement runs either way (the same work).
-// Reads field[pf] (the pixel field) and vT, writes field[fE].
+// Reads field[pf] (the pixel field) and vT, writes field[fE] (and clears the content rescue's coverage bits and keys).
 #include "common.glsl"
 #include "motion_v2.glsl"
 #include "v2_temporal.glsl"
@@ -98,4 +98,7 @@ void main() {
         if (v2SeedValid() && et <= er + 9.0 * pc.tBonus) best = vt;
     }
     field[pc.fE + q.y * pc.fw + q.x] = best;
+    // the content rescue's coverage bits and keys start empty (v2_cover / v2_rescue / v2_merge.comp)
+    v2b[v2ROff() + q.y * pc.fw + q.x] = 0u;
+    v2b[v2ROff() + pc.fw * pc.fh + q.y * pc.fw + q.x] = 0u;
 }

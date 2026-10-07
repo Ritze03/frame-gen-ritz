@@ -2,7 +2,9 @@
 // use it (v2_seed, v2_search, v2_smooth, v2_occl), with either push-constant block (motion_v1.glsl's PC and motion_v2.glsl's PC2 both
 // have W, H, fw, fh) and with v2b[] (binding 13) and u[] declared.
 //
-// Layout in v2b[] (words), after the occlusion map (4 fw fh) and the class map (E_STRIDE H): tOff = 4 fw fh + ((W + 3) / 4) H,
+// Layout in v2b[] (words), after the occlusion map (4 fw fh), the class map (E_STRIDE H) and the content rescue's scratch (3 fw fh,
+// v2_rescue.comp: rOff = 4 fw fh + ((W + 3) / 4) H; [rOff, + fw fh) the coverage bits, [rOff + fw fh, + fw fh) the rescue keys,
+// [rOff + 2 fw fh, + fw fh) the rescued vectors per source pixel): tOff = rOff + 3 fw fh,
 //   [tOff + s fw fh, + fw fh)    s = 0, 1: the edge-aware field of an estimate (packed, v2_pack.glsl, flow units), ping-pong: the
 //                                estimate of parity p (PC2 tFlags bit 0) reads slot 1 - p (the previous pair's) and writes slot p
 //                                (v2_occl.comp)
@@ -13,9 +15,12 @@
 // x 2^20, + 2^31 if the host had no valid previous estimate (framegen.cpp v2SeedOk; or Settings::v2Temporal off). The seed is valid
 // below V2_SEED_MAX (0.25 levels: the same frame gives exactly 0).
 const int V2_U_SEED = 30;
+const int V2_U_VOTES = 29;     // (I11) votes of the content rescue (v2_rescue.comp; cleared with the estimate's counters)
+const int V2_U_RESCUED = 31;   // (I11) pixels the content rescue put back (v2_merge.comp; cleared with the estimate's counters)
 const uint V2_SEED_MAX = 262144u;
 bool v2SeedValid() { return u[V2_U_SEED] < V2_SEED_MAX; }
-int v2TOff() { return 4 * pc.fw * pc.fh + ((pc.W + 3) >> 2) * pc.H; }
+int v2ROff() { return 4 * pc.fw * pc.fh + ((pc.W + 3) >> 2) * pc.H; }   // the content rescue's scratch (v2_rescue.comp)
+int v2TOff() { return v2ROff() + 3 * pc.fw * pc.fh; }
 int v2POff(int slot) { return v2TOff() + slot * pc.fw * pc.fh; }
 int v2VTOff() { return v2TOff() + 2 * pc.fw * pc.fh; }
 int v2LOff(int slot, int n) { return v2TOff() + 3 * pc.fw * pc.fh + slot * n; }

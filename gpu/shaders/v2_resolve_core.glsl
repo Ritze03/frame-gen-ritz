@@ -9,6 +9,8 @@
 //                               (Settings::hudBonus)
 //   occAt(p, hv, s)             the occlusion map entry of pixel p (motion_v2.glsl)
 //   W_, H_, FSCALE_             the full resolution and the flow scale
+//   V2R_FEATHER                 V2Knobs holdFeather (full-resolution px, <= 32; 0 = V1's hold edge), uniform
+//   V2R_OCCSOFT                 V2Knobs occSoft (levels; 0 = the hard pick at a clean occlusion), uniform
 //
 // Per pixel p, with e7 = 7x7 mean of e (V1's box, over the pixels whose e is known: a pixel with a warp tap on the UI (CrosshairV2
 // tap rejection) shows the other frame's tap for both, which says nothing about its vector, so it takes the trust of the pixels
@@ -26,6 +28,12 @@
 //   background from the one frame that sees it instead of V1's held patch. The 3x3 instead of V1's 7x7 keeps the occlusion classes to
 //   the strip itself. At the edge of a clean occlusion region the result fades into V1's by the share of the 3x3 that has one.
 // The untrusted count of the whole-frame fallback is V1's (Ut > 0.5), so its decisions and the bench's fallback% compare with V1.
+// The soft hold edge (I11, D18; V2R_FEATHER = F > 0): V1's held regions end in a hard ~4 px edge (the 7x7 box and the ramp), the
+// "too sharp islands": a patch of the unwarped nearer frame, |v| px off from the warped content around it. The frame is cut into
+// 4 x 4 px cells; a cell whose mean known e is past the middle of the trust ramp is a hold source of weight hc = 2 ramp - 1; around
+// it the hold weight falls off linearly with the distance, uf = max over the sources of hc (1 - d / F) (a cone: the held region
+// itself keeps its full hold, only its outside gets the soft edge), bilinear between the cell centres; the pixel's hold is
+// max(Ut, uf) (also in the class map's weight). The untrusted count is that of Ut.
 
 const int TS = 16, AP = 3, TT = TS + 2 * AP, TB = TS + 2;
 shared float te[TT * TT];   // e + KN of the tile + 3 (7x7 box); 0 where e is unknown (V2_E_UNKNOWN)
@@ -35,6 +43,9 @@ shared float tb[TB * TB], tf[TB * TB];   // e of vB / vF of the tile + 1 (= e wh
 shared float tz[TB * TB];                 // e of the zero vector (= e where the pixel has no clean occlusion)
 shared float tg[TB * TB];                 // 1 = the pixel has a clean occlusion
 shared vec2 thv[TB * TB];                 // the half-vector of the field at t
+const int FC = 4, FRMAX = 8, FNMAX = TS / FC + 2 + 2 * FRMAX;   // the soft hold edge: cell size, largest radius (cells), cells
+shared float fsrc[FNMAX * FNMAX];         // hold source weight hc of the cells around the tile
+shared float fcone[36];                   // uf at the 6 x 6 cell centres around the tile's 4 x 4 cells
 
 struct V2Px {
     vec3 o;          // the output (levels, unrounded)
@@ -85,6 +96,37 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         tg[i] = oc.z != 0u ? 1.0 : 0.0;
     }
     barrier();
+    // the soft hold edge (uniform branch: V2R_FEATHER is a push constant)
+    float F = V2R_FEATHER;
+    if (F > 0.0) {
+        int R = min(int(ceil(F / float(FC))), FRMAX);
+        int n = TS / FC + 2 + 2 * R;
+        ivec2 c0 = tile * (TS / FC) - 1 - R;
+        for (int i = lid; i < n * n; i += TS * TS) {
+            ivec2 c = c0 + ivec2(i % n, i / n);
+            float se = 0.0, ke = 0.0;
+            for (int j = 0; j < FC * FC; j++) {
+                ivec2 q = c * FC + ivec2(j % FC, j / FC);
+                if (any(lessThan(q, ivec2(0))) || q.x >= W_ || q.y >= H_) continue;
+                uint e = V2R_E(q);
+                if (e != V2_E_UNKNOWN) { se += float(e); ke += 1.0; }
+            }
+            float rr = ke > 0.0 ? clamp((se / ke - V2R_TRUST0) * V2R_TRUSTSCALE, 0.0, 1.0) : 0.0;
+            fsrc[i] = clamp(2.0 * rr - 1.0, 0.0, 1.0);
+        }
+        barrier();
+        if (lid < 36) {
+            ivec2 cc = ivec2(lid % 6, lid / 6) + R;
+            float mx = 0.0;
+            for (int dy = -R; dy <= R; dy++)
+                for (int dx = -R; dx <= R; dx++) {
+                    float w = 1.0 - length(vec2(dx, dy)) * float(FC) / F;
+                    if (w > 0.0) mx = max(mx, fsrc[(cc.y + dy) * n + cc.x + dx] * w);
+                }
+            fcone[lid] = mx;
+        }
+        barrier();
+    }
     ivec2 l = ivec2(gl_LocalInvocationID.xy);
     ivec2 p = tile * TS + l;
     V2Px r;
@@ -97,6 +139,15 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
     float e7 = n7 == 49.0 ? s7 * (1.0 / 49.0) : n7 > 0.0 ? s7 / n7 : 0.0;
     float ut = clamp((e7 - V2R_TRUST0) * V2R_TRUSTSCALE, 0.0, 1.0);
     r.untrusted = ut > 0.5;
+    float ufe = 0.0;   // the soft hold edge (not counted)
+    if (F > 0.0) {
+        vec2 sc = (vec2(l) + 0.5) * (1.0 / float(FC)) + 0.5;   // in the 6 x 6 cell centres (cell -1 of the tile at 0)
+        ivec2 i0 = ivec2(floor(sc));
+        vec2 f = sc - vec2(i0);
+        ivec2 i1 = min(i0 + 1, ivec2(5));
+        float u00 = fcone[i0.y * 6 + i0.x], u01 = fcone[i0.y * 6 + i1.x], u10 = fcone[i1.y * 6 + i0.x], u11 = fcone[i1.y * 6 + i1.x];
+        ufe = mix(mix(u00, u01, f.x), mix(u10, u11, f.x), f.y);
+    }
     if (te[(l.y + AP) * TT + l.x + AP] == 0.0 || n7 < 25.0) {
         // e unknown (a tap on the UI: the output is the other frame's tap, right only if p's vector is, which nothing measures) or
         // mostly unknown around p: a vector that most of its 8 neighbours do not share (within 1/4 px) is a stray one (a vector the
@@ -118,10 +169,17 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
     r.alpha = nr.a;
     uvec4 oc = occAt(p, hv, V2R_S);
     vec3 a8 = FG_FETCH(nr.rgb);
-    vec3 v1o = m0 * (1.0 - ut) + a8 * ut;   // trusted / held: V1
-    if (oc.z == 0u) {
+    // the content rescue's pixels (occlusion map w): an object both frames show, put back at its midpoint with a vector that rarely
+    // matches exactly (perspective); holding, or the background vector of a clean occlusion, would show the background it covers,
+    // i.e. delete it again: the two-sided blend of its own vector
+    bool resc = (oc.w & 1u) != 0u;
+    if (resc) ut = 0.0;
+    float utf = resc ? 0.0 : max(ut, ufe);
+    vec3 v1o = m0 * (1.0 - utf) + a8 * utf;   // trusted / held: V1 (with the soft hold edge)
+    if (oc.z == 0u || resc) {   // (a rescued pixel is two-sided with its own vector: the occlusion picks would put the background
+                                // back over the object)
         r.o = v1o;
-        r.cls = (ut > 0.0 ? V2_CLS_HELD : V2_CLS_TRUSTED) | (uint(ut * 15.0 + 0.5) << 4);
+        r.cls = (resc ? V2_CLS_RESCUED : utf > 0.0 ? V2_CLS_HELD : V2_CLS_TRUSTED) | (uint(utf * 15.0 + 0.5) << 4);
         return r;
     }
     // clean occlusion

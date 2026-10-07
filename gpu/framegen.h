@@ -308,6 +308,20 @@ struct Settings {
     //   (by more than 1/4 flow px) it replaces it if its 3x3 mean |a - c| (flow res) is at most this much higher. Higher = steadier
     //   field from pair to pair (less vector jitter where the content does not decide), lower = the content decides more often.
     float v2TemporalBonus = -1.0f;
+    //   v2Rescue: [0, 64] levels (I11). The content rescue: content that both frames show but the field would show at neither
+    //   place (a thin or fast object whose midpoint the field gives a vector that maps background to background, so it vanishes) is
+    //   found again (an unused, structured patch of prev that a vector from its neighbourhood maps onto an unused patch of curr) and
+    //   put back at its midpoint with that vector. The largest 3x3 mean luma difference of such a match; 0 = off. Higher = more
+    //   rescues (and more risk of a wrong one).
+    float v2Rescue = -1.0f;
+    //   v2HoldFeather: [0, 32] full-resolution pixels (I11). The soft edge of held regions (V1's hold of the nearer real frame
+    //   where the warp failed): the hold weight falls off linearly over this distance outside a held region instead of V1's hard
+    //   ~4 px edge (the "too sharp islands"). 0 = V1's edge.
+    float v2HoldFeather = -1.0f;
+    //   v2OccSoft: [0, 64] levels (I11). At a clean occlusion the candidate vectors (the field's, the background's, the
+    //   foreground's, zero) are weighted softly by their 3x3 mismatch, w = exp(-(e - e_best) / v2OccSoft), instead of the hard pick of
+    //   the best (single pixels flipping between candidates: specks on silhouette edges). 0 = the hard pick.
+    float v2OccSoft = -1.0f;
 };
 
 // The effective V2 knobs of a Settings (Interpolator::v2Knobs(): the preset with the v2* overrides applied).
@@ -315,6 +329,7 @@ struct V2Knobs {
     float occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow, trustHigh;
     float refineRes, edgeSigma;   // refineRes rounded to an integer percentage
     float temporal, temporalBonus;   // temporal 0 / 1
+    float rescue, holdFeather, occSoft;   // (I11)
 };
 
 struct InitInfo {

@@ -21,6 +21,8 @@ float gT = 0.5;    // its time
 #define V2R_OCCSCALE pc.occScale
 #define V2R_PICKBIAS pc.pickBias
 #define V2R_ZEROBONUS pc.zeroBonus
+#define V2R_FEATHER pc.feather
+#define V2R_OCCSOFT pc.occSoft
 #define W_ P_W
 #define H_ P_H
 #define FSCALE_ P_FSCALE

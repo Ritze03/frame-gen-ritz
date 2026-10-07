@@ -37,6 +37,10 @@
 #include "v2_lookup_spv.h"
 #include "v2_error_spv.h"
 #include "v2_seed_spv.h"
+#include "v2_cover_spv.h"
+#include "v2_rescue_spv.h"
+#include "v2_merge_spv.h"
+#include "v2_close_spv.h"
 #include "v2_search_spv.h"
 #include "v2_blur_error_spv.h"
 
@@ -198,7 +202,7 @@ struct PC2 {
     int32_t tFlags;   // the temporal store: bit 0 parity of this estimate, bit 1 the previous estimate is usable (v2_temporal.glsl)
     float tBonus;
     int32_t lw, lh;   // v2_seed: the coarsest pyramid level
-    int32_t pad_;
+    float rescue;     // v2_rescue: V2Knobs rescue
 };
 static_assert(sizeof(PC2) == sizeof(PC), "PC2 is pushed over PC's range");
 
@@ -231,7 +235,8 @@ struct BlurPC2 {
     int32_t blocks;
     float cutSad, trust0, trustScale, globalFrac, occ0, occScale, pickBias, zeroBonus;
     float t[16];
-    int32_t pad_[3];
+    float feather, occSoft;   // V2Knobs holdFeather, occSoft
+    int32_t pad_;
 };
 static_assert(sizeof(BlurPC2) == sizeof(BlurPC), "BlurPC2 is pushed over BlurPC's range");
 enum BlurPipe { B_LOOKUP, B_ERROR, B_RESOLVE, B_COUNT_ };
@@ -259,6 +264,7 @@ struct UiEntry {
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
             P_V2OCCL, P_V2SMOOTH, P_V2REFINE,   // V2 only: v2_occl / v2_smooth / v2_refine.comp (V1's group leaves them null)
             P_V2SEED,                           // V2 only: v2_seed.comp (the temporal store, D19)
+            P_V2COVER, P_V2RESCUE, P_V2MERGE, P_V2CLOSE,   // V2 only: the content rescue (I11): v2_cover / rescue / merge / close.comp
             P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
@@ -413,7 +419,7 @@ struct Interpolator::Impl {
     // all of V2's buffer (binding 13), in words: the occlusion map, the class map, the temporal store (v2_temporal.glsl: two field slots,
     // the compensated field, two slots of the coarsest pyramid level)
     VkDeviceSize v2Words() const {
-        return v2OccWords() + (VkDeviceSize)((W + 3) / 4) * H + (VkDeviceSize)3 * fw * fh + (VkDeviceSize)2 * lv.back().w * lv.back().h;
+        return v2OccWords() + (VkDeviceSize)((W + 3) / 4) * H + (VkDeviceSize)6 * fw * fh + (VkDeviceSize)2 * lv.back().w * lv.back().h;
     }
     // V2's refined-field buffer (binding 14) when V2 is selected and sized, else null
     VkBuffer v2Field() { MotionGroup& g = mg(); return set.motionVersion == MotionVersion::V2 && g.bufs.size() > 1 ? g.bufs[1].b : VK_NULL_HANDLE; }
@@ -1117,12 +1123,12 @@ bool Interpolator::validate(const Settings& s) {
 
 // MotionVersion::V2: the knob values of each preset (MotionPreset A-D, in order). -1 for the trust ramp = Settings::trustLow / trustHigh,
 // -1 for the occlusion ramp = the effective trust ramp. Fields: occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow,
-// trustHigh, refineRes, edgeSigma, temporal, temporalBonus (V2Knobs).
+// trustHigh, refineRes, edgeSigma, temporal, temporalBonus, rescue, holdFeather, occSoft (V2Knobs).
 static const V2Knobs kV2Presets[4] = {
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f, 1.0f, 2.0f},   // A balanced
-    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f, 1.0f, 1.0f},   // B strict
-    {1.0f, 6.0f, 30.0f, -1.0f, -1.0f, 0.5f, -1.0f, -1.0f, 100.0f, 5.0f, 1.0f, 3.0f},    // C wide
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f, 1.0f, 2.0f},   // D soft (wider trust ramp)
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 0.0f},   // A balanced
+    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f, 1.0f, 1.0f, 12.0f, 0.0f, 0.0f},   // B strict
+    {1.0f, 6.0f, 30.0f, -1.0f, -1.0f, 0.5f, -1.0f, -1.0f, 100.0f, 5.0f, 1.0f, 3.0f, 12.0f, 0.0f, 0.0f},    // C wide
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 0.0f},   // D soft (wider trust ramp)
 };
 
 V2Knobs Interpolator::v2Knobs(const Settings& s) {
@@ -1133,6 +1139,7 @@ V2Knobs Interpolator::v2Knobs(const Settings& s) {
     ov(k.trustLow, s.v2TrustLow); ov(k.trustHigh, s.v2TrustHigh);
     ov(k.refineRes, s.v2RefineRes); ov(k.edgeSigma, s.v2EdgeSigma);
     ov(k.temporal, s.v2Temporal); ov(k.temporalBonus, s.v2TemporalBonus);
+    ov(k.rescue, s.v2Rescue); ov(k.holdFeather, s.v2HoldFeather); ov(k.occSoft, s.v2OccSoft);
     if (k.trustLow == -1.0f) k.trustLow = s.trustLow;
     if (k.trustHigh == -1.0f) k.trustHigh = s.trustHigh;
     if (k.occLow == -1.0f) k.occLow = k.trustLow;
@@ -1150,7 +1157,8 @@ static bool v2Valid(const Settings& s) {
     if (!in(s.v2OcclWidth, 0.5f, 64.0f) || !in(s.v2Reach, 1.0f, 16.0f) || !in(s.v2Confidence, 1.0f, 255.0f) ||
         !in(s.v2OccLow, 0.0f, 255.0f) || !in(s.v2OccHigh, 0.0f, 255.0f) || !in(s.v2PickBias, 0.0f, 255.0f) ||
         !in(s.v2TrustLow, 0.0f, 255.0f) || !in(s.v2TrustHigh, 0.0f, 255.0f) || !in(s.v2RefineRes, 1.0f, 100.0f) ||
-        !in(s.v2EdgeSigma, 1.0f, 255.0f) || !in(s.v2Temporal, 0.0f, 1.0f) || !in(s.v2TemporalBonus, 0.0f, 255.0f))
+        !in(s.v2EdgeSigma, 1.0f, 255.0f) || !in(s.v2Temporal, 0.0f, 1.0f) || !in(s.v2TemporalBonus, 0.0f, 255.0f) ||
+        !in(s.v2Rescue, 0.0f, 64.0f) || !in(s.v2HoldFeather, 0.0f, 32.0f) || !in(s.v2OccSoft, 0.0f, 64.0f))
         return false;
     const V2Knobs k = Interpolator::v2Knobs(s);
     return k.trustHigh - k.trustLow >= 1.0f && k.occHigh - k.occLow >= 1.0f;
@@ -1225,6 +1233,10 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2SMOOTH] = {SPV(v2_smooth), nullptr};
         spv[P_V2REFINE] = {SPV(v2_refine), nullptr};
         spv[P_V2SEED] = {SPV(v2_seed), nullptr};
+        spv[P_V2COVER] = {SPV(v2_cover), nullptr};
+        spv[P_V2RESCUE] = {SPV(v2_rescue), nullptr};
+        spv[P_V2MERGE] = {SPV(v2_merge), nullptr};
+        spv[P_V2CLOSE] = {SPV(v2_close), nullptr};
         spv[P_SEARCH] = {SPV(v2_search), nullptr};   // search.comp + the temporal seed
         spv[P_LOOKUP] = {SPV(v2_lookup), nullptr};
         spv[P_ERROR] = {SPV(v2_error), nullptr};
@@ -2008,6 +2020,23 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         r.run2(P_V2SMOOTH, p2, divUp(I.fw, 16), divUp(I.fh, 16));
         r.cbar();
         r.stamp("v2 edge field");
+        // the content rescue (I11): content both frames show and the field would show at neither place gets its vector back
+        if (k2.rescue > 0.0f && (int64_t)I.fw * I.fh <= (1 << 23)) {   // (the vote's key holds a 23-bit source index)
+            p2.pf = I.fieldT;
+            p2.rescue = k2.rescue;
+            r.run2(P_V2COVER, p2, divUp(I.fw, 16), divUp(I.fh, 16));
+            r.cbar();
+            r.stamp("v2 cover");
+            r.run2(P_V2RESCUE, p2, divUp(I.fw, 8), divUp(I.fh, 8));   // (one workgroup per 8 x 8 block)
+            r.cbar();
+            r.stamp("v2 rescue");
+            r.run2(P_V2MERGE, p2, divUp(I.fw, 16), divUp(I.fh, 16));
+            r.cbar();
+            r.stamp("v2 merge");
+            r.run2(P_V2CLOSE, p2, divUp(I.fw, 16), divUp(I.fh, 16));
+            r.cbar();
+            r.stamp("v2 close");
+        }
         // occlusion analysis of the edge-aware midpoint field (v2_occl.comp)
         p2.pf = I.fieldT;
         r.run2(P_V2OCCL, p2, divUp(I.fw, 16), divUp(I.fh, 16));
@@ -2056,6 +2085,8 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
     }
     if (mv2) {   // V2: its lookup / mismatch / resolve on the refined field (rf[], the estimate's refinement grid)
         PC2 q = r.pc2();
+        const V2Knobs k2 = Interpolator::v2Knobs(I.set);
+        q.edgeMin = k2.holdFeather; q.confMax = k2.occSoft;   // (synth: motion_v2.glsl's edgeMin / confMax carry them)
         const int rn = I.estRw * I.estRh;
         if (t != 0.5f) {   // 9a. field lookup at time t (refinement grid): rf[0..rn) -> rf[rn..2 rn)
             q.rpf = 0; q.rfOut = rn;
@@ -2163,6 +2194,7 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
         bq.blocks = bp.bw * bp.bh;
         bq.cutSad = bp.cutSad; bq.trust0 = k.trustLow; bq.trustScale = 1.0f / (k.trustHigh - k.trustLow); bq.globalFrac = bp.globalFrac;
         bq.occ0 = k.occLow; bq.occScale = 1.0f / (k.occHigh - k.occLow); bq.pickBias = k.pickBias; bq.zeroBonus = st.hudBonus;
+        bq.feather = k.holdFeather; bq.occSoft = k.occSoft;
         std::memcpy(bq.t, bp.t, sizeof bq.t);
     }
     auto run = [&](BlurPipe p, uint32_t gx, uint32_t gy, uint32_t gz) {
