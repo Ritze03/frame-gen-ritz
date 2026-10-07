@@ -13,6 +13,10 @@
 // whole-frame fallback / scene-cut decisions of the pair's last synth, via Interpolator::recordDebugCounters; read-only).
 // --window N: destroy + init the Interpolator before every N-th pair (pair 0, N, 2N, ..): independent windows of consecutive
 // pairs in one call, no state carried across (bench/score). Neither changes any output.
+// --dump DIR: after each pair write DIR/pair_NNNN.fgmaps (Interpolator::recordDebugMaps, read-only, output unchanged): a 64-byte
+// header (uint32 magic 'FGMP', version 1, W, H, fw, fh, bw, bh, fscale, eStride, float trustLow, trustHigh, smoothBonus, hudBonus,
+// 2 x 0), then the block field (bw*bh vec2 f32), the per-pixel half-vector field (fw*fh vec2 f32, midpoint grid) and the packed
+// mismatch e (eStride*H uint32, 4 px per word, low byte first) of the pair's last record. gpu/fgmaps.py turns it into PNG maps.
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
 
@@ -109,6 +113,7 @@ int main(int argc, char** argv) {
     int bench = 0, mult = 2;
     bool split = false, stats = false;
     int window = 0;
+    const char* dumpDir = nullptr;
     std::vector<float> ts{0.5f};
     framegen::Settings setA;
     char* thenArg = nullptr;
@@ -120,6 +125,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--split")) split = true;
         else if (!strcmp(argv[i], "--stats")) stats = true;
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) window = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dumpDir = argv[++i];
         else if (!strcmp(argv[i], "--set") && i + 1 < argc) { if (!parseSettings(argv[++i], setA)) return 2; }
         else if (!strcmp(argv[i], "--then") && i + 1 < argc) thenArg = argv[++i];
         else if (!strcmp(argv[i], "--t") && i + 1 < argc) {
@@ -129,7 +135,7 @@ int main(int argc, char** argv) {
         else pos.push_back(argv[i]);
     }
     if (pos.size() < 5 || (pos.size() - 2) % 3) {
-        fprintf(stderr, "usage: fgtest [--bgra] [--split] [--t ..] [--set ..] [--then ..] [--stats] [--window N] [--bench N] W H prev.rgba curr.rgba out.rgba [...]\n");
+        fprintf(stderr, "usage: fgtest [--bgra] [--split] [--t ..] [--set ..] [--then ..] [--stats] [--window N] [--dump DIR] [--bench N] W H prev.rgba curr.rgba out.rgba [...]\n");
         return 2;
     }
     framegen::Settings setB = setA;
@@ -254,6 +260,25 @@ int main(int argc, char** argv) {
     info.getMemProps = vkGetPhysicalDeviceMemoryProperties;
     info.settings = setA;
     if (!fg.init(info)) { fprintf(stderr, "fg.init failed (invalid --set?)\n"); return 1; }
+    // --dump: host-visible copy of the debug maps
+    framegen::Interpolator::DebugMapLayout dl{};
+    VkBuffer dmp = VK_NULL_HANDLE;
+    VkDeviceMemory dmpMem = VK_NULL_HANDLE;
+    uint8_t* dmpMap = nullptr;
+    if (dumpDir) {
+        if (!fg.debugMapLayout(dl)) { fprintf(stderr, "debugMapLayout failed\n"); return 1; }
+        VkBufferCreateInfo dbci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        dbci.size = dl.size;
+        dbci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        CK(vkCreateBuffer(dev, &dbci, nullptr, &dmp));
+        VkMemoryRequirements dreq;
+        vkGetBufferMemoryRequirements(dev, dmp, &dreq);
+        VkMemoryAllocateInfo dma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, dreq.size,
+                                 memType(dreq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+        CK(vkAllocateMemory(dev, &dma, nullptr, &dmpMem));
+        CK(vkBindBufferMemory(dev, dmp, dmpMem, 0));
+        CK(vkMapMemory(dev, dmpMem, 0, dl.size, 0, (void**)&dmpMap));
+    }
 
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -297,7 +322,24 @@ int main(int argc, char** argv) {
             VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
             vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
         }
+        if (dumpDir) {
+            if (!fg.recordDebugMaps(cb, dmp, 0)) { fprintf(stderr, "recordDebugMaps failed\n"); return 1; }
+            VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
+        }
         submit();
+        if (dumpDir) {
+            char path[4096];
+            snprintf(path, sizeof path, "%s/pair_%04zu.fgmaps", dumpDir, pairIdx);
+            FILE* f = fopen(path, "wb");
+            if (!f) { fprintf(stderr, "cannot write %s\n", path); return 1; }
+            uint32_t hdr[16]{0x504d4746u, 1, dl.W, dl.H, dl.fw, dl.fh, dl.bw, dl.bh, dl.fscale, dl.eStride};
+            float hf[4]{setB.trustLow, setB.trustHigh, setB.smoothBonus, setB.hudBonus};   // the settings of the last record
+            memcpy(hdr + 10, hf, sizeof hf);
+            fwrite(hdr, 1, sizeof hdr, f);
+            fwrite(dmpMap, 1, dl.size, f);
+            fclose(f);
+        }
         if (stats) printf("STATS %zu %u %u %u %zu\n", pairIdx, dbgMap[0], dbgMap[1], fg.debugSadBlocks(), (size_t)W * H);
         for (size_t k = 0; k < ts.size(); k++) {
             begin();
@@ -388,6 +430,7 @@ int main(int argc, char** argv) {
     }
     vkDestroyBuffer(dev, stg, nullptr);
     vkDestroyBuffer(dev, dbg, nullptr);
+    if (dmp) { vkDestroyBuffer(dev, dmp, nullptr); vkFreeMemory(dev, dmpMem, nullptr); }
     vkFreeMemory(dev, dbgMem, nullptr);
     vkFreeMemory(dev, stgMem, nullptr);
     vkDestroyFence(dev, fence, nullptr);
