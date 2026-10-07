@@ -8,7 +8,7 @@
 //     x = packHalf2x16(background half-vector), y = packHalf2x16(foreground half-vector) (flow-resolution units, like field[]),
 //     z = side: 0 = no clean occlusion, 1 = covered (take prev), 2 = uncovered (take curr), w = 0 (reserved).
 //   words [clsOff, clsOff + eStride H): the class map of the latest synth (debug, recordDebugMaps), one byte per pixel, 4 per
-//     word, low byte first: bits 0-2 class (V2_CLS_*), bit 3 = side curr, bits 4-7 = weight of the hold / one-sided output x 15.
+//     word, low byte first: bits 0-2 class (V2_CLS_*: 0 trusted, 1 held, clean occlusion with 2 the field's vector, 3 vB, 4 vF, 5 zero), bit 3 = side curr, bits 4-7 = weight of the hold / one-sided output x 15.
 
 layout(set = 0, binding = 13, std430) buffer V2Buf { uint v2b[]; };
 
@@ -27,6 +27,7 @@ layout(push_constant) uniform PC2 {
     float pickBias;             // V2Knobs pickBias
     float edgeMin;              // v2_occl: min normal motion difference, flow-resolution half-vector units (occlWidth / fscale)
     float confMax;              // v2_occl: V2Knobs confidence
+    float zeroBonus;            // Settings::hudBonus (the zero candidate at a clean occlusion)
 } pc;
 
 const int E_OFF = 64;          // packed mismatch in u[] (== motion_v1.glsl)
@@ -34,7 +35,7 @@ const int E_OFF = 64;          // packed mismatch in u[] (== motion_v1.glsl)
 const int U_UNTRUSTED = 0;
 #define NEAR_C (pc.wC > 0.5)
 #define MID (pc.wC == 0.5)
-const uint V2_CLS_TRUSTED = 0u, V2_CLS_HELD = 1u, V2_CLS_OCC_FIELD = 2u, V2_CLS_OCC_BG = 3u, V2_CLS_OCC_FG = 4u;
+const uint V2_CLS_TRUSTED = 0u, V2_CLS_HELD = 1u, V2_CLS_OCC_FIELD = 2u, V2_CLS_OCC_BG = 3u, V2_CLS_OCC_FG = 4u, V2_CLS_OCC_ZERO = 5u;
 
 // luma texel of the finest level, clamp to edge; bilinear tap (as motion_v1.glsl's L / sampleL)
 float L(int off, int x, int y, int w, int h) {

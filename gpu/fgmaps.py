@@ -20,9 +20,9 @@ import numpy as np
 CAND_NAMES = ["bilinear", "own", "up", "down", "left", "right", "zero"]
 # colours of the candidate map: bilinear dark grey (the smooth default), own white, neighbours saturated, zero black-blue
 # V2 class map: trusted black, held red, clean occlusion with the field's vector green, with the background vector blue, with the
-# foreground vector magenta; brightness = weight of the held / one-sided output (dim = mostly blended); one-sided from curr: whitened
-CLASS_NAMES = ["trusted", "held", "occ-field", "occ-bg", "occ-fg"]
-CLASS_RGB = np.array([[0, 0, 0], [255, 0, 0], [0, 200, 0], [0, 120, 255], [255, 0, 255]], np.float32)
+# foreground vector magenta, with zero yellow; brightness = weight of the held / one-sided output (dim = mostly blended); one-sided from curr: whitened
+CLASS_NAMES = ["trusted", "held", "occ-field", "occ-bg", "occ-fg", "occ-zero"]
+CLASS_RGB = np.array([[0, 0, 0], [255, 0, 0], [0, 200, 0], [0, 120, 255], [255, 0, 255], [255, 255, 0]], np.float32)
 CAND_RGB = np.array([[60, 60, 60], [255, 255, 255], [255, 60, 60], [60, 255, 60], [60, 120, 255], [255, 220, 0], [0, 0, 140]],
                     np.uint8)
 
@@ -49,7 +49,7 @@ def load(path):
 
 def class_rgb(c):
     """V2 class-map bytes -> RGB"""
-    k = np.minimum(c & 7, 4)
+    k = np.minimum(c & 7, 5)
     w = ((c >> 4) & 15).astype(np.float32) / 15.0
     img = CLASS_RGB[k] * (0.35 + 0.65 * w[..., None])
     sc = ((c & 8) != 0) & (k >= 2)
@@ -129,8 +129,8 @@ def main():
     Image.fromarray(flow_rgb(d["pf"])).save(pre + "_flow.png")
     if d["cls"] is not None:
         Image.fromarray(class_rgb(d["cls"])).save(pre + "_class.png")
-        k = np.minimum(d["cls"] & 7, 4)
-        print("class share:", {CLASS_NAMES[i]: round(float((k == i).mean()), 4) for i in range(5)})
+        k = np.minimum(d["cls"] & 7, 5)
+        print("class share:", {CLASS_NAMES[i]: round(float((k == i).mean()), 4) for i in range(6)})
     print("candidate share:", {CAND_NAMES[k]: round(float((idx == k).mean()), 4) for k in range(7)},
           "unmatched", float((idx == 7).mean()))
 

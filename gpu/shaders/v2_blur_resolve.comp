@@ -20,6 +20,7 @@ float gT = 0.5;    // its time
 #define V2R_OCC0 pc.occ0
 #define V2R_OCCSCALE pc.occScale
 #define V2R_PICKBIAS pc.pickBias
+#define V2R_ZEROBONUS pc.zeroBonus
 #define W_ pc.W
 #define H_ pc.H
 #define FSCALE_ pc.fscale
@@ -80,7 +81,7 @@ void main() {
     int lid = int(gl_LocalInvocationIndex);
     if (lid < pc.n) {
         float x = (2.0 * float(lid) + 1.0 - float(pc.n)) / float(pc.n);
-        wk[lid] = pc.gauss != 0 ? exp(-2.0 * x * x) : 1.0;
+        wk[lid] = (pc.flags & 1) != 0 ? exp(-2.0 * x * x) : 1.0;
     }
     if (lid < 16) cnt[lid] = 0u;
     barrier();
@@ -89,7 +90,7 @@ void main() {
     float meanSad = float(u[1]) * (1.0 / 256.0) / float(pc.blocks);   // U_SADSUM
     bool cut = meanSad > pc.cutSad;
 
-    if (pc.fix == 0) {
+    if ((pc.flags & 2) == 0) {
         tileOut(ivec2(gl_WorkGroupID.xy), true, cut, wsum);
         return;
     }

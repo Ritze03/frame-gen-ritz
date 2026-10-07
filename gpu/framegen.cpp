@@ -185,8 +185,8 @@ static const int kEOff = 64;   // == E_OFF in motion_v1.glsl
 // layout (sizeof(PC) bytes, so the layouts stay one and the descriptor set stays bound); V2's shared passes push PC.
 struct PC2 {
     int32_t W, H, fw, fh, fscale, pf, offA, offC, reach, clsOff;
-    float s, wA, wC, trust0, trustScale, occ0, occScale, pickBias, edgeMin, confMax;
-    int32_t pad_[12];
+    float s, wA, wC, trust0, trustScale, occ0, occScale, pickBias, edgeMin, confMax, zeroBonus;
+    int32_t pad_[11];
 };
 static_assert(sizeof(PC2) == sizeof(PC), "PC2 is pushed over PC's range");
 
@@ -213,8 +213,8 @@ struct BlurPC {
 static_assert(sizeof(BlurPC) <= 128, "push constants beyond the guaranteed minimum");
 // Must match the push-constant block in shaders/blur_motion_v2.glsl (v2_blur_resolve.comp; V2's blur lookup / error push BlurPC).
 struct BlurPC2 {
-    int32_t W, H, fw, fh, fscale, n, blocks, gauss, fix;
-    float cutSad, trust0, trustScale, globalFrac, occ0, occScale, pickBias;
+    int32_t W, H, fw, fh, fscale, n, blocks, flags;   // flags: bit 0 Gaussian, bit 1 the fix-up pass
+    float cutSad, trust0, trustScale, globalFrac, occ0, occScale, pickBias, zeroBonus;
     float t[16];
 };
 static_assert(sizeof(BlurPC2) == sizeof(BlurPC), "BlurPC2 is pushed over BlurPC's range");
@@ -1433,6 +1433,7 @@ struct Rec {
         q.pickBias = k.pickBias;
         q.edgeMin = k.occlWidth / (float)pc.fscale;
         q.confMax = k.confidence;
+        q.zeroBonus = I.set.hudBonus;
         return q;
     }
     void run2(Pipe p, const PC2& q, uint32_t gx, uint32_t gy) {
@@ -2019,15 +2020,15 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     if (v2) {
         const V2Knobs k = Interpolator::v2Knobs(st);
         bq.W = bp.W; bq.H = bp.H; bq.fw = bp.fw; bq.fh = bp.fh; bq.fscale = bp.fscale; bq.n = bp.n;
-        bq.blocks = bp.bw * bp.bh; bq.gauss = bp.gauss;
+        bq.blocks = bp.bw * bp.bh;
         bq.cutSad = bp.cutSad; bq.trust0 = k.trustLow; bq.trustScale = 1.0f / (k.trustHigh - k.trustLow); bq.globalFrac = bp.globalFrac;
-        bq.occ0 = k.occLow; bq.occScale = 1.0f / (k.occHigh - k.occLow); bq.pickBias = k.pickBias;
+        bq.occ0 = k.occLow; bq.occScale = 1.0f / (k.occHigh - k.occLow); bq.pickBias = k.pickBias; bq.zeroBonus = st.hudBonus;
         std::memcpy(bq.t, bp.t, sizeof bq.t);
     }
     auto run = [&](BlurPipe p, uint32_t gx, uint32_t gy, uint32_t gz) {
         I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().blurPipes[p]);
         if (v2 && p == B_RESOLVE) {
-            bq.fix = bp.fix;
+            bq.flags = (bp.gauss ? 1 : 0) | (bp.fix ? 2 : 0);
             I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC2), &bq);
         } else {
             I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC), &bp);

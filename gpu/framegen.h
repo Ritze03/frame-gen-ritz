@@ -569,7 +569,7 @@ public:
     // sub-pixel), the per-pixel half-vector field on the midpoint grid (fw x fh vec2) and the packed full-res mismatch e (one byte per
     // pixel, eStride words per row, 4 pixels per word, low byte first; e of the latest synth, before the 7x7 box). MotionVersion::V2
     // adds the class map of the latest synth at clsOff (same packing as e; per pixel bits 0-2 = class: 0 trusted, 1 held (V1's ramp),
-    // 2 clean occlusion with the field's vector, 3 with the background vector, 4 with the foreground vector; bit 3 = the one-sided side
+    // 2 clean occlusion with the field's vector, 3 with the background vector, 4 with the foreground vector, 5 with zero; bit 3 = the one-sided side
     // is curr (else prev); bits 4-7 = weight x 15 of the held frame (0-1) or of the one-sided warp (2-4)). V1: clsOff = 0, no class map.
     // Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
     struct DebugMapLayout {

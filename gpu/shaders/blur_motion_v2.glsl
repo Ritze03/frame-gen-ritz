@@ -11,14 +11,14 @@ layout(push_constant) uniform BPC2 {
     int fscale;        // flow scale (1, 2, 4)
     int n;             // samples of the output
     int blocks;        // finest block count bw * bh (scene-cut mean)
-    int gauss;         // 0 = even weights, 1 = Gaussian
-    int fix;           // 0 = main pass (counts the untrusted pixels), 1 = fix-up pass (redoes the output if needed)
+    int flags;         // bit 0: Gaussian weights (else even); bit 1: the fix-up pass (redoes the output if needed; else the main pass,
+                       // which counts the untrusted pixels)
     float cutSad, trust0, trustScale, globalFrac;   // runtime settings (trust: V2Knobs trustLow / trustHigh)
-    float occ0, occScale, pickBias;                 // V2Knobs: the occlusion ramp, pickBias
+    float occ0, occScale, pickBias, zeroBonus;      // V2Knobs: the occlusion ramp, pickBias; Settings::hudBonus
     float t[16];       // time of each sample, in [0, 1]; <= 0 / >= 1 = the real frame prev / curr
 } pc;
 
-const uint V2_CLS_TRUSTED = 0u, V2_CLS_HELD = 1u, V2_CLS_OCC_FIELD = 2u, V2_CLS_OCC_BG = 3u, V2_CLS_OCC_FG = 4u;
+const uint V2_CLS_TRUSTED = 0u, V2_CLS_HELD = 1u, V2_CLS_OCC_FIELD = 2u, V2_CLS_OCC_BG = 3u, V2_CLS_OCC_FG = 4u, V2_CLS_OCC_ZERO = 5u;
 int eStride() { return (pc.W + 3) >> 2; }
 int eWords() { return eStride() * pc.H; }
 const int CNT0 = 32;      // u[CNT0 + k]: untrusted-pixel count of sample k (== blur_motion_v1.glsl)

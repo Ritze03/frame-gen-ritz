@@ -4,18 +4,20 @@
 //   V2R_HV(p)                   the full-res half-vector of the field at t at p
 //   V2R_MIS(p, hv, wa, wc)      motion_v1.glsl's mismatch() with the half-vector hv: the two warped taps, returns e
 //   V2R_S, V2R_WA, V2R_WC       2t - 1, 1 - t, t
-//   V2R_TRUST0, V2R_TRUSTSCALE  the held class's ramp; V2R_OCC0, V2R_OCCSCALE the occlusion ramp; V2R_PICKBIAS
+//   V2R_TRUST0, V2R_TRUSTSCALE  the held class's ramp; V2R_OCC0, V2R_OCCSCALE the occlusion ramp; V2R_PICKBIAS; V2R_ZEROBONUS
+//                               (Settings::hudBonus)
 //   occAt(p, hv, s)             the occlusion map entry of pixel p (motion_v2.glsl)
 //   W_, H_, FSCALE_             the full resolution and the flow scale
 //
 // Per pixel p, with e7 = 7x7 mean of e (V1's box) and Ut = ramp(e7) (V1's trust):
 //   no clean occlusion at p (occlusion map side 0):  out = mix(blend, nearer real frame unwarped, Ut)   == V1 (trusted / held)
-//   clean occlusion (side a or c, vectors vB, vF):   three 3x3 mismatch means, of the field's vector (e0), of vB (eb) and of vF (ef),
-//     each pixel of the 3x3 with its own vectors. The best of them (a side vector only if lower by more than pickBias) gives the
-//     two-sided blend Mk and its mismatch ek; w = occlusion ramp(ek);
+//   clean occlusion (side a or c, vectors vB, vF):   four 3x3 mismatch means, of the field's vector (e0), of vB (eb), of vF (ef) and
+//     of zero (ez), each pixel of the 3x3 with its own vectors. The best of them (another than the field's only if lower by more than
+//     pickBias; zero with the hudBonus as in pixfield.comp) gives the two-sided blend Mk and its mismatch ek; w = occlusion ramp(ek);
 //     out = mix(Mk, one-sided warp with vB from the side (a: warped prev, c: warped curr), w).
 //   So a pixel that one of the three vectors explains is blended with it (a foreground pixel the field gave the background's vector
-//   gets the foreground's back: no background over the character), and a pixel none explains (the occluded strip) shows the
+//   gets the foreground's back: no background over the character; static HUD text between two moving sides keeps zero), and a pixel
+//   none explains (the occluded strip) shows the
 //   background from the one frame that sees it instead of V1's held patch. The 3x3 instead of V1's 7x7 keeps the occlusion classes to
 //   the strip itself. At the edge of a clean occlusion region the result fades into V1's by the share of the 3x3 that has one.
 // The untrusted count of the whole-frame fallback is V1's (Ut > 0.5), so its decisions and the bench's fallback% compare with V1.
@@ -24,6 +26,7 @@ const int TS = 16, AP = 3, TT = TS + 2 * AP, TB = TS + 2;
 shared float te[TT * TT];   // e of the tile + 3 (7x7 box)
 shared float hs[TT * TS];   // horizontal 7-sums
 shared float tb[TB * TB], tf[TB * TB];   // e of vB / vF of the tile + 1 (= e where the pixel has no clean occlusion)
+shared float tz[TB * TB];                 // e of the zero vector (= e where the pixel has no clean occlusion)
 shared float tg[TB * TB];                 // 1 = the pixel has a clean occlusion
 
 struct V2Px {
@@ -56,15 +59,17 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
     for (int i = lid; i < TB * TB; i += TS * TS) {   // the tile + 1: e of the two side vectors where there is a clean occlusion
         ivec2 q = clamp(b0 + ivec2(i % TB, i / TB), ivec2(0), ivec2(W_ - 1, H_ - 1));
         float e = te[(i / TB + AP - 1) * TT + i % TB + AP - 1];
-        float eb = e, ef = e;
+        float eb = e, ef = e, ez = e;
         uvec4 oc = occAt(q, V2R_HV(q), V2R_S);
         if (oc.z != 0u) {
             vec3 wa, wc;
             eb = float(V2R_MIS(q, float(FSCALE_) * unpackHalf2x16(oc.x), wa, wc));
             ef = float(V2R_MIS(q, float(FSCALE_) * unpackHalf2x16(oc.y), wa, wc));
+            ez = float(V2R_MIS(q, vec2(0.0), wa, wc));
         }
         tb[i] = eb;
         tf[i] = ef;
+        tz[i] = ez;
         tg[i] = oc.z != 0u ? 1.0 : 0.0;
     }
     barrier();
@@ -92,15 +97,16 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         return r;
     }
     // clean occlusion
-    float e0 = 0.0, eb = 0.0, ef = 0.0, g = 0.0;
+    float e0 = 0.0, eb = 0.0, ef = 0.0, ez = 0.0, g = 0.0;
     for (int y = 0; y < 3; y++)
         for (int x = 0; x < 3; x++) {
             e0 += te[(l.y + y + AP - 1) * TT + l.x + x + AP - 1];
             eb += tb[(l.y + y) * TB + l.x + x];
             ef += tf[(l.y + y) * TB + l.x + x];
+            ez += tz[(l.y + y) * TB + l.x + x];
             g += tg[(l.y + y) * TB + l.x + x];
         }
-    e0 *= 1.0 / 9.0; eb *= 1.0 / 9.0; ef *= 1.0 / 9.0;
+    e0 *= 1.0 / 9.0; eb *= 1.0 / 9.0; ef *= 1.0 / 9.0; ez *= 1.0 / 9.0;
     vec2 vB = float(FSCALE_) * unpackHalf2x16(oc.x), vF = float(FSCALE_) * unpackHalf2x16(oc.y);
     vec3 ba, bc;
     V2R_MIS(p, vB, ba, bc);
@@ -113,6 +119,12 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         vec3 fa, fc;
         V2R_MIS(p, vF, fa, fc);
         mk = v2Blend(fa, fc);
+    }
+    if (ez - V2R_ZEROBONUS + V2R_PICKBIAS < ek) {
+        ek = max(ez - V2R_ZEROBONUS, 0.0); k = V2_CLS_OCC_ZERO;
+        vec3 za, zc;
+        V2R_MIS(p, vec2(0.0), za, zc);
+        mk = v2Blend(za, zc);
     }
     float w = clamp((ek - V2R_OCC0) * V2R_OCCSCALE, 0.0, 1.0);
     vec3 one = oc.z == 1u ? ba : bc;   // covered: prev sees it; uncovered: curr
