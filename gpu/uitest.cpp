@@ -1481,6 +1481,9 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const c
     return vkGetDeviceProcAddr(d, name);
 }
 static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : "V1"; }
+// The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes;
+// V2 = the same plus its occlusion analysis (v2_occl.comp; its resolve and blur resolve replace V1's, they do not add).
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : 14; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1488,8 +1491,9 @@ static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "
 //   A switch drops the estimate: recordSynth / recordSynthBlur of the pair return false until a new recordEstimate, also after
 //   switching straight back (an estimate of one version is never synthesised by the other); setSettings without a switch keeps it.
 //   The new version's output equals a fresh instance's in that version.
-//   releaseUnusedMotion(): the first switch to a version creates its pipelines, the release frees the unselected version's (and
-//   nothing while there is none), selecting it again re-creates them and gives the same output as before; destroy() frees all.
+//   releaseUnusedMotion(): the first switch to a version creates its pipelines (versionPipes()), the release frees the unselected
+//   version's (and nothing while there is none), selecting it again re-creates them and gives the same output as before; destroy()
+//   frees all.
 static void motionCheck(const Scene& sc) {
     const int W = sc.W, H = sc.H;
     const MotionVersion from = gAlgo, to = gAlgo == MotionVersion::V1 ? MotionVersion::V2 : MotionVersion::V1;
@@ -1508,6 +1512,25 @@ static void motionCheck(const Scene& sc) {
         expect(v2Refused, "settingsError: V2 refused for Rgb10, RgbaF16, Nv12 and P010");
         printf("    reason: %s\n", Interpolator::settingsError(v2, Format::Rgb10));
         expect(Interpolator::settingsError(bad, Format::Rgba8) != nullptr, "settingsError refuses what validate refuses");
+        {   // V2's preset and knobs (Settings::v2Preset, v2*: -1 = the preset's value)
+            Settings k = v2;
+            bool ok = Interpolator::validate(k);
+            k.v2Preset = (MotionPreset)4; ok = ok && !Interpolator::validate(k);
+            k = v2; k.v2OcclWidth = 0.4f; ok = ok && !Interpolator::validate(k);
+            k = v2; k.v2Reach = 17.0f; ok = ok && !Interpolator::validate(k);
+            k = v2; k.v2OccLow = 50.0f; ok = ok && !Interpolator::validate(k);   // the inherited occHigh (trustHigh 40) is below it
+            k.v2OccHigh = 80.0f; ok = ok && Interpolator::validate(k);
+            k = v2; k.v2TrustLow = 30.0f; k.v2TrustHigh = 30.5f; ok = ok && !Interpolator::validate(k);
+            expect(ok, "validate: V2 preset A-D only, knobs -1 or in range, effective ramps high >= low + 1");
+            Settings a = v2, d = v2;
+            a.trustLow = 10.0f; a.trustHigh = 30.0f;
+            d.v2Preset = MotionPreset::D;
+            const V2Knobs ka = Interpolator::v2Knobs(a), kd = Interpolator::v2Knobs(d);
+            a.v2Reach = 5.0f;
+            expect(ka.trustLow == 10.0f && ka.trustHigh == 30.0f && ka.occLow == 10.0f && ka.occHigh == 30.0f &&
+                   kd.trustLow == 16.0f && kd.trustHigh == 48.0f && Interpolator::v2Knobs(a).reach == 5.0f,
+                   "v2Knobs: A inherits trustLow / trustHigh (and the occlusion ramp from them), D uses 16 / 48, a knob overrides");
+        }
         // init() of a non-SDR view format with V2: false before anything is created, with that reason (RgbaF16 also linear)
         const VkFormat vfs[5] = {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
                                  VK_FORMAT_R8_UNORM, VK_FORMAT_R16_UNORM};
@@ -1577,18 +1600,19 @@ static void motionCheck(const Scene& sc) {
     expect(fg.setSettings(sTo), "switch accepted");
     const int64_t k = gLivePipes - p0;
     printf("    pipelines: %lld after init, +%lld for the first switch to %s\n", (long long)p0, (long long)k, algoName(to));
-    expect(k > 0, "the first switch creates the new version's pipelines");
+    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 15)");
+    const int64_t pTo = p0 - versionPipes(from) + versionPipes(to);   // after releasing the start version
     expect(!run(fg, false, nullptr) && blurRefused(fg), "after the switch the old estimate is gone: recordSynth and recordSynthBlur return false");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "switching back creates nothing (the start version kept its pipelines)");
     expect(!run(fg, false, nullptr), "switching straight back does not revive the dropped estimate");
     expect(fg.setSettings(sTo) && run(fg, true, &outC), "a new estimate in the new version synthesises");
     expect(outC == outR, "the new version's output equals a fresh instance's in that version");
-    printf("    (%s output %s %s's: V2 aliases V1's passes for now)\n", algoName(to), outC == outA ? "equals" : "DIFFERS FROM", algoName(from));
+    expect(outC != outA, "V1 and V2 give different outputs (V2 has its own resolve)");
     vkDeviceWaitIdle(dev);
     fg.releaseUnusedMotion();
-    expect(gLivePipes == p0, "releaseUnusedMotion frees the unselected version's pipelines");
+    expect(gLivePipes == pTo, "releaseUnusedMotion frees the unselected version's pipelines");
     fg.releaseUnusedMotion();
-    expect(gLivePipes == p0, "a second releaseUnusedMotion frees nothing (nothing unused)");
+    expect(gLivePipes == pTo, "a second releaseUnusedMotion frees nothing (nothing unused)");
     expect(run(fg, true, &outC) && outC == outR, "the selected version still works after the release");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "selecting the released version again re-creates its pipelines");
     expect(run(fg, true, &outD) && outD == outA, "the re-created version gives the same output as before the release");
