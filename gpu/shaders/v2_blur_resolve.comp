@@ -1,0 +1,108 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2, motion blur pass 3 (+ 4) (replaces blur_resolve.comp): out = round(sum_k w_k * frame_k), where frame_k is the 8-bit result
+// V2's recordSynth(t_k) would have produced (v2_resolve_core.glsl per sample, then fallback.comp's whole-frame decisions), and a sample
+// with t <= 0 / t >= 1 is the real frame prev / curr. Structure, weights, counting and the fix-up pass as blur_resolve.comp (see there).
+#include "blur_common.glsl"
+#include "blur_motion_v2.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+int gSlot = 0;     // the sample the core is resolving
+float gT = 0.5;    // its time
+#define V2R_E(p) eAt(gSlot, p)
+#define V2R_HV(p) halfVec(gSlot, p)
+#define V2R_MIS(p, hv, wa, wc) mismatchV(gT, p, hv, wa, wc)
+#define V2R_S (2.0 * gT - 1.0)
+#define V2R_WA (1.0 - gT)
+#define V2R_WC gT
+#define V2R_TRUST0 pc.trust0
+#define V2R_TRUSTSCALE pc.trustScale
+#define V2R_OCC0 pc.occ0
+#define V2R_OCCSCALE pc.occScale
+#define V2R_PICKBIAS pc.pickBias
+#define V2R_ZEROBONUS pc.zeroBonus
+#define W_ pc.W
+#define H_ pc.H
+#define FSCALE_ pc.fscale
+#include "v2_resolve_core.glsl"
+
+shared float wk[16];
+shared uint cnt[16];
+
+// One 16x16 tile: all threads of the workgroup. counting: add this tile's untrusted counts to u[CNT0 + k].
+void tileOut(ivec2 tile, bool counting, bool cut, float wsum) {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 p = tile * TS + ivec2(gl_LocalInvocationID.xy);
+    bool inside = p.x < pc.W && p.y < pc.H;
+    vec3 acc = vec3(0.0);
+    float accA = 0.0;
+    float untrustedLimit = pc.globalFrac * float(pc.W) * float(pc.H);
+    for (int k = 0; k < pc.n; k++) {
+        float t = pc.t[k];
+        vec3 v = vec3(0.0);
+        float a = 0.0;
+        if (t <= 0.0 || t >= 1.0) {   // a real frame
+            if (inside) {
+                vec4 r = t >= 1.0 ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
+                v = FG_FETCH(r.rgb);
+                a = r.a;
+            }
+        } else {
+            bool nearC = t > 0.5;
+            bool fb = cut || (!counting && float(u[CNT0 + k]) > untrustedLimit);   // uniform across the workgroup
+            if (fb) {
+                if (inside) {
+                    vec4 r = nearC ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
+                    v = FG_FETCH(r.rgb);
+                    a = r.a;
+                }
+            } else {
+                gSlot = k;
+                gT = t;
+                V2Px r = v2ResolvePixel(tile, nearC);
+                if (inside) {
+                    if (counting && r.untrusted) atomicAdd(cnt[k], 1u);
+                    v = clamp(floor(r.o + 0.5), 0.0, 255.0);
+                    a = r.alpha;
+                }
+            }
+        }
+        acc += wk[k] * v;
+        accA += wk[k] * a;
+    }
+    if (inside) imageStore(outImg, p, FG_STORE(acc / wsum, accA / wsum));
+    if (counting) {
+        barrier();
+        if (lid < pc.n && cnt[lid] > 0u) atomicAdd(u[CNT0 + lid], cnt[lid]);
+    }
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    if (lid < pc.n) {
+        float x = (2.0 * float(lid) + 1.0 - float(pc.n)) / float(pc.n);
+        wk[lid] = (pc.flags & 1) != 0 ? exp(-2.0 * x * x) : 1.0;
+    }
+    if (lid < 16) cnt[lid] = 0u;
+    barrier();
+    float wsum = 0.0;
+    for (int k = 0; k < pc.n; k++) wsum += wk[k];
+    float meanSad = float(u[1]) * (1.0 / 256.0) / float(pc.blocks);   // U_SADSUM
+    bool cut = meanSad > pc.cutSad;
+
+    if ((pc.flags & 2) == 0) {
+        tileOut(ivec2(gl_WorkGroupID.xy), true, cut, wsum);
+        return;
+    }
+    if (cut) return;
+    bool flicked = false;
+    float untrustedLimit = pc.globalFrac * float(pc.W) * float(pc.H);
+    for (int k = 0; k < pc.n; k++)
+        if (pc.t[k] > 0.0 && pc.t[k] < 1.0 && float(u[CNT0 + k]) > untrustedLimit) flicked = true;
+    if (!flicked) return;
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++) {
+            ivec2 tile = ivec2(gl_WorkGroupID.xy) * 4 + ivec2(i, j);
+            if (tile.x * TS < pc.W && tile.y * TS < pc.H) tileOut(tile, false, false, wsum);
+        }
+}

@@ -29,6 +29,9 @@
 #include "blur_lookup_spv.h"
 #include "blur_error_spv.h"
 #include "blur_resolve_spv.h"
+#include "v2_occl_spv.h"
+#include "v2_resolve_spv.h"
+#include "v2_blur_resolve_spv.h"
 
 // The colour shaders of the formats other than Rgba8 (shaders/format.glsl), when built.
 // rgb10: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
@@ -178,6 +181,15 @@ struct PC {
 static_assert(sizeof(PC) <= 128, "push constants beyond the guaranteed minimum");
 static const int kEOff = 64;   // == E_OFF in motion_v1.glsl
 
+// Must match the push-constant block in shaders/motion_v2.glsl. V2's own passes push it over the same range of the same pipeline
+// layout (sizeof(PC) bytes, so the layouts stay one and the descriptor set stays bound); V2's shared passes push PC.
+struct PC2 {
+    int32_t W, H, fw, fh, fscale, pf, offA, offC, reach, clsOff;
+    float s, wA, wC, trust0, trustScale, occ0, occScale, pickBias, edgeMin, confMax, zeroBonus;
+    int32_t pad_[11];
+};
+static_assert(sizeof(PC2) == sizeof(PC), "PC2 is pushed over PC's range");
+
 // Must match the push-constant block in shaders/ui_common.glsl.
 struct UiPC {
     int32_t W, H, boxX, boxY, boxW, boxH, cell, cw, ch, wholeScreen, still;
@@ -199,6 +211,13 @@ struct BlurPC {
     float t[16];
 };
 static_assert(sizeof(BlurPC) <= 128, "push constants beyond the guaranteed minimum");
+// Must match the push-constant block in shaders/blur_motion_v2.glsl (v2_blur_resolve.comp; V2's blur lookup / error push BlurPC).
+struct BlurPC2 {
+    int32_t W, H, fw, fh, fscale, n, blocks, flags;   // flags: bit 0 Gaussian, bit 1 the fix-up pass
+    float cutSad, trust0, trustScale, globalFrac, occ0, occScale, pickBias, zeroBonus;
+    float t[16];
+};
+static_assert(sizeof(BlurPC2) == sizeof(BlurPC), "BlurPC2 is pushed over BlurPC's range");
 enum BlurPipe { B_LOOKUP, B_ERROR, B_RESOLVE, B_COUNT_ };
 static const int kBlurCnt0 = 32;   // == CNT0 in blur_motion_v1.glsl: u[] words 32.. hold the per-sample untrusted counts
 
@@ -221,20 +240,22 @@ struct UiEntry {
     bool active = false;                // in the LRU set (Settings::uiHistory of them); an inactive one keeps its memory
 };
 
-enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP, P_COUNT };
+enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
+            P_V2OCCL,   // V2 only: v2_occl.comp (V1's group leaves it null)
+            P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
 // The resources of one motion version (Settings::motionVersion): created by motionEnsure() the first time the version is selected
 // (init, setSettings, reconfigure), kept while another one is selected, freed by releaseUnusedMotion() / destroy(). V1: the pipelines
-// of the estimate / synth passes and of the motion-blur passes over the shared layouts, set rings and scratch buffers. V2 aliases V1
-// for now: its group holds its own pipelines of V1's shaders, so the switch, the release and the re-creation are the real ones; its
-// own shaders (v2_*.comp) replace them, and its own size-dependent buffers go into `bufs` (created by motionSized()).
+// of the estimate / synth passes and of the motion-blur passes over the shared layouts, set rings and scratch buffers. V2: its own
+// pipelines (of V1's shaders for the passes it shares, of v2_*.comp for its own: P_V2OCCL, P_RESOLVE, B_RESOLVE) and its buffer
+// (bufs[0], binding 13: the occlusion map + the class map, motion_v2.glsl; created by motionSized()).
 static const int kMotionVersions = 2;   // MotionVersion::V1, V2
 struct MotionGroup {
     VkPipeline pipes[P_COUNT]{};
     VkPipeline blurPipes[B_COUNT_]{};
-    std::vector<UiBuf> bufs;   // size-dependent buffers of this version only (none yet), freed with the size like buf[]
+    std::vector<UiBuf> bufs;   // size-dependent buffers of this version only (V2: bufs[0]), freed with the size like buf[]
     bool live = false;         // created (the pipelines; the buffers whenever a size is held)
 };
 
@@ -360,6 +381,9 @@ struct Interpolator::Impl {
     uint32_t qcount = 0;
 
     VkDescriptorSet takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur = false, RejPair rej = {});
+    // V2's buffer (binding 13) when V2 is selected and sized, else null (V1's sets leave binding 13 unwritten: no V1 shader declares it)
+    VkBuffer v2Buf() { MotionGroup& g = mg(); return set.motionVersion == MotionVersion::V2 && !g.bufs.empty() ? g.bufs[0].b : VK_NULL_HANDLE; }
+    VkDeviceSize v2OccWords() const { return (VkDeviceSize)4 * fw * fh; }   // V2's occlusion map, in words; the class map follows
     bool framesOk(const Frame& a) const { return a.view && (!yuv || a.chroma); }
     bool createSizeDependent();
     bool rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force);
@@ -511,7 +535,7 @@ bool Interpolator::Impl::allocBuf(UiBuf& b, VkDeviceSize bytes) {
     b = UiBuf{};
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // src: recordDebugMaps
     if (CreateBuffer(info.device, &bci, nullptr, &b.b) != VK_SUCCESS) { b.b = VK_NULL_HANDLE; return false; }
     VkMemoryRequirements req;
     GetBufferMemoryRequirements(info.device, b.b, &req);
@@ -845,9 +869,10 @@ bool Interpolator::init(const InitInfo& ii) {
     if (m->CreateSampler(d, &sci, nullptr, &m->sampler) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
 
     // bindings 0-2 buffers, 3-4 prev/curr, 5 out; 6-7: motion-blur scratch (only the blur passes use them);
-    // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out; 11-12 (synth sets): the V2 masks of prev / curr (ui_reject.glsl)
+    // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out; 11-12 (synth sets): the V2 masks of prev / curr (ui_reject.glsl);
+    // 13: MotionVersion::V2's buffer (motion_v2.glsl; written only into the sets of V2 records)
     uint32_t nb = m->yuv ? 11 : 8;
-    VkDescriptorSetLayoutBinding b[13]{};
+    VkDescriptorSetLayoutBinding b[14]{};
     VkDescriptorType types[11] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -861,7 +886,7 @@ bool Interpolator::init(const InitInfo& ii) {
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         if (i == 3 || i == 4 || i == 8 || i == 9) b[i].pImmutableSamplers = &m->sampler;
     }
-    for (uint32_t k = 11; k <= 12; k++, nb++) {
+    for (uint32_t k = 11; k <= 13; k++, nb++) {
         b[nb].binding = k;
         b[nb].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         b[nb].descriptorCount = 1;
@@ -1033,6 +1058,7 @@ bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool forc
     return true;
 }
 
+static bool v2Valid(const Settings& s);
 bool Interpolator::validate(const Settings& s) {
     auto in = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
     return in(s.trustLow, 0.0f, 255.0f) && in(s.trustHigh, 0.0f, 255.0f) && s.trustHigh - s.trustLow >= 1.0f &&
@@ -1050,7 +1076,43 @@ bool Interpolator::validate(const Settings& s) {
            s.uiInpaintReach >= 1 && s.uiInpaintReach <= 16 &&
            in(s.uiMaxStillFraction, 0.0f, 1.0f) && s.uiMaxStillFraction > 0.0f &&
            in(s.uiContrastThreshold, 0.0f, 255.0f) && s.uiLeaveFrames >= 1 && s.uiLeaveFrames <= 255 && s.uiReentryFrames <= 255 &&
-           s.uiHistory >= kUiFrames && s.uiHistory <= kUiFramesMax;
+           s.uiHistory >= kUiFrames && s.uiHistory <= kUiFramesMax && v2Valid(s);
+}
+
+// MotionVersion::V2: the knob values of each preset (MotionPreset A-D, in order). -1 for the trust ramp = Settings::trustLow / trustHigh,
+// -1 for the occlusion ramp = the effective trust ramp. Fields: occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow,
+// trustHigh (V2Knobs).
+static const V2Knobs kV2Presets[4] = {
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f},    // A balanced
+    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f},     // B strict
+    {1.0f, 6.0f, 30.0f, -1.0f, -1.0f, 0.5f, -1.0f, -1.0f},    // C wide
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f},    // D soft (wider trust ramp)
+};
+
+V2Knobs Interpolator::v2Knobs(const Settings& s) {
+    V2Knobs k = kV2Presets[std::min((uint32_t)s.v2Preset, 3u)];
+    auto ov = [](float& knob, float v) { if (v != -1.0f) knob = v; };
+    ov(k.occlWidth, s.v2OcclWidth); ov(k.reach, s.v2Reach); ov(k.confidence, s.v2Confidence);
+    ov(k.occLow, s.v2OccLow); ov(k.occHigh, s.v2OccHigh); ov(k.pickBias, s.v2PickBias);
+    ov(k.trustLow, s.v2TrustLow); ov(k.trustHigh, s.v2TrustHigh);
+    if (k.trustLow == -1.0f) k.trustLow = s.trustLow;
+    if (k.trustHigh == -1.0f) k.trustHigh = s.trustHigh;
+    if (k.occLow == -1.0f) k.occLow = k.trustLow;
+    if (k.occHigh == -1.0f) k.occHigh = k.trustHigh;
+    k.reach = std::nearbyint(k.reach);
+    return k;
+}
+
+// The V2 fields: each -1 (the preset's value) or in its range; the effective ramps are proper (high >= low + 1).
+static bool v2Valid(const Settings& s) {
+    auto in = [](float v, float lo, float hi) { return v == -1.0f || (std::isfinite(v) && v >= lo && v <= hi); };
+    if ((uint32_t)s.v2Preset > (uint32_t)MotionPreset::D) return false;
+    if (!in(s.v2OcclWidth, 0.5f, 64.0f) || !in(s.v2Reach, 1.0f, 16.0f) || !in(s.v2Confidence, 1.0f, 255.0f) ||
+        !in(s.v2OccLow, 0.0f, 255.0f) || !in(s.v2OccHigh, 0.0f, 255.0f) || !in(s.v2PickBias, 0.0f, 255.0f) ||
+        !in(s.v2TrustLow, 0.0f, 255.0f) || !in(s.v2TrustHigh, 0.0f, 255.0f))
+        return false;
+    const V2Knobs k = Interpolator::v2Knobs(s);
+    return k.trustHigh - k.trustLow >= 1.0f && k.occHigh - k.occLow >= 1.0f;
 }
 
 const char* Interpolator::settingsError(const Settings& s, Format f) {
@@ -1106,16 +1168,22 @@ void Interpolator::releaseUnusedMotion() {
 bool Interpolator::Impl::motionEnsure() {
     MotionGroup& g = mg();
     if (g.live) return true;
-    // V1 (and V2 while it aliases V1): the motion estimate is the same code for every format; the four colour passes of the
-    // estimate/synth set are the format's, as are the two colour passes of the blur
+    // V1: the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's,
+    // as are the two colour passes of the blur. V2 (Rgba8 only: settingsError()): V1's passes but for its occlusion analysis (in the
+    // estimate), its resolve and its blur resolve.
     struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
         {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
         {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
-        {SPV(lookup), nullptr}};
+        {SPV(lookup), nullptr}, {Spv{}, nullptr}};
     struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
+    if (set.motionVersion == MotionVersion::V2) {
+        spv[P_V2OCCL] = {SPV(v2_occl), nullptr};
+        spv[P_RESOLVE] = {SPV(v2_resolve), nullptr};
+        bspv[B_RESOLVE] = {SPV(v2_blur_resolve), nullptr};
+    }
     bool ok = true;
-    for (int i = 0; ok && i < P_COUNT; i++) ok = makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
+    for (int i = 0; ok && i < P_COUNT; i++) ok = !spv[i].sp.code || makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
     for (int i = 0; ok && i < B_COUNT_; i++) ok = makePipe(bspv[i].sp, blurLayout, g.blurPipes[i], bspv[i].sc);
     ok = ok && (!W || motionSized(g));
     if (!ok) { motionFree(g); return false; }
@@ -1124,9 +1192,13 @@ bool Interpolator::Impl::motionEnsure() {
 }
 
 // The size-dependent buffers of one motion version, beside the shared buf[] (called while a size is held: by motionEnsure and
-// createSizeDependent; destroySizeDependent frees them). V1 and today's V2 have none of their own.
+// createSizeDependent; destroySizeDependent frees them). V1 has none of its own; V2 its buffer (motion_v2.glsl): the occlusion map
+// (one uvec4 per flow pixel) and the class map (one byte per pixel).
 bool Interpolator::Impl::motionSized(MotionGroup& g) {
-    (void)g;
+    if (&g != &mo[(int)MotionVersion::V2] || !g.bufs.empty()) return true;
+    UiBuf b;
+    if (!allocBuf(b, (v2OccWords() + (VkDeviceSize)((W + 3) / 4) * H) * 4)) return false;
+    g.bufs.push_back(b);
     return true;
 }
 
@@ -1223,6 +1295,11 @@ bool Interpolator::debugMapLayout(DebugMapLayout& l) const {
     l.pixOff = (VkDeviceSize)l.bw * l.bh * 8;
     l.eOff = l.pixOff + (VkDeviceSize)l.fw * l.fh * 8;
     l.size = l.eOff + (VkDeviceSize)l.eStride * l.H * 4;
+    l.clsOff = 0;
+    if (I.set.motionVersion == MotionVersion::V2) {   // + the class map of V2's resolve
+        l.clsOff = l.size;
+        l.size += (VkDeviceSize)l.eStride * l.H * 4;
+    }
     return true;
 }
 
@@ -1236,8 +1313,14 @@ bool Interpolator::recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSiz
     VkBufferCopy f[2] = {{(VkDeviceSize)blockIn * 8, dstOffset + L.blockOff, L.pixOff - L.blockOff},
                          {(VkDeviceSize)I.fieldPF * 8, dstOffset + L.pixOff, L.eOff - L.pixOff}};
     I.CmdCopyBuffer(cb, I.buf[1], dst, 2, f);
-    VkBufferCopy e{(VkDeviceSize)kEOff * 4, dstOffset + L.eOff, L.size - L.eOff};
+    VkBufferCopy e{(VkDeviceSize)kEOff * 4, dstOffset + L.eOff, (VkDeviceSize)L.eStride * L.H * 4};
     I.CmdCopyBuffer(cb, I.buf[2], dst, 1, &e);
+    if (L.clsOff) {
+        VkBuffer vb = I.v2Buf();
+        if (!vb) return false;
+        VkBufferCopy c{I.v2OccWords() * 4, dstOffset + L.clsOff, (VkDeviceSize)L.eStride * L.H * 4};
+        I.CmdCopyBuffer(cb, vb, dst, 1, &c);
+    }
     return true;
 }
 
@@ -1253,7 +1336,8 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
                                    {VK_NULL_HANDLE, curr.chroma, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, out.chroma, VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorBufferInfo rj[2] = {{rej.a ? rej.a : rejNone.b, 0, VK_WHOLE_SIZE}, {rej.c ? rej.c : rejNone.b, 0, VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet wr[13]{};
+    VkDescriptorBufferInfo v2i{v2Buf(), 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet wr[14]{};
     uint32_t n = 0;
     auto add = [&](uint32_t binding, VkDescriptorType t) -> VkWriteDescriptorSet& {
         VkWriteDescriptorSet& w = wr[n++];
@@ -1287,6 +1371,7 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
         add(11, BUF).pBufferInfo = &rj[0];
         add(12, BUF).pBufferInfo = &rj[1];
     }
+    if (v2i.buffer) add(13, BUF).pBufferInfo = &v2i;   // V2 records only
     UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
     return set;
 }
@@ -1333,6 +1418,27 @@ struct Rec {
     void run(Pipe p, uint32_t gx, uint32_t gy) {
         I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().pipes[p]);
         I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
+        I.CmdDispatch(cb, gx, gy, 1);
+    }
+    // V2's own passes: motion_v2.glsl's block, from this record's PC and the V2 knobs
+    PC2 pc2() const {
+        const V2Knobs k = Interpolator::v2Knobs(I.set);
+        PC2 q{};
+        q.W = pc.W; q.H = pc.H; q.fw = pc.fw; q.fh = pc.fh; q.fscale = pc.fscale; q.pf = pc.pf;
+        q.reach = (int)k.reach;
+        q.clsOff = (int)I.v2OccWords();
+        q.s = pc.s; q.wA = pc.wA; q.wC = pc.wC;
+        q.trust0 = k.trustLow; q.trustScale = 1.0f / (k.trustHigh - k.trustLow);
+        q.occ0 = k.occLow; q.occScale = 1.0f / (k.occHigh - k.occLow);
+        q.pickBias = k.pickBias;
+        q.edgeMin = k.occlWidth / (float)pc.fscale;
+        q.confMax = k.confidence;
+        q.zeroBonus = I.set.hudBonus;
+        return q;
+    }
+    void run2(Pipe p, const PC2& q, uint32_t gx, uint32_t gy) {
+        I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().pipes[p]);
+        I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC2), &q);
         I.CmdDispatch(cb, gx, gy, 1);
     }
 };
@@ -1789,6 +1895,14 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     r.run(P_PIXFIELD, divUp(I.fw, 16), divUp(I.fh, 16));
     r.cbar();
     r.stamp("pixel field");
+    if (I.set.motionVersion == MotionVersion::V2) {   // V2: occlusion analysis of the midpoint field (v2_occl.comp)
+        PC2 p2 = r.pc2();
+        p2.pf = I.fieldPF;
+        p2.offA = l0.offA; p2.offC = l0.offC;
+        r.run2(P_V2OCCL, p2, divUp(I.fw, 16), divUp(I.fh, 16));
+        r.cbar();
+        r.stamp("v2 occlusion");
+    }
     return true;
 }
 
@@ -1831,8 +1945,9 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
     r.run(P_ERROR, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8));
     r.cbar();
     r.stamp("mismatch");
-    // 10-11. box + trust + resolve
-    r.run(P_RESOLVE, divUp((int)I.W, 16), divUp((int)I.H, 16));
+    // 10-11. box + trust + resolve (V2: the three-class resolve, v2_resolve.comp)
+    if (I.set.motionVersion == MotionVersion::V2) r.run2(P_RESOLVE, r.pc2(), divUp((int)I.W, 16), divUp((int)I.H, 16));
+    else r.run(P_RESOLVE, divUp((int)I.W, 16), divUp((int)I.H, 16));
     r.cbar();
     r.stamp("resolve");
     // global fallbacks (scene cut / too much untrusted) -> the nearer real frame
@@ -1899,9 +2014,25 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     bp.gauss = st.blurWeights == BlurWeights::Gaussian;
     bp.cutSad = st.sceneCutSad; bp.trust0 = st.trustLow; bp.trustScale = 1.0f / (st.trustHigh - st.trustLow);
     bp.globalFrac = st.globalFallback;
+    // V2's blur resolve (v2_blur_resolve.comp) pushes blur_motion_v2.glsl's block instead
+    const bool v2 = st.motionVersion == MotionVersion::V2;
+    BlurPC2 bq{};
+    if (v2) {
+        const V2Knobs k = Interpolator::v2Knobs(st);
+        bq.W = bp.W; bq.H = bp.H; bq.fw = bp.fw; bq.fh = bp.fh; bq.fscale = bp.fscale; bq.n = bp.n;
+        bq.blocks = bp.bw * bp.bh;
+        bq.cutSad = bp.cutSad; bq.trust0 = k.trustLow; bq.trustScale = 1.0f / (k.trustHigh - k.trustLow); bq.globalFrac = bp.globalFrac;
+        bq.occ0 = k.occLow; bq.occScale = 1.0f / (k.occHigh - k.occLow); bq.pickBias = k.pickBias; bq.zeroBonus = st.hudBonus;
+        std::memcpy(bq.t, bp.t, sizeof bq.t);
+    }
     auto run = [&](BlurPipe p, uint32_t gx, uint32_t gy, uint32_t gz) {
         I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().blurPipes[p]);
-        I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC), &bp);
+        if (v2 && p == B_RESOLVE) {
+            bq.flags = (bp.gauss ? 1 : 0) | (bp.fix ? 2 : 0);
+            I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC2), &bq);
+        } else {
+            I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC), &bp);
+        }
         I.CmdDispatch(cb, gx, gy, gz);
     };
     if (nInt > 0) {
