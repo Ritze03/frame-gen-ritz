@@ -11,3 +11,6 @@ __pycache__/
 *.png
 .local-work/
 .claude/
+bench/**/work/
+bench/**/out/
+bench/blind/sessions/
