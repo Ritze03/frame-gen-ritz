@@ -40,16 +40,21 @@ enum class MotionVersion : uint32_t {
 
 // The tuning presets of MotionVersion::V2 (Settings::v2Preset). One algorithm, four settings of its knobs (the v2* fields of Settings
 // override single knobs). Values are append-only and never renumbered. Knob values per preset: Interpolator::v2Knobs().
-// Every preset refines at 100 % (on the bench 50 % gains about half of what 100 % gains, for ~0.05 ms less); they differ in the
-// edge sigma with their character (8 balanced, 12 strict: softer picks, 5 wide: the hardest picks).
-//   A  balanced (default): occlusions of >= 2 px width, side vectors at 4 / 8 / 16 flow px, confidence 12, V1's trust ramp, edge
-//      sigma 8.
-//   B  strict: only wide (>= 4 px), very confident (6) occlusions take the one-sided warp, reach 3, a larger pick bias; more stays
-//      held as in V1; edge sigma 12 (softer picks between near-equal vectors). The safe end.
-//   C  wide: occlusions from 1 px, reach 6 (strips up to ~48 px at flowScale 2), less confident side vectors accepted (30), pick
-//      bias 0.5: the most pixels leave V1's hold; edge sigma 5 (the hardest picks). The aggressive end.
-//   D  soft: A's occlusion classes and edge sigma with the wider, softer trust ramp 16 / 48 (the user's first blind test of V1
-//      variants preferred it narrowly: "a bit crisper", "more motion clarity") for the held class and the occlusion ramp alike.
+// Round 1 of the blind test against V1 (I11): the presets span the open choices, so the votes say which way to go. Every preset
+// refines at 100 %, keeps the temporal seed and the soft pick at clean occlusions (v2OccSoft 4: no single-pixel flips between the
+// candidates).
+//   A  balanced (default): occlusions of >= 2 px width, side vectors at 4 / 8 / 16 flow px, confidence 12, V1's trust ramp
+//      (12 / 40) and hard hold edge, edge sigma 8, temporal bonus 2, content rescue 16 (a thin / fast object both frames show is
+//      put back at its midpoint instead of vanishing).
+//   B  safe, closest to V1: only wide (>= 4 px), very confident (6) occlusions take the one-sided warp, reach 3, pick bias 2,
+//      edge sigma 12, temporal bonus 1, the strictest rescue (12); and the SOFT HOLD EDGE (v2HoldFeather 12 px): held patches
+//      fade out over 12 px instead of V1's hard ~4 px edge (the "too sharp islands" question; the bench prices it at about
+//      -0.2 dB / +0.1 ground-truth flicker: it holds more).
+//   C  bold: occlusions from 1 px, reach 6, less confident side vectors (16; I10's 30 warped a lighting change one-sided into
+//      orange blobs on fps_cs2_a), pick bias 0.5, edge sigma 5 (hardest picks), the
+//      wide trust ramp 16 / 48, temporal bonus 3, the most permissive rescue (24): the fewest pixels held, the most warped.
+//   D  A with the wider, softer trust ramp 16 / 48 (the user's blind test of V1 variants preferred it narrowly: "a bit crisper",
+//      "more motion clarity"): the A vs D vote repeats that question on V2.
 enum class MotionPreset : uint32_t { A = 0, B = 1, C = 2, D = 3 };
 
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
@@ -228,8 +233,8 @@ struct Settings {
     // 2..kBlurMaxSamples; any value works: the sub-frames sit at the MIDPOINTS of N equal slices of the window,
     // t_k = t0 + (t1 - t0)(k + 0.5)/N, k = 0..N-1 (a box-filter shutter; no sample on a window end), with the weights of blurWeights. Runtime: setSettings() at any time; the scratch it needs (per sample one
     // field at t and one mismatch image: ~3 B per pixel at flowScale 2, 9 B at flowScale 1; MotionVersion::V2 keeps no field, only the
-    // mismatch: 1 B per pixel per sample) is allocated by the first blurred record and only grows. Off = byte-identical to a library
-    // without it.
+    // mismatch and its soft hold edge map: 1.25 B per pixel per sample) is allocated by the first blurred record and only grows.
+    // Off = byte-identical to a library without it.
     // Cost (RX 7900 XTX, per output, on top of the pair's estimate): see "Motion blur" in INTEGRATION.md.
     uint32_t blurSamples = 0;
     BlurWeights blurWeights = BlurWeights::Gaussian;
@@ -239,14 +244,15 @@ struct Settings {
     // return false (out untouched, the host shows the real frame, as with no estimate since init/resize) until the next
     // recordEstimate, which runs the new version; an estimate of one version is never synthesised by the other. The first switch to a
     // version creates its pipelines and buffers at once, no GPU wait (false from setSettings if that fails, nothing changed);
-    // switching away keeps them for a later switch back, releaseUnusedMotion() frees them. V2's buffers: 28 B per flow-resolution
-    // pixel (the occlusion map, the temporal store of v2Temporal) + 1 B per pixel (the class map), ~16.7 MB at 1080p, flowScale 2, plus
-    // the refined fields, 8 B per pixel of the refinement grid (v2RefineRes: ~16.6 MB at 1080p and 100 %, ~4.1 MB at 50 %): ~33 MB in
-    // all at 1080p (I9: ~43.5 MB, and its motion blur kept a further 8 B per pixel per sample: 265 MB at 16 samples, now none). Cost
-    // of V2 (RX 7900 XTX, 1080p 2x, preset A at 100 % refinement): ~0.54 ms per pair against V1's ~0.33 (estimate: the temporal
-    // seed ~0.005 ms, edge-aware field ~0.068, occlusion pass ~0.042, refinement ~0.046; synth: mismatch ~0.034 instead of ~0.028,
-    // resolve ~0.064 instead of ~0.031). V2 reads only prev and curr: the same latency as V1 (v2Temporal reuses the previous pair's
-    // field, which already exists).
+    // switching away keeps them for a later switch back, releaseUnusedMotion() frees them. V2's buffers: 40 B per flow-resolution
+    // pixel (the occlusion map, the content rescue's scratch, the temporal store of v2Temporal) + 1.25 B per pixel (the class map, the
+    // soft hold edge's map), ~23.3 MB at 1080p, flowScale 2, plus the refined fields, 8 B per pixel of the refinement grid
+    // (v2RefineRes: ~16.6 MB at 1080p and 100 %, ~4.1 MB at 50 %): ~40 MB in all at 1080p; its motion blur keeps 1.25 B per pixel
+    // per sample (the mismatch and the soft hold edge's map). Cost of V2 (RX 7900 XTX, 1080p 2x, 100 % refinement, I11): ~0.63 ms
+    // per pair for presets A / D, ~0.63-0.64 for B / C, against V1's ~0.33 (estimate: the temporal seed ~0.005 ms, edge-aware field
+    // ~0.075, content rescue ~0.06 (cover / rescue / merge / close), occlusion pass ~0.048, refinement ~0.052; synth: mismatch
+    // ~0.034 instead of ~0.028, soft hold edge ~0.010 (B), resolve ~0.072 instead of ~0.031). V2 reads only prev and curr: the same
+    // latency as V1 (v2Temporal reuses the previous pair's field, which already exists).
     MotionVersion motionVersion = MotionVersion::V1;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
@@ -278,7 +284,7 @@ struct Settings {
     //   by more than this.
     float v2PickBias = -1.0f;
     //   v2TrustLow / v2TrustHigh: the trust ramp of V2's held class (trustLow / trustHigh of V1), [0, 255], high >= low + 1.
-    //   -1 = the preset's; presets A-C use Settings::trustLow / trustHigh, D 16 / 48.
+    //   -1 = the preset's; presets A and B use Settings::trustLow / trustHigh, C and D 16 / 48.
     float v2TrustLow = -1.0f, v2TrustHigh = -1.0f;
     //   v2RefineRes: [1, 100] % of the frame size per axis (rounded to an integer). The resolution of V2's refinement grid (D13): the
     //   edge-aware flow field is upsampled to it edge-preservingly, with a per-pixel re-pick from full-resolution detail (two RGB

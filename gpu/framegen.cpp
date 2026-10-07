@@ -1131,7 +1131,7 @@ bool Interpolator::validate(const Settings& s) {
 static const V2Knobs kV2Presets[4] = {
     {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f},     // A balanced
     {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f, 1.0f, 1.0f, 12.0f, 12.0f, 4.0f},   // B safe (soft hold edge)
-    {1.0f, 6.0f, 30.0f, -1.0f, -1.0f, 0.5f, 16.0f, 48.0f, 100.0f, 5.0f, 1.0f, 3.0f, 24.0f, 0.0f, 4.0f},    // C bold
+    {1.0f, 6.0f, 16.0f, -1.0f, -1.0f, 0.5f, 16.0f, 48.0f, 100.0f, 5.0f, 1.0f, 3.0f, 24.0f, 0.0f, 4.0f},    // C bold
     {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f},    // D = A + trust 16 / 48
 };
 
