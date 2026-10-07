@@ -28,9 +28,23 @@ enum class UiProtection : uint32_t {
 enum class MotionVersion : uint32_t {
     V1 = 0,   // the algorithm of proto/interp.py (the frozen reference), every Format: output byte-identical to a library without the
               // choice. The default.
-    V2 = 1,   // the second algorithm, next to V1 (unchanged). Rgba8 only: settingsError() refuses it with any other Format. For now it
-              // runs V1's passes (its own pipelines of the same shaders), so its output equals V1's until its own shaders land.
+    V2 = 1,   // the second algorithm, next to V1 (unchanged). Rgba8 only: settingsError() refuses it with any other Format. V1's motion
+              // estimate (the same shaders) plus an occlusion analysis of the symmetric field and a three-class resolve: trusted pixels
+              // blend as in V1, a clean occlusion between two confident, distinct vectors is warped from ONE side (covered: prev,
+              // uncovered: curr) with the background vector, everything else holds the nearer real frame as in V1. Settings::v2Preset
+              // picks its tuning (MotionPreset). Same latency as V1: it reads only prev and curr.
 };
+
+// The tuning presets of MotionVersion::V2 (Settings::v2Preset). One algorithm, four settings of its knobs (the v2* fields of Settings
+// override single knobs). Values are append-only and never renumbered. Knob values per preset: Interpolator::v2Knobs().
+//   A  balanced (default): occlusions of >= 2 px width, side vectors at 4 / 8 / 16 flow px, confidence 12, V1's trust ramp.
+//   B  strict: only wide (>= 4 px), very confident (6) occlusions take the one-sided warp, reach 3, a larger pick bias; more stays
+//      held as in V1. The safe end.
+//   C  wide: occlusions from 1 px, reach 6 (strips up to ~48 px at flowScale 2), less confident side vectors accepted (30), pick
+//      bias 0.5: the most pixels leave V1's hold. The aggressive end.
+//   D  soft: A's occlusion classes with the wider, softer trust ramp 16 / 48 (the user's first blind test of V1 variants preferred
+//      it narrowly: "a bit crisper", "more motion clarity") for the held class and the occlusion ramp alike.
+enum class MotionPreset : uint32_t { A = 0, B = 1, C = 2, D = 3 };
 
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
 enum class BlurWeights : uint32_t {
@@ -217,8 +231,11 @@ struct Settings {
     // (settingsError()). Runtime: setSettings() at any time. A switch DROPS the current estimate: recordSynth / recordSynthBlur
     // return false (out untouched, the host shows the real frame, as with no estimate since init/resize) until the next
     // recordEstimate, which runs the new version; an estimate of one version is never synthesised by the other. The first switch to a
-    // version creates its pipelines (and later its buffers) at once, no GPU wait (false from setSettings if that fails, nothing
-    // changed); switching away keeps them for a later switch back, releaseUnusedMotion() frees them.
+    // version creates its pipelines and buffers at once, no GPU wait (false from setSettings if that fails, nothing changed);
+    // switching away keeps them for a later switch back, releaseUnusedMotion() frees them. V2's buffer: 16 B per flow-resolution
+    // pixel (the occlusion map) + 1 B per pixel (the class map), ~10.4 MB at 1080p, flowScale 2. Cost of V2 (RX 7900 XTX, 1080p 2x):
+    // ~0.41 ms per pair against V1's ~0.34 (the occlusion pass ~0.025 ms in the estimate, the resolve ~0.07 instead of ~0.03).
+    // V2 reads only prev and curr: the same latency as V1.
     MotionVersion motionVersion = MotionVersion::V1;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
@@ -226,6 +243,37 @@ struct Settings {
     // 4 = performance (1440p: ~40 % less total time at 2x, ~30 % at 4x; can miss thin/fine motion detail);
     // 1 = full res (1080p 2x: ~2.3x the time, not better on the test clips).
     uint32_t flowScale = 2;
+
+    // ---- runtime, appended: MotionVersion::V2 only (V1 ignores them; setSettings() at any time) ----
+    // The V2 tuning preset (see MotionPreset). Default A.
+    MotionPreset v2Preset = MotionPreset::A;
+    // Single knobs of V2, each overriding the preset's value; -1 (the default) = the preset's value. Interpolator::v2Knobs() gives the
+    // effective values. validate() takes -1 or the range given.
+    //   v2OcclWidth: [0.5, 64] full-resolution pixels. A motion boundary is an occlusion only if the motion difference across it,
+    //   normal to it, is at least this wide (half-vector: the width of the occluded strip at the midpoint). Higher = fewer, wider
+    //   occlusions take the one-sided warp; smaller ones keep V1's hold.
+    float v2OcclWidth = -1.0f;
+    //   v2Reach: [1, 16] flow-resolution pixels (integer). The side vectors of a boundary are looked for at 1, 2 and 4 x this
+    //   distance from a pixel (4 directions): the widest occluded strip handled is about 4 x reach x flowScale px.
+    float v2Reach = -1.0f;
+    //   v2Confidence: [1, 255] luma levels. Both side vectors must match prev and curr at their own place (3x3 mean |a - c| at flow
+    //   resolution) to at most this, else the pixel is not a clean occlusion. Higher = more boundaries count as clean.
+    float v2Confidence = -1.0f;
+    //   v2OccLow / v2OccHigh: [0, 255], high >= low + 1, levels. At a clean occlusion the 3x3 mean mismatch of the best of {the
+    //   field's vector, the two side vectors} ramps from the two-sided blend (<= low) to the one-sided warp (>= high).
+    //   -1 = the effective trust ramp (v2TrustLow / v2TrustHigh).
+    float v2OccLow = -1.0f, v2OccHigh = -1.0f;
+    //   v2PickBias: [0, 255] levels. At a clean occlusion a side vector replaces the field's vector when its 3x3 mismatch is lower
+    //   by more than this.
+    float v2PickBias = -1.0f;
+    //   v2TrustLow / v2TrustHigh: the trust ramp of V2's held class (trustLow / trustHigh of V1), [0, 255], high >= low + 1.
+    //   -1 = the preset's; presets A-C use Settings::trustLow / trustHigh, D 16 / 48.
+    float v2TrustLow = -1.0f, v2TrustHigh = -1.0f;
+};
+
+// The effective V2 knobs of a Settings (Interpolator::v2Knobs(): the preset with the v2* overrides applied).
+struct V2Knobs {
+    float occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow, trustHigh;
 };
 
 struct InitInfo {
@@ -280,6 +328,9 @@ public:
     // literal). init(), setSettings() and reconfigure() refuse what it refuses (init() with this as initError()); a host whose
     // setSettings() returned false can ask it why. Today's only Format rule: MotionVersion::V2 needs Format::Rgba8.
     static const char* settingsError(const Settings&, Format format);
+    // The effective knobs of MotionVersion::V2 for these settings: Settings::v2Preset's values, each replaced by its v2* field
+    // unless that is -1. Does not check validity.
+    static V2Knobs v2Knobs(const Settings&);
     // The box size (pixels) a frame of w x h gets under these settings: the explicit uiBoxWidth/uiBoxHeight, else the
     // square from uiBoxHeightFrac (or the legacy uiCrosshairArea). The same numbers the library protects; for a host
     // preview. Does not check validity.
@@ -516,11 +567,15 @@ public:
     // Debug / test only (fgtest --dump), read-only like recordDebugCounters: copies the latest record's / recordSynth's maps into dst at
     // dstOffset, laid out as debugMapLayout() says: the block field the per-pixel choice read (bw x bh vec2, finest level after
     // sub-pixel), the per-pixel half-vector field on the midpoint grid (fw x fh vec2) and the packed full-res mismatch e (one byte per
-    // pixel, eStride words per row, 4 pixels per word, low byte first; e of the latest synth, before the 7x7 box). Preceded by a
-    // COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
+    // pixel, eStride words per row, 4 pixels per word, low byte first; e of the latest synth, before the 7x7 box). MotionVersion::V2
+    // adds the class map of the latest synth at clsOff (same packing as e; per pixel bits 0-2 = class: 0 trusted, 1 held (V1's ramp),
+    // 2 clean occlusion with the field's vector, 3 with the background vector, 4 with the foreground vector; bit 3 = the one-sided side
+    // is curr (else prev); bits 4-7 = weight x 15 of the held frame (0-1) or of the one-sided warp (2-4)). V1: clsOff = 0, no class map.
+    // Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
     struct DebugMapLayout {
         uint32_t W, H, fw, fh, bw, bh, fscale, eStride;   // eStride in uint32 words
         VkDeviceSize blockOff, pixOff, eOff, size;          // byte offsets in dst (relative to dstOffset) and the total size
+        VkDeviceSize clsOff;                                // V2: the class map (eStride * H words) before `size`; 0 = none (V1)
     };
     bool debugMapLayout(DebugMapLayout& l) const;
     bool recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);

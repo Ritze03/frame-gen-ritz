@@ -1,0 +1,71 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2, estimate (after the pixel field, flow res, midpoint grid): occlusion analysis of the symmetric field (D12) and the vectors of
+// the occluded pixels (D16). Writes the occlusion map (motion_v2.glsl) for every flow pixel q.
+//
+// The field h is symmetric: midpoint content at q is a(q - h) and c(q + h). At a motion boundary with normal n between side vectors
+// v- (at q - r n) and v+ (at q + r n), d = (v+ - v-) . n is the normal motion difference:
+//   d < 0: the field CONVERGES. The side behind moves into the side ahead: the strip next to the boundary is being covered between a
+//          and c, it is visible in prev only -> side a (prev).
+//   d > 0: the field DIVERGES. The strip is being uncovered, visible in curr only -> side c (curr).
+// (1D check: left object moving right, h = +k, static right side h = 0: d = 0 - k < 0, and the strip [x0, x0 + k] right of the
+// midpoint edge x0 shows the static background in a, but the object in c (its edge is at x0 + k at c): covered, take a. Mirror for
+// d > 0.) The occluded strip at the midpoint is |d| wide (flow units) and lies on the background's side of the edge.
+// A forward/backward check cannot see this on a symmetric field (search.comp: both directions are one vector).
+//
+// Per q: the direction (4: x, y, both diagonals) and distance (reach x 1, 2, 4) with the largest |d|; the pixel is near a clean
+// occlusion if |d| >= edgeMin (distinct vectors), the distance is at most |d| + reach (the pixel is in or next to the strip, not just
+// somewhere within 4 reach of an edge), and both side vectors are confident (3x3 mean |a - c| at their own place, finest-level luma,
+// <= confMax). Background = the side vector nearer the global median vector (the camera motion; u[4..5], medhist.comp of the finest
+// level, the same units): which side of the edge the background is on cannot be told from one symmetric field (both hypotheses
+// produce the same field and mismatch), so the dominant motion decides. Foreground = the other side vector.
+#include "common.glsl"
+#include "motion_v2.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+vec2 Fq(ivec2 q) { return field[pc.pf + clamp(q.y, 0, pc.fh - 1) * pc.fw + clamp(q.x, 0, pc.fw - 1)]; }
+
+// 3x3 mean |a(y - v) - c(y + v)| around x (finest-level luma, flow res): does v describe the content at x?
+float sideCost(ivec2 x, vec2 v) {
+    float s = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            vec2 y = vec2(x + ivec2(dx, dy));
+            s += abs(sampleL(pc.offA, y - v, pc.fw, pc.fh) - sampleL(pc.offC, y + v, pc.fw, pc.fh));
+        }
+    return s * (1.0 / 9.0);
+}
+
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= pc.fw || q.y >= pc.fh) return;
+    float best = 0.0;
+    ivec2 bo = ivec2(0);
+    for (int k = 0; k < 3; k++) {
+        int r = pc.reach << k;
+        int rd = (r * 181 + 128) >> 8;   // r / sqrt(2), rounded: the diagonal steps about as far
+        ivec2 offs[4] = ivec2[4](ivec2(r, 0), ivec2(0, r), ivec2(rd, rd), ivec2(rd, -rd));
+        for (int i = 0; i < 4; i++) {
+            ivec2 o = offs[i];
+            vec2 n = normalize(vec2(o));
+            float d = dot(Fq(q + o) - Fq(q - o), n);
+            if (abs(d) > abs(best)) { best = d; bo = o; }   // ties: the nearer distance (searched first)
+        }
+    }
+    uvec4 res = uvec4(0u);
+    if (abs(best) >= pc.edgeMin && length(vec2(bo)) <= abs(best) + float(pc.reach)) {
+        vec2 vp = Fq(q + bo), vm = Fq(q - bo);
+        // a side is a region, not one noisy vector: the field half a reach further out agrees with it
+        ivec2 ext = ivec2(roundEven(normalize(vec2(bo)) * max(1.0, 0.5 * float(pc.reach))));
+        float tol = max(0.5, 0.25 * abs(best));
+        bool steady = distance(Fq(q + bo + ext), vp) <= tol && distance(Fq(q - bo - ext), vm) <= tol;
+        if (steady && sideCost(q + bo, vp) <= pc.confMax && sideCost(q - bo, vm) <= pc.confMax) {
+            vec2 med = vec2(uintBitsToFloat(u[4]), uintBitsToFloat(u[5]));
+            bool pBg = distance(vp, med) <= distance(vm, med);
+            vec2 vB = pBg ? vp : vm, vF = pBg ? vm : vp;
+            res = uvec4(packHalf2x16(vB), packHalf2x16(vF), best < 0.0 ? 1u : 2u, 0u);
+        }
+    }
+    int i = 4 * (q.y * pc.fw + q.x);
+    v2b[i] = res.x; v2b[i + 1] = res.y; v2b[i + 2] = res.z; v2b[i + 3] = res.w;
+}

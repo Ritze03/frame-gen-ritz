@@ -1,0 +1,48 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2, synth (full res, replaces resolve.comp): the three-class resolve of v2_resolve_core.glsl, the untrusted count for fallback.comp
+// (V1's rule), and the class map of this synth (debug, motion_v2.glsl). Reads e from error.comp (shared with V1) and the field at t
+// (the midpoint field, or lookup.comp's at t != 0.5).
+#include "common.glsl"
+#include "motion_v2.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#define V2R_E(p) eAtU(p)
+#define V2R_HV(p) halfVec(p)
+#define V2R_MIS(p, hv, wa, wc) mismatchV(p, hv, wa, wc)
+#define V2R_S (MID ? 0.0 : pc.s)
+#define V2R_WA pc.wA
+#define V2R_WC pc.wC
+#define V2R_TRUST0 pc.trust0
+#define V2R_TRUSTSCALE pc.trustScale
+#define V2R_OCC0 pc.occ0
+#define V2R_OCCSCALE pc.occScale
+#define V2R_PICKBIAS pc.pickBias
+#define W_ pc.W
+#define H_ pc.H
+#define FSCALE_ pc.fscale
+#include "v2_resolve_core.glsl"
+
+shared uint cnt;
+shared uint clsRow[TS * TS];
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    if (lid == 0) cnt = 0u;
+    ivec2 tile = ivec2(gl_WorkGroupID.xy);
+    V2Px r = v2ResolvePixel(tile, NEAR_C);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = p.x < pc.W && p.y < pc.H;
+    if (inside) {
+        imageStore(outImg, p, FG_STORE(r.o, r.alpha));
+        if (r.untrusted) atomicAdd(cnt, 1u);
+    }
+    clsRow[lid] = inside ? r.cls : 0u;
+    barrier();
+    if (lid == 0 && cnt > 0u) atomicAdd(u[U_UNTRUSTED], cnt);
+    // class map: 4 pixels per word (the tile's x origin is a multiple of 16)
+    if ((lid & 3) == 0 && inside) {
+        uint w = clsRow[lid] | (clsRow[lid + 1] << 8) | (clsRow[lid + 2] << 16) | (clsRow[lid + 3] << 24);
+        v2b[pc.clsOff + p.y * E_STRIDE + (p.x >> 2)] = w;
+    }
+}
