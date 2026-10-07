@@ -7,9 +7,10 @@
 //   V2R_S, V2R_WA, V2R_WC       2t - 1, 1 - t, t
 //   V2R_TRUST0, V2R_TRUSTSCALE  the held class's ramp; V2R_OCC0, V2R_OCCSCALE the occlusion ramp; V2R_PICKBIAS; V2R_ZEROBONUS
 //                               (Settings::hudBonus)
-//   occAt(p, hv, s)             the occlusion map entry of pixel p (motion_v2.glsl)
+//   occAt(p, hv, s)             the occlusion map entry of pixel p (motion_v2.glsl); occSideAt(j) its side at flow pixel j (clamped)
 //   W_, H_, FSCALE_             the full resolution and the flow scale
 //   V2R_FEATHER                 V2Knobs holdFeather (full-resolution px, <= 32; 0 = V1's hold edge), uniform
+//   V2R_UF(c, cw)               the soft hold edge's uf of 4 x 4 px cell c (cw cells per row; v2_hold_core.glsl), read if V2R_FEATHER > 0
 //   V2R_OCCSOFT                 V2Knobs occSoft (levels; 0 = the hard pick at a clean occlusion), uniform
 //
 // Per pixel p, with e7 = 7x7 mean of e (V1's box, over the pixels whose e is known: a pixel with a warp tap on the UI (CrosshairV2
@@ -28,12 +29,9 @@
 //   background from the one frame that sees it instead of V1's held patch. The 3x3 instead of V1's 7x7 keeps the occlusion classes to
 //   the strip itself. At the edge of a clean occlusion region the result fades into V1's by the share of the 3x3 that has one.
 // The untrusted count of the whole-frame fallback is V1's (Ut > 0.5), so its decisions and the bench's fallback% compare with V1.
-// The soft hold edge (I11, D18; V2R_FEATHER = F > 0): V1's held regions end in a hard ~4 px edge (the 7x7 box and the ramp), the
-// "too sharp islands": a patch of the unwarped nearer frame, |v| px off from the warped content around it. The frame is cut into
-// 4 x 4 px cells; a cell whose mean known e is past the middle of the trust ramp is a hold source of weight hc = 2 ramp - 1; around
-// it the hold weight falls off linearly with the distance, uf = max over the sources of hc (1 - d / F) (a cone: the held region
-// itself keeps its full hold, only its outside gets the soft edge), bilinear between the cell centres; the pixel's hold is
-// max(Ut, uf) (also in the class map's weight). The untrusted count is that of Ut.
+// The soft hold edge (I11, D18; V2R_FEATHER > 0): the pixel's hold is max(Ut, uf), uf = the map of v2_hold_core.glsl (the hold
+// weight falling off softly outside held regions instead of V1's hard ~4 px edge), also in the class map's weight. The untrusted
+// count is that of Ut.
 
 const int TS = 16, AP = 3, TT = TS + 2 * AP, TB = TS + 2;
 shared float te[TT * TT];   // e + KN of the tile + 3 (7x7 box); 0 where e is unknown (V2_E_UNKNOWN)
@@ -43,9 +41,6 @@ shared float tb[TB * TB], tf[TB * TB];   // e of vB / vF of the tile + 1 (= e wh
 shared float tz[TB * TB];                 // e of the zero vector (= e where the pixel has no clean occlusion)
 shared float tg[TB * TB];                 // 1 = the pixel has a clean occlusion
 shared vec2 thv[TB * TB];                 // the half-vector of the field at t
-const int FC = 4, FRMAX = 8, FNMAX = TS / FC + 2 + 2 * FRMAX;   // the soft hold edge: cell size, largest radius (cells), cells
-shared float fsrc[FNMAX * FNMAX];         // hold source weight hc of the cells around the tile
-shared float fcone[36];                   // uf at the 6 x 6 cell centres around the tile's 4 x 4 cells
 
 struct V2Px {
     vec3 o;          // the output (levels, unrounded)
@@ -96,37 +91,7 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         tg[i] = oc.z != 0u ? 1.0 : 0.0;
     }
     barrier();
-    // the soft hold edge (uniform branch: V2R_FEATHER is a push constant)
     float F = V2R_FEATHER;
-    if (F > 0.0) {
-        int R = min(int(ceil(F / float(FC))), FRMAX);
-        int n = TS / FC + 2 + 2 * R;
-        ivec2 c0 = tile * (TS / FC) - 1 - R;
-        for (int i = lid; i < n * n; i += TS * TS) {
-            ivec2 c = c0 + ivec2(i % n, i / n);
-            float se = 0.0, ke = 0.0;
-            for (int j = 0; j < FC * FC; j++) {
-                ivec2 q = c * FC + ivec2(j % FC, j / FC);
-                if (any(lessThan(q, ivec2(0))) || q.x >= W_ || q.y >= H_) continue;
-                uint e = V2R_E(q);
-                if (e != V2_E_UNKNOWN) { se += float(e); ke += 1.0; }
-            }
-            float rr = ke > 0.0 ? clamp((se / ke - V2R_TRUST0) * V2R_TRUSTSCALE, 0.0, 1.0) : 0.0;
-            fsrc[i] = clamp(2.0 * rr - 1.0, 0.0, 1.0);
-        }
-        barrier();
-        if (lid < 36) {
-            ivec2 cc = ivec2(lid % 6, lid / 6) + R;
-            float mx = 0.0;
-            for (int dy = -R; dy <= R; dy++)
-                for (int dx = -R; dx <= R; dx++) {
-                    float w = 1.0 - length(vec2(dx, dy)) * float(FC) / F;
-                    if (w > 0.0) mx = max(mx, fsrc[(cc.y + dy) * n + cc.x + dx] * w);
-                }
-            fcone[lid] = mx;
-        }
-        barrier();
-    }
     ivec2 l = ivec2(gl_LocalInvocationID.xy);
     ivec2 p = tile * TS + l;
     V2Px r;
@@ -139,13 +104,15 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
     float e7 = n7 == 49.0 ? s7 * (1.0 / 49.0) : n7 > 0.0 ? s7 / n7 : 0.0;
     float ut = clamp((e7 - V2R_TRUST0) * V2R_TRUSTSCALE, 0.0, 1.0);
     r.untrusted = ut > 0.5;
-    float ufe = 0.0;   // the soft hold edge (not counted)
+    float ufe = 0.0;   // the soft hold edge (v2_hold_core.glsl's map, bilinear between the 4 x 4 px cell centres; not counted)
     if (F > 0.0) {
-        vec2 sc = (vec2(l) + 0.5) * (1.0 / float(FC)) + 0.5;   // in the 6 x 6 cell centres (cell -1 of the tile at 0)
+        ivec2 cw = ivec2((W_ + 3) >> 2, (H_ + 3) >> 2);
+        vec2 sc = (vec2(p) + 0.5) * 0.25 - 0.5;
         ivec2 i0 = ivec2(floor(sc));
         vec2 f = sc - vec2(i0);
-        ivec2 i1 = min(i0 + 1, ivec2(5));
-        float u00 = fcone[i0.y * 6 + i0.x], u01 = fcone[i0.y * 6 + i1.x], u10 = fcone[i1.y * 6 + i0.x], u11 = fcone[i1.y * 6 + i1.x];
+        ivec2 j0 = clamp(i0, ivec2(0), cw - 1), j1 = clamp(i0 + 1, ivec2(0), cw - 1);
+        float u00 = V2R_UF(ivec2(j0.x, j0.y), cw.x), u01 = V2R_UF(ivec2(j1.x, j0.y), cw.x);
+        float u10 = V2R_UF(ivec2(j0.x, j1.y), cw.x), u11 = V2R_UF(ivec2(j1.x, j1.y), cw.x);
         ufe = mix(mix(u00, u01, f.x), mix(u10, u11, f.x), f.y);
     }
     if (te[(l.y + AP) * TT + l.x + AP] == 0.0 || n7 < 25.0) {
@@ -212,11 +179,32 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         V2R_MIS(p, vec2(0.0), za, zc);
         mk = v2Blend(za, zc);
     }
+    float sig = V2R_OCCSOFT;
+    if (sig > 0.0) {   // soft pick (I11): every candidate by exp(-(its biased cost - the best's) / occSoft), not the best alone
+        float c0 = e0, cb = eb + V2R_PICKBIAS, cf = ef + V2R_PICKBIAS, cz = max(ez - V2R_ZEROBONUS, 0.0) + V2R_PICKBIAS;
+        float cm = min(min(c0, cb), min(cf, cz));
+        float w0 = exp((cm - c0) / sig), wb = exp((cm - cb) / sig), wf = exp((cm - cf) / sig), wz = exp((cm - cz) / sig);
+        vec3 fa, fc, za, zc;
+        V2R_MIS(p, vF, fa, fc);
+        V2R_MIS(p, vec2(0.0), za, zc);
+        float ws = w0 + wb + wf + wz;
+        mk = (w0 * m0 + wb * v2Blend(ba, bc) + wf * v2Blend(fa, fc) + wz * v2Blend(za, zc)) / ws;
+        ek = (w0 * e0 + wb * eb + wf * ef + wz * max(ez - V2R_ZEROBONUS, 0.0)) / ws;
+    }
     float w = clamp((ek - V2R_OCC0) * V2R_OCCSCALE, 0.0, 1.0);
     vec3 one = oc.z == 1u ? ba : bc;   // covered: prev sees it; uncovered: curr
     // at the edge of an occluded region (some 3x3 neighbours without a clean occlusion) fade to V1's output: no hard seam between
     // the classes
     g *= 1.0 / 9.0;
+    // (I11) an island of clean occlusion (fewer than 15 of the 5x5 flow pixels around p's own: inside a held region, a lighting
+    // change, noise) fades to V1's output too: its one-sided warp would be a speck of the other frame in the held patch
+    {
+        vec2 m = vec2(p) - V2R_S * hv;
+        ivec2 j = ivec2(floor((m + 0.5) / float(FSCALE_)));
+        int n5 = 0;
+        for (int d = 0; d < 25; d++) n5 += occSideAt(j + ivec2(d % 5 - 2, d / 5 - 2)) != 0u ? 1 : 0;
+        g *= clamp(float(n5 - 7) * (1.0 / 8.0), 0.0, 1.0);
+    }
     vec3 oo = mk * (1.0 - w) + one * w;
     r.o = v1o * (1.0 - g) + oo * g;
     r.cls = k | (oc.z == 2u ? 8u : 0u) | (uint(w * 15.0 + 0.5) << 4);

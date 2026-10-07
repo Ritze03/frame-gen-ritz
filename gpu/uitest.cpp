@@ -1490,7 +1490,7 @@ static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "
 // V2 = the same plus its temporal seed, edge-aware field, occlusion analysis and refinement (v2_seed / v2_smooth / v2_occl /
 // v2_refine.comp; its search, lookup, mismatch, resolve and two blur passes replace V1's, they do not add) and minus the blur lookup
 // (V2's blur computes the field at t_k on the fly): 15 + 2.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 17 : 14; }
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 23 : 14; }   // (V2: + 6 of I11)
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1616,7 +1616,7 @@ static void motionCheck(const Scene& sc) {
     expect(fg.setSettings(sTo), "switch accepted");
     const int64_t k = gLivePipes - p0;
     printf("    pipelines: %lld after init, +%lld for the first switch to %s\n", (long long)p0, (long long)k, algoName(to));
-    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 17)");
+    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 23)");
     const int64_t pTo = p0 - versionPipes(from) + versionPipes(to);   // after releasing the start version
     expect(!run(fg, false, nullptr) && blurRefused(fg), "after the switch the old estimate is gone: recordSynth and recordSynthBlur return false");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "switching back creates nothing (the start version kept its pipelines)");

@@ -5,9 +5,11 @@
 // (the refined midpoint field, or v2_lookup.comp's at t != 0.5; motion_v2.glsl halfVec).
 #include "common.glsl"
 #include "motion_v2.glsl"
+#include "v2_temporal.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
 
 #define V2R_E(p) eAtU(p)
+#define V2R_UF(c, cw) uintBitsToFloat(v2b[v2HOff() + (c).y * (cw) + (c).x])
 #define V2R_HV(p) halfVec(p)
 #define V2R_MIS(p, hv, wa, wc) mismatchV(p, hv, wa, wc)
 #define V2R_S (MID ? 0.0 : pc.s)

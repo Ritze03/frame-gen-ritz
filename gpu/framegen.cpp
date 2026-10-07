@@ -41,6 +41,8 @@
 #include "v2_rescue_spv.h"
 #include "v2_merge_spv.h"
 #include "v2_close_spv.h"
+#include "v2_hold_spv.h"
+#include "v2_blur_hold_spv.h"
 #include "v2_search_spv.h"
 #include "v2_blur_error_spv.h"
 
@@ -239,7 +241,7 @@ struct BlurPC2 {
     int32_t pad_;
 };
 static_assert(sizeof(BlurPC2) == sizeof(BlurPC), "BlurPC2 is pushed over BlurPC's range");
-enum BlurPipe { B_LOOKUP, B_ERROR, B_RESOLVE, B_COUNT_ };
+enum BlurPipe { B_LOOKUP, B_ERROR, B_RESOLVE, B_HOLD, B_COUNT_ };   // B_HOLD: V2 only (v2_blur_hold.comp)
 static const int kBlurCnt0 = 32;   // == CNT0 in blur_motion_v1.glsl: u[] words 32.. hold the per-sample untrusted counts
 
 struct UiBuf { VkBuffer b = VK_NULL_HANDLE; VkDeviceMemory m = VK_NULL_HANDLE; VkDeviceSize size = 0; };
@@ -265,6 +267,7 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD
             P_V2OCCL, P_V2SMOOTH, P_V2REFINE,   // V2 only: v2_occl / v2_smooth / v2_refine.comp (V1's group leaves them null)
             P_V2SEED,                           // V2 only: v2_seed.comp (the temporal store, D19)
             P_V2COVER, P_V2RESCUE, P_V2MERGE, P_V2CLOSE,   // V2 only: the content rescue (I11): v2_cover / rescue / merge / close.comp
+            P_V2HOLD,                           // V2 only: the soft hold edge's map (I11): v2_hold.comp
             P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
@@ -419,7 +422,8 @@ struct Interpolator::Impl {
     // all of V2's buffer (binding 13), in words: the occlusion map, the class map, the temporal store (v2_temporal.glsl: two field slots,
     // the compensated field, two slots of the coarsest pyramid level)
     VkDeviceSize v2Words() const {
-        return v2OccWords() + (VkDeviceSize)((W + 3) / 4) * H + (VkDeviceSize)6 * fw * fh + (VkDeviceSize)2 * lv.back().w * lv.back().h;
+        return v2OccWords() + (VkDeviceSize)((W + 3) / 4) * H + (VkDeviceSize)6 * fw * fh + (VkDeviceSize)2 * lv.back().w * lv.back().h +
+               (VkDeviceSize)((W + 3) / 4) * ((H + 3) / 4);
     }
     // V2's refined-field buffer (binding 14) when V2 is selected and sized, else null
     VkBuffer v2Field() { MotionGroup& g = mg(); return set.motionVersion == MotionVersion::V2 && g.bufs.size() > 1 ? g.bufs[1].b : VK_NULL_HANDLE; }
@@ -1237,6 +1241,7 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2RESCUE] = {SPV(v2_rescue), nullptr};
         spv[P_V2MERGE] = {SPV(v2_merge), nullptr};
         spv[P_V2CLOSE] = {SPV(v2_close), nullptr};
+        spv[P_V2HOLD] = {SPV(v2_hold), nullptr};
         spv[P_SEARCH] = {SPV(v2_search), nullptr};   // search.comp + the temporal seed
         spv[P_LOOKUP] = {SPV(v2_lookup), nullptr};
         spv[P_ERROR] = {SPV(v2_error), nullptr};
@@ -1244,6 +1249,7 @@ bool Interpolator::Impl::motionEnsure() {
         bspv[B_LOOKUP] = {Spv{}, nullptr};   // none: V2's blur passes compute the field at t_k on the fly (blur_motion_v2.glsl)
         bspv[B_ERROR] = {SPV(v2_blur_error), nullptr};
         bspv[B_RESOLVE] = {SPV(v2_blur_resolve), nullptr};
+        bspv[B_HOLD] = {SPV(v2_blur_hold), nullptr};
     }
     bool ok = true;
     for (int i = 0; ok && i < P_COUNT; i++) ok = !spv[i].sp.code || makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
@@ -2098,6 +2104,11 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
         r.run2(P_ERROR, q, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8));   // 9. full-res mismatch
         r.cbar();
         r.stamp("mismatch");
+        if (k2.holdFeather > 0.0f) {   // the soft hold edge's map (v2_hold.comp, 4 x 4 px cells)
+            r.run2(P_V2HOLD, q, divUp(((int)I.W + 3) / 4, 16), divUp(((int)I.H + 3) / 4, 16));
+            r.cbar();
+            r.stamp("hold edge");
+        }
         r.run2(P_RESOLVE, q, divUp((int)I.W, 16), divUp((int)I.H, 16));   // 10-11. the three-class resolve (v2_resolve.comp)
         r.cbar();
         r.stamp("resolve");
@@ -2170,7 +2181,9 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     const bool v2 = I.set.motionVersion == MotionVersion::V2;
     const VkDeviceSize errWords = (VkDeviceSize)((I.W + 3) / 4) * I.H;
     // V2 keeps no field scratch: its blur passes compute the field at t_k on the fly from the refined midpoint field
-    if ((!v2 && !I.growBlur(I.blurField, (VkDeviceSize)n * I.fw * I.fh * 8)) || !I.growBlur(I.blurErr, (VkDeviceSize)n * errWords * 4)) return false;
+    // (V2: + n maps of the soft hold edge, one float per 4 x 4 px cell: v2_blur_hold.comp)
+    const VkDeviceSize holdWords = v2 ? (VkDeviceSize)((I.W + 3) / 4) * ((I.H + 3) / 4) : 0;
+    if ((!v2 && !I.growBlur(I.blurField, (VkDeviceSize)n * I.fw * I.fh * 8)) || !I.growBlur(I.blurErr, (VkDeviceSize)n * (errWords + holdWords) * 4)) return false;
     VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out, true, I.rejectMasks(cb));
 
     Rec r(I, cb);
@@ -2216,6 +2229,11 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
         run(B_ERROR, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8), (uint32_t)nInt);
         r.cbar();
         r.stamp("blur mismatch");
+        if (v2 && bq.feather > 0.0f) {   // the soft hold edge's map of every sample (v2_blur_hold.comp)
+            run(B_HOLD, divUp(((int)I.W + 3) / 4, 16), divUp(((int)I.H + 3) / 4, 16), (uint32_t)nInt);
+            r.cbar();
+            r.stamp("blur hold edge");
+        }
     }
     bp.fix = 0;
     run(B_RESOLVE, divUp((int)I.W, 16), divUp((int)I.H, 16), 1);

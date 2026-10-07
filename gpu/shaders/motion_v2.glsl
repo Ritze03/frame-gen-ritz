@@ -133,6 +133,11 @@ uint mismatchE(ivec2 p, vec2 hv) {
 
 // The occlusion map entry of the midpoint position of full-resolution pixel p at time t: the content at p sits at the midpoint
 // m = p - (2t - 1) hv (hv = the field at t at p; lookup.comp's relation), nearest flow pixel of m.
+// the side of the occlusion map at flow pixel j (clamped)
+uint occSideAt(ivec2 j) {
+    j = clamp(j, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    return v2b[4 * (j.y * pc.fw + j.x) + 2];
+}
 uvec4 occAt(ivec2 p, vec2 hv, float s) {
     vec2 m = vec2(p) - s * hv;
     ivec2 j = clamp(ivec2(floor((m + 0.5) / float(pc.fscale))), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));

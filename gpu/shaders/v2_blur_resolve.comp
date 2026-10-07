@@ -10,6 +10,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 int gSlot = 0;     // the sample the core is resolving
 float gT = 0.5;    // its time
 #define V2R_E(p) eAt(gSlot, p)
+#define V2R_UF(c, cw) uintBitsToFloat(be[holdOff(gSlot) + (c).y * (cw) + (c).x])
 #define V2R_HV(p) halfVecT(gT, p)
 #define V2R_MIS(p, hv, wa, wc) mismatchV(gT, p, hv, wa, wc)
 #define V2R_S (2.0 * gT - 1.0)
