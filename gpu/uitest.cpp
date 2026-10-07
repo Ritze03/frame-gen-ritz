@@ -1482,8 +1482,9 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const c
 }
 static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : "V1"; }
 // The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes;
-// V2 = the same plus its occlusion analysis (v2_occl.comp; its resolve and blur resolve replace V1's, they do not add).
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : 14; }
+// V2 = the same plus its edge-aware field, occlusion analysis and refinement (v2_smooth / v2_occl / v2_refine.comp; its lookup,
+// mismatch, resolve and the three blur passes replace V1's, they do not add).
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 17 : 14; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1521,15 +1522,24 @@ static void motionCheck(const Scene& sc) {
             k = v2; k.v2OccLow = 50.0f; ok = ok && !Interpolator::validate(k);   // the inherited occHigh (trustHigh 40) is below it
             k.v2OccHigh = 80.0f; ok = ok && Interpolator::validate(k);
             k = v2; k.v2TrustLow = 30.0f; k.v2TrustHigh = 30.5f; ok = ok && !Interpolator::validate(k);
-            expect(ok, "validate: V2 preset A-D only, knobs -1 or in range, effective ramps high >= low + 1");
+            k = v2; k.v2RefineRes = 100.0f; ok = ok && Interpolator::validate(k);
+            k.v2RefineRes = 1.0f; ok = ok && Interpolator::validate(k);
+            k.v2RefineRes = 0.5f; ok = ok && !Interpolator::validate(k);
+            k = v2; k.v2RefineRes = 101.0f; ok = ok && !Interpolator::validate(k);
+            k = v2; k.v2EdgeSigma = 0.9f; ok = ok && !Interpolator::validate(k);
+            k.v2EdgeSigma = 255.0f; ok = ok && Interpolator::validate(k);
+            expect(ok, "validate: V2 preset A-D only, knobs -1 or in range (refineRes 1-100, edgeSigma 1-255), effective ramps high >= low + 1");
             Settings a = v2, d = v2;
             a.trustLow = 10.0f; a.trustHigh = 30.0f;
             d.v2Preset = MotionPreset::D;
             const V2Knobs ka = Interpolator::v2Knobs(a), kd = Interpolator::v2Knobs(d);
             a.v2Reach = 5.0f;
+            a.v2RefineRes = 33.4f;
             expect(ka.trustLow == 10.0f && ka.trustHigh == 30.0f && ka.occLow == 10.0f && ka.occHigh == 30.0f &&
-                   kd.trustLow == 16.0f && kd.trustHigh == 48.0f && Interpolator::v2Knobs(a).reach == 5.0f,
-                   "v2Knobs: A inherits trustLow / trustHigh (and the occlusion ramp from them), D uses 16 / 48, a knob overrides");
+                   kd.trustLow == 16.0f && kd.trustHigh == 48.0f && Interpolator::v2Knobs(a).reach == 5.0f &&
+                   Interpolator::v2Knobs(a).refineRes == 33.0f,
+                   "v2Knobs: A inherits trustLow / trustHigh (and the occlusion ramp from them), D uses 16 / 48, a knob overrides "
+                   "(refineRes rounded)");
         }
         // init() of a non-SDR view format with V2: false before anything is created, with that reason (RgbaF16 also linear)
         const VkFormat vfs[5] = {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -1600,7 +1610,7 @@ static void motionCheck(const Scene& sc) {
     expect(fg.setSettings(sTo), "switch accepted");
     const int64_t k = gLivePipes - p0;
     printf("    pipelines: %lld after init, +%lld for the first switch to %s\n", (long long)p0, (long long)k, algoName(to));
-    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 15)");
+    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 17)");
     const int64_t pTo = p0 - versionPipes(from) + versionPipes(to);   // after releasing the start version
     expect(!run(fg, false, nullptr) && blurRefused(fg), "after the switch the old estimate is gone: recordSynth and recordSynthBlur return false");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "switching back creates nothing (the start version kept its pipelines)");

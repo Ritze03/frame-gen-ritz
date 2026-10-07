@@ -29,7 +29,10 @@ enum class MotionVersion : uint32_t {
     V1 = 0,   // the algorithm of proto/interp.py (the frozen reference), every Format: output byte-identical to a library without the
               // choice. The default.
     V2 = 1,   // the second algorithm, next to V1 (unchanged). Rgba8 only: settingsError() refuses it with any other Format. V1's motion
-              // estimate (the same shaders) plus an occlusion analysis of the symmetric field and a three-class resolve: trusted pixels
+              // estimate (the same shaders) up to the per-pixel field, then an edge-aware field (a guided vector median that moves
+              // field discontinuities onto image edges) refined edge-preservingly to Settings::v2RefineRes of the frame (each
+              // full-resolution pixel picks among its neighbouring vectors by its own full-resolution mismatch, instead of V1's
+              // bilinear blend of them), an occlusion analysis of the symmetric field and a three-class resolve: trusted pixels
               // blend as in V1, a clean occlusion between two confident, distinct vectors is warped from ONE side (covered: prev,
               // uncovered: curr) with the background vector, everything else holds the nearer real frame as in V1. Settings::v2Preset
               // picks its tuning (MotionPreset). Same latency as V1: it reads only prev and curr.
@@ -37,13 +40,16 @@ enum class MotionVersion : uint32_t {
 
 // The tuning presets of MotionVersion::V2 (Settings::v2Preset). One algorithm, four settings of its knobs (the v2* fields of Settings
 // override single knobs). Values are append-only and never renumbered. Knob values per preset: Interpolator::v2Knobs().
-//   A  balanced (default): occlusions of >= 2 px width, side vectors at 4 / 8 / 16 flow px, confidence 12, V1's trust ramp.
+// Every preset refines at 100 % (on the bench 50 % gains about half of what 100 % gains, for ~0.05 ms less); they differ in the
+// edge sigma with their character (8 balanced, 12 strict: softer picks, 5 wide: the hardest picks).
+//   A  balanced (default): occlusions of >= 2 px width, side vectors at 4 / 8 / 16 flow px, confidence 12, V1's trust ramp, edge
+//      sigma 8.
 //   B  strict: only wide (>= 4 px), very confident (6) occlusions take the one-sided warp, reach 3, a larger pick bias; more stays
-//      held as in V1. The safe end.
+//      held as in V1; edge sigma 12 (softer picks between near-equal vectors). The safe end.
 //   C  wide: occlusions from 1 px, reach 6 (strips up to ~48 px at flowScale 2), less confident side vectors accepted (30), pick
-//      bias 0.5: the most pixels leave V1's hold. The aggressive end.
-//   D  soft: A's occlusion classes with the wider, softer trust ramp 16 / 48 (the user's first blind test of V1 variants preferred
-//      it narrowly: "a bit crisper", "more motion clarity") for the held class and the occlusion ramp alike.
+//      bias 0.5: the most pixels leave V1's hold; edge sigma 5 (the hardest picks). The aggressive end.
+//   D  soft: A's occlusion classes and edge sigma with the wider, softer trust ramp 16 / 48 (the user's first blind test of V1
+//      variants preferred it narrowly: "a bit crisper", "more motion clarity") for the held class and the occlusion ramp alike.
 enum class MotionPreset : uint32_t { A = 0, B = 1, C = 2, D = 3 };
 
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
@@ -232,9 +238,11 @@ struct Settings {
     // return false (out untouched, the host shows the real frame, as with no estimate since init/resize) until the next
     // recordEstimate, which runs the new version; an estimate of one version is never synthesised by the other. The first switch to a
     // version creates its pipelines and buffers at once, no GPU wait (false from setSettings if that fails, nothing changed);
-    // switching away keeps them for a later switch back, releaseUnusedMotion() frees them. V2's buffer: 16 B per flow-resolution
-    // pixel (the occlusion map) + 1 B per pixel (the class map), ~10.4 MB at 1080p, flowScale 2. Cost of V2 (RX 7900 XTX, 1080p 2x):
-    // ~0.42 ms per pair against V1's ~0.34 (the occlusion pass ~0.037 ms in the estimate, the resolve ~0.066 instead of ~0.032).
+    // switching away keeps them for a later switch back, releaseUnusedMotion() frees them. V2's buffers: 16 B per flow-resolution
+    // pixel (the occlusion map) + 1 B per pixel (the class map), ~10.4 MB at 1080p, flowScale 2, plus the refined fields, 16 B per
+    // pixel of the refinement grid (v2RefineRes: ~33 MB at 1080p and 100 %, ~8.3 MB at 50 %). Cost of V2 (RX 7900 XTX, 1080p 2x,
+    // preset A at 100 % refinement): ~0.54 ms per pair against V1's ~0.33 (estimate: edge-aware field ~0.060 ms, occlusion pass
+    // ~0.036, refinement ~0.050; synth: mismatch ~0.046 instead of ~0.028, resolve ~0.066 instead of ~0.031).
     // V2 reads only prev and curr: the same latency as V1.
     MotionVersion motionVersion = MotionVersion::V1;
 
@@ -269,11 +277,25 @@ struct Settings {
     //   v2TrustLow / v2TrustHigh: the trust ramp of V2's held class (trustLow / trustHigh of V1), [0, 255], high >= low + 1.
     //   -1 = the preset's; presets A-C use Settings::trustLow / trustHigh, D 16 / 48.
     float v2TrustLow = -1.0f, v2TrustHigh = -1.0f;
+    //   v2RefineRes: [1, 100] % of the frame size per axis (rounded to an integer). The resolution of V2's refinement grid (D13): the
+    //   edge-aware flow field is upsampled to it edge-preservingly, with a per-pixel re-pick from full-resolution detail (two RGB
+    //   taps per candidate), and every full-resolution pass reads its vector from that grid (bilinear between grid points; at 100 %
+    //   each pixel has its own refined vector). Every preset uses 100 %. Cost and memory scale with the grid's pixel count (1080p 2x,
+    //   RX 7900 XTX, preset A: ~0.54 ms per pair at 100 %, ~0.49 at 50 %, ~0.48 at 25 %); on the bench (fps reference clips, PSNR
+    //   against V1) 50 % gains about half of what 100 % gains. Memory: 16 B per grid pixel (the refined midpoint field and the field
+    //   at t, grown at the first estimate that needs more; a motion-blurred output's scratch holds blurSamples x 8 B per grid pixel).
+    float v2RefineRes = -1.0f;
+    //   v2EdgeSigma: [1, 255] levels. The strength of the edge awareness (D17): the range scale of the guide (the midpoint image the
+    //   field predicts) in the edge-aware vector median of the flow field and of the candidate costs (mismatch + guide difference) in
+    //   the refinement's soft pick. Smaller = vectors follow image edges more strictly (and the pick is harder); larger = closer to a
+    //   plain median and a plain bilinear upsample.
+    float v2EdgeSigma = -1.0f;
 };
 
 // The effective V2 knobs of a Settings (Interpolator::v2Knobs(): the preset with the v2* overrides applied).
 struct V2Knobs {
     float occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow, trustHigh;
+    float refineRes, edgeSigma;   // refineRes rounded to an integer percentage
 };
 
 struct InitInfo {
@@ -571,11 +593,16 @@ public:
     // adds the class map of the latest synth at clsOff (same packing as e; per pixel bits 0-2 = class: 0 trusted, 1 held (V1's ramp),
     // 2 clean occlusion with the field's vector, 3 with the background vector, 4 with the foreground vector, 5 with zero; bit 3 = the one-sided side
     // is curr (else prev); bits 4-7 = weight x 15 of the held frame (0-1) or of the one-sided warp (2-4)). V1: clsOff = 0, no class map.
+    // MotionVersion::V2 also adds its fields: the edge-aware field (fw x fh vec2, flow-resolution half-vector units, like the per-pixel
+    // field) at edgeOff and the refined midpoint field (rw x rh vec2, the refinement grid of the settings at layout time, full-resolution
+    // half-vector units) at refOff; recordDebugMaps fails if the latest estimate used another grid. V1: edgeOff = refOff = 0, rw = rh = 0.
     // Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
     struct DebugMapLayout {
         uint32_t W, H, fw, fh, bw, bh, fscale, eStride;   // eStride in uint32 words
         VkDeviceSize blockOff, pixOff, eOff, size;          // byte offsets in dst (relative to dstOffset) and the total size
         VkDeviceSize clsOff;                                // V2: the class map (eStride * H words) before `size`; 0 = none (V1)
+        VkDeviceSize edgeOff, refOff;                       // V2: the edge-aware and the refined field; 0 = none (V1)
+        uint32_t rw, rh;                                    // V2: the refinement grid of refOff
     };
     bool debugMapLayout(DebugMapLayout& l) const;
     bool recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);

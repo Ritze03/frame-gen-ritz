@@ -1,0 +1,74 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2, estimate (flow res, after the pixel field; D17): the edge-aware field hE. A guided, confidence-weighted vector median of the
+// pixel field h over a 5x5 window:
+//   guide   G(q) = 0.5 (a(q - h(q)) + c(q + h(q)))   the midpoint image the field predicts (finest-level luma)
+//   conf    c(q) = 1 / (1 + (|a(q - h) - c(q + h)| / 8)^2)   does h(q) explain q?
+//   weight  w(j) = spatial(j) * exp(-|G(q) - G(j)| / edgeSigma) * c(j)
+//   hE(q)   = the vector v_i of the inner 3x3 that minimises sum_j w(j) |v_i - v_j|_1   (ties: the centre, then raster order)
+// A median picks one of the window's vectors: a field discontinuity moves to where the guide's weights flip, i.e. to the image edge,
+// without the blended in-between vectors a weighted mean would put there; a lone vector the weights do not back is replaced (no
+// specks). On a smooth field (a linear ramp) the median of a symmetric window is the centre's own vector. The median's vector
+// replaces q's own only if it explains q clearly better (3x3 mean |a - c| at flow res lower by 2 levels): a vector that explains q
+// stays, however its neighbours vote (between two motions a median can pick an in-between vector that neither side has; next to a
+// static UI the votes are the UI's).
+// Reads field[pf] (the pixel field), writes field[fE].
+#include "common.glsl"
+#include "motion_v2.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int TS = 16, R = 2, D = 2 * R + 1, TT = TS + 2 * R;
+shared vec2 sv[TT * TT];
+shared float sg[TT * TT], sc[TT * TT];
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - R;
+    for (int i = lid; i < TT * TT; i += TS * TS) {
+        ivec2 q = clamp(t0 + ivec2(i % TT, i / TT), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));   // replicate border
+        vec2 h = field[pc.pf + q.y * pc.fw + q.x];
+        float la = sampleL(pc.offA, vec2(q) - h, pc.fw, pc.fh), lc = sampleL(pc.offC, vec2(q) + h, pc.fw, pc.fh);
+        float e = abs(la - lc) * (1.0 / 8.0);
+        sv[i] = h;
+        sg[i] = 0.5 * (la + lc);
+        sc[i] = 1.0 / (1.0 + e * e);
+    }
+    barrier();
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= pc.fw || q.y >= pc.fh) return;
+    const int c0 = (l.y + R) * TT + l.x + R;
+    float gc = sg[c0];
+    float w[D * D];
+    vec2 v[D * D];
+    for (int j = 0; j < D * D; j++) {
+        int dx = j % D - R, dy = j / D - R;
+        int i = c0 + dy * TT + dx;
+        v[j] = sv[i];
+        w[j] = exp(-0.125 * float(dx * dx + dy * dy) - abs(sg[i] - gc) * pc.edgeK) * sc[i];
+    }
+    // candidates: the inner 3x3 of the window (centre first); a discontinuity moves by up to 1 flow pixel per pass, which is the
+    // error left by the pixel field's 5x5 cost box (the vectors further out still vote)
+    const int NC = 9;
+    const int cand[NC] = int[NC](12, 6, 7, 8, 11, 13, 16, 17, 18);
+    vec2 best = v[12];
+    float bc = 1e30;
+    for (int i = 0; i < NC; i++) {
+        vec2 vi = v[cand[i]];
+        float cst = 0.0;
+        for (int j = 0; j < D * D; j++) cst += w[j] * (abs(vi.x - v[j].x) + abs(vi.y - v[j].y));
+        if (cst < bc) { bc = cst; best = vi; }
+    }
+    // the median's vector replaces q's own only if it explains q (3x3 mean |a - c| at flow res) clearly better: a vector that
+    // explains q stays, however its neighbours vote (a median between two motions can pick an in-between vector neither side has)
+    if (best != v[12]) {
+        float eo = 0.0, eb = 0.0;
+        for (int j = 0; j < 9; j++) {
+            vec2 y = vec2(q + ivec2(j % 3 - 1, j / 3 - 1));
+            eo += abs(sampleL(pc.offA, y - v[12], pc.fw, pc.fh) - sampleL(pc.offC, y + v[12], pc.fw, pc.fh));
+            eb += abs(sampleL(pc.offA, y - best, pc.fw, pc.fh) - sampleL(pc.offC, y + best, pc.fw, pc.fh));
+        }
+        if (eb + 9.0 * 2.0 >= eo) best = v[12];   // not better by 2 levels on the mean: keep
+    }
+    field[pc.fE + q.y * pc.fw + q.x] = best;
+}

@@ -1,7 +1,8 @@
-// Motion version 2 (Settings::motionVersion = V2): the push constants and helpers of V2's own synth / estimate passes (v2_occl.comp,
-// v2_resolve.comp). Included after common.glsl. Rgba8 only (settingsError() refuses V2 for every other Format), so there is no YUV or
-// other-format path here. V2 shares V1's estimate passes and its error / lookup / fallback passes (they push V1's block,
-// motion_v1.glsl); its own passes push this block over the same 128-byte range of the same pipeline layout.
+// Motion version 2 (Settings::motionVersion = V2): the push constants and helpers of V2's own synth / estimate passes (v2_smooth,
+// v2_occl, v2_refine, v2_lookup, v2_error, v2_resolve). Included after common.glsl. Rgba8 only (settingsError() refuses V2 for every
+// other Format), so there is no YUV or other-format path here. V2 shares V1's estimate passes up to the pixel field and its fallback
+// pass (they push V1's block, motion_v1.glsl); its own passes push this block over the same 128-byte range of the same pipeline
+// layout.
 //
 // V2's own buffer (binding 13, framegen.cpp MotionGroup::bufs[0]):
 //   words [0, 4 fw fh): the occlusion map, one uvec4 per flow-resolution pixel of the MIDPOINT grid (v2_occl.comp):
@@ -9,14 +10,25 @@
 //     z = side: 0 = no clean occlusion, 1 = covered (take prev), 2 = uncovered (take curr), w = 0 (reserved).
 //   words [clsOff, clsOff + eStride H): the class map of the latest synth (debug, recordDebugMaps), one byte per pixel, 4 per
 //     word, low byte first: bits 0-2 class (V2_CLS_*: 0 trusted, 1 held, clean occlusion with 2 the field's vector, 3 vB, 4 vF, 5 zero), bit 3 = side curr, bits 4-7 = weight of the hold / one-sided output x 15.
+//
+// V2's fields (D17, D13). The estimate adds two passes after the pixel field:
+//   v2_smooth.comp (flow res): the edge-aware field hE, a guided weighted vector median of the pixel field (written to field[] at the
+//     slot V1 uses for its field at t, which V2 never needs: framegen.cpp fieldT).
+//   v2_refine.comp (the refinement grid rw x rh, Settings::v2RefineRes % of the frame): the edge-preserving upsample of hE, written
+//     to rf[] (binding 14, framegen.cpp MotionGroup::bufs[1]) at offset 0 in FULL-RESOLUTION half-vector units.
+// Every full-resolution pass of V2 (v2_error, v2_resolve, the blur passes) reads its half-vector from rf[] with halfVec() below:
+// bilinear on the refinement grid, i.e. the refined field itself at 100 %. The field at t != 0.5 (v2_lookup.comp) is looked up on the
+// same grid, into rf[] at offset rw * rh.
 
 layout(set = 0, binding = 13, std430) buffer V2Buf { uint v2b[]; };
+layout(set = 0, binding = 14, std430) buffer V2Field { vec2 rf[]; };   // refined fields (full-resolution half-vector units)
 
 layout(push_constant) uniform PC2 {
     int W, H;          // full resolution
     int fw, fh;        // flow resolution (= the finest pyramid level)
     int fscale;        // flow scale (1, 2, 4)
-    int pf;            // offset of the per-pixel field the pass reads (the midpoint field, or the field at t)
+    int pf;            // offset in field[] of the flow-resolution field the pass reads (v2_smooth: the pixel field; v2_occl,
+                       // v2_refine: the edge-aware field hE)
     int offA, offC;    // v2_occl: luma offsets of the finest level
     int reach;         // v2_occl: side-vector distance (flow px)
     int clsOff;        // word offset of the class map in v2b[]
@@ -28,6 +40,11 @@ layout(push_constant) uniform PC2 {
     float edgeMin;              // v2_occl: min normal motion difference, flow-resolution half-vector units (occlWidth / fscale)
     float confMax;              // v2_occl: V2Knobs confidence
     float zeroBonus;            // Settings::hudBonus (the zero candidate at a clean occlusion)
+    int rw, rh;                 // the refinement grid (V2Knobs refineRes % of W x H)
+    int rpf;                    // offset in rf[] of the refined field the pass reads (0 = the midpoint field, rw * rh = at t)
+    int rfOut;                  // v2_refine / v2_lookup: offset in rf[] written
+    int fE;                     // offset in field[] of the edge-aware flow-resolution field (v2_smooth writes it)
+    float edgeK;                // 1 / V2Knobs edgeSigma (levels): the range weight of the guide
 } pc;
 
 const int E_OFF = 64;          // packed mismatch in u[] (== motion_v1.glsl)
@@ -35,6 +52,7 @@ const int E_OFF = 64;          // packed mismatch in u[] (== motion_v1.glsl)
 const int U_UNTRUSTED = 0;
 #define NEAR_C (pc.wC > 0.5)
 #define MID (pc.wC == 0.5)
+const uint V2_E_UNKNOWN = 255u;   // v2_error.comp: a warp tap was on the UI (known e is capped at 254)
 const uint V2_CLS_TRUSTED = 0u, V2_CLS_HELD = 1u, V2_CLS_OCC_FIELD = 2u, V2_CLS_OCC_BG = 3u, V2_CLS_OCC_FG = 4u, V2_CLS_OCC_ZERO = 5u;
 
 // luma texel of the finest level, clamp to edge; bilinear tap (as motion_v1.glsl's L / sampleL)
@@ -51,18 +69,19 @@ float sampleL(int off, vec2 p, int w, int h) {
          + p10 * (f.y * (1.0 - f.x)) + p11 * (f.y * f.x);
 }
 
-// == motion_v1.glsl halfVec (the field at pc.pf)
+// The full-resolution half-vector at pixel p: the refined field at rpf, bilinear on the refinement grid (pixel centres aligned like
+// cv2.resize). At 100 % refinement the grid is the frame: the refined vector of p itself (fraction 0, exact).
 vec2 halfVec(ivec2 p) {
-    int S = pc.fscale;
-    p = min(p, ivec2(S * pc.fw - 1, S * pc.fh - 1));
-    vec2 s = (vec2(p) + 0.5) * (1.0 / float(S)) - 0.5;
+    if (pc.rw == pc.W && pc.rh == pc.H)   // 100 %: one read (the bilinear weights below would be 1, 0, 0, 0)
+        return rf[pc.rpf + clamp(p.y, 0, pc.H - 1) * pc.rw + clamp(p.x, 0, pc.W - 1)];
+    vec2 s =(vec2(p) + 0.5) * (vec2(pc.rw, pc.rh) / vec2(pc.W, pc.H)) - 0.5;
     vec2 fl = floor(s);
     vec2 f = s - fl;
-    ivec2 i0 = clamp(ivec2(fl), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
-    ivec2 i1 = clamp(ivec2(fl) + 1, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
-    vec2 v00 = field[pc.pf + i0.y * pc.fw + i0.x], v01 = field[pc.pf + i0.y * pc.fw + i1.x];
-    vec2 v10 = field[pc.pf + i1.y * pc.fw + i0.x], v11 = field[pc.pf + i1.y * pc.fw + i1.x];
-    return float(S) * mix(mix(v00, v01, f.x), mix(v10, v11, f.x), f.y);
+    ivec2 i0 = clamp(ivec2(fl), ivec2(0), ivec2(pc.rw - 1, pc.rh - 1));
+    ivec2 i1 = clamp(ivec2(fl) + 1, ivec2(0), ivec2(pc.rw - 1, pc.rh - 1));
+    vec2 v00 = rf[pc.rpf + i0.y * pc.rw + i0.x], v01 = rf[pc.rpf + i0.y * pc.rw + i1.x];
+    vec2 v10 = rf[pc.rpf + i1.y * pc.rw + i0.x], v11 = rf[pc.rpf + i1.y * pc.rw + i1.x];
+    return mix(mix(v00, v01, f.x), mix(v10, v11, f.x), f.y);
 }
 
 vec3 sampleRGBRaw(sampler2D t, vec2 p) {
@@ -81,6 +100,18 @@ uint mismatchV(ivec2 p, vec2 hv, out vec3 wa, out vec3 wc) {
     wc = FG_FETCH(rc);
     vec3 d = FG_DIFF(wa, wc);
     return FG_PACKE(max(d.r, max(d.g, d.b)));
+}
+
+// v2_error.comp's e at p with the half-vector hv: as mismatchV, but V2_E_UNKNOWN when a tap was on its frame's UI (CrosshairV2 tap
+// rejection: the pixel shows the other frame's tap for both, so its mismatch says nothing; v2_resolve_core.glsl's trust box skips it)
+uint mismatchE(ivec2 p, vec2 hv) {
+    precise float ka = 2.0 * pc.wC, kc = 2.0 * pc.wA;
+    precise vec2 pa = vec2(p) - ka * hv;
+    precise vec2 pc_ = vec2(p) + kc * hv;
+    bool ha, hc;
+    if (uiRejectHits(pa, pc_, ha, hc)) return V2_E_UNKNOWN;
+    vec3 d = FG_DIFF(FG_FETCH(sampleRGBRaw(texPrev, pa)), FG_FETCH(sampleRGBRaw(texCurr, pc_)));
+    return min(FG_PACKE(max(d.r, max(d.g, d.b))), V2_E_UNKNOWN - 1u);
 }
 
 // The occlusion map entry of the midpoint position of full-resolution pixel p at time t: the content at p sits at the midpoint

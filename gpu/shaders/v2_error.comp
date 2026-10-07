@@ -1,0 +1,21 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2, synth (full res; error.comp with V2's field): e = max-channel |wa - wc| of the two warps with the refined half-vector
+// (motion_v2.glsl halfVec: the edge-preserving field instead of V1's bilinear upsample of the flow field), 4 pixels per thread,
+// packed as bytes into u[]; V2_E_UNKNOWN where a tap was on the UI (motion_v2.glsl mismatchE).
+#include "common.glsl"
+#include "motion_v2.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= E_STRIDE || g.y >= pc.H) return;
+    uint packed = 0u;
+    for (int i = 0; i < 4; i++) {
+        ivec2 p = ivec2(g.x * 4 + i, g.y);
+        if (p.x < pc.W) {
+            packed |= mismatchE(p, halfVec(p)) << (8 * i);
+        }
+    }
+    u[E_OFF + g.y * E_STRIDE + g.x] = packed;
+}
