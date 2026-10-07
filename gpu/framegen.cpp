@@ -166,7 +166,7 @@ VkFormat cleanFormatC(Format f) { return f == Format::P010 ? VK_FORMAT_R16G16_UN
     X(DestroyQueryPool) X(GetQueryPoolResults) X(CmdBindPipeline) X(CmdBindDescriptorSets) \
     X(CmdPushConstants) X(CmdDispatch) X(CmdPipelineBarrier) X(CmdFillBuffer) X(CmdResetQueryPool) \
     X(CmdWriteTimestamp) X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(BindImageMemory) \
-    X(CreateImageView) X(DestroyImageView)
+    X(CreateImageView) X(DestroyImageView) X(CmdCopyBuffer)
 
 // Must match the push-constant block in shaders/motion_v1.glsl.
 struct PC {
@@ -373,6 +373,7 @@ bool Interpolator::Impl::makeBuffer(int i, VkDeviceSize size) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (i == 2) bci.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // the counters: recordDebugCounters() copies them out
     if (CreateBuffer(info.device, &bci, nullptr, &buf[i]) != VK_SUCCESS) { buf[i] = VK_NULL_HANDLE; return false; }
     VkMemoryRequirements req;
     GetBufferMemoryRequirements(info.device, buf[i], &req);
@@ -1194,6 +1195,22 @@ bool Interpolator::readTimings(std::vector<const char*>& names, std::vector<uint
     ticks.clear();
     for (uint32_t i = 1; i < m->qcount; i++) ticks.push_back(ts[i] - ts[i - 1]);
     return true;
+}
+
+bool Interpolator::recordDebugCounters(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset) {
+    if (!m || !m->W || !m->buf[2]) return false;
+    Impl& I = *m;
+    // the synth's atomics (and the estimate's SAD sum) -> this copy; nothing of ours is written, so the next record's own
+    // clearCounters barrier (CS RW -> transfer write) already orders its fill after this read
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    VkBufferCopy c{0, dstOffset, 8};   // u[U_UNTRUSTED], u[U_SADSUM]
+    I.CmdCopyBuffer(cb, I.buf[2], dst, 1, &c);
+    return true;
+}
+
+uint32_t Interpolator::debugSadBlocks() const {
+    return m && !m->lv.empty() ? (uint32_t)(m->lv[0].bw * m->lv[0].bh) : 0;
 }
 
 VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur, RejPair rej) {
