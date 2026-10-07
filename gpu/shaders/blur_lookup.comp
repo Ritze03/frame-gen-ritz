@@ -4,6 +4,7 @@
 // dispatch (z = sample): the field at time t_k, g(q) = h(q - (2t - 1) g(q)), 2 bilinear fixed-point steps from h(q).
 // Reads the estimate's pixel field, writes bf[k].
 #include "blur_common.glsl"
+#include "blur_motion_v1.glsl"
 
 vec2 F(int x, int y) { return field[pc.pf + clamp(y, 0, pc.fh - 1) * pc.fw + clamp(x, 0, pc.fw - 1)]; }
 vec2 sampleF(vec2 p) {   // == common.glsl sampleF

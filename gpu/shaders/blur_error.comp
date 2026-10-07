@@ -3,6 +3,7 @@
 // Motion blur, pass 2 (full res): error.comp for every interior sample k in one dispatch (z = sample):
 // e = max-channel |wa - wc| of the two warps, 4 pixels per thread packed as bytes into be[k].
 #include "blur_common.glsl"
+#include "blur_motion_v1.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
 void main() {

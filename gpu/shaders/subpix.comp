@@ -4,6 +4,7 @@
 // median-filtered integer vector, cost = SAD + LAMBDA*step*|d|_1, bilinear taps from LDS.
 // Also accumulates the winning SAD for the scene-cut test (fixed point, 1/256).
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 64) in;
 
 const int T = 13, O = 2;   // tile covers block +- (0.75 + bilinear) px

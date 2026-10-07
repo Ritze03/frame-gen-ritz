@@ -3,6 +3,7 @@
 // Pass 9: full res. Upsample the per-pixel field, warp a and c (RGB, bilinear, rounded to 8 bit like
 // cv2.remap on uint8), e = max-channel |wa - wc|. 4 pixels per thread, packed as bytes into u[].
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
 void main() {

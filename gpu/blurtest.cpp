@@ -9,6 +9,7 @@
 //                               (every N 2..8, windows, weights, with scene cut / flick fallbacks), the smear of a moving
 //                               object's edge against the ideal model, the crosshair pixel-exact under UI protection, the
 //                               descriptor rings, validation of the settings.
+//   option --algo v1|v2         the motion version (Settings::motionVersion) every Interpolator is created and set with (default v1)
 #include "framegen.h"
 #include "blendbench_spv.h"
 
@@ -24,6 +25,7 @@
 
 // protection modes of the tests: 0 Off, 1 Crosshair, 2 WholeScreen, 3 CrosshairV2 (compile with -DBLURTEST_NO_V2 against a library without it)
 #ifdef BLURTEST_NO_V2
+#define BLURTEST_NO_MOTION   // a library before CrosshairV2 has no motion version either
 #define BT_NMODES 3
 #else
 #define BT_NMODES 4
@@ -240,10 +242,17 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
     for (uint8_t b : v) { h ^= b; h *= 1099511628211ull; }
     return h;
 }
+// --algo: the motion version every Interpolator of the run is created and set with
+#ifndef BLURTEST_NO_MOTION
+static MotionVersion gAlgo = MotionVersion::V1;
+static Settings algo(Settings s) { s.motionVersion = gAlgo; return s; }
+#else
+static Settings algo(Settings s) { return s; }
+#endif
 static bool makeInterp(Interpolator& fg, int W, int H, const Settings& s) {
     InitInfo info;
     info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
-    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = s;
+    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = algo(s);
     return fg.init(info);
 }
 static void destroyImg(Img& i) { vkDestroyImageView(dev, i.view, nullptr); vkDestroyImage(dev, i.img, nullptr); vkFreeMemory(dev, i.mem, nullptr); }
@@ -416,7 +425,7 @@ static void benchOne(int W, int H, uint32_t flowScale, const Settings& base) {
     auto blurRun = [&](int N, float w0, float w1, int outputs, BlurWeights bw) {
         Settings sb = s;
         sb.blurSamples = N; sb.blurWeights = bw;
-        fg.setSettings(sb);
+        fg.setSettings(algo(sb));
         int PP = std::max(1, std::min(P, 32 / std::max(outputs, 1)));
         return timePairs(fg, ring, PP, [&](int p) {
             for (int o = 0; o < outputs; o++) {
@@ -453,7 +462,7 @@ static void benchOne(int W, int H, uint32_t flowScale, const Settings& base) {
         }
     {   // per-pass of one blurred output (profiling, isolated)
         Settings sb = s; sb.blurSamples = 4;
-        fg.setSettings(sb);
+        fg.setSettings(algo(sb));
         fg.setProfiling(true);
         std::vector<std::vector<double>> per;
         std::vector<const char*> names;
@@ -471,7 +480,7 @@ static void benchOne(int W, int H, uint32_t flowScale, const Settings& base) {
         printf("   passes of 1 pair + 1 blurred output (N=4, [0.25,0.75], isolated):");
         for (size_t i = 0; i < names.size(); i++) if (!strncmp(names[i], "blur", 4)) printf(" %s %.3f", names[i], median(per[i]));
         printf(" ms\n");
-        fg.setSettings(s);
+        fg.setSettings(algo(s));
     }
 #endif
     vkDeviceWaitIdle(dev);
@@ -652,7 +661,11 @@ static Edge modelEdge(const BScene& bs, const std::vector<float>& t, const std::
 #endif
 
 static int check(int W, int H) {
+#ifndef BLURTEST_NO_MOTION
+    printf("check %dx%d %s, motion version %s (--algo)\n", W, H, bgra ? "BGRA8" : "RGBA8", gAlgo == MotionVersion::V2 ? "V2" : "V1");
+#else
     printf("check %dx%d %s\n", W, H, bgra ? "BGRA8" : "RGBA8");
+#endif
     const char* wn[2] = {"even", "gaussian"};
 #ifdef BLURTEST_NO_BLUR
     (void)wn;
@@ -670,6 +683,19 @@ static int check(int W, int H) {
             for (int i = 0; i < 3; i++) { synthOut(c, i, ts[i]); printf(" %016llx", (unsigned long long)fnv(c.get(i))); }
             printf("\n");
         }
+#ifndef BLURTEST_NO_BLUR
+        // the blurred outputs too (4 Gaussian samples; windows 0-0.5, 0.25-0.75, 0.5-1 of the last pair): diff two builds of the library
+        for (int mi = 0; mi < BT_NMODES; mi++) {
+            const UiProtection mode = btMode(mi);
+            Settings s;
+            s.uiProtection = mode; s.uiBoxWidth = s.uiBoxHeight = 64;
+            Ctx c(W, H, withBlur(s, 4, BlurWeights::Gaussian));
+            printf("HASH blur mode %d:", (int)mode);
+            float w0[3] = {0.0f, 0.25f, 0.5f};
+            for (int i = 0; i < 3; i++) { blurOut(c, i, w0[i], w0[i] + 0.5f); printf(" %016llx", (unsigned long long)fnv(c.get(i))); }
+            printf("\n");
+        }
+#endif
     }
 #ifdef BLURTEST_NO_BLUR
     return 0;
@@ -684,7 +710,7 @@ static int check(int W, int H) {
         blurOut(c, 1, 0.1f, 0.3f);   // blur off: the window collapses to its end
         expect(c.get(0) == c.get(1), "blur off: recordSynthBlur(t0, t1) == recordSynth(t1) (bit-exact, UI protection on)");
         Settings b = withBlur(s, 4, BlurWeights::Gaussian);
-        c.fg.setSettings(b);
+        c.fg.setSettings(algo(b));
         blurOut(c, 2, 0.3f, 0.3f);
         expect(c.get(0) == c.get(2), "blur on, t0 == t1: == recordSynth(t) (bit-exact)");
         blurOut(c, 3, 0.5f, 0.5f);
@@ -738,7 +764,7 @@ static int check(int W, int H) {
                     if (&var != &vars[0] && (N != 3 && N != 4 && N != 7)) continue;   // the fallback variants: a subset of N
                     auto t = sampleTimes(N, wd[0], wd[1]);
                     std::vector<std::vector<uint8_t>> sub(N);
-                    c.fg.setSettings(withBlur(s, N, BlurWeights::Even));
+                    c.fg.setSettings(algo(withBlur(s, N, BlurWeights::Even)));
                     for (int k = 0; k < N; k++) {
                         if (t[k] <= 0.0f) sub[k] = c.real10;
                         else if (t[k] >= 1.0f) sub[k] = c.real11;
@@ -746,7 +772,7 @@ static int check(int W, int H) {
                     }
                     for (int wi = 0; wi < 2; wi++) {
                         BlurWeights bw = wi ? BlurWeights::Gaussian : BlurWeights::Even;
-                        c.fg.setSettings(withBlur(s, N, bw));
+                        c.fg.setSettings(algo(withBlur(s, N, bw)));
                         blurOut(c, 1, wd[0], wd[1]);
                         auto got = c.get(1);
                         auto w = sampleWeights(N, bw);
@@ -772,8 +798,8 @@ static int check(int W, int H) {
         Settings s0, s1;
         s1.globalFallback = 0.001f;
         Ctx c0(W, H, s0), c1(W, H, s1);
-        c0.fg.setSettings(withBlur(s0, 4, BlurWeights::Even));
-        c1.fg.setSettings(withBlur(s1, 4, BlurWeights::Even));
+        c0.fg.setSettings(algo(withBlur(s0, 4, BlurWeights::Even)));
+        c1.fg.setSettings(algo(withBlur(s1, 4, BlurWeights::Even)));
         blurOut(c0, 0, 0.25f, 0.75f);
         blurOut(c1, 0, 0.25f, 0.75f);
         auto a = c0.get(0), b = c1.get(0);
@@ -809,7 +835,7 @@ static int check(int W, int H) {
                 }
                 for (int wi = 0; wi < 2; wi++) {
                     BlurWeights bw = wi ? BlurWeights::Gaussian : BlurWeights::Even;
-                    c.fg.setSettings(withBlur(s, N, bw));
+                    c.fg.setSettings(algo(withBlur(s, N, bw)));
                     blurOut(c, 1, wd[0], wd[1]);
                     auto img = c.get(1);
                     auto w = sampleWeights(N, bw);
@@ -873,10 +899,10 @@ static int check(int W, int H) {
         // output([0,1]) (Even, N = 8) equals the average of output([0,.5]) and output([.5,1]) (Even, N = 4) up to rounding
         Settings s; s.uiProtection = UiProtection::Off;
         Ctx c(W, H, s);
-        c.fg.setSettings(withBlur(s, 4, BlurWeights::Even));
+        c.fg.setSettings(algo(withBlur(s, 4, BlurWeights::Even)));
         blurOut(c, 0, 0.0f, 0.5f); blurOut(c, 1, 0.5f, 1.0f);
         auto ha = c.get(0), hb = c.get(1);
-        c.fg.setSettings(withBlur(s, 8, BlurWeights::Even));
+        c.fg.setSettings(algo(withBlur(s, 8, BlurWeights::Even)));
         blurOut(c, 2, 0.0f, 1.0f);
         auto whole = c.get(2);
         int worst = 0;
@@ -902,21 +928,21 @@ static int check(int W, int H) {
             if (mode == 0) {   // mixed N in one submission (the scratch grows between records): each equals its own single record
                 Settings s2 = s;
                 s2.blurSamples = 2;
-                c.fg.setSettings(s2);
+                c.fg.setSettings(algo(s2));
                 begin();
                 c.fg.beginFrame();
                 bool a = c.fg.recordSynthBlur(cb, c.prv->view, c.cur->view, c.outs[0].view, 0.25f, 0.75f);
                 s2.blurSamples = 8;
-                c.fg.setSettings(s2);
+                c.fg.setSettings(algo(s2));
                 bool b = c.fg.recordSynthBlur(cb, c.prv->view, c.cur->view, c.outs[1].view, 0.25f, 0.75f);
                 s2.blurSamples = 3;
-                c.fg.setSettings(s2);
+                c.fg.setSettings(algo(s2));
                 bool d = c.fg.recordSynthBlur(cb, c.prv->view, c.cur->view, c.outs[2].view, 0.25f, 0.75f);
                 submit();
                 auto o0 = c.get(0), o1 = c.get(1), o2 = c.get(2);
-                s2.blurSamples = 2; c.fg.setSettings(s2); blurOut(c, 3, 0.25f, 0.75f);
-                s2.blurSamples = 8; c.fg.setSettings(s2); blurOut(c, 4, 0.25f, 0.75f);
-                s2.blurSamples = 3; c.fg.setSettings(s2); blurOut(c, 5, 0.25f, 0.75f);
+                s2.blurSamples = 2; c.fg.setSettings(algo(s2)); blurOut(c, 3, 0.25f, 0.75f);
+                s2.blurSamples = 8; c.fg.setSettings(algo(s2)); blurOut(c, 4, 0.25f, 0.75f);
+                s2.blurSamples = 3; c.fg.setSettings(algo(s2)); blurOut(c, 5, 0.25f, 0.75f);
                 expect(a && b && d && o0 == c.get(3) && o1 == c.get(4) && o2 == c.get(5), "N = 2, 8, 3 recorded in ONE submission (scratch growing) == each recorded alone");
             }
             if (mode == 0) {
@@ -957,9 +983,17 @@ int main(int argc, char** argv) {
     std::vector<std::string> pos;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bgra")) bgra = true;
+#ifndef BLURTEST_NO_MOTION
+        else if (!strcmp(argv[i], "--algo") && i + 1 < argc) {
+            const char* a = argv[++i];
+            if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
+            else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
+            else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
+        }
+#endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

@@ -1,5 +1,6 @@
 // uitest: validation + benchmark of framegen's static-UI protection (Settings::uiProtection).
 //   uitest check [--bgra] [--hash] [W H]     default 1280 720
+//   option --algo v1|v2 (every mode): the motion version (Settings::motionVersion) every run starts with (default v1)
 //   uitest deep [W H]                        Settings::uiHistory: a synth from a pair 10 frames back still finds its clean copies (default 640x360)
 //   uitest track [W H]                       recordTrack: UI protection kept warm while the host does not generate (default 640x360)
 //   uitest trackbench [W H]                  GPU cost of recordTrack vs recordObserve (default 1920x1080 and 2560x1440)
@@ -15,6 +16,8 @@
 // WholeScreen, the HUD box's only in WholeScreen, background PSNR does not drop; --hash prints an FNV-1a hash of
 // every generated frame of the Off run (compare against a build of the library before protection existed: build
 // this file with -DUITEST_NO_UI against it).
+// check also covers the motion version (motionCheck): V2 refused for every Format but Rgba8, a switch drops the estimate,
+// releaseUnusedMotion() frees the unselected version's pipelines and a later switch back re-creates them.
 #include "framegen.h"
 
 #include <algorithm>
@@ -28,6 +31,9 @@
 
 #ifdef UITEST_NO_UI
 #define UITEST_NO_V2   // a library without the feature has no CrosshairV2 either
+#endif
+#ifdef UITEST_NO_V2
+#define UITEST_NO_MOTION   // nor a motion version (Settings::motionVersion)
 #endif
 // the modes the shared tests (deep, track, trackbench, bench) loop over besides Crosshair and WholeScreen
 #ifdef UITEST_NO_V2
@@ -248,6 +254,13 @@ struct Scene {
 // ---------------------------------------------------------------- one run
 using namespace framegen;
 struct Result { std::vector<uint8_t> out[2]; };   // t = 0.5, 0.25 of the last pair
+// --algo: the motion version every Interpolator of the run is created and set with
+#ifndef UITEST_NO_MOTION
+static MotionVersion gAlgo = MotionVersion::V1;
+static Settings algo(Settings s) { s.motionVersion = gAlgo; return s; }
+#else
+static Settings algo(Settings s) { return s; }
+#endif
 static uint64_t fnv(const std::vector<uint8_t>& v) {
     uint64_t h = 1469598103934665603ull;
     for (uint8_t b : v) { h ^= b; h *= 1099511628211ull; }
@@ -257,7 +270,7 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
 static bool makeInterp(Interpolator& fg, int W, int H, const Settings& s) {
     InitInfo info;
     info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
-    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = s;
+    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = algo(s);
     return fg.init(info);
 }
 
@@ -350,6 +363,9 @@ static void expect(bool ok, const char* what) {
     if (!ok) fails++;
 }
 
+#ifndef UITEST_NO_MOTION
+static void motionCheck(const Scene& sc);
+#endif
 #ifndef UITEST_NO_V2
 static int v2Check(int W, int H);
 static void marginCheck(int W, int H);
@@ -441,14 +457,14 @@ static int check(int W, int H, bool hash) {
     {
         Result r = runSequence(sc, off, true, nullptr, [&](Interpolator& fg, int f) {
             Settings x;
-            if (f == 1) { x.uiProtection = UiProtection::Crosshair; if (!fg.setSettings(x)) { printf("setSettings failed\n"); exit(1); } }
-            if (f == 3) { x.uiProtection = UiProtection::WholeScreen; if (!fg.setSettings(x)) { printf("setSettings failed\n"); exit(1); } }
+            if (f == 1) { x.uiProtection = UiProtection::Crosshair; if (!fg.setSettings(algo(x))) { printf("setSettings failed\n"); exit(1); } }
+            if (f == 3) { x.uiProtection = UiProtection::WholeScreen; if (!fg.setSettings(algo(x))) { printf("setSettings failed\n"); exit(1); } }
         });
         Metrics m = measure(sc, r.out[0], real11, &truth);
         printf(" Runtime Off -> Crosshair (frame 1) -> WholeScreen (frame 3): crosshair wrong %zu, hud wrong %zu\n", m.xhBad, m.hudBad);
         expect(m.xhBad == 0 && m.hudBad == 0, "runtime switch to WholeScreen mid-stream protects crosshair and HUD");
         Result r2 = runSequence(sc, w1, true, nullptr, [&](Interpolator& fg, int f) {
-            if (f == 9) { if (!fg.setSettings(Settings{})) { printf("setSettings failed\n"); exit(1); } }
+            if (f == 9) { if (!fg.setSettings(algo(Settings{}))) { printf("setSettings failed\n"); exit(1); } }
         });
         expect(r2.out[0] == rOff.out[0] && r2.out[1] == rOff.out[1], "runtime switch WholeScreen -> Off: later output bit-identical to an Off run");
     }
@@ -499,6 +515,9 @@ static int check(int W, int H, bool hash) {
         bad = Settings{}; bad.uiProtection = (UiProtection)4; expect(!Interpolator::validate(bad), "validate rejects an unknown mode");
         expect(Interpolator::validate(Settings{}), "defaults valid");
     }
+#ifndef UITEST_NO_MOTION
+    motionCheck(sc);
+#endif
 #ifndef UITEST_NO_V2
     marginCheck(W, H);
     return v2Check(W, H);
@@ -1052,7 +1071,7 @@ static int v2Check(int W, int H) {
                         Settings x = fg.settings();
                         x.uiProtection = st.second;
                         x.uiBoxHeightFrac = 43.0f / H;
-                        if (!fg.setSettings(x)) { printf("setSettings failed\n"); exit(1); }
+                        if (!fg.setSettings(algo(x))) { printf("setSettings failed\n"); exit(1); }
                     }
             });
         };
@@ -1120,7 +1139,7 @@ static int deepHistory(int W, int H) {
         if (tail) {
             // lower to the default: the pair is evicted; release the memory (everything retired: waited above)
             Settings lo = s; lo.uiHistory = 3;
-            if (!fg.setSettings(lo)) { printf("setSettings(lower) failed\n"); exit(1); }
+            if (!fg.setSettings(algo(lo))) { printf("setSettings(lower) failed\n"); exit(1); }
             vkDeviceWaitIdle(dev);
             fg.releaseUnusedUi();
             // the newest pair is still protected
@@ -1132,7 +1151,7 @@ static int deepHistory(int W, int H) {
             Metrics m = measure(sc, r2, sc.frame(NF - 1), nullptr);
             *tailOk = m.xhBad == 0;
             // and a raise allocates again (the settings call must succeed)
-            if (!fg.setSettings(s)) { printf("setSettings(raise) failed\n"); exit(1); }
+            if (!fg.setSettings(algo(s))) { printf("setSettings(raise) failed\n"); exit(1); }
         }
         vkDeviceWaitIdle(dev);
         fg.destroy();
@@ -1442,16 +1461,164 @@ static void bench(int W, int H) {
 }
 #endif
 
+#ifndef UITEST_NO_MOTION
+// ---------------------------------------------------------------- the motion version (Settings::motionVersion)
+// The pipelines the library holds, counted through the gdpa it loads its device functions with (InitInfo::gdpa): created - destroyed.
+static int64_t gLivePipes = 0;
+static VKAPI_ATTR VkResult VKAPI_CALL countCreatePipes(VkDevice d, VkPipelineCache c, uint32_t n, const VkComputePipelineCreateInfo* ci,
+                                                      const VkAllocationCallbacks* a, VkPipeline* out) {
+    VkResult r = vkCreateComputePipelines(d, c, n, ci, a, out);
+    if (r == VK_SUCCESS) gLivePipes += n;
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL countDestroyPipe(VkDevice d, VkPipeline p, const VkAllocationCallbacks* a) {
+    if (p) gLivePipes--;
+    vkDestroyPipeline(d, p, a);
+}
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const char* name) {
+    if (!strcmp(name, "vkCreateComputePipelines")) return (PFN_vkVoidFunction)countCreatePipes;
+    if (!strcmp(name, "vkDestroyPipeline")) return (PFN_vkVoidFunction)countDestroyPipe;
+    return vkGetDeviceProcAddr(d, name);
+}
+static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : "V1"; }
+
+// --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
+// protection Off, t = 0.5.
+//   V2 needs Rgba8: settingsError() refuses it for every other Format with a reason, init() refuses it with that reason.
+//   A switch drops the estimate: recordSynth / recordSynthBlur of the pair return false until a new recordEstimate, also after
+//   switching straight back (an estimate of one version is never synthesised by the other); setSettings without a switch keeps it.
+//   The new version's output equals a fresh instance's in that version.
+//   releaseUnusedMotion(): the first switch to a version creates its pipelines, the release frees the unselected version's (and
+//   nothing while there is none), selecting it again re-creates them and gives the same output as before; destroy() frees all.
+static void motionCheck(const Scene& sc) {
+    const int W = sc.W, H = sc.H;
+    const MotionVersion from = gAlgo, to = gAlgo == MotionVersion::V1 ? MotionVersion::V2 : MotionVersion::V1;
+    printf("\n== motion version: start %s, switch to %s ==\n", algoName(from), algoName(to));
+    {   // V2 needs Rgba8
+        Settings v1, v2; v2.motionVersion = MotionVersion::V2;
+        Settings bad; bad.motionVersion = (MotionVersion)2;
+        expect(Interpolator::validate(v2) && !Interpolator::validate(bad), "validate accepts V2 and rejects an unknown motion version");
+        const Format others[4] = {Format::Rgb10, Format::RgbaF16, Format::Nv12, Format::P010};
+        bool v1All = !Interpolator::settingsError(v1, Format::Rgba8), v2Refused = true;
+        for (Format f : others) {
+            v1All = v1All && !Interpolator::settingsError(v1, f);
+            v2Refused = v2Refused && Interpolator::settingsError(v2, f) != nullptr;
+        }
+        expect(v1All && !Interpolator::settingsError(v2, Format::Rgba8), "settingsError: V1 valid for every Format, V2 for Rgba8");
+        expect(v2Refused, "settingsError: V2 refused for Rgb10, RgbaF16, Nv12 and P010");
+        printf("    reason: %s\n", Interpolator::settingsError(v2, Format::Rgb10));
+        expect(Interpolator::settingsError(bad, Format::Rgba8) != nullptr, "settingsError refuses what validate refuses");
+        // init() of a non-SDR view format with V2: false before anything is created, with that reason (RgbaF16 also linear)
+        const VkFormat vfs[5] = {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                 VK_FORMAT_R8_UNORM, VK_FORMAT_R16_UNORM};
+        bool initRefused = true;
+        for (int i = 0; i < 5; i++) {
+            Interpolator fg;
+            InitInfo info;
+            info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
+            info.viewFormat = vfs[i]; info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = v2;
+            if (i == 2) info.transfer = Transfer::Linear;
+            Format f;
+            formatOf(vfs[i], &f);
+            const bool ok = fg.init(info);
+            const char* e = fg.initError();
+            initRefused = initRefused && !ok && e && (!strcmp(e, Interpolator::settingsError(v2, f)) || strstr(e, "not built"));
+            fg.destroy();
+        }
+        expect(initRefused, "init refuses V2 for Rgb10, RgbaF16 (encoded and linear), Nv12 and P010, initError = settingsError's reason");
+    }
+
+    Img a = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    Img b = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    Img o = makeImage(W, H, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    begin();
+    for (Img* i : {&a, &b, &o}) imgBarrier(i->img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    submit();
+    upload(sc.frame(10), a, W, H);
+    upload(sc.frame(11), b, W, H);
+    // estimate (optional) + synth at 0.5 into o; returns the synth's result, the output is downloaded only when it succeeded
+    auto run = [&](Interpolator& fg, bool estimate, std::vector<uint8_t>* out) {
+        begin();
+        fg.beginFrame();
+        bool ok = (!estimate || fg.recordEstimate(cb, a.view, b.view)) && fg.recordSynth(cb, a.view, b.view, o.view, 0.5f);
+        submit();
+        if (ok && out) *out = download(o, W, H);
+        return ok;
+    };
+    auto blurRefused = [&](Interpolator& fg) {
+        begin();
+        fg.beginFrame();
+        bool ok = fg.recordSynthBlur(cb, a.view, b.view, o.view, 0.25f, 0.75f);
+        submit();
+        return !ok;
+    };
+    Settings sFrom, sTo;
+    sFrom.motionVersion = from; sTo.motionVersion = to;
+    sFrom.blurSamples = sTo.blurSamples = 4;   // recordSynthBlur blurs (else it is recordSynth)
+    std::vector<uint8_t> outA, outB, outC, outR, outD;
+    {   // the reference: a fresh instance in `to`
+        Interpolator ref;
+        InitInfo info;
+        info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
+        info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = sTo;
+        if (!ref.init(info) || !run(ref, true, &outR)) { expect(false, "reference instance"); }
+        vkDeviceWaitIdle(dev);
+        ref.destroy();
+    }
+    gLivePipes = 0;
+    Interpolator fg;
+    InitInfo info;
+    info.phys = phys; info.device = dev; info.gdpa = countingGdpa; info.width = W; info.height = H;
+    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = sFrom;
+    if (!fg.init(info)) { expect(false, "init with the counting gdpa"); return; }
+    const int64_t p0 = gLivePipes;
+    expect(run(fg, true, &outA), "estimate + synth in the start version");
+    expect(fg.setSettings(sFrom) && run(fg, false, &outB) && outB == outA, "setSettings without a switch keeps the estimate (same output)");
+    expect(fg.setSettings(sTo), "switch accepted");
+    const int64_t k = gLivePipes - p0;
+    printf("    pipelines: %lld after init, +%lld for the first switch to %s\n", (long long)p0, (long long)k, algoName(to));
+    expect(k > 0, "the first switch creates the new version's pipelines");
+    expect(!run(fg, false, nullptr) && blurRefused(fg), "after the switch the old estimate is gone: recordSynth and recordSynthBlur return false");
+    expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "switching back creates nothing (the start version kept its pipelines)");
+    expect(!run(fg, false, nullptr), "switching straight back does not revive the dropped estimate");
+    expect(fg.setSettings(sTo) && run(fg, true, &outC), "a new estimate in the new version synthesises");
+    expect(outC == outR, "the new version's output equals a fresh instance's in that version");
+    printf("    (%s output %s %s's: V2 aliases V1's passes for now)\n", algoName(to), outC == outA ? "equals" : "DIFFERS FROM", algoName(from));
+    vkDeviceWaitIdle(dev);
+    fg.releaseUnusedMotion();
+    expect(gLivePipes == p0, "releaseUnusedMotion frees the unselected version's pipelines");
+    fg.releaseUnusedMotion();
+    expect(gLivePipes == p0, "a second releaseUnusedMotion frees nothing (nothing unused)");
+    expect(run(fg, true, &outC) && outC == outR, "the selected version still works after the release");
+    expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "selecting the released version again re-creates its pipelines");
+    expect(run(fg, true, &outD) && outD == outA, "the re-created version gives the same output as before the release");
+    vkDeviceWaitIdle(dev);
+    fg.releaseUnusedMotion();
+    expect(gLivePipes == p0, "release after switching back: the other version freed");
+    fg.destroy();
+    expect(gLivePipes == 0, "destroy frees every pipeline");
+    for (Img* i : {&a, &b, &o}) { vkDestroyImageView(dev, i->view, nullptr); vkDestroyImage(dev, i->img, nullptr); vkFreeMemory(dev, i->mem, nullptr); }
+}
+#endif
+
 int main(int argc, char** argv) {
     std::vector<std::string> pos;
     bool hash = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bgra")) bgra = true;
+#ifndef UITEST_NO_MOTION
+        else if (!strcmp(argv[i], "--algo") && i + 1 < argc) {
+            const char* a = argv[++i];
+            if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
+            else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
+            else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
+        }
+#endif
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dumpDir = argv[++i];
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [--algo v1|v2] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -1518,6 +1685,9 @@ int main(int argc, char** argv) {
     } else if (pos[0] == "check") {
         int W = pos.size() >= 3 ? atoi(pos[1].c_str()) : 1280, H = pos.size() >= 3 ? atoi(pos[2].c_str()) : 720;
         initStaging(std::max((size_t)W * H, (size_t)1280 * 960) * 4);   // ghostCheck() runs its own 1280x960 scenes
+#ifndef UITEST_NO_MOTION
+        printf("motion version %s (--algo)\n", algoName(gAlgo));
+#endif
         rc = check(W, H, hash);
         printf(rc ? "RESULT: FAIL (%d)\n" : "RESULT: PASS\n", fails);
     } else {

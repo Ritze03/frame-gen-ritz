@@ -168,7 +168,7 @@ VkFormat cleanFormatC(Format f) { return f == Format::P010 ? VK_FORMAT_R16G16_UN
     X(CmdWriteTimestamp) X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(BindImageMemory) \
     X(CreateImageView) X(DestroyImageView)
 
-// Must match the push-constant block in shaders/common.glsl.
+// Must match the push-constant block in shaders/motion_v1.glsl.
 struct PC {
     int32_t w, h, bw, bh, pw, ph, offA, offC, srcA, srcC, fIn, fOut, fPar, radius, medIdx,
         W, H, fw, fh, pf, fscale, sadAcc;
@@ -176,7 +176,7 @@ struct PC {
     float lambda, smoothBonus, zeroBonus, cutSad, trust0, trustScale, globalFrac;
 };
 static_assert(sizeof(PC) <= 128, "push constants beyond the guaranteed minimum");
-static const int kEOff = 64;   // == E_OFF in common.glsl
+static const int kEOff = 64;   // == E_OFF in motion_v1.glsl
 
 // Must match the push-constant block in shaders/ui_common.glsl.
 struct UiPC {
@@ -192,7 +192,7 @@ static const int kUiCell = 2;    // whole-screen detection resolution: 1/kUiCell
 static const int kUiTile = 32;   // == TILE in ui_common.glsl
 static const int kUiInpTile = 16;   // == T in ui_inpaint.comp
 
-// Must match the push-constant block in shaders/blur_common.glsl.
+// Must match the push-constant block in shaders/blur_motion_v1.glsl.
 struct BlurPC {
     int32_t W, H, fw, fh, fscale, n, bw, bh, k0, pf, gauss, fix;
     float cutSad, trust0, trustScale, globalFrac;
@@ -200,7 +200,7 @@ struct BlurPC {
 };
 static_assert(sizeof(BlurPC) <= 128, "push constants beyond the guaranteed minimum");
 enum BlurPipe { B_LOOKUP, B_ERROR, B_RESOLVE, B_COUNT_ };
-static const int kBlurCnt0 = 32;   // == CNT0 in blur_common.glsl: u[] words 32.. hold the per-sample untrusted counts
+static const int kBlurCnt0 = 32;   // == CNT0 in blur_motion_v1.glsl: u[] words 32.. hold the per-sample untrusted counts
 
 struct UiBuf { VkBuffer b = VK_NULL_HANDLE; VkDeviceMemory m = VK_NULL_HANDLE; VkDeviceSize size = 0; };
 struct RejPair { VkBuffer a = VK_NULL_HANDLE, c = VK_NULL_HANDLE; };   // the V2 masks of prev / curr, bound to synth sets 11 / 12
@@ -225,6 +225,19 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
+// The resources of one motion version (Settings::motionVersion): created by motionEnsure() the first time the version is selected
+// (init, setSettings, reconfigure), kept while another one is selected, freed by releaseUnusedMotion() / destroy(). V1: the pipelines
+// of the estimate / synth passes and of the motion-blur passes over the shared layouts, set rings and scratch buffers. V2 aliases V1
+// for now: its group holds its own pipelines of V1's shaders, so the switch, the release and the re-creation are the real ones; its
+// own shaders (v2_*.comp) replace them, and its own size-dependent buffers go into `bufs` (created by motionSized()).
+static const int kMotionVersions = 2;   // MotionVersion::V1, V2
+struct MotionGroup {
+    VkPipeline pipes[P_COUNT]{};
+    VkPipeline blurPipes[B_COUNT_]{};
+    std::vector<UiBuf> bufs;   // size-dependent buffers of this version only (none yet), freed with the size like buf[]
+    bool live = false;         // created (the pipelines; the buffers whenever a size is held)
+};
+
 struct Interpolator::Impl {
 #define X(n) PFN_vk##n n = nullptr;
     FG_FUNCS(X)
@@ -240,12 +253,23 @@ struct Interpolator::Impl {
     VkSampler sampler = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    VkPipeline pipes[P_COUNT]{};
     bool makePipe(const Spv& sp, VkPipelineLayout lay, VkPipeline& out, const VkSpecializationInfo* spec);
-    // motion blur (recordSynthBlur): own push-constant layout over the same set layout, 4 pipelines, and a scratch
-    // that is created by the first blur record and only ever grows (the old buffer waits in the graveyard)
+    // Specialization constants of the colour shaders (init(), shaders/format.glsl), kept for the pipelines of a motion version
+    // that is created later
+    union W32 { uint32_t u; float f; };
+    W32 specData[9]{};
+    VkSpecializationMapEntry specEnts[9]{};
+    VkSpecializationInfo specInfo{};
+    const VkSpecializationInfo* spec = nullptr;
+    // the motion versions' pipelines and buffers (MotionGroup); mg() = the selected one, which every record uses
+    MotionGroup mo[kMotionVersions];
+    MotionGroup& mg() { return mo[(int)set.motionVersion]; }
+    bool motionEnsure();
+    bool motionSized(MotionGroup& g);
+    void motionFree(MotionGroup& g);
+    // motion blur (recordSynthBlur): own push-constant layout over the same set layout, 3 pipelines (per motion version, in
+    // MotionGroup), and a scratch that is created by the first blur record and only ever grows (the old buffer waits in the graveyard)
     VkPipelineLayout blurLayout = VK_NULL_HANDLE;
-    VkPipeline blurPipes[B_COUNT_]{};
     UiBuf blurField, blurErr;
     std::vector<UiBuf> blurGrave;
     bool growBlur(UiBuf& b, VkDeviceSize bytes);
@@ -399,6 +423,9 @@ bool Interpolator::Impl::createSizeDependent() {
     cw = ((int)W + kUiCell - 1) / kUiCell; ch = ((int)H + kUiCell - 1) / kUiCell;
     tilesX = ((int)W + kUiTile - 1) / kUiTile; tilesY = ((int)H + kUiTile - 1) / kUiTile;
     if (!uiEnsure()) return false;
+    // the motion versions' own buffers (of every version created so far, so a switch back needs no allocation)
+    for (MotionGroup& g : mo)
+        if (g.live && !motionSized(g)) return false;
     return true;
 }
 
@@ -409,6 +436,10 @@ void Interpolator::Impl::destroySizeDependent() {
         buf[i] = VK_NULL_HANDLE; mem[i] = VK_NULL_HANDLE;
     }
     uiDestroy();
+    for (MotionGroup& g : mo) {
+        for (UiBuf& b : g.bufs) freeBuf(b);
+        g.bufs.clear();
+    }
     freeBuf(blurField);
     freeBuf(blurErr);
     for (UiBuf& b : blurGrave) freeBuf(b);
@@ -780,6 +811,7 @@ bool Interpolator::init(const InitInfo& ii) {
     if (!formatOf(ii.viewFormat, &fmt)) { err_ = "unsupported viewFormat (see framegen::Format)"; return false; }
     ColourSpv cs{};
     if (!colourSpv(fmt, cs)) { err_ = "the shader variants of this format are not built into the library (meson option 'formats')"; return false; }
+    if (const char* e = settingsError(ii.settings, fmt)) { err_ = e; return false; }
     if (fmt == Format::RgbaF16 && ii.transfer == Transfer::Linear && !(ii.linearWhiteNits > 0.0f && ii.linearWhiteNits <= 10000.0f)) {
         err_ = "linearWhiteNits must be in (0, 10000]";
         return false;
@@ -849,11 +881,10 @@ bool Interpolator::init(const InitInfo& ii) {
 
     // Specialization constants of the colour shaders (shaders/format.glsl): the transfer of float input, or the
     // sample scale / range / matrix of YUV. Plain Rgba8 and Rgb10 have none.
-    union W32 { uint32_t u; float f; };
-    W32 sd[9]{};
-    VkSpecializationMapEntry ents[9]{};
-    VkSpecializationInfo specInfo{};
-    const VkSpecializationInfo* spec = nullptr;
+    Impl::W32* sd = m->specData;
+    VkSpecializationMapEntry* ents = m->specEnts;
+    VkSpecializationInfo& specInfo = m->specInfo;
+    const VkSpecializationInfo*& spec = m->spec;
     if (fmt == Format::RgbaF16) {
         sd[0].u = ii.transfer == Transfer::Linear ? 1u : 0u;
         sd[1].f = ii.linearWhiteNits;
@@ -884,14 +915,6 @@ bool Interpolator::init(const InitInfo& ii) {
         spec = &specInfo;
     }
 
-    // the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's
-    struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
-        {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
-        {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
-        {SPV(lookup), nullptr}};
-    for (int i = 0; i < P_COUNT; i++)
-        if (!m->makePipe(spv[i].sp, m->layout, m->pipes[i], spv[i].sc)) { destroy(); err_ = fail; return false; }
-
     // motion-blur passes: the same set layout, their own (larger) push-constant block
     {
         VkPushConstantRange bpcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC)};
@@ -901,11 +924,9 @@ bool Interpolator::init(const InitInfo& ii) {
         bplci.pushConstantRangeCount = 1;
         bplci.pPushConstantRanges = &bpcr;
         if (m->CreatePipelineLayout(d, &bplci, nullptr, &m->blurLayout) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
-        struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
-            {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
-        for (int i = 0; i < B_COUNT_; i++)
-            if (!m->makePipe(bspv[i].sp, m->blurLayout, m->blurPipes[i], bspv[i].sc)) { destroy(); err_ = fail; return false; }
     }
+    // the pipelines of the selected motion version (another version's are created when it is first selected)
+    if (!m->motionEnsure()) { destroy(); err_ = fail; return false; }
 
     // one pool for the sets of both rings, sized by what the layout above holds (every set is allocated with all of it)
     uint32_t nBuf = 0, nSamp = 0, nImg = 0;
@@ -1018,7 +1039,7 @@ bool Interpolator::validate(const Settings& s) {
            in(s.sceneCutSad, 0.0f, 255.0f) && s.sceneCutSad > 0.0f &&
            in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) &&
-           (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 &&
+           (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V2 &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
            in(s.uiBoxHeightFrac, 0.0f, 1.0f) &&
@@ -1031,26 +1052,39 @@ bool Interpolator::validate(const Settings& s) {
            s.uiHistory >= kUiFrames && s.uiHistory <= kUiFramesMax;
 }
 
+const char* Interpolator::settingsError(const Settings& s, Format f) {
+    if (!validate(s)) return "invalid settings: a field is out of range or not finite (see Interpolator::validate)";
+    if (s.motionVersion == MotionVersion::V2 && f != Format::Rgba8)
+        return "MotionVersion::V2 supports only Format::Rgba8 (8-bit RGBA / BGRA views); Rgb10, RgbaF16 (encoded or linear), Nv12 and P010 need MotionVersion::V1";
+    return nullptr;
+}
+
 bool Interpolator::setSettings(const Settings& s) {
-    if (!m || !validate(s) || s.flowScale != m->set.flowScale) return false;
-    // UI protection: creating what the new mode needs is allowed here (it frees nothing, so no GPU wait); false =
-    // the allocation failed and nothing changed.
+    if (!m || settingsError(s, m->fmt) || s.flowScale != m->set.flowScale) return false;
+    // UI protection, and a motion version selected for the first time: creating what the new settings need is allowed here (it
+    // frees nothing, so no GPU wait); false = the creation failed and nothing changed (a version created before a later failure
+    // is kept, unused, for releaseUnusedMotion()).
     Settings old = m->set;
     m->set = s;
-    if (!m->uiEnsure()) { m->set = old; return false; }
+    if (!m->motionEnsure() || !m->uiEnsure()) { m->set = old; return false; }
     m->uiAdopted(old);
+    // A switch of the motion version drops the estimate, the way the library already has for "no estimate" (after init/resize):
+    // recordSynth / recordSynthBlur return false until the next recordEstimate, which runs the new version.
+    if (s.motionVersion != old.motionVersion) m->haveEst = false;
     return true;
 }
 
 bool Interpolator::reconfigure(const Settings& s) {
-    if (!m || !validate(s)) return false;
+    if (!m || settingsError(s, m->fmt)) return false;
     bool structural = s.flowScale != m->set.flowScale;
     Settings old = m->set;
     m->set = s;
+    if (!m->motionEnsure()) { m->set = old; return false; }
     // re-create only if a size is held (W == 0: a later resize() creates the buffers with the new settings)
-    if (structural && m->W) return m->rebuild(m->W, m->H, m->info.viewFormat, true);
+    if (structural && m->W) return m->rebuild(m->W, m->H, m->info.viewFormat, true);   // (drops the estimate anyway)
     if (!m->uiEnsure()) { m->set = old; return false; }
     m->uiAdopted(old);
+    if (s.motionVersion != old.motionVersion) m->haveEst = false;   // as in setSettings
     return true;
 }
 
@@ -1058,6 +1092,49 @@ void Interpolator::releaseUnusedUi() {
     if (!m) return;
     for (UiEntry& e : m->uiE)
         if (!e.active && (e.img || e.ws.b || e.box.b)) m->uiFreeEntry(e);
+}
+
+void Interpolator::releaseUnusedMotion() {
+    if (!m) return;
+    for (int v = 0; v < kMotionVersions; v++)
+        if (v != (int)m->set.motionVersion && m->mo[v].live) m->motionFree(m->mo[v]);
+}
+
+// Creates the resources of the selected motion version if it has none yet (see MotionGroup); never frees another version's.
+// False = a creation failed: what this call created is freed again and the caller refuses the settings.
+bool Interpolator::Impl::motionEnsure() {
+    MotionGroup& g = mg();
+    if (g.live) return true;
+    // V1 (and V2 while it aliases V1): the motion estimate is the same code for every format; the four colour passes of the
+    // estimate/synth set are the format's, as are the two colour passes of the blur
+    struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
+        {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
+        {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
+        {SPV(lookup), nullptr}};
+    struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
+        {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
+    bool ok = true;
+    for (int i = 0; ok && i < P_COUNT; i++) ok = makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
+    for (int i = 0; ok && i < B_COUNT_; i++) ok = makePipe(bspv[i].sp, blurLayout, g.blurPipes[i], bspv[i].sc);
+    ok = ok && (!W || motionSized(g));
+    if (!ok) { motionFree(g); return false; }
+    g.live = true;
+    return true;
+}
+
+// The size-dependent buffers of one motion version, beside the shared buf[] (called while a size is held: by motionEnsure and
+// createSizeDependent; destroySizeDependent frees them). V1 and today's V2 have none of their own.
+bool Interpolator::Impl::motionSized(MotionGroup& g) {
+    (void)g;
+    return true;
+}
+
+// Frees one motion version's resources (retire rule of resize()/destroy()).
+void Interpolator::Impl::motionFree(MotionGroup& g) {
+    for (VkPipeline p : g.pipes) if (p) DestroyPipeline(info.device, p, nullptr);
+    for (VkPipeline p : g.blurPipes) if (p) DestroyPipeline(info.device, p, nullptr);
+    for (UiBuf& b : g.bufs) freeBuf(b);
+    g = MotionGroup{};
 }
 
 Format Interpolator::format() const {
@@ -1074,9 +1151,8 @@ void Interpolator::destroy() {
     if (m->DestroyBuffer) { m->destroySizeDependent(); m->freeBuf(m->rejNone); }
     if (m->qpool) m->DestroyQueryPool(d, m->qpool, nullptr);
     if (m->pool) m->DestroyDescriptorPool(d, m->pool, nullptr);
-    for (auto p : m->pipes) if (p) m->DestroyPipeline(d, p, nullptr);
+    if (m->DestroyPipeline) for (MotionGroup& g : m->mo) m->motionFree(g);
     for (auto p : m->uiPipes) if (p) m->DestroyPipeline(d, p, nullptr);
-    for (auto p : m->blurPipes) if (p) m->DestroyPipeline(d, p, nullptr);
     if (m->blurLayout) m->DestroyPipelineLayout(d, m->blurLayout, nullptr);
     if (m->uiPool) m->DestroyDescriptorPool(d, m->uiPool, nullptr);
     if (m->uiLayout) m->DestroyPipelineLayout(d, m->uiLayout, nullptr);
@@ -1210,7 +1286,7 @@ struct Rec {
         I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);
     }
     void run(Pipe p, uint32_t gx, uint32_t gy) {
-        I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.pipes[p]);
+        I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().pipes[p]);
         I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
         I.CmdDispatch(cb, gx, gy, 1);
     }
@@ -1779,7 +1855,7 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     bp.cutSad = st.sceneCutSad; bp.trust0 = st.trustLow; bp.trustScale = 1.0f / (st.trustHigh - st.trustLow);
     bp.globalFrac = st.globalFallback;
     auto run = [&](BlurPipe p, uint32_t gx, uint32_t gy, uint32_t gz) {
-        I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.blurPipes[p]);
+        I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().blurPipes[p]);
         I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC), &bp);
         I.CmdDispatch(cb, gx, gy, gz);
     };

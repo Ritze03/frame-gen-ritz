@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 // Pass 5: per-component 3x3 median of the block field, replicate border (cv2.medianBlur ksize 3).
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
 float med9(float v[9]) {

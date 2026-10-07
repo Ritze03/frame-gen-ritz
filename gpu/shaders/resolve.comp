@@ -5,6 +5,7 @@
 // 0.5 * (wa + wc) exactly as in the 2x path. The global decisions (scene cut, > GLOBAL_FRAC untrusted) are applied by
 // fallback.comp once every workgroup has added to the counter.
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const int TS = 16, AP = 3, TT = TS + 2 * AP;

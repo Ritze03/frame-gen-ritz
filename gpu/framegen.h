@@ -23,6 +23,15 @@ enum class UiProtection : uint32_t {
                       // See "CrosshairV2" below.
 };
 
+// Motion algorithm (Settings::motionVersion): the motion estimate and the warp / mismatch / resolve passes that turn it into
+// generated frames. Values are append-only and never renumbered. Runtime: setSettings() switches between them (see there).
+enum class MotionVersion : uint32_t {
+    V1 = 0,   // the algorithm of proto/interp.py (the frozen reference), every Format: output byte-identical to a library without the
+              // choice. The default.
+    V2 = 1,   // the second algorithm, next to V1 (unchanged). Rgba8 only: settingsError() refuses it with any other Format. For now it
+              // runs V1's passes (its own pipelines of the same shaders), so its output equals V1's until its own shaders land.
+};
+
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
 enum class BlurWeights : uint32_t {
     Even = 0,       // every sub-frame 1/N: a plain box shutter
@@ -204,6 +213,14 @@ struct Settings {
     uint32_t blurSamples = 0;
     BlurWeights blurWeights = BlurWeights::Gaussian;
 
+    // The motion algorithm (see MotionVersion). V1 = the default: output and memory exactly as before. V2 needs Format::Rgba8
+    // (settingsError()). Runtime: setSettings() at any time. A switch DROPS the current estimate: recordSynth / recordSynthBlur
+    // return false (out untouched, the host shows the real frame, as with no estimate since init/resize) until the next
+    // recordEstimate, which runs the new version; an estimate of one version is never synthesised by the other. The first switch to a
+    // version creates its pipelines (and later its buffers) at once, no GPU wait (false from setSettings if that fails, nothing
+    // changed); switching away keeps them for a later switch back, releaseUnusedMotion() frees them.
+    MotionVersion motionVersion = MotionVersion::V1;
+
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
     // Motion estimation runs at 1/flowScale of the frame size: 1, 2 or 4. 2 = quality (default);
     // 4 = performance (1440p: ~40 % less total time at 2x, ~30 % at 4x; can miss thin/fine motion detail);
@@ -234,7 +251,7 @@ struct InitInfo {
     // Nv12 / P010 only: how the planes encode colour. Defaults: BT.709, limited (video) range.
     YuvMatrix yuvMatrix = YuvMatrix::Bt709;
     bool yuvFullRange = false;
-    Settings settings{};                      // init() returns false if !Interpolator::validate(settings)
+    Settings settings{};                      // init() returns false if Interpolator::settingsError(settings, format) (initError() says why)
 };
 
 class Interpolator {
@@ -259,6 +276,10 @@ public:
 
     // Settings (see struct Settings). validate(): true if every field is finite and in range.
     static bool validate(const Settings&);
+    // validate() plus the rules that depend on the Format: null if the settings are valid for `format`, else why not (a string
+    // literal). init(), setSettings() and reconfigure() refuse what it refuses (init() with this as initError()); a host whose
+    // setSettings() returned false can ask it why. Today's only Format rule: MotionVersion::V2 needs Format::Rgba8.
+    static const char* settingsError(const Settings&, Format format);
     // The box size (pixels) a frame of w x h gets under these settings: the explicit uiBoxWidth/uiBoxHeight, else the
     // square from uiBoxHeightFrac (or the legacy uiCrosshairArea). The same numbers the library protects; for a host
     // preview. Does not check validity.
@@ -276,12 +297,13 @@ public:
     // Runtime change: applies the runtime fields (the UI-protection ones too) to every record*() recorded after this call (each record
     // copies them into its own push constants, so in-flight and already-recorded work keeps its values;
     // no retire needed). Returns false and changes nothing if the object is not initialised, the settings
-    // are invalid, or flowScale differs from the active one (that needs reconfigure()).
+    // are invalid (settingsError() for the active format says why), or flowScale differs from the active one (that needs
+    // reconfigure()). Switching Settings::motionVersion drops the current estimate (see there).
     bool setSettings(const Settings&);
     // Structural change (flowScale) plus the runtime fields. If flowScale changes it re-creates the
     // size-dependent buffers: same retire rule and failure behaviour as resize(), and the next synth needs a
     // new recordEstimate(). Returns false and changes nothing if the object is not initialised or the
-    // settings are invalid.
+    // settings are invalid (settingsError() for the active format).
     bool reconfigure(const Settings&);
     // The active settings (defaults if not initialised).
     Settings settings() const;
@@ -463,6 +485,13 @@ public:
     // GPU, e.g. after the depth has stayed lower for a while. No-op if nothing is unused. resize()/reconfigure()
     // with a new size/flowScale/destroy() free everything anyway.
     void releaseUnusedUi();
+
+    // Frees the pipelines and buffers of the motion versions that Settings::motionVersion no longer selects (they stay
+    // allocated, unused, when it is switched, so switching back costs nothing). Retire rule of resize()/destroy(): every earlier
+    // record must have retired (the freed pipelines and buffers may be in a submission still running), so call it where the host
+    // already waits for the GPU, e.g. after the version has stayed switched for a while. No-op if nothing is unused. Selecting a
+    // freed version again creates its resources anew (setSettings, see Settings::motionVersion). destroy() frees everything anyway.
+    void releaseUnusedMotion();
 
     // Profiling (test/benchmark only): timestamps after every pass group. recordEstimate (or record)
     // starts a new profile, recordSynth appends its passes to it. Returns false if the query pool cannot

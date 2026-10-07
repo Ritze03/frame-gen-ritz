@@ -5,6 +5,7 @@
 // using its own candidate vector (as cv2.blur over the per-candidate error image does);
 // -SMOOTH_BONUS for the bilinear field, -ZERO_BONUS for zero. First candidate wins ties.
 #include "common.glsl"
+#include "motion_v1.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const int TS = 16, AP = 2, TT = TS + 2 * AP, NC = 7;
