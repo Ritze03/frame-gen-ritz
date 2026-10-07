@@ -17,13 +17,14 @@
 //   So a pixel that one of the three vectors explains is blended with it (a foreground pixel the field gave the background's vector
 //   gets the foreground's back: no background over the character), and a pixel none explains (the occluded strip) shows the
 //   background from the one frame that sees it instead of V1's held patch. The 3x3 instead of V1's 7x7 keeps the occlusion classes to
-//   the strip itself.
+//   the strip itself. At the edge of a clean occlusion region the result fades into V1's by the share of the 3x3 that has one.
 // The untrusted count of the whole-frame fallback is V1's (Ut > 0.5), so its decisions and the bench's fallback% compare with V1.
 
 const int TS = 16, AP = 3, TT = TS + 2 * AP, TB = TS + 2;
 shared float te[TT * TT];   // e of the tile + 3 (7x7 box)
 shared float hs[TT * TS];   // horizontal 7-sums
 shared float tb[TB * TB], tf[TB * TB];   // e of vB / vF of the tile + 1 (= e where the pixel has no clean occlusion)
+shared float tg[TB * TB];                 // 1 = the pixel has a clean occlusion
 
 struct V2Px {
     vec3 o;          // the output (levels, unrounded)
@@ -64,6 +65,7 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         }
         tb[i] = eb;
         tf[i] = ef;
+        tg[i] = oc.z != 0u ? 1.0 : 0.0;
     }
     barrier();
     ivec2 l = ivec2(gl_LocalInvocationID.xy);
@@ -82,19 +84,21 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
     vec4 nr = nearC ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
     r.alpha = nr.a;
     uvec4 oc = occAt(p, hv, V2R_S);
-    if (oc.z == 0u) {   // trusted / held: V1
-        vec3 a8 = FG_FETCH(nr.rgb);
-        r.o = m0 * (1.0 - ut) + a8 * ut;
+    vec3 a8 = FG_FETCH(nr.rgb);
+    vec3 v1o = m0 * (1.0 - ut) + a8 * ut;   // trusted / held: V1
+    if (oc.z == 0u) {
+        r.o = v1o;
         r.cls = (ut > 0.0 ? V2_CLS_HELD : V2_CLS_TRUSTED) | (uint(ut * 15.0 + 0.5) << 4);
         return r;
     }
     // clean occlusion
-    float e0 = 0.0, eb = 0.0, ef = 0.0;
+    float e0 = 0.0, eb = 0.0, ef = 0.0, g = 0.0;
     for (int y = 0; y < 3; y++)
         for (int x = 0; x < 3; x++) {
             e0 += te[(l.y + y + AP - 1) * TT + l.x + x + AP - 1];
             eb += tb[(l.y + y) * TB + l.x + x];
             ef += tf[(l.y + y) * TB + l.x + x];
+            g += tg[(l.y + y) * TB + l.x + x];
         }
     e0 *= 1.0 / 9.0; eb *= 1.0 / 9.0; ef *= 1.0 / 9.0;
     vec2 vB = float(FSCALE_) * unpackHalf2x16(oc.x), vF = float(FSCALE_) * unpackHalf2x16(oc.y);
@@ -112,7 +116,11 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
     }
     float w = clamp((ek - V2R_OCC0) * V2R_OCCSCALE, 0.0, 1.0);
     vec3 one = oc.z == 1u ? ba : bc;   // covered: prev sees it; uncovered: curr
-    r.o = mk * (1.0 - w) + one * w;
+    // at the edge of an occluded region (some 3x3 neighbours without a clean occlusion) fade to V1's output: no hard seam between
+    // the classes
+    g *= 1.0 / 9.0;
+    vec3 oo = mk * (1.0 - w) + one * w;
+    r.o = v1o * (1.0 - g) + oo * g;
     r.cls = k | (oc.z == 2u ? 8u : 0u) | (uint(w * 15.0 + 0.5) << 4);
     return r;
 }

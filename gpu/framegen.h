@@ -234,7 +234,7 @@ struct Settings {
     // version creates its pipelines and buffers at once, no GPU wait (false from setSettings if that fails, nothing changed);
     // switching away keeps them for a later switch back, releaseUnusedMotion() frees them. V2's buffer: 16 B per flow-resolution
     // pixel (the occlusion map) + 1 B per pixel (the class map), ~10.4 MB at 1080p, flowScale 2. Cost of V2 (RX 7900 XTX, 1080p 2x):
-    // ~0.41 ms per pair against V1's ~0.34 (the occlusion pass ~0.025 ms in the estimate, the resolve ~0.07 instead of ~0.03).
+    // ~0.42 ms per pair against V1's ~0.34 (the occlusion pass ~0.037 ms in the estimate, the resolve ~0.066 instead of ~0.032).
     // V2 reads only prev and curr: the same latency as V1.
     MotionVersion motionVersion = MotionVersion::V1;
 

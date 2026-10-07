@@ -16,12 +16,14 @@
 // Per q: the direction (4: x, y, both diagonals) and distance (reach x 1, 2, 4) with the largest |d|; the pixel is near a clean
 // occlusion if |d| >= edgeMin (distinct vectors), the distance is at most |d| + reach (the pixel is in or next to the strip, not just
 // somewhere within 4 reach of an edge), and both side vectors are confident (3x3 mean |a - c| at their own place, finest-level luma,
-// <= confMax). Background = the side vector nearer the global median vector (the camera motion; u[4..5], medhist.comp of the finest
+// <= confMax), and each side vector is steady (the field half a reach further out agrees with it). Then a 3x3 majority cleans the
+// map (main()). Background = the side vector nearer the global median vector (the camera motion; u[4..5], medhist.comp of the finest
 // level, the same units): which side of the edge the background is on cannot be told from one symmetric field (both hypotheses
 // produce the same field and mismatch), so the dominant motion decides. Foreground = the other side vector.
 #include "common.glsl"
 #include "motion_v2.glsl"
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 16, local_size_y = 16) in;
+const int TQ = 16, TR = TQ + 2;   // tile, tile + 1
 
 vec2 Fq(ivec2 q) { return field[pc.pf + clamp(q.y, 0, pc.fh - 1) * pc.fw + clamp(q.x, 0, pc.fw - 1)]; }
 
@@ -36,9 +38,8 @@ float sideCost(ivec2 x, vec2 v) {
     return s * (1.0 / 9.0);
 }
 
-void main() {
-    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
-    if (q.x >= pc.fw || q.y >= pc.fh) return;
+// The raw analysis of flow pixel q (before the 3x3 regularisation in main()).
+uvec4 analyse(ivec2 q) {
     float best = 0.0;
     ivec2 bo = ivec2(0);
     for (int k = 0; k < 3; k++) {
@@ -52,18 +53,50 @@ void main() {
             if (abs(d) > abs(best)) { best = d; bo = o; }   // ties: the nearer distance (searched first)
         }
     }
-    uvec4 res = uvec4(0u);
-    if (abs(best) >= pc.edgeMin && length(vec2(bo)) <= abs(best) + float(pc.reach)) {
-        vec2 vp = Fq(q + bo), vm = Fq(q - bo);
-        // a side is a region, not one noisy vector: the field half a reach further out agrees with it
-        ivec2 ext = ivec2(roundEven(normalize(vec2(bo)) * max(1.0, 0.5 * float(pc.reach))));
-        float tol = max(0.5, 0.25 * abs(best));
-        bool steady = distance(Fq(q + bo + ext), vp) <= tol && distance(Fq(q - bo - ext), vm) <= tol;
-        if (steady && sideCost(q + bo, vp) <= pc.confMax && sideCost(q - bo, vm) <= pc.confMax) {
-            vec2 med = vec2(uintBitsToFloat(u[4]), uintBitsToFloat(u[5]));
-            bool pBg = distance(vp, med) <= distance(vm, med);
-            vec2 vB = pBg ? vp : vm, vF = pBg ? vm : vp;
-            res = uvec4(packHalf2x16(vB), packHalf2x16(vF), best < 0.0 ? 1u : 2u, 0u);
+    if (abs(best) < pc.edgeMin || length(vec2(bo)) > abs(best) + float(pc.reach)) return uvec4(0u);
+    vec2 vp = Fq(q + bo), vm = Fq(q - bo);
+    // a side is a region, not one noisy vector: the field half a reach further out agrees with it
+    ivec2 ext = ivec2(roundEven(normalize(vec2(bo)) * max(1.0, 0.5 * float(pc.reach))));
+    float tol = max(0.5, 0.25 * abs(best));
+    if (distance(Fq(q + bo + ext), vp) > tol || distance(Fq(q - bo - ext), vm) > tol) return uvec4(0u);
+    if (sideCost(q + bo, vp) > pc.confMax || sideCost(q - bo, vm) > pc.confMax) return uvec4(0u);
+    vec2 med = vec2(uintBitsToFloat(u[4]), uintBitsToFloat(u[5]));
+    bool pBg = distance(vp, med) <= distance(vm, med);
+    vec2 vB = pBg ? vp : vm, vF = pBg ? vm : vp;
+    return uvec4(packHalf2x16(vB), packHalf2x16(vF), best < 0.0 ? 1u : 2u, 0u);
+}
+
+shared uvec4 raw[TR * TR];   // the tile + 1
+
+// Regularisation (3x3 majority): a flagged pixel with fewer than 3 flagged neighbours is dropped (an isolated decision is noise, and
+// a lone warped pixel in a held patch is a speckle); an unflagged pixel with at least 5 flagged neighbours takes the side of their
+// majority and the vectors of the first of them with that side (a hole in an occluded strip would be a held speck).
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TQ - 1;
+    for (int i = lid; i < TR * TR; i += TQ * TQ) {
+        ivec2 q = t0 + ivec2(i % TR, i / TR);
+        raw[i] = (q.x >= 0 && q.y >= 0 && q.x < pc.fw && q.y < pc.fh) ? analyse(q) : uvec4(0u);
+    }
+    barrier();
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= pc.fw || q.y >= pc.fh) return;
+    uvec4 res = raw[(l.y + 1) * TR + l.x + 1];
+    int na = 0, nc = 0;
+    for (int y = 0; y < 3; y++)
+        for (int x = 0; x < 3; x++) {
+            if (x == 1 && y == 1) continue;
+            uint sd = raw[(l.y + y) * TR + l.x + x].z;
+            na += sd == 1u ? 1 : 0;
+            nc += sd == 2u ? 1 : 0;
+        }
+    if (res.z != 0u && na + nc < 3) res = uvec4(0u);
+    else if (res.z == 0u && na + nc >= 5) {
+        uint want = na >= nc ? 1u : 2u;
+        for (int k = 0; k < 9; k++) {
+            uvec4 r = raw[(l.y + k / 3) * TR + l.x + k % 3];
+            if (r.z == want) { res = r; break; }
         }
     }
     int i = 4 * (q.y * pc.fw + q.x);

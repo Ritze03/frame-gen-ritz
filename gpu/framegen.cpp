@@ -1898,7 +1898,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         PC2 p2 = r.pc2();
         p2.pf = I.fieldPF;
         p2.offA = l0.offA; p2.offC = l0.offC;
-        r.run2(P_V2OCCL, p2, divUp(I.fw, 8), divUp(I.fh, 8));
+        r.run2(P_V2OCCL, p2, divUp(I.fw, 16), divUp(I.fh, 16));
         r.cbar();
         r.stamp("v2 occlusion");
     }
