@@ -11,7 +11,7 @@
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill;
 // MotionVersion::V2: preset=a|b|c|d = v2Preset, and the single-knob overrides v2OcclWidth v2Reach v2Confidence v2OccLow v2OccHigh
-// v2PickBias v2TrustLow v2TrustHigh v2RefineRes v2EdgeSigma v2Temporal v2TemporalBonus (-1 = the preset's value)), passed to init. Keys apply in order, later ones win.
+// v2PickBias v2TrustLow v2TrustHigh v2RefineRes v2EdgeSigma v2Temporal v2TemporalBonus v2Rescue v2HoldFeather v2OccSoft (-1 = the preset's value)), passed to init. Keys apply in order, later ones win.
 // UI protection (ui != off in --set or --then): every real frame is recordObserve'd once, in pair order, into a ring of 3 input
 // images; consecutive pairs (pair k+1's prev path == pair k's curr path) form one frame stream, as a host sees it. A fresh
 // Interpolator (start, --window) has to warm up: CrosshairV2 / Crosshair mask a pixel only after uiStillFrames (8) still frames,
@@ -108,6 +108,9 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         else if (k == "v2EdgeSigma") s.v2EdgeSigma = (float)v;
         else if (k == "v2Temporal") s.v2Temporal = (float)v;
         else if (k == "v2TemporalBonus") s.v2TemporalBonus = (float)v;
+        else if (k == "v2Rescue") s.v2Rescue = (float)v;
+        else if (k == "v2HoldFeather") s.v2HoldFeather = (float)v;
+        else if (k == "v2OccSoft") s.v2OccSoft = (float)v;
         else { fprintf(stderr, "unknown setting %s\n", tok); return false; }
     }
     return true;

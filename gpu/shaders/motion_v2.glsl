@@ -7,7 +7,8 @@
 // V2's own buffer (binding 13, framegen.cpp MotionGroup::bufs[0]):
 //   words [0, 4 fw fh): the occlusion map, one uvec4 per flow-resolution pixel of the MIDPOINT grid (v2_occl.comp):
 //     x = packHalf2x16(background half-vector), y = packHalf2x16(foreground half-vector) (flow-resolution units, like field[]),
-//     z = side: 0 = no clean occlusion, 1 = covered (take prev), 2 = uncovered (take curr), w = 0 (reserved).
+//     z = side: 0 = no clean occlusion, 1 = covered (take prev), 2 = uncovered (take curr), w = 1: the content rescue put this
+//     pixel's vector back (v2_merge.comp; the resolve does not hold it), else 0.
 //   words [clsOff, clsOff + eStride H): the class map of the latest synth (debug, recordDebugMaps), one byte per pixel, 4 per
 //     word, low byte first: bits 0-2 class (V2_CLS_*: 0 trusted, 1 held, clean occlusion with 2 the field's vector, 3 vB, 4 vF, 5 zero), bit 3 = side curr, bits 4-7 = weight of the hold / one-sided output x 15.
 //   then the temporal store (D19, I10: the previous pair's field, v2_temporal.glsl; written by v2_seed / v2_occl, read by v2_seed,
@@ -42,8 +43,9 @@ layout(push_constant) uniform PC2 {
     float trust0, trustScale;   // the held class's ramp (V2Knobs trustLow, 1 / (trustHigh - trustLow))
     float occ0, occScale;       // the occlusion ramp (V2Knobs occLow, 1 / (occHigh - occLow))
     float pickBias;             // V2Knobs pickBias
-    float edgeMin;              // v2_occl: min normal motion difference, flow-resolution half-vector units (occlWidth / fscale)
-    float confMax;              // v2_occl: V2Knobs confidence
+    float edgeMin;              // v2_occl: min normal motion difference, flow-resolution half-vector units (occlWidth / fscale);
+                                // v2_resolve (synth): V2Knobs holdFeather (px)
+    float confMax;              // v2_occl: V2Knobs confidence; v2_resolve (synth): V2Knobs occSoft
     float zeroBonus;            // Settings::hudBonus (the zero candidate at a clean occlusion)
     int rw, rh;                 // the refinement grid (V2Knobs refineRes % of W x H)
     int rpf;                    // offset in rf[] of the refined field the pass reads (0 = the midpoint field, rw * rh = at t)
@@ -55,7 +57,7 @@ layout(push_constant) uniform PC2 {
     float tBonus;               // v2_smooth: V2Knobs temporalBonus (levels, 3x3 mean): how much worse the compensated previous
                                 // vector may explain a pixel and still replace its own
     int lw, lh;                 // v2_seed: the coarsest pyramid level's size (its luma at offA / offC)
-    int pad_;
+    float rescue;               // v2_rescue: V2Knobs rescue (levels): the largest 3x3 mean |a - c| of a rescued match
 } pc;
 
 #define V2_RF(i) rf[(i)]
@@ -68,6 +70,7 @@ const int U_UNTRUSTED = 0;
 #define MID (pc.wC == 0.5)
 const uint V2_E_UNKNOWN = 255u;   // v2_error.comp: a warp tap was on the UI (known e is capped at 254)
 const uint V2_CLS_TRUSTED = 0u, V2_CLS_HELD = 1u, V2_CLS_OCC_FIELD = 2u, V2_CLS_OCC_BG = 3u, V2_CLS_OCC_FG = 4u, V2_CLS_OCC_ZERO = 5u;
+const uint V2_CLS_RESCUED = 6u;   // (I11) the content rescue's vector, not held
 
 // luma texel of the finest level, clamp to edge; bilinear tap (as motion_v1.glsl's L / sampleL)
 float L(int off, int x, int y, int w, int h) {
@@ -130,6 +133,11 @@ uint mismatchE(ivec2 p, vec2 hv) {
 
 // The occlusion map entry of the midpoint position of full-resolution pixel p at time t: the content at p sits at the midpoint
 // m = p - (2t - 1) hv (hv = the field at t at p; lookup.comp's relation), nearest flow pixel of m.
+// the side of the occlusion map at flow pixel j (clamped)
+uint occSideAt(ivec2 j) {
+    j = clamp(j, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    return v2b[4 * (j.y * pc.fw + j.x) + 2];
+}
 uvec4 occAt(ivec2 p, vec2 hv, float s) {
     vec2 m = vec2(p) - s * hv;
     ivec2 j = clamp(ivec2(floor((m + 0.5) / float(pc.fscale))), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));

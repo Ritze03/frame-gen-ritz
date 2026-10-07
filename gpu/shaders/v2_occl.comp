@@ -125,6 +125,8 @@ void main() {
         }
     }
     int i = 4 * (q.y * pc.fw + q.x);
+    res.w = (v2b[v2ROff() + q.y * pc.fw + q.x] & 12u) != 0u ? 1u : 0u;   // rescued / filled by v2_merge / v2_close.comp (0 when the
+                                                                          // rescue is off: v2_smooth cleared it)
     v2b[i] = res.x; v2b[i + 1] = res.y; v2b[i + 2] = res.z; v2b[i + 3] = res.w;
     v2b[v2POff(pc.tFlags & 1) + q.y * pc.fw + q.x] = packV(Fq(q));   // the temporal store: this pair's field for the next estimate
 }

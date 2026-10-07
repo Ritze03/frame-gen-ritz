@@ -21,7 +21,8 @@ layout(push_constant) uniform BPC2 {
     float cutSad, trust0, trustScale, globalFrac;   // runtime settings (trust: V2Knobs trustLow / trustHigh)
     float occ0, occScale, pickBias, zeroBonus;      // V2Knobs: the occlusion ramp, pickBias; Settings::hudBonus
     float t[16];       // time of each sample, in [0, 1]; <= 0 / >= 1 = the real frame prev / curr
-} pc;                  // (3 words free)
+    float feather, occSoft;   // V2Knobs holdFeather, occSoft
+} pc;                  // (1 word free)
 
 #define P_W (pc.wh & 0xFFFF)
 #define P_H (pc.wh >> 16)
@@ -37,8 +38,10 @@ layout(push_constant) uniform BPC2 {
 
 const uint V2_E_UNKNOWN = 255u;   // == motion_v2.glsl
 const uint V2_CLS_TRUSTED = 0u, V2_CLS_HELD = 1u, V2_CLS_OCC_FIELD = 2u, V2_CLS_OCC_BG = 3u, V2_CLS_OCC_FG = 4u, V2_CLS_OCC_ZERO = 5u;
+const uint V2_CLS_RESCUED = 6u;
 int eStride() { return (P_W + 3) >> 2; }
 int eWords() { return eStride() * P_H; }
+int holdOff(int k) { return P_N * eWords() + k * eStride() * ((P_H + 3) >> 2); }   // the soft hold edge's map of sample k (I11)
 const int CNT0 = 32;      // u[CNT0 + k]: untrusted-pixel count of sample k (== blur_motion_v1.glsl)
 
 // == motion_v2.glsl halfVec of the field at time t (v2_lookup.comp's field, computed here on the fly with the same code: v2_pack.glsl
@@ -90,6 +93,11 @@ uint mismatchE(float t, ivec2 p, vec2 hv) {
 }
 
 // == motion_v2.glsl occAt
+// the side of the occlusion map at flow pixel j (clamped)
+uint occSideAt(ivec2 j) {
+    j = clamp(j, ivec2(0), ivec2(P_FW - 1, P_FH - 1));
+    return v2b[4 * (j.y * P_FW + j.x) + 2];
+}
 uvec4 occAt(ivec2 p, vec2 hv, float s) {
     vec2 m = vec2(p) - s * hv;
     ivec2 j = clamp(ivec2(floor((m + 0.5) / float(P_FSCALE))), ivec2(0), ivec2(P_FW - 1, P_FH - 1));

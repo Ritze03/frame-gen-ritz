@@ -1,0 +1,56 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2, estimate (flow res, after v2_merge; the content rescue, step 4 of 4, I11): closes the holes of a rescued object. A rescued
+// object's votes are sparse (v2_rescue.comp matches 3x3 patches of a fast object that turns, scales and has flat parts: about half
+// of its pixels find their match), and a hole shows the background through the object: a speckled object. A pixel that is not
+// rescued, with rescued pixels (v2_merge.comp, coverage bit 2) on both sides of it along one of 4 axes (x, y, both diagonals)
+// within 6 flow px, lies inside the object: it takes the vector of the nearest of them (ties: the axis order, then the - side) and
+// is marked filled (bit 3; the occlusion map gets it like bit 2: not held). A morphological closing along lines: the object's outline
+// does not grow. Reads only bit 2 and the vectors of rescued pixels, which this pass never writes: the result does not depend on
+// the order. The whole pass returns at once when nothing was rescued (u[V2_U_RESCUED], v2_merge.comp).
+#include "common.glsl"
+#include "motion_v2.glsl"
+#include "v2_temporal.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int REACH = 6, TS = 16, TC = TS + 2 * REACH;
+shared uint sr[TC * TC];   // rescued (bit 2) of the tile + REACH
+shared uint anyRes;
+
+int rescuedAt(ivec2 l) { return int(sr[(l.y + REACH) * TC + l.x + REACH]); }   // l: tile-local, may lie in the apron
+
+void main() {
+    if (u[V2_U_RESCUED] == 0u) return;   // (uniform)
+    int lid = int(gl_LocalInvocationIndex);
+    if (lid == 0) anyRes = 0u;
+    barrier();
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - REACH;
+    for (int i = lid; i < TC * TC; i += TS * TS) {
+        ivec2 y = t0 + ivec2(i % TC, i / TC);
+        uint r = all(greaterThanEqual(y, ivec2(0))) && all(lessThan(y, ivec2(pc.fw, pc.fh))) ?
+                 (v2b[v2ROff() + y.y * pc.fw + y.x] >> 2) & 1u : 0u;
+        sr[i] = r;
+        if (r != 0u) anyRes = 1u;
+    }
+    barrier();
+    if (anyRes == 0u) return;   // (uniform)
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    ivec2 m = ivec2(gl_GlobalInvocationID.xy);
+    if (m.x >= pc.fw || m.y >= pc.fh) return;
+    if (rescuedAt(l) != 0) return;
+    const ivec2 ax[4] = ivec2[4](ivec2(1, 0), ivec2(0, 1), ivec2(1, 1), ivec2(1, -1));
+    int bestD = 1000;
+    ivec2 bestY = ivec2(0);
+    for (int a = 0; a < 4; a++) {
+        int dn = 0, dp = 0;
+        for (int k = 1; k <= REACH && dn == 0; k++) dn = rescuedAt(l - k * ax[a]) != 0 ? k : 0;
+        if (dn == 0) continue;
+        for (int k = 1; k <= REACH && dp == 0; k++) dp = rescuedAt(l + k * ax[a]) != 0 ? k : 0;
+        if (dp == 0) continue;
+        if (dn < bestD) { bestD = dn; bestY = m - dn * ax[a]; }
+        if (dp < bestD) { bestD = dp; bestY = m + dp * ax[a]; }
+    }
+    if (bestD == 1000) return;
+    field[pc.fE + m.y * pc.fw + m.x] = field[pc.fE + bestY.y * pc.fw + bestY.x];
+    v2b[v2ROff() + m.y * pc.fw + m.x] |= 8u;
+}

@@ -7,8 +7,11 @@
 //   V2R_S, V2R_WA, V2R_WC       2t - 1, 1 - t, t
 //   V2R_TRUST0, V2R_TRUSTSCALE  the held class's ramp; V2R_OCC0, V2R_OCCSCALE the occlusion ramp; V2R_PICKBIAS; V2R_ZEROBONUS
 //                               (Settings::hudBonus)
-//   occAt(p, hv, s)             the occlusion map entry of pixel p (motion_v2.glsl)
+//   occAt(p, hv, s)             the occlusion map entry of pixel p (motion_v2.glsl); occSideAt(j) its side at flow pixel j (clamped)
 //   W_, H_, FSCALE_             the full resolution and the flow scale
+//   V2R_FEATHER                 V2Knobs holdFeather (full-resolution px, <= 32; 0 = V1's hold edge), uniform
+//   V2R_UF(c, cw)               the soft hold edge's uf of 4 x 4 px cell c (cw cells per row; v2_hold_core.glsl), read if V2R_FEATHER > 0
+//   V2R_OCCSOFT                 V2Knobs occSoft (levels; 0 = the hard pick at a clean occlusion), uniform
 //
 // Per pixel p, with e7 = 7x7 mean of e (V1's box, over the pixels whose e is known: a pixel with a warp tap on the UI (CrosshairV2
 // tap rejection) shows the other frame's tap for both, which says nothing about its vector, so it takes the trust of the pixels
@@ -26,6 +29,9 @@
 //   background from the one frame that sees it instead of V1's held patch. The 3x3 instead of V1's 7x7 keeps the occlusion classes to
 //   the strip itself. At the edge of a clean occlusion region the result fades into V1's by the share of the 3x3 that has one.
 // The untrusted count of the whole-frame fallback is V1's (Ut > 0.5), so its decisions and the bench's fallback% compare with V1.
+// The soft hold edge (I11, D18; V2R_FEATHER > 0): the pixel's hold is max(Ut, uf), uf = the map of v2_hold_core.glsl (the hold
+// weight falling off softly outside held regions instead of V1's hard ~4 px edge), also in the class map's weight. The untrusted
+// count is that of Ut.
 
 const int TS = 16, AP = 3, TT = TS + 2 * AP, TB = TS + 2;
 shared float te[TT * TT];   // e + KN of the tile + 3 (7x7 box); 0 where e is unknown (V2_E_UNKNOWN)
@@ -85,6 +91,7 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         tg[i] = oc.z != 0u ? 1.0 : 0.0;
     }
     barrier();
+    float F = V2R_FEATHER;
     ivec2 l = ivec2(gl_LocalInvocationID.xy);
     ivec2 p = tile * TS + l;
     V2Px r;
@@ -97,6 +104,17 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
     float e7 = n7 == 49.0 ? s7 * (1.0 / 49.0) : n7 > 0.0 ? s7 / n7 : 0.0;
     float ut = clamp((e7 - V2R_TRUST0) * V2R_TRUSTSCALE, 0.0, 1.0);
     r.untrusted = ut > 0.5;
+    float ufe = 0.0;   // the soft hold edge (v2_hold_core.glsl's map, bilinear between the 4 x 4 px cell centres; not counted)
+    if (F > 0.0) {
+        ivec2 cw = ivec2((W_ + 3) >> 2, (H_ + 3) >> 2);
+        vec2 sc = (vec2(p) + 0.5) * 0.25 - 0.5;
+        ivec2 i0 = ivec2(floor(sc));
+        vec2 f = sc - vec2(i0);
+        ivec2 j0 = clamp(i0, ivec2(0), cw - 1), j1 = clamp(i0 + 1, ivec2(0), cw - 1);
+        float u00 = V2R_UF(ivec2(j0.x, j0.y), cw.x), u01 = V2R_UF(ivec2(j1.x, j0.y), cw.x);
+        float u10 = V2R_UF(ivec2(j0.x, j1.y), cw.x), u11 = V2R_UF(ivec2(j1.x, j1.y), cw.x);
+        ufe = mix(mix(u00, u01, f.x), mix(u10, u11, f.x), f.y);
+    }
     if (te[(l.y + AP) * TT + l.x + AP] == 0.0 || n7 < 25.0) {
         // e unknown (a tap on the UI: the output is the other frame's tap, right only if p's vector is, which nothing measures) or
         // mostly unknown around p: a vector that most of its 8 neighbours do not share (within 1/4 px) is a stray one (a vector the
@@ -118,10 +136,17 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
     r.alpha = nr.a;
     uvec4 oc = occAt(p, hv, V2R_S);
     vec3 a8 = FG_FETCH(nr.rgb);
-    vec3 v1o = m0 * (1.0 - ut) + a8 * ut;   // trusted / held: V1
-    if (oc.z == 0u) {
+    // the content rescue's pixels (occlusion map w): an object both frames show, put back at its midpoint with a vector that rarely
+    // matches exactly (perspective); holding, or the background vector of a clean occlusion, would show the background it covers,
+    // i.e. delete it again: the two-sided blend of its own vector
+    bool resc = (oc.w & 1u) != 0u;
+    if (resc) ut = 0.0;
+    float utf = resc ? 0.0 : max(ut, ufe);
+    vec3 v1o = m0 * (1.0 - utf) + a8 * utf;   // trusted / held: V1 (with the soft hold edge)
+    if (oc.z == 0u || resc) {   // (a rescued pixel is two-sided with its own vector: the occlusion picks would put the background
+                                // back over the object)
         r.o = v1o;
-        r.cls = (ut > 0.0 ? V2_CLS_HELD : V2_CLS_TRUSTED) | (uint(ut * 15.0 + 0.5) << 4);
+        r.cls = (resc ? V2_CLS_RESCUED : utf > 0.0 ? V2_CLS_HELD : V2_CLS_TRUSTED) | (uint(utf * 15.0 + 0.5) << 4);
         return r;
     }
     // clean occlusion
@@ -154,11 +179,32 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         V2R_MIS(p, vec2(0.0), za, zc);
         mk = v2Blend(za, zc);
     }
+    float sig = V2R_OCCSOFT;
+    if (sig > 0.0) {   // soft pick (I11): every candidate by exp(-(its biased cost - the best's) / occSoft), not the best alone
+        float c0 = e0, cb = eb + V2R_PICKBIAS, cf = ef + V2R_PICKBIAS, cz = max(ez - V2R_ZEROBONUS, 0.0) + V2R_PICKBIAS;
+        float cm = min(min(c0, cb), min(cf, cz));
+        float w0 = exp((cm - c0) / sig), wb = exp((cm - cb) / sig), wf = exp((cm - cf) / sig), wz = exp((cm - cz) / sig);
+        vec3 fa, fc, za, zc;
+        V2R_MIS(p, vF, fa, fc);
+        V2R_MIS(p, vec2(0.0), za, zc);
+        float ws = w0 + wb + wf + wz;
+        mk = (w0 * m0 + wb * v2Blend(ba, bc) + wf * v2Blend(fa, fc) + wz * v2Blend(za, zc)) / ws;
+        ek = (w0 * e0 + wb * eb + wf * ef + wz * max(ez - V2R_ZEROBONUS, 0.0)) / ws;
+    }
     float w = clamp((ek - V2R_OCC0) * V2R_OCCSCALE, 0.0, 1.0);
     vec3 one = oc.z == 1u ? ba : bc;   // covered: prev sees it; uncovered: curr
     // at the edge of an occluded region (some 3x3 neighbours without a clean occlusion) fade to V1's output: no hard seam between
     // the classes
     g *= 1.0 / 9.0;
+    // (I11) an island of clean occlusion (fewer than 15 of the 5x5 flow pixels around p's own: inside a held region, a lighting
+    // change, noise) fades to V1's output too: its one-sided warp would be a speck of the other frame in the held patch
+    {
+        vec2 m = vec2(p) - V2R_S * hv;
+        ivec2 j = ivec2(floor((m + 0.5) / float(FSCALE_)));
+        int n5 = 0;
+        for (int d = 0; d < 25; d++) n5 += occSideAt(j + ivec2(d % 5 - 2, d / 5 - 2)) != 0u ? 1 : 0;
+        g *= clamp(float(n5 - 7) * (1.0 / 8.0), 0.0, 1.0);
+    }
     vec3 oo = mk * (1.0 - w) + one * w;
     r.o = v1o * (1.0 - g) + oo * g;
     r.cls = k | (oc.z == 2u ? 8u : 0u) | (uint(w * 15.0 + 0.5) << 4);
