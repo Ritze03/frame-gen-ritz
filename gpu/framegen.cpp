@@ -45,6 +45,9 @@
 #include "v2_blur_hold_spv.h"
 #include "v2_search_spv.h"
 #include "v2_blur_error_spv.h"
+#include "v2_gate_spv.h"
+#include "v2_rcheck_e_spv.h"
+#include "v2_rcheck_spv.h"
 
 // The colour shaders of the formats other than Rgba8 (shaders/format.glsl), when built.
 // rgb10: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
@@ -205,7 +208,7 @@ struct PC2 {
     float tBonus;
     int32_t lw, lh;   // v2_seed: the coarsest pyramid level
     float rescue;     // v2_rescue: V2Knobs rescue
-};
+};   // (full: the estimate's I12 passes take their parameter in occ0, which only the synth reads otherwise; motion_v2.glsl)
 static_assert(sizeof(PC2) == sizeof(PC), "PC2 is pushed over PC's range");
 
 // Must match the push-constant block in shaders/ui_common.glsl.
@@ -268,6 +271,8 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD
             P_V2SEED,                           // V2 only: v2_seed.comp (the temporal store, D19)
             P_V2COVER, P_V2RESCUE, P_V2MERGE, P_V2CLOSE,   // V2 only: the content rescue (I11): v2_cover / rescue / merge / close.comp
             P_V2HOLD,                           // V2 only: the soft hold edge's map (I11): v2_hold.comp
+            P_V2GATE,                           // V2 only: the occlusion gate (I12): v2_gate.comp
+            P_V2RCHECKE, P_V2RCHECK,            // V2 only: the content rescue's acceptance check (I12): v2_rcheck_e / v2_rcheck.comp
             P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
@@ -1127,12 +1132,12 @@ bool Interpolator::validate(const Settings& s) {
 
 // MotionVersion::V2: the knob values of each preset (MotionPreset A-D, in order). -1 for the trust ramp = Settings::trustLow / trustHigh,
 // -1 for the occlusion ramp = the effective trust ramp. Fields: occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow,
-// trustHigh, refineRes, edgeSigma, temporal, temporalBonus, rescue, holdFeather, occSoft (V2Knobs).
+// trustHigh, refineRes, edgeSigma, temporal, temporalBonus, rescue, holdFeather, occSoft, occGate, seedMargin, rescueCheck (V2Knobs).
 static const V2Knobs kV2Presets[4] = {
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f},     // A balanced
-    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f, 1.0f, 1.0f, 12.0f, 12.0f, 4.0f},   // B safe (soft hold edge)
-    {1.0f, 6.0f, 16.0f, -1.0f, -1.0f, 0.5f, 16.0f, 48.0f, 100.0f, 5.0f, 1.0f, 3.0f, 24.0f, 0.0f, 4.0f},    // C bold
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f},    // D = A + trust 16 / 48
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f, 0.0f, 0.0f, 0.0f},     // A balanced
+    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f, 1.0f, 1.0f, 12.0f, 12.0f, 4.0f, 0.0f, 0.0f, 0.0f},   // B safe (soft hold edge)
+    {1.0f, 6.0f, 16.0f, -1.0f, -1.0f, 0.5f, 16.0f, 48.0f, 100.0f, 5.0f, 1.0f, 3.0f, 24.0f, 0.0f, 4.0f, 0.0f, 0.0f, 0.0f},    // C bold
+    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f, 0.0f, 0.0f, 0.0f},    // D = A + trust 16 / 48
 };
 
 V2Knobs Interpolator::v2Knobs(const Settings& s) {
@@ -1144,6 +1149,7 @@ V2Knobs Interpolator::v2Knobs(const Settings& s) {
     ov(k.refineRes, s.v2RefineRes); ov(k.edgeSigma, s.v2EdgeSigma);
     ov(k.temporal, s.v2Temporal); ov(k.temporalBonus, s.v2TemporalBonus);
     ov(k.rescue, s.v2Rescue); ov(k.holdFeather, s.v2HoldFeather); ov(k.occSoft, s.v2OccSoft);
+    ov(k.occGate, s.v2OccGate); ov(k.seedMargin, s.v2SeedMargin); ov(k.rescueCheck, s.v2RescueCheck);
     if (k.trustLow == -1.0f) k.trustLow = s.trustLow;
     if (k.trustHigh == -1.0f) k.trustHigh = s.trustHigh;
     if (k.occLow == -1.0f) k.occLow = k.trustLow;
@@ -1162,7 +1168,8 @@ static bool v2Valid(const Settings& s) {
         !in(s.v2OccLow, 0.0f, 255.0f) || !in(s.v2OccHigh, 0.0f, 255.0f) || !in(s.v2PickBias, 0.0f, 255.0f) ||
         !in(s.v2TrustLow, 0.0f, 255.0f) || !in(s.v2TrustHigh, 0.0f, 255.0f) || !in(s.v2RefineRes, 1.0f, 100.0f) ||
         !in(s.v2EdgeSigma, 1.0f, 255.0f) || !in(s.v2Temporal, 0.0f, 1.0f) || !in(s.v2TemporalBonus, 0.0f, 255.0f) ||
-        !in(s.v2Rescue, 0.0f, 64.0f) || !in(s.v2HoldFeather, 0.0f, 32.0f) || !in(s.v2OccSoft, 0.0f, 64.0f))
+        !in(s.v2Rescue, 0.0f, 64.0f) || !in(s.v2HoldFeather, 0.0f, 32.0f) || !in(s.v2OccSoft, 0.0f, 64.0f) ||
+        !in(s.v2OccGate, 0.0f, 1.0f) || !in(s.v2SeedMargin, 0.0f, 64.0f) || !in(s.v2RescueCheck, 0.0f, 4096.0f))
         return false;
     const V2Knobs k = Interpolator::v2Knobs(s);
     return k.trustHigh - k.trustLow >= 1.0f && k.occHigh - k.occLow >= 1.0f;
@@ -1242,6 +1249,9 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2MERGE] = {SPV(v2_merge), nullptr};
         spv[P_V2CLOSE] = {SPV(v2_close), nullptr};
         spv[P_V2HOLD] = {SPV(v2_hold), nullptr};
+        spv[P_V2GATE] = {SPV(v2_gate), nullptr};
+        spv[P_V2RCHECKE] = {SPV(v2_rcheck_e), nullptr};
+        spv[P_V2RCHECK] = {SPV(v2_rcheck), nullptr};
         spv[P_SEARCH] = {SPV(v2_search), nullptr};   // search.comp + the temporal seed
         spv[P_LOOKUP] = {SPV(v2_lookup), nullptr};
         spv[P_ERROR] = {SPV(v2_error), nullptr};
@@ -1995,6 +2005,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         }
         pc.fOut = l.fS;
         pc.sadAcc = i == 0 && !I.set.subpixel;   // without sub-pixel refinement the search's SAD is final
+        if (mv2) std::memcpy(&pc.srcA, &k2.seedMargin, 4);   // v2_search.comp: the temporal seed's margin (srcA is down.comp's alone)
         r.run(P_SEARCH, l.bw, l.bh);
         r.cbar();
         pc.fIn = l.fS; pc.fOut = l.fM;
@@ -2042,12 +2053,29 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
             r.run2(P_V2CLOSE, p2, divUp(I.fw, 16), divUp(I.fh, 16));
             r.cbar();
             r.stamp("v2 close");
+            if (k2.rescueCheck > 0.0f) {   // the rescue's acceptance check (v2_rcheck_e / v2_rcheck.comp)
+                PC2 pr = p2;
+                pr.occ0 = k2.rescueCheck / (float)(pc.fscale * pc.fscale);   // the smallest area kept, flow pixels
+                r.run2(P_V2RCHECKE, pr, divUp(I.fw, 16), divUp(I.fh, 16));
+                r.cbar();
+                r.run2(P_V2RCHECK, pr, divUp(I.fw, 16), divUp(I.fh, 16));
+                r.cbar();
+                r.stamp("v2 rescue check");
+            }
         }
         // occlusion analysis of the edge-aware midpoint field (v2_occl.comp)
         p2.pf = I.fieldT;
+        if (k2.rescue > 0.0f && k2.rescueCheck > 0.0f) p2.tFlags |= 4;   // the rescue check on: the soft edge of rescued objects
         r.run2(P_V2OCCL, p2, divUp(I.fw, 16), divUp(I.fh, 16));
         r.cbar();
         r.stamp("v2 occlusion");
+        if (k2.occGate > 0.0f) {   // the occlusion gate (v2_gate.comp)
+            PC2 pg = p2;
+            pg.occ0 = k2.occGate;
+            r.run2(P_V2GATE, pg, divUp(I.fw, 16), divUp(I.fh, 16));
+            r.cbar();
+            r.stamp("v2 gate");
+        }
         // the refined field on the refinement grid (v2_refine.comp -> rf[0..rw rh))
         p2.rfOut = 0;
         r.run2(P_V2REFINE, p2, divUp(rw, 8), divUp(rh, 8));

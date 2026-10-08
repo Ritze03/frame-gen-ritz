@@ -1,5 +1,5 @@
 // The body of search.comp (V1, and V2 without its temporal seed) and v2_search.comp (V2_SEED: the previous pair's field as a
-// 7th seed candidate). Included after the includes and the layout of the pass.
+// 7th seed candidate; it must beat the others by SEED_MARGIN, I12). Included after the includes and the layout of the pass.
 
 const int MAXR = 6, MAXT = 8 + 2 * MAXR, MAXC = (2 * MAXR + 1) * (2 * MAXR + 1);
 shared float ta[MAXT * MAXT], tc[MAXT * MAXT];
@@ -32,7 +32,7 @@ void main() {
             if (lid < s) { red[0][lid] += red[0][lid + s]; red[1][lid] += red[1][lid + s]; }
             barrier();
         }
-        if (lid == 0) seedS = tv && red[1][0] * (1.0 / 64.0) + LAMBDA < red[0][0] * (1.0 / 64.0) ? ts : ivec2(0);
+        if (lid == 0) seedS = tv && red[1][0] * (1.0 / 64.0) + LAMBDA + SEED_MARGIN < red[0][0] * (1.0 / 64.0) ? ts : ivec2(0);
 #else
         if (lid == 0) seedS = ivec2(0);
 #endif
@@ -67,7 +67,8 @@ void main() {
                 if (c < best) { best = c; bi = k; }
             }
 #ifdef V2_SEED
-            if (tv && red[6][0] * (1.0 / 64.0) + LAMBDA < best) bi = 6;   // the temporal seed (after the others: ties keep V1's pick)
+            if (tv && red[6][0] * (1.0 / 64.0) + LAMBDA + SEED_MARGIN < best) bi = 6;   // the temporal seed (after the others: ties keep
+                                                                                   // V1's pick; I12: it must win by SEED_MARGIN)
 #endif
             seedS = cand[bi];
         }

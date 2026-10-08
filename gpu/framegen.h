@@ -328,6 +328,29 @@ struct Settings {
     //   foreground's, zero) are weighted softly by their 3x3 mismatch, w = exp(-(e - e_best) / v2OccSoft), instead of the hard pick of
     //   the best (single pixels flipping between candidates: specks on silhouette edges). 0 = the hard pick.
     float v2OccSoft = -1.0f;
+    // (I12: three fixes of the round-1 blind test's losses to V1 on the shooter clips, each its own knob, each 0 = off = I11's
+    // output exactly, independent of each other and of the preset.)
+    //   v2OccGate: [0, 1] (I12). The occlusion gate: a clean occlusion whose surroundings are held (within +-12 flow px, the share of
+    //   the pixels without a clean occlusion whose own vector leaves a colour mismatch at or above the middle of the trust ramp, ramp
+    //   0.6 .. 0.85) is given back to V1's output, its one-sided warp AND its candidate pick, by that ramp x this strength. A real
+    //   occlusion lies between two regions its vectors explain; one inside a region nothing explains is the noise of a wrong field: a
+    //   muzzle flash or an explosion (the next frame's colour in blotchy, hard-edged patches over V1's soft hold), specks of the
+    //   other frame on tracer streaks. 0 = off. Cost ~0.009 ms (1080p 2x) + ~0.009 ms of statistics in the occlusion pass (always).
+    float v2OccGate = -1.0f;
+    //   v2SeedMargin: [0, 64] levels (I12). The temporal seed (v2Temporal) wins the block search's seed choice only if its block mean
+    //   SAD is lower than the best other candidate's by more than this (at every pyramid level; 0 = strictly lower, I11). Last pair's
+    //   motion is stale where the motion changes (a swaying, recoiling weapon: a torn box edge and a black speck where V1 moves it as
+    //   one rectangle); higher = the seed only where it clearly explains the content better, lower = more of its reach (steady fast
+    //   motion, thin fast objects). No cost.
+    float v2SeedMargin = -1.0f;
+    //   v2RescueCheck: [0, 4096] full-resolution pixels (I12). The content rescue's acceptance check (v2Rescue): the smallest rescued
+    //   blob kept (its area counted within +-10 flow px of each rescued pixel), and its mean colour mismatch (the rescued vector's,
+    //   at full resolution) at most the middle of the trust ramp, x min(area / (4 x this), 1) (a small blob must match better); a
+    //   blob that fails gets its own vector back and is held or trusted as usual. The rescue's misses are small hard-edged blobs of
+    //   the other content (a dark ring on a light pillar, a dark speck under a tree, a grey rectangle over tracers); a whole object
+    //   (a tree trunk) passes. Also softens the rescued object's edge (its hold exemption fades over the outer flow pixel). 0 = off.
+    //   Cost ~0.012 ms (1080p 2x, only where something was rescued).
+    float v2RescueCheck = -1.0f;
 };
 
 // The effective V2 knobs of a Settings (Interpolator::v2Knobs(): the preset with the v2* overrides applied).
@@ -336,6 +359,7 @@ struct V2Knobs {
     float refineRes, edgeSigma;   // refineRes rounded to an integer percentage
     float temporal, temporalBonus;   // temporal 0 / 1
     float rescue, holdFeather, occSoft;   // (I11)
+    float occGate, seedMargin, rescueCheck;   // (I12)
 };
 
 struct InitInfo {

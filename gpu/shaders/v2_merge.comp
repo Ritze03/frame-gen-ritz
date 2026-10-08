@@ -8,7 +8,8 @@
 // with at least 3 votes in its 5x5 tries the best of them the same way (the votes of an object are sparse: perspective, flat parts;
 // the test keeps the vector to where it explains the content). Each pixel writes only itself (its field vector and its coverage
 // word, bit 2 = rescued): the result does not depend on the order.
-// Reads the keys, the vectors and field[fE]; writes field[fE].
+// Reads the keys, the vectors and field[fE]; writes field[fE] (I12: and the replaced vector into vT's slot, dead after v2_rescue.comp,
+// for v2_rcheck.comp to put back).
 #include "common.glsl"
 #include "motion_v2.glsl"
 #include "v2_temporal.glsl"
@@ -61,6 +62,8 @@ void main() {
             vec2 uh = unpackV(v2b[ro + 2 * n + src]);
             vec2 h = field[pc.fE + m.y * pc.fw + m.x];
             if (cost3(m, uh) <= max(cost3(m, h) + 4.0, pc.rescue)) {
+                v2b[v2VTOff() + m.y * pc.fw + m.x] = packV(h);   // (I12) hE's own vector, for v2_rcheck.comp to put back (vT is
+                                                                  // dead after v2_rescue.comp)
                 field[pc.fE + m.y * pc.fw + m.x] = uh;
                 v2b[ro + m.y * pc.fw + m.x] |= 4u;   // rescued (v2_occl.comp copies it into the occlusion map: not held)
                 done = true;

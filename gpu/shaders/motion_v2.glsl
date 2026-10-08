@@ -7,8 +7,10 @@
 // V2's own buffer (binding 13, framegen.cpp MotionGroup::bufs[0]):
 //   words [0, 4 fw fh): the occlusion map, one uvec4 per flow-resolution pixel of the MIDPOINT grid (v2_occl.comp):
 //     x = packHalf2x16(background half-vector), y = packHalf2x16(foreground half-vector) (flow-resolution units, like field[]),
-//     z = side: 0 = no clean occlusion, 1 = covered (take prev), 2 = uncovered (take curr), w = 1: the content rescue put this
-//     pixel's vector back (v2_merge.comp; the resolve does not hold it), else 0.
+//     z = side: 0 = no clean occlusion, 1 = covered (take prev), 2 = uncovered (take curr), w: bit 0 = the content rescue put this
+//     pixel's vector back (v2_merge.comp; the resolve does not hold it); (I12) bits 4-7 = the occlusion gate's weight x 15
+//     (v2_gate.comp, Settings::v2OccGate: the resolve fades this clean occlusion towards V1's output by it; a full gate sets z = 0);
+//     bits 8-11 = the rescued pixels of the 3x3 (v2_occl.comp, only with Settings::v2RescueCheck: the rescued object's soft edge).
 //   words [clsOff, clsOff + eStride H): the class map of the latest synth (debug, recordDebugMaps), one byte per pixel, 4 per
 //     word, low byte first: bits 0-2 class (V2_CLS_*: 0 trusted, 1 held, clean occlusion with 2 the field's vector, 3 vB, 4 vF, 5 zero), bit 3 = side curr, bits 4-7 = weight of the hold / one-sided output x 15.
 //   then the temporal store (D19, I10: the previous pair's field, v2_temporal.glsl; written by v2_seed / v2_occl, read by v2_seed,
@@ -59,6 +61,9 @@ layout(push_constant) uniform PC2 {
     int lw, lh;                 // v2_seed: the coarsest pyramid level's size (its luma at offA / offC)
     float rescue;               // v2_rescue: V2Knobs rescue (levels): the largest 3x3 mean |a - c| of a rescued match
 } pc;
+// (The block is full: 32 words. The estimate's passes never read the synth's s, wA, wC, occ0, occScale, pickBias, zeroBonus, so a
+// new estimate parameter rides in one of them, set by framegen.cpp for that pass only: I12's v2_gate.comp reads V2Knobs occGate and
+// v2_rcheck.comp the rescue check's smallest area (flow px) from occ0. tFlags bit 2 (I12) = the rescue check is on (v2_occl.comp).)
 
 #define V2_RF(i) rf[(i)]
 #include "v2_pack.glsl"
