@@ -1534,7 +1534,13 @@ static void motionCheck(const Scene& sc) {
             k = v2; k.v2RefineRes = 101.0f; ok = ok && !Interpolator::validate(k);
             k = v2; k.v2EdgeSigma = 0.9f; ok = ok && !Interpolator::validate(k);
             k.v2EdgeSigma = 255.0f; ok = ok && Interpolator::validate(k);
-            expect(ok, "validate: V2 preset A-D only, knobs -1 or in range (refineRes 1-100, edgeSigma 1-255), effective ramps high >= low + 1");
+            k = v2; k.v2OccGate = 1.0f; k.v2SeedMargin = 64.0f; k.v2RescueCheck = 4096.0f; ok = ok && Interpolator::validate(k);   // (I12)
+            k.v2OccGate = 0.0f; k.v2SeedMargin = 0.0f; k.v2RescueCheck = 0.0f; ok = ok && Interpolator::validate(k);
+            k = v2; k.v2OccGate = 1.01f; ok = ok && !Interpolator::validate(k);
+            k = v2; k.v2SeedMargin = 64.5f; ok = ok && !Interpolator::validate(k);
+            k = v2; k.v2RescueCheck = 4097.0f; ok = ok && !Interpolator::validate(k);
+            expect(ok, "validate: V2 preset A-D only, knobs -1 or in range (refineRes 1-100, edgeSigma 1-255, occGate 0-1, seedMargin "
+                       "0-64, rescueCheck 0-4096), effective ramps high >= low + 1");
             Settings a = v2, d = v2;
             a.trustLow = 10.0f; a.trustHigh = 30.0f;
             d.v2Preset = MotionPreset::D;
