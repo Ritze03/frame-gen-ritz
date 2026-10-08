@@ -27,7 +27,8 @@
 // between. A clear winner (lower by at least 3/4 of |vp - vm|_1, i.e. about one mismatched point) decides; else the median rule.
 // (An object moving across a static view: the median is the static background's, so the rule picks right; a pan following a moving
 // object: the median is the object's, and the median rule picks the object as background - the case this fixes.)
-// Also stores this estimate's edge-aware field for the next one (v2_temporal.glsl, P slot parity).
+// Also stores this estimate's edge-aware field for the next one (v2_temporal.glsl, P slot parity), and (I12) the occlusion gate's
+// statistics of every pixel (v2_gate.comp) and, with the rescue check on (tFlags bit 2), the rescued count of the 3x3 (w bits 8-11).
 #include "common.glsl"
 #include "motion_v2.glsl"
 #include "v2_temporal.glsl"
@@ -92,6 +93,7 @@ uvec4 analyse(ivec2 q) {
 }
 
 shared uvec4 raw[TR * TR];   // the tile + 1
+shared uint rsc[TR * TR];    // (I12) rescued / filled (v2_merge / v2_close.comp, after v2_rcheck.comp) of the tile + 1
 
 // Regularisation (3x3 majority): a flagged pixel with fewer than 3 flagged neighbours is dropped (an isolated decision is noise, and
 // a lone warped pixel in a held patch is a speckle); an unflagged pixel with at least 5 flagged neighbours takes the side of their
@@ -101,7 +103,9 @@ void main() {
     ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TQ - 1;
     for (int i = lid; i < TR * TR; i += TQ * TQ) {
         ivec2 q = t0 + ivec2(i % TR, i / TR);
-        raw[i] = (q.x >= 0 && q.y >= 0 && q.x < pc.fw && q.y < pc.fh) ? analyse(q) : uvec4(0u);
+        bool in_ = q.x >= 0 && q.y >= 0 && q.x < pc.fw && q.y < pc.fh;
+        raw[i] = in_ ? analyse(q) : uvec4(0u);
+        rsc[i] = in_ && (v2b[v2ROff() + q.y * pc.fw + q.x] & 12u) != 0u ? 1u : 0u;
     }
     barrier();
     ivec2 l = ivec2(gl_LocalInvocationID.xy);
@@ -125,8 +129,27 @@ void main() {
         }
     }
     int i = 4 * (q.y * pc.fw + q.x);
-    res.w = (v2b[v2ROff() + q.y * pc.fw + q.x] & 12u) != 0u ? 1u : 0u;   // rescued / filled by v2_merge / v2_close.comp (0 when the
-                                                                          // rescue is off: v2_smooth cleared it)
+    res.w = rsc[(l.y + 1) * TR + l.x + 1];   // rescued / filled by v2_merge / v2_close.comp (0 when the rescue is off: v2_smooth
+                                             // cleared it)
+    if ((pc.tFlags & 4) != 0 && res.w != 0u) {   // (I12, the rescue check on) the rescued share of the 3x3, for the resolve's soft edge
+        uint n9 = 0u;
+        for (int k = 0; k < 9; k++) n9 += rsc[(l.y + k / 3) * TR + l.x + k % 3];
+        res.w |= n9 << 8;
+    }
     v2b[i] = res.x; v2b[i + 1] = res.y; v2b[i + 2] = res.z; v2b[i + 3] = res.w;
-    v2b[v2POff(pc.tFlags & 1) + q.y * pc.fw + q.x] = packV(Fq(q));   // the temporal store: this pair's field for the next estimate
+    vec2 h = Fq(q);
+    v2b[v2POff(pc.tFlags & 1) + q.y * pc.fw + q.x] = packV(h);   // the temporal store: this pair's field for the next estimate
+    // the occlusion gate's statistics of q (v2_gate.comp, I12), with q's own vector, in COLOUR at full resolution (the estimate is
+    // luma only: a flash that shifts the hue matches grey with orange of the same luma, so only the colour shows that the vector is
+    // wrong): over the 3x3 flow pixels around q, the max-channel |a - c| of the two taps at each one's full-resolution centre (as the
+    // resolve's e), mean ea; held = ea at or above the middle of the trust ramp (as the resolve's hold and v2_cover.comp). Word:
+    // bits 0-1 side (res.z), bit 2 held. (Measured whether the gate is on or not: the same work.)
+    float ea = 0.0;
+    vec2 hf = float(pc.fscale) * h;
+    for (int j = 0; j < 9; j++) {
+        vec2 P = (vec2(q + ivec2(j % 3 - 1, j / 3 - 1)) + 0.5) * float(pc.fscale) - 0.5;
+        vec3 dd = abs(FG_FETCH(sampleRGBRaw(texCurr, P + hf)) - FG_FETCH(sampleRGBRaw(texPrev, P - hf)));
+        ea += max(dd.r, max(dd.g, dd.b));
+    }
+    v2b[v2GOff() + q.y * pc.fw + q.x] = res.z | (ea * (1.0 / 9.0) >= pc.trust0 + 0.5 / pc.trustScale ? 4u : 0u);
 }

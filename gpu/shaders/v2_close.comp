@@ -7,7 +7,8 @@
 // within 6 flow px, lies inside the object: it takes the vector of the nearest of them (ties: the axis order, then the - side) and
 // is marked filled (bit 3; the occlusion map gets it like bit 2: not held). A morphological closing along lines: the object's outline
 // does not grow. Reads only bit 2 and the vectors of rescued pixels, which this pass never writes: the result does not depend on
-// the order. The whole pass returns at once when nothing was rescued (u[V2_U_RESCUED], v2_merge.comp).
+// the order. The whole pass returns at once when nothing was rescued (u[V2_U_RESCUED], v2_merge.comp). (I12: a filled pixel's own
+// vector goes into vT's slot as in v2_merge.comp, for v2_rcheck.comp.)
 #include "common.glsl"
 #include "motion_v2.glsl"
 #include "v2_temporal.glsl"
@@ -52,6 +53,7 @@ void main() {
         if (dp < bestD) { bestD = dp; bestY = m + dp * ax[a]; }
     }
     if (bestD == 1000) return;
+    v2b[v2VTOff() + m.y * pc.fw + m.x] = packV(field[pc.fE + m.y * pc.fw + m.x]);   // (I12) hE's own vector (as v2_merge.comp)
     field[pc.fE + m.y * pc.fw + m.x] = field[pc.fE + bestY.y * pc.fw + bestY.x];
     v2b[v2ROff() + m.y * pc.fw + m.x] |= 8u;
 }

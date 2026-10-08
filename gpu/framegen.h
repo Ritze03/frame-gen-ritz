@@ -55,6 +55,18 @@ enum class MotionVersion : uint32_t {
 //      wide trust ramp 16 / 48, temporal bonus 3, the most permissive rescue (24): the fewest pixels held, the most warped.
 //   D  A with the wider, softer trust ramp 16 / 48 (the user's blind test of V1 variants preferred it narrowly: "a bit crisper",
 //      "more motion clarity"): the A vs D vote repeats that question on V2.
+// Round 1's result (blind test, 2026-10-07): D best overall (10-6-1), A beat V1 most often (4-1), B weakest (2-7-4); V2 won on racing,
+// Minecraft and the indie clips and lost on Battlefield (3-0 for V1 against A, B, D) to rare hard-edged artifacts V1 does not make.
+// I12 adds three knobs, each switchable alone on top of any preset (0 = I11's output exactly):
+//   v2OccGate      the occlusion gate: a clean occlusion in a held neighbourhood (a muzzle flash, an explosion, tracer streaks) falls
+//                  back to V1's output instead of a blotchy one-sided patch of the other frame. A, D: 1. B, C: 0.
+//   v2RescueCheck  the content rescue's acceptance check: rescued blobs below this area (px), or matching worse than the trust
+//                  ramp's middle (stricter for small blobs), are dropped (a dark ring on a pillar, specks); the rescued edge is soft.
+//                  A, D: 256. B, C: 0.
+//   v2SeedMargin   the temporal seed must beat the other seed candidates by this block SAD margin (levels): fixes a recoiling
+//                  weapon's torn edge, but costs the seed's reach (holes in a fast trunk, ~-0.07 dB on the fps reference clips at
+//                  8): 0 in every preset, a round-2 contestant on its own (D + v2SeedMargin 8).
+// B and C are unchanged (B: likely dropped or reworked after round 1; C: not blind-tested).
 enum class MotionPreset : uint32_t { A = 0, B = 1, C = 2, D = 3 };
 
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
@@ -252,7 +264,9 @@ struct Settings {
     // per pair for presets A / D, ~0.63-0.64 for B / C, against V1's ~0.33 (estimate: the temporal seed ~0.005 ms, edge-aware field
     // ~0.075, content rescue ~0.06 (cover / rescue / merge / close), occlusion pass ~0.048, refinement ~0.052; synth: mismatch
     // ~0.034 instead of ~0.028, soft hold edge ~0.010 (B), resolve ~0.072 instead of ~0.031). V2 reads only prev and curr: the same
-    // latency as V1 (v2Temporal reuses the previous pair's field, which already exists).
+    // latency as V1 (v2Temporal reuses the previous pair's field, which already exists). I12: A / D ~0.64-0.65 ms (timestamp sum;
+    // back-to-back ~0.62) with the occlusion gate (~0.009 + ~0.009 of statistics in the occlusion pass, which every preset pays) and
+    // the rescue check (~0.012), B / C ~0.63.
     MotionVersion motionVersion = MotionVersion::V1;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
@@ -328,6 +342,29 @@ struct Settings {
     //   foreground's, zero) are weighted softly by their 3x3 mismatch, w = exp(-(e - e_best) / v2OccSoft), instead of the hard pick of
     //   the best (single pixels flipping between candidates: specks on silhouette edges). 0 = the hard pick.
     float v2OccSoft = -1.0f;
+    // (I12: three fixes of the round-1 blind test's losses to V1 on the shooter clips, each its own knob, each 0 = off = I11's
+    // output exactly, independent of each other and of the preset.)
+    //   v2OccGate: [0, 1] (I12). The occlusion gate: a clean occlusion whose surroundings are held (within +-12 flow px, the share of
+    //   the pixels without a clean occlusion whose own vector leaves a colour mismatch at or above the middle of the trust ramp, ramp
+    //   0.6 .. 0.85) is given back to V1's output, its one-sided warp AND its candidate pick, by that ramp x this strength. A real
+    //   occlusion lies between two regions its vectors explain; one inside a region nothing explains is the noise of a wrong field: a
+    //   muzzle flash or an explosion (the next frame's colour in blotchy, hard-edged patches over V1's soft hold), specks of the
+    //   other frame on tracer streaks. 0 = off. Cost ~0.009 ms (1080p 2x) + ~0.009 ms of statistics in the occlusion pass (always).
+    float v2OccGate = -1.0f;
+    //   v2SeedMargin: [0, 64] levels (I12). The temporal seed (v2Temporal) wins the block search's seed choice only if its block mean
+    //   SAD is lower than the best other candidate's by more than this (at every pyramid level; 0 = strictly lower, I11). Last pair's
+    //   motion is stale where the motion changes (a swaying, recoiling weapon: a torn box edge and a black speck where V1 moves it as
+    //   one rectangle); higher = the seed only where it clearly explains the content better, lower = more of its reach (steady fast
+    //   motion, thin fast objects). No cost.
+    float v2SeedMargin = -1.0f;
+    //   v2RescueCheck: [0, 4096] full-resolution pixels (I12). The content rescue's acceptance check (v2Rescue): the smallest rescued
+    //   blob kept (its area counted within +-10 flow px of each rescued pixel), and its mean colour mismatch (the rescued vector's,
+    //   at full resolution) at most the middle of the trust ramp, x min(area / (4 x this), 1) (a small blob must match better); a
+    //   blob that fails gets its own vector back and is held or trusted as usual. The rescue's misses are small hard-edged blobs of
+    //   the other content (a dark ring on a light pillar, a dark speck under a tree, a grey rectangle over tracers); a whole object
+    //   (a tree trunk) passes. Also softens the rescued object's edge (its hold exemption fades over the outer flow pixel). 0 = off.
+    //   Cost ~0.012 ms (1080p 2x, only where something was rescued).
+    float v2RescueCheck = -1.0f;
 };
 
 // The effective V2 knobs of a Settings (Interpolator::v2Knobs(): the preset with the v2* overrides applied).
@@ -336,6 +373,7 @@ struct V2Knobs {
     float refineRes, edgeSigma;   // refineRes rounded to an integer percentage
     float temporal, temporalBonus;   // temporal 0 / 1
     float rescue, holdFeather, occSoft;   // (I11)
+    float occGate, seedMargin, rescueCheck;   // (I12)
 };
 
 struct InitInfo {

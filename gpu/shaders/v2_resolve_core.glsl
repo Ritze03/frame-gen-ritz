@@ -32,6 +32,10 @@
 // The soft hold edge (I11, D18; V2R_FEATHER > 0): the pixel's hold is max(Ut, uf), uf = the map of v2_hold_core.glsl (the hold
 // weight falling off softly outside held regions instead of V1's hard ~4 px edge), also in the class map's weight. The untrusted
 // count is that of Ut.
+// (I12) The occlusion gate (v2_gate.comp): a clean occlusion's share in the 3x3 (tg) counts 1 - G, G = the gate's weight in the
+// occlusion map (w bits 4-7), so a gated pixel's one-sided warp and candidate pick fade to V1's output (G = 1 arrives as side 0).
+// The rescue check's soft edge (Settings::v2RescueCheck, w bits 8-11 = the rescued 3x3 count n9 > 0): a rescued pixel's exemption
+// from the hold is x = ramp(n9, 3 .. 9) (1 inside the object, fading over its outer flow pixel) instead of 1.
 
 const int TS = 16, AP = 3, TT = TS + 2 * AP, TB = TS + 2;
 shared float te[TT * TT];   // e + KN of the tile + 3 (7x7 box); 0 where e is unknown (V2_E_UNKNOWN)
@@ -88,7 +92,7 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
         tb[i] = eb;
         tf[i] = ef;
         tz[i] = ez;
-        tg[i] = oc.z != 0u ? 1.0 : 0.0;
+        tg[i] = oc.z != 0u ? 1.0 - float((oc.w >> 4) & 15u) * (1.0 / 15.0) : 0.0;   // (I12: less the occlusion gate's weight)
     }
     barrier();
     float F = V2R_FEATHER;
@@ -140,8 +144,12 @@ V2Px v2ResolvePixel(ivec2 tile, bool nearC) {
     // matches exactly (perspective); holding, or the background vector of a clean occlusion, would show the background it covers,
     // i.e. delete it again: the two-sided blend of its own vector
     bool resc = (oc.w & 1u) != 0u;
-    if (resc) ut = 0.0;
-    float utf = resc ? 0.0 : max(ut, ufe);
+    // (I12, the rescue check on: the 3x3 rescued count n9 in oc.w bits 8-11) the soft edge of a rescued object: its exemption from the
+    // hold fades over its outer flow pixel, x = 1 inside (n9 = 9), 0 at n9 <= 3 (without the check n9 = 0: x = 1, I11's hard edge)
+    uint n9 = (oc.w >> 8) & 15u;
+    float xr = resc ? (n9 == 0u ? 1.0 : clamp((float(n9) - 3.0) * (1.0 / 6.0), 0.0, 1.0)) : 0.0;
+    ut *= 1.0 - xr;
+    float utf = max(ut, ufe) * (1.0 - xr);
     vec3 v1o = m0 * (1.0 - utf) + a8 * utf;   // trusted / held: V1 (with the soft hold edge)
     if (oc.z == 0u || resc) {   // (a rescued pixel is two-sided with its own vector: the occlusion picks would put the background
                                 // back over the object)

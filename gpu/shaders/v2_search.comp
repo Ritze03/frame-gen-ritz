@@ -7,6 +7,9 @@
 // The +-radius search then runs around the chosen seed as before: steady motion beyond the pyramid's reach (+-6 at the top level,
 // +-2 per finer level) is found again from where the last pair found it. Invalid seed (no previous pair, a skipped or out-of-order
 // pair, Settings::v2Temporal off): the candidate is measured but never picked, so the result is search.comp's.
+// (I12, Settings::v2SeedMargin) The seed wins only if its block mean SAD + LAMBDA is lower than the best other candidate's by more
+// than the margin (at the coarsest level: than zero's): last pair's motion is stale where the motion changes (a swaying, recoiling
+// weapon took last pair's vector over the box and tore its edge), so it has to explain the block clearly better.
 #include "common.glsl"
 #include "motion_v1.glsl"
 layout(set = 0, binding = 13, std430) buffer V2Buf { uint v2b[]; };
@@ -22,5 +25,8 @@ ivec2 v2SeedAt(ivec2 blk) {
     return ivec2(roundEven(v / lf));
 }
 
+// (I12) the temporal seed wins only by this margin (levels of block mean SAD; V2Knobs seedMargin, 0 = strictly better): carried in
+// PC srcA as float bits (srcA is down.comp's alone; framegen.cpp sets it for the search passes of a V2 estimate)
+#define SEED_MARGIN intBitsToFloat(pc.srcA)
 #define V2_SEED 1
 #include "search_core.glsl"
