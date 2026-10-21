@@ -123,6 +123,8 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     }
     vec3 d = abs(wa - wc);
     float em = max(d.r, max(d.g, d.b));
+    vec2 sp = vec2(0.0);
+    if (subgroupAny((sbits & 1u) != 0u)) sp = sAt(q, sbits);   // the static-structure mask S and its enclosure E here
     // Where the taps disagree badly: the block vectors around the content's place, each as one rigid motion. Between two
     // blocks whose vectors differ a lot (a periodic texture matched a period apart, an outlier block, a motion edge) the bilinear
     // blend of them is neither motion and its taps sweep the content into ring-shaped outlines; one of the blocks' own vectors often
@@ -137,6 +139,7 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
         float s0 = sum16(em), sb = s0;
         vec3 ba = wa, bc = wc;
         float baa = a.a, bca = c.a;
+        vec2 bso = vec2(sout, sboth);   // the overlay test of the winner's taps (sReject's), for the zero-vector test below
         for (int k = 0; k < 4; k++) {
             vec2 gk = S * VF(i0 + ivec2(k & 1, k >> 1));
             vec2 qa = q - (2.0 * t) * gk, qc = q + (2.0 - 2.0 * t) * gk;
@@ -145,19 +148,23 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
             uiReject(qa, qc, ya, yc);
             ya = FG_FETCH(ya); yc = FG_FETCH(yc);
             edgeReject(qa, qc, ya, yc);
+            vec2 sok = vec2(all(lessThan(abs(qc - qa), vec2(1.0))) ? 0.0 : 1.0, 0.0);
             if (subgroupAny(nearT)) {   // (the static pass, near an overlay: its tap rejection as for the main taps)
                 ivec2 ka = sCell(qa), kc = sCell(qc);
-                sReject(qa, qc, ya, yc, sOverAt(qa, ka), sOverAt(qc, kc));
+                sok = sReject(qa, qc, ya, yc, sOverAt(qa, ka), sOverAt(qc, kc));
             }
             vec3 dk = abs(ya - yc);
             float sk = sum16(max(dk.r, max(dk.g, dk.b)));   // (the same for the group's 16 lanes: a uniform choice in the group)
-            if (sk < sb) { sb = sk; ba = ya; bc = yc; baa = xa.a; bca = xc.a; }
+            if (sk < sb) { sb = sk; ba = ya; bc = yc; baa = xa.a; bca = xc.a; bso = sok; }
         }
-        float wb = clamp((s0 - sb - 16.0 * V2_C1) * (1.0 / (16.0 * V2_C2)), 0.0, 1.0);
+        // (not on an overlay or inside one, S / E: a rigid vector there pastes the scene behind a semi-transparent panel in blocks)
+        float wb = clamp((s0 - sb - 16.0 * V2_C1) * (1.0 / (16.0 * V2_C2)), 0.0, 1.0) * (1.0 - clamp(2.0 * max(sp.x, sp.y), 0.0, 1.0));
         vec3 da = abs(ba - bc);
         wa = mix(wa, ba, wb); wc = mix(wc, bc, wb);
         a.a = mix(a.a, baa, wb); c.a = mix(c.a, bca, wb);
         em = mix(em, max(da.r, max(da.g, da.b)), wb);
+        sout = mix(sout, bso.x, wb);
+        sboth = mix(sboth, bso.y, wb);
     }
 #ifdef V2_QUALITY
     vec3 cq = qCovAt(q);   // this pixel's coverage word (its z: the static-overlay mask)
@@ -198,8 +205,6 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
 #else
     float emz = em;
 #endif
-    vec2 sp = vec2(0.0);
-    if (subgroupAny((sbits & 1u) != 0u)) sp = sAt(q, sbits);   // the static-structure mask S and its enclosure E here
     if (emz > V2_Z0 || sp.x > 0.0 || sp.y * sout > 0.0 || sboth > 0.0) {   // (only then can it win)
         vec4 s0 = texelFetch(texPrev, p, 0), s1 = texelFetch(texCurr, p, 0);
         vec3 sa = FG_FETCH(s0.rgb), sc = FG_FETCH(s1.rgb);
