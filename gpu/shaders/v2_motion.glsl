@@ -55,16 +55,19 @@ ivec2 sCell(vec2 x) { return clamp(ivec2(floor((x + 0.5) * (1.0 / float(V2_BLOCK
 uint sCellBits(ivec2 c) { return qb[cOff() + c.y * s8W() + c.x]; }
 bool sNear(ivec2 c) { return (sCellBits(c) & 1u) != 0u; }
 ivec2 sTexel(vec2 x) { return ivec2(floor((x + 0.5) * (1.0 / float(pc.fscale)))); }
-// The static-structure mask S (nearest flow pixel) and its enclosure E (bilinear on the cell grid) at full-resolution position x
-// (pixel-centre coordinates)
-vec2 sAt(vec2 x, uint bits) {   // bits: sCellBits of x's cell
-    if ((bits & 1u) == 0u) return vec2(0.0);
+// The static-structure mask S (nearest flow pixel), its enclosure E (bilinear on the cell grid) and S dilated by ~1 flow px (the
+// largest of the 4 S texels around x, as sOverAt) at full-resolution position x (pixel-centre coordinates)
+vec3 sAt(vec2 x, uint bits) {   // bits: sCellBits of x's cell
+    if ((bits & 1u) == 0u) return vec3(0.0);
     vec2 s = (x + 0.5) * (1.0 / float(V2_BLOCK * pc.fscale)) - 0.5;
     vec2 fl = floor(s);
     vec2 f = s - fl;
     ivec2 i = ivec2(fl);
     float E = mix(mix(eF(i), eF(i + ivec2(1, 0)), f.x), mix(eF(i + ivec2(0, 1)), eF(i + ivec2(1, 1)), f.x), f.y);
-    return vec2(sF(sTexel(x)), E);
+    ivec2 m = ivec2(floor((x + 0.5) * (1.0 / float(pc.fscale)) - 0.5)), n = sTexel(x);   // (n is one of the 4 around x)
+    float s00 = sF(m), s10 = sF(m + ivec2(1, 0)), s01 = sF(m + ivec2(0, 1)), s11 = sF(m + ivec2(1, 1));
+    float sn = n.y == m.y ? (n.x == m.x ? s00 : s10) : (n.x == m.x ? s01 : s11);
+    return vec3(sn, E, max(max(s00, s10), max(s01, s11)));
 }
 // The overlay at full-resolution position x for the tap rejection: the largest of the 4 S texels around x (S dilated by about one
 // flow pixel: the anti-aliased rim of a stroke, a gap in its mask), or E of its cell

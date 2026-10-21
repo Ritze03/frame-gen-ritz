@@ -143,8 +143,9 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     vec2 sp = vec2(0.0);
     float sxd = 0.0;   // S dilated by ~1 flow px (sOverAt's): the anti-aliased rim of a stroke
     if (subgroupAny((sbits & 1u) != 0u)) {
-        sp = sAt(q, sbits);   // the static-structure mask S and its enclosure E here
-        sxd = (sbits & 1u) != 0u ? max(sp.x, sOverAt(q, sCell(q)).x) : 0.0;
+        vec3 s3 = sAt(q, sbits);   // the static-structure mask S, its enclosure E and S dilated here
+        sp = s3.xy;
+        sxd = s3.z;
     }
     // Where the taps disagree badly: the block vectors around the content's place, each as one rigid motion. Between two
     // blocks whose vectors differ a lot (a periodic texture matched a period apart, an outlier block, a motion edge) the bilinear
