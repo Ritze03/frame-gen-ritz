@@ -9,7 +9,8 @@
 //         motion where the taps disagree);
 //   blended toward the zero vector's (1 - t) prev(q) + t curr(q) where the two frames show q (and a line of its neighbours) the same
 //   but the morph's taps disagree: HUD text and other static overlays, static background that the smooth field would drag along;
-//   a tap outside the frame takes the other tap.
+//   a tap outside the frame takes the other tap; where the taps disagree badly, one of the 4 block vectors around the content's
+//   place may take over as a rigid motion of the pixel's 4x4 group (no blend of two very different vectors: ring outlines).
 // Static overlays (both modes, V2's static-structure mask S and its enclosure E, v2_static.comp / v2_enclose.comp; where both real
 // frames show the same structure, also a semi-transparent HUD panel whose background moves): a pixel on S (confirmed at full
 // resolution) or inside E whose taps leave it takes the zero vector, and a tap that lands on S / E while the field moves takes the
@@ -35,6 +36,9 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 shared uint esum[16];
 const float V2_Z0 = 8.0, V2_Z1 = 12.0, V2_ZMAX = 6.0;
+// the block-vector candidates where the taps differ by more than V2_C0 levels; one takes over from V2_C1 levels better (per pixel,
+// summed over its 4x4 group), fully at V2_C1 + V2_C2
+const float V2_C0 = 24.0, V2_C1 = 8.0, V2_C2 = 16.0;
 // full-resolution structure agreement (the static-mask confirmation): ratio of the gradient mismatch to the gradients
 const float V2_SEPS = 8.0, V2_SR0 = 0.3, V2_SR1 = 0.6;
 const float V2_SZMAX = 12.0;   // ... or the zero-vector mismatch of the pixel and a line of its neighbours (levels; lossy video adds noise)
@@ -65,6 +69,16 @@ void edgeReject(vec2 pa, vec2 pc_, inout vec3 wa, inout vec3 wc) {
     vec3 a = wa;
     wa = mix(wa, wc, clamp(oa - oc, 0.0, 1.0));
     wc = mix(wc, a, clamp(oc - oa, 0.0, 1.0));
+}
+
+// The sum of x over the 4x4 pixels of this lane's group (8x8 workgroup tile, lanes in row order; subgroups of >= 32 lanes)
+// (subgroups of fewer lanes: the pixel's own value x 16, a per-pixel choice)
+float sum16(float x) {
+    if (gl_SubgroupSize < 32u) return 16.0 * x;
+    x += subgroupShuffleXor(x, 1u);
+    x += subgroupShuffleXor(x, 2u);
+    x += subgroupShuffleXor(x, 8u);
+    return x + subgroupShuffleXor(x, 16u);
 }
 
 // One generated sub-frame at time t (0 < t < 1): 8-bit levels, unrounded; al = the taps' alpha, blended alike; e = the mismatch.
@@ -109,6 +123,42 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     }
     vec3 d = abs(wa - wc);
     float em = max(d.r, max(d.g, d.b));
+    // Where the taps disagree badly: the block vectors around the content's place, each as one rigid motion. Between two
+    // blocks whose vectors differ a lot (a periodic texture matched a period apart, an outlier block, a motion edge) the bilinear
+    // blend of them is neither motion and its taps sweep the content into ring-shaped outlines; one of the blocks' own vectors often
+    // matches there. The choice is made per 4x4 pixels (lanes x ^ 1, 2, y ^ 1, 2 of the 8x8 workgroup tile; at t = 0.5 such a group
+    // never straddles a change of the 4 block vectors) by the summed mismatch, so the content moves coherently (no per-pixel specks),
+    // and it takes over by how clearly it matches better (soft); where none does, as before. Quality's edge-aware per-pixel field has
+    // the same blend between such blocks (fainter), so both modes do it.
+    if (subgroupAny(em > V2_C0)) {
+        vec2 xm = q - (2.0 * t - 1.0) * g;   // the content's midpoint location
+        float S = float(pc.fscale);
+        ivec2 i0 = ivec2(floor((xm + 0.5) * (1.0 / (float(V2_BLOCK) * S)) - 0.5));
+        float s0 = sum16(em), sb = s0;
+        vec3 ba = wa, bc = wc;
+        float baa = a.a, bca = c.a;
+        for (int k = 0; k < 4; k++) {
+            vec2 gk = S * VF(i0 + ivec2(k & 1, k >> 1));
+            vec2 qa = q - (2.0 * t) * gk, qc = q + (2.0 - 2.0 * t) * gk;
+            vec4 xa = tapRaw(texPrev, qa), xc = tapRaw(texCurr, qc);
+            vec3 ya = xa.rgb, yc = xc.rgb;
+            uiReject(qa, qc, ya, yc);
+            ya = FG_FETCH(ya); yc = FG_FETCH(yc);
+            edgeReject(qa, qc, ya, yc);
+            if (subgroupAny(nearT)) {   // (the static pass, near an overlay: its tap rejection as for the main taps)
+                ivec2 ka = sCell(qa), kc = sCell(qc);
+                sReject(qa, qc, ya, yc, sOverAt(qa, ka), sOverAt(qc, kc));
+            }
+            vec3 dk = abs(ya - yc);
+            float sk = sum16(max(dk.r, max(dk.g, dk.b)));   // (the same for the group's 16 lanes: a uniform choice in the group)
+            if (sk < sb) { sb = sk; ba = ya; bc = yc; baa = xa.a; bca = xc.a; }
+        }
+        float wb = clamp((s0 - sb - 16.0 * V2_C1) * (1.0 / (16.0 * V2_C2)), 0.0, 1.0);
+        vec3 da = abs(ba - bc);
+        wa = mix(wa, ba, wb); wc = mix(wc, bc, wb);
+        a.a = mix(a.a, baa, wb); c.a = mix(c.a, bca, wb);
+        em = mix(em, max(da.r, max(da.g, da.b)), wb);
+    }
 #ifdef V2_QUALITY
     vec3 cq = qCovAt(q);   // this pixel's coverage word (its z: the static-overlay mask)
     float wt = qWeightC(t == 0.5 ? cq : qCovAt(q - (2.0 * t - 1.0) * g), t);   // the visible side: curr's share of the blend

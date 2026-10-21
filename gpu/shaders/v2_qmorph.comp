@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 // V2 Quality's synthesis: v2_morph.glsl with the visible-side blend weights of the coverage (v2_quality.glsl).
 #define V2_QUALITY 1
 #include "v2_morph.glsl"
