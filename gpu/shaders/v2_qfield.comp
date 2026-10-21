@@ -1,0 +1,84 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2 Quality, the per-pixel field (flow resolution, once per estimate), see v2_quality.glsl:
+//   1. the cleaned block field upsampled with edge awareness: each flow pixel blends the 4 block vectors around it (the bilinear
+//      corners) with weights (bilinear + Q_FB) * exp(-(e_k - e_min) / (Q_FS + Q_FK * e_min)), e_k the mean
+//      |luma_a(m + o - v_k) - luma_c(m + o + v_k)| over its 3x3. Inside an object its own vector wins against the background's, so the
+//      motion edge follows the object (the plain bilinear blend ramps over a whole block: 16 px at flowScale 2). Soft, no hard
+//      choice: where no candidate matches clearly (occlusion, a flat area, content that changed) the blend stays near bilinear and
+//      content stretches instead of tearing. Where the 4 vectors agree (within Q_FSAME) the bilinear blend is taken as is.
+//   2. the static-overlay mask z: where the field moves and the pixel has structure, the zero vector's mismatch with its 3x3 mean
+//      removed (a semi-transparent overlay follows the brightness of the scene behind it), relative to the structure. A static
+//      overlay is in front of whatever moves behind it, so it only has to match, not to match better than the motion (which often
+//      matches the moving background around the text as well). z >= 0.5: the field is zero there.
+// Writes vf[qPF() + m] and z (float bits) into the coverage word's slot qb[3N + m] (v2_qcov packs it).
+#include "common.glsl"
+#include "v2_motion.glsl"
+#include "v2_quality.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+float err(vec2 m, vec2 v) {
+    float e = 0.0;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            vec2 p = m + vec2(i, j);
+            e += abs(qLuma(0, p - v) - qLuma(qN(), p + v));
+        }
+    return e * (1.0 / 9.0);
+}
+
+// the zero vector's mismatch over the 3x3, mean removed
+float err0(ivec2 m) {
+    float d[9];
+    float s = 0.0;
+    for (int k = 0; k < 9; k++) {
+        ivec2 p = m + ivec2(k % 3 - 1, k / 3 - 1);
+        d[k] = qL(0, p) - qL(qN(), p);
+        s += d[k];
+    }
+    s *= 1.0 / 9.0;
+    float e = 0.0;
+    for (int k = 0; k < 9; k++) e += abs(d[k] - s);
+    return e * (1.0 / 9.0);
+}
+
+void main() {
+    ivec2 m = ivec2(gl_GlobalInvocationID.xy);
+    if (m.x >= pc.fw || m.y >= pc.fh) return;
+    vec2 s = (vec2(m) + 0.5) * (1.0 / float(V2_BLOCK)) - 0.5;
+    vec2 fl = floor(s);
+    vec2 f = s - fl;
+    ivec2 i = ivec2(fl);
+    vec2 v[4] = vec2[4](VF(i), VF(i + ivec2(1, 0)), VF(i + ivec2(0, 1)), VF(i + ivec2(1, 1)));
+    float b[4] = float[4]((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+    vec2 lo = min(min(v[0], v[1]), min(v[2], v[3])), hi = max(max(v[0], v[1]), max(v[2], v[3]));
+    vec2 h = b[0] * v[0] + b[1] * v[1] + b[2] * v[2] + b[3] * v[3];
+    if (max(hi.x - lo.x, hi.y - lo.y) > Q_FSAME) {
+        float e[4];
+        float emin = 1e9;
+        for (int k = 0; k < 4; k++) { e[k] = err(vec2(m), v[k]); emin = min(emin, e[k]); }
+        float inv = 1.0 / (Q_FS + Q_FK * emin);
+        vec2 acc = vec2(0.0);
+        float ws = 0.0;
+        for (int k = 0; k < 4; k++) {
+            float w = (b[k] + Q_FB) * exp(-(e[k] - emin) * inv);
+            acc += w * v[k];
+            ws += w;
+        }
+        h = acc / ws;
+    }
+    float z = 0.0;
+    if (max(max(abs(lo.x), abs(hi.x)), max(abs(lo.y), abs(hi.y))) > Q_ZMOVE) {
+        float mn = 1e9, mx = -1e9;
+        for (int k = 0; k < 9; k++) {
+            float l = qL(0, m + ivec2(k % 3 - 1, k / 3 - 1));
+            mn = min(mn, l);
+            mx = max(mx, l);
+        }
+        float con = mx - mn;
+        if (con >= Q_ZCON) z = clamp((Q_ZR1 - err0(m) / con) * (1.0 / (Q_ZR1 - Q_ZR0)), 0.0, 1.0);
+    }
+    if (z >= 0.5) h = vec2(0.0);
+    vf[qPF() + m.y * pc.fw + m.x] = h;
+    qb[3 * qN() + m.y * pc.fw + m.x] = floatBitsToUint(z);
+}

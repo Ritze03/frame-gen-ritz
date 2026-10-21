@@ -24,7 +24,8 @@
 // header (uint32 magic 'FGMP', version 5, W, H, fw, fh, bw, bh, fscale, eStride, float trustLow, trustHigh, smoothBonus, hudBonus,
 // uint32 motionVersion, v2Mode), then the block field (bw*bh vec2 f32), the per-pixel half-vector field (fw*fh vec2 f32, midpoint
 // grid) and the packed mismatch e (eStride*H uint32, 4 px per word, low byte first) of the pair's last record. gpu/fgmaps.py turns it
-// into PNG maps. (Version 1: the same maps, header words 14-15 = 0. Versions 2-4 were the old MotionVersion::V2's, tag v2-occlusion:
+// into PNG maps. MotionVersion::V2: Performance writes its cleaned block field and zeros; Quality its cleaned block field, its
+// per-pixel field and, at the start of the e part, its coverage (see fgmaps.py). (Version 1: the same maps, header words 14-15 = 0. Versions 2-4 were the old MotionVersion::V2's, tag v2-occlusion:
 // the same maps followed by its own, which no longer exist.)
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"

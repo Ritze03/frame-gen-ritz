@@ -1,0 +1,30 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2 Quality, coverage step 1 (flow resolution, once per estimate; the claims were reset to 0xFFFFFFFF), see v2_quality.glsl: every
+// midpoint location m claims its footprint pixel in prev (m - h) and in curr (m + h), h the per-pixel field at m, with the key
+// |luma_a(m - h) - luma_c(m + h)| (bilinear); each pixel keeps the smallest key | vector (atomicMin). A static-overlay pixel (v2_qfield's
+// z >= 0.5) also claims its own place in both frames with key 0: a location whose tap lands on the overlay does not see its content
+// there. Also stores each location's own claim.
+#include "common.glsl"
+#include "v2_motion.glsl"
+#include "v2_quality.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 m = ivec2(gl_GlobalInvocationID.xy);
+    if (m.x >= pc.fw || m.y >= pc.fh) return;
+    int N = qN(), me = m.y * pc.fw + m.x;
+    vec2 h = qF(m);
+    vec2 pa = vec2(m) - h, pc_ = vec2(m) + h;
+    float k = abs(qLuma(0, pa) - qLuma(N, pc_));
+    uint w = qPack(uint(k * Q_KEY + 0.5), qQuant(h));
+    qb[2 * N + me] = w;
+    int ia = qPix(pa), ic = qPix(pc_);
+    if (ia >= 0) atomicMin(qb[ia], w);
+    if (ic >= 0) atomicMin(qb[N + ic], w);
+    if (uintBitsToFloat(qb[3 * N + me]) >= 0.5) {
+        uint z = qPack(0u, ivec2(0));
+        atomicMin(qb[me], z);
+        atomicMin(qb[N + me], z);
+    }
+}

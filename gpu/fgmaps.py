@@ -8,6 +8,11 @@ Layout (fgtest.cpp, Interpolator::recordDebugMaps): 64-byte header, block field 
 (fw*fh vec2 f32, midpoint grid), packed mismatch e (eStride*H uint32, 4 px per word, low byte first). Header version 5: words
 14-15 = motionVersion, v2Mode (printed); version 1: the same maps; versions 2-4 (the old V2, tag v2-occlusion): the same maps
 first, its own extras after them are ignored.
+MotionVersion::V2 (header words 14-15): Performance dumps only its cleaned block field (the rest is zero): OUTPREFIX_block.png.
+Quality dumps its cleaned block field, its per-pixel field in the pixel-field slot, and its coverage in the first fw*fh words of the
+e slot (flowScale >= 2; one uint32 per flow pixel: cP | cC << 11 (11 bits each), static-overlay mask z << 22 (10 bits),
+shaders/v2_quality.glsl): OUTPREFIX_flow.png, _block.png and _cov.png (red: curr does not show the content (the gather leans to
+prev), blue: prev does not, green: both do, white: the static-overlay mask). V1's maps follow.
 u = ramp(7x7 box of e (replicate border), trustLow..trustHigh) as resolve.comp computes it; the candidate index is recovered by
 matching the stored per-pixel vector against the 7 candidates of pixfield.comp (first match wins, as the first candidate wins ties):
 0 bilinear block field, 1 own block, 2 above, 3 below, 4 left, 5 right, 6 zero.
@@ -106,6 +111,22 @@ def main():
     d = load(sys.argv[1])
     pre = sys.argv[2]
     print("fgmaps version %d, algo %s%s" % (d["version"], d["algo"], ", v2Mode " + d["mode"] if d["algo"] == "v2" and d["mode"] else ""))
+    if d["algo"] == "v2" and d["mode"] is not None:
+        Image.fromarray(flow_rgb(d["block"])).save(pre + "_block.png")
+        if d["mode"] == "quality":
+            Image.fromarray(flow_rgb(d["pf"])).save(pre + "_flow.png")
+            raw = open(sys.argv[1], "rb").read()
+            n = d["fw"] * d["fh"]
+            off = 64 + d["bw"] * d["bh"] * 8 + n * 8
+            if len(raw) >= off + n * 4:
+                w = np.frombuffer(raw, np.uint32, n, off).reshape(d["fh"], d["fw"])
+                cp, cc = (w & 2047) / 2047.0, ((w >> 11) & 2047) / 2047.0
+                z = ((w >> 22) / 1023.0)[..., None]
+                rgb = np.stack([1 - cc, np.minimum(cp, cc), 1 - cp], -1) * (1 - z) + z
+                Image.fromarray((np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8)).save(pre + "_cov.png")
+                print("coverage: prev hidden %.4f, curr hidden %.4f, static overlay %.4f" %
+                      (float((cp < 0.5).mean()), float((cc < 0.5).mean()), float((z > 0.5).mean())))
+        return
     Image.fromarray((trust(d) * 255 + 0.5).astype(np.uint8)).save(pre + "_u.png")
     Image.fromarray(np.clip(d["e"] * 4, 0, 255).astype(np.uint8)).save(pre + "_e.png")
     idx, _ = cand_index(d)

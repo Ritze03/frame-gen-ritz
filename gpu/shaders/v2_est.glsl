@@ -1,4 +1,4 @@
-// Motion version 2, the motion estimate (both V2Modes): helpers of v2_medhist / v2_search / v2_subpix. Included after common.glsl and
+// Motion version 2, the motion estimate (both V2Modes): helpers of v2_medhist / v2_search / v2_repick. Included after common.glsl and
 // motion_v1.glsl (V2's estimate pushes V1's PC block and computes V1's block field, faster).
 //
 // V1 runs a separate 3x3 median pass (median3.comp) after the search of every level; its output is read by the next finer level's
