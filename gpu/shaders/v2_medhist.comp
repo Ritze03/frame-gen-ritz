@@ -1,0 +1,55 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2 estimate: medhist.comp's global median seed candidate, the same value, faster (V1's pass is ~0.02 ms per level, mostly two
+// threads scanning 256 bins serially). The histogram is built over the PARENT blocks, each weighted by the number of fine blocks
+// that map to it (min(ix / 2, pw - 1), as medhist.comp counts them one by one), from the parent's 3x3 median taken here (fPar is
+// the parent's raw search output, see v2_est.glsl). The k-th value comes from a parallel prefix sum. Writes 2 * median to
+// u[medIdx..+1].
+#include "common.glsl"
+#include "motion_v1.glsl"
+#include "v2_est.glsl"
+layout(local_size_x = 256) in;
+shared uint hx[256], hy[256];
+shared float res[4];
+
+// fine blocks (of n along an axis) whose parent index min(i / 2, np - 1) is j
+int wAxis(int j, int n, int np) { return j < np - 1 ? clamp(n - 2 * j, 0, 2) : max(n - 2 * j, 0); }
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    hx[t] = 0u; hy[t] = 0u;
+    barrier();
+    int np = pc.pw * pc.ph;
+    for (int i = int(t); i < np; i += 256) {
+        int px = i % pc.pw, py = i / pc.pw;
+        uint w = uint(wAxis(px, pc.bw, pc.pw) * wAxis(py, pc.bh, pc.ph));
+        if (w == 0u) continue;
+        ivec2 v = ivec2(roundEven(median3At(pc.fPar, ivec2(px, py), pc.pw, pc.ph)));
+        atomicAdd(hx[clamp(v.x + 128, 0, 255)], w);
+        atomicAdd(hy[clamp(v.y + 128, 0, 255)], w);
+    }
+    barrier();
+    // inclusive prefix sums (Hillis-Steele), both components
+    for (uint s = 1u; s < 256u; s <<= 1) {
+        uint ax = t >= s ? hx[t - s] : 0u, ay = t >= s ? hy[t - s] : 0u;
+        barrier();
+        hx[t] += ax; hy[t] += ay;
+        barrier();
+    }
+    // medhist.comp kth(): the first bin whose running count exceeds k (127 if none)
+    int n = pc.bw * pc.bh;
+    uint k1 = uint(n - 1) / 2u, k2 = uint(n) / 2u;
+    if (t < 4u) res[t] = 127.0;
+    barrier();
+    uint ex = t > 0u ? hx[t - 1u] : 0u, ey = t > 0u ? hy[t - 1u] : 0u;
+    float b = float(int(t) - 128);
+    if (hx[t] > k1 && ex <= k1) res[0] = b;
+    if (hx[t] > k2 && ex <= k2) res[1] = b;
+    if (hy[t] > k1 && ey <= k1) res[2] = b;
+    if (hy[t] > k2 && ey <= k2) res[3] = b;
+    barrier();
+    if (t < 2u) {
+        float m = 0.5 * (t == 0u ? res[0] + res[1] : res[2] + res[3]);
+        u[pc.medIdx + int(t)] = floatBitsToUint(2.0 * m);
+    }
+}

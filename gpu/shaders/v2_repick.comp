@@ -1,0 +1,77 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_clustered : require
+// V2 Performance, field clean-up step 1 (block grid, once per estimate): block re-pick and sub-pixel refinement. Reads vf[fIn] (the
+// search's finest field with its equiangular sub-pixel fit, v2_est.glsl), writes field[fOut]. A workgroup is 2x2 blocks, 16 threads
+// each (one subgroup cluster); each block is measured on 16 of its 64 pixels (a quincunx: every other pixel of every other row,
+// shifted by one on alternate rows), by the mean |a(q - v) - c(q + v)| (bilinear luma, flow res).
+//   1. re-pick: the 9 vectors of the block's 3x3 neighbourhood (own first, all snapped to the quarter-pel grid), plus LAMBDA
+//      (searchPenalty) for a neighbour's; the cheapest wins (own on ties). A block whose search went wrong (a local minimum on a
+//      repetitive or aliased texture: on a hard random pattern a third of the blocks, see uitest's doubled-crosshair scenes) takes a
+//      neighbour's vector; the field stays a block field (no per-pixel choice, so nothing tears). V1's estimate has its per-pixel
+//      field for this, which Performance drops.
+//   2. refinement around the winner: its 8 neighbours at +-0.5 px, then at +-0.25 px (V1's sub-pixel pass, on the quincunx and
+//      started from the fit instead of the integer vector: ~0.03 ms cheaper at 1080p). The final SAD is Performance's scene-cut sum.
+#include "common.glsl"
+#include "motion_v1.glsl"
+#include "v2_est.glsl"
+layout(local_size_x = 64) in;
+shared float sums[4][9];
+const int V2_REFINE = 2;
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    int bl = lid >> 4, i = lid & 15;
+    ivec2 blk = ivec2(gl_WorkGroupID.xy) * 2 + ivec2(bl & 1, bl >> 1);
+    bool live = blk.x < pc.bw && blk.y < pc.bh;
+    ivec2 bc = min(blk, ivec2(pc.bw - 1, pc.bh - 1));
+    vec2 cv[9];
+    for (int k = 0; k < 9; k++) {   // own first, then the 8 neighbours
+        int j = k == 0 ? 4 : (k <= 4 ? k - 1 : k);
+        ivec2 b = clamp(bc + ivec2(j % 3 - 1, j / 3 - 1), ivec2(0), ivec2(pc.bw - 1, pc.bh - 1));
+        cv[k] = roundEven(vf[pc.fIn + b.y * pc.bw + b.x] * 4.0) * 0.25;   // on the quarter-pel grid the refinement walks
+    }
+    int ry = i >> 2;
+    vec2 q = vec2(bc * BLOCK + ivec2(2 * (i & 3) + (ry & 1), 2 * ry));
+    float d[9];
+    for (int k = 0; k < 9; k++) d[k] = abs(sampleL(pc.offA, q - cv[k], pc.w, pc.h) - sampleL(pc.offC, q + cv[k], pc.w, pc.h));
+    for (int k = 0; k < 9; k++) {
+        float s = subgroupClusteredAdd(d[k], 16);
+        if (i == 0) sums[bl][k] = s;
+    }
+    barrier();
+    int bi = 0;   // every thread of the block's cluster picks the same
+    float best = 0.0;
+    for (int k = 0; k < 9; k++) {
+        float c = sums[bl][k] * (1.0 / 16.0) + (k == 0 ? 0.0 : LAMBDA);
+        if (k == 0 || c < best) { best = c; bi = k; }
+    }
+    // 2. refinement of the winner: its 8 neighbours at +-0.5, then at +-0.25 flow px
+    vec2 v0 = cv[bi];
+    float c0 = sums[bl][bi];
+    for (int it = 0; it < V2_REFINE; it++) {
+        float stp = it == 0 ? 0.5 : 0.25;
+        for (int k = 0; k < 8; k++) {
+            int j = k < 4 ? k : k + 1;
+            vec2 v = v0 + stp * vec2(j % 3 - 1, j / 3 - 1);
+            d[k] = abs(sampleL(pc.offA, q - v, pc.w, pc.h) - sampleL(pc.offC, q + v, pc.w, pc.h));
+        }
+        barrier();   // every cluster has read sums[]
+        for (int k = 0; k < 8; k++) {
+            float s = subgroupClusteredAdd(d[k], 16);
+            if (i == 0) sums[bl][k] = s;
+        }
+        barrier();
+        vec2 v = v0;
+        for (int k = 0; k < 8; k++) {
+            int j = k < 4 ? k : k + 1;
+            if (sums[bl][k] < c0) { c0 = sums[bl][k]; v = v0 + stp * vec2(j % 3 - 1, j / 3 - 1); }
+        }
+        v0 = v;
+    }
+    if (i == 0 && live) {
+        field[pc.fOut + blk.y * pc.bw + blk.x] = v0;
+        // Performance's scene-cut sum: the final vector's SAD (V1: the sub-pixel pass's), sampled on the quincunx
+        atomicAdd(u[U_V2SAD], uint(roundEven(c0 * (256.0 / 16.0))));
+    }
+}

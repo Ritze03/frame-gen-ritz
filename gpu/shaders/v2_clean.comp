@@ -1,0 +1,60 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2 Performance, field clean-up (block grid, once per estimate): a 3x3 vector median of the finest block field (the neighbour whose
+// summed L1 distance to the other 8 is smallest; the centre wins ties), so a lone wrong vector takes its neighbours' motion, then a
+// light 3x3 bilateral smoothing ([1 2 1]^2 spatial weights times 1 / (1 + |v - v_centre|^2 / sigma^2)): sub-pixel jitter between
+// neighbours averages out, a real motion edge (an object against the background) stays where it is, and the bilinear upsample of
+// v2_morph.comp then stretches content across it. Reads field[fIn] (bw x bh), writes vf (binding 13).
+#include "common.glsl"
+#include "v2_motion.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const int TS = 8, TT = TS + 4, TM = TS + 2;   // tile of 8x8 blocks; raw with a 2-block apron, medians with 1
+shared vec2 raw[TT * TT];
+shared vec2 med[TM * TM];
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - 2;
+    for (int i = lid; i < TT * TT; i += TS * TS) {
+        ivec2 b = clamp(t0 + ivec2(i % TT, i / TT), ivec2(0), ivec2(pc.bw - 1, pc.bh - 1));
+        raw[i] = field[pc.fIn + b.y * pc.bw + b.x];
+    }
+    barrier();
+    for (int i = lid; i < TM * TM; i += TS * TS) {
+        int x = i % TM + 1, y = i / TM + 1;   // centre in raw[]
+        vec2 v[9];
+        v[0] = raw[y * TT + x];
+        int k = 1;
+        for (int j = -1; j <= 1; j++)
+            for (int ii = -1; ii <= 1; ii++)
+                if (ii != 0 || j != 0) v[k++] = raw[(y + j) * TT + x + ii];
+        int best = 0;
+        float bestC = 0.0;
+        for (int c = 0; c < 9; c++) {
+            float s = 0.0;
+            for (int o = 0; o < 9; o++) {
+                vec2 d = abs(v[o] - v[c]);
+                s += d.x + d.y;
+            }
+            if (c == 0 || s < bestC) { bestC = s; best = c; }
+        }
+        med[i] = v[best];
+    }
+    barrier();
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    if (b.x >= pc.bw || b.y >= pc.bh) return;
+    ivec2 l = ivec2(gl_LocalInvocationID.xy) + 1;
+    vec2 m = med[l.y * TM + l.x];
+    vec2 acc = vec2(0.0);
+    float ws = 0.0;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            vec2 v = med[(l.y + j) * TM + l.x + i];
+            vec2 d = v - m;
+            float w = float((2 - abs(i)) * (2 - abs(j))) / (1.0 + dot(d, d) * pc.sigma2Inv);
+            acc += w * v;
+            ws += w;
+        }
+    vf[b.y * pc.bw + b.x] = acc / ws;
+}

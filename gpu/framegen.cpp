@@ -29,6 +29,13 @@
 #include "blur_lookup_spv.h"
 #include "blur_error_spv.h"
 #include "blur_resolve_spv.h"
+// MotionVersion::V2 (Rgba8 only, settingsError(): no format variants)
+#include "v2_medhist_spv.h"
+#include "v2_search_spv.h"
+#include "v2_subpix_spv.h"
+#include "v2_clean_spv.h"
+#include "v2_morph_spv.h"
+#include "v2_repick_spv.h"
 
 // The colour shaders of the formats other than Rgba8 (shaders/format.glsl), when built.
 // rgb10: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
@@ -178,6 +185,18 @@ struct PC {
 static_assert(sizeof(PC) <= 128, "push constants beyond the guaranteed minimum");
 static const int kEOff = 64;   // == E_OFF in motion_v1.glsl
 
+// Must match the push-constant block in shaders/v2_motion.glsl (V2 Performance's synthesis passes; V2's estimate pushes PC). Pushed
+// over the same range of the same pipeline layout as PC.
+struct V2PC {
+    int32_t W, H, fw, fh, bw, bh, fscale, fIn, n, gauss, fix, cnt;
+    float cutSad, globalFrac, sigma2Inv, trustMid;
+    float t[16];
+};
+static_assert(sizeof(V2PC) == sizeof(PC), "V2PC is pushed over PC's range");
+// V2 Performance's field clean-up (v2_clean.comp): sigma of the bilateral smoothing's range weight, in flow pixels of half-vector
+// (1 flow px of half-vector = 2 * flowScale px of motion between the real frames).
+static const float kV2CleanSigma = 1.0f;
+
 // Must match the push-constant block in shaders/ui_common.glsl.
 struct UiPC {
     int32_t W, H, boxX, boxY, boxW, boxH, cell, cw, ch, wholeScreen, still;
@@ -221,20 +240,25 @@ struct UiEntry {
     bool active = false;                // in the LRU set (Settings::uiHistory of them); an inactive one keeps its memory
 };
 
-enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP, P_COUNT };
+// P_V2_*: MotionVersion::V2's own passes (empty in V1's group; V2's group leaves V1's P_MEDHIST / P_SEARCH / P_SUBPIX empty instead).
+enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
+            P_V2_MEDHIST, P_V2_SEARCH, P_V2_SUBPIX, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
 // The resources of one motion version (Settings::motionVersion): created by motionEnsure() the first time the version is selected
 // (init, setSettings, reconfigure), kept while another one is selected, freed by releaseUnusedMotion() / destroy(). V1: the pipelines
-// of the estimate / synth passes and of the motion-blur passes over the shared layouts, set rings and scratch buffers. V2 aliases V1
-// for now: its group holds its own pipelines of V1's shaders, so the switch, the release and the re-creation are the real ones; its
-// own shaders (v2_*.comp) replace them, and its own size-dependent buffers go into `bufs` (created by motionSized()).
+// of the estimate / synth passes and of the motion-blur passes over the shared layouts, set rings and scratch buffers. V2: the
+// pipelines of BOTH V2Modes (the mode is runtime: a switch creates nothing). Its estimate is V1's block field computed by its own,
+// faster passes (P_V2_MEDHIST / SEARCH / SUBPIX, shaders/v2_est.glsl); Quality then runs V1's pixel field and synthesis passes on it
+// (its own pipelines of V1's shaders: V1's output), Performance its field clean-up and one-pass morph (P_V2_CLEAN / MORPH) over its
+// own buffer (`bufs`, created by motionSized()).
 static const int kMotionVersions = 2;   // MotionVersion::V1, V2
+enum { V2B_FIELD, V2B_COUNT };          // MotionGroup::bufs of V2: the cleaned block field + the fitted finest field (2 x bw x bh vec2, binding 13)
 struct MotionGroup {
     VkPipeline pipes[P_COUNT]{};
     VkPipeline blurPipes[B_COUNT_]{};
-    std::vector<UiBuf> bufs;   // size-dependent buffers of this version only (none yet), freed with the size like buf[]
+    std::vector<UiBuf> bufs;   // size-dependent buffers of this version only (V1: none; V2: V2B_*), freed with the size like buf[]
     bool live = false;         // created (the pipelines; the buffers whenever a size is held)
 };
 
@@ -289,6 +313,14 @@ struct Interpolator::Impl {
     // latest recordEstimate (recordSynth uses its results)
     bool haveEst = false;
     VkImageView estPrev = VK_NULL_HANDLE, estCurr = VK_NULL_HANDLE;   // the Y / only views of the estimate's pair
+    // V2: the estimate ends after the search (V1's raw finest search, and Performance's fitted finest field); what each V2Mode derives
+    // from it (v2Tail) is recorded once per estimate, by the estimate for the mode selected then, else by the first synth of the other
+    // mode (a switch of the mode keeps the estimate): Quality V1's sub-pixel refinement and pixel field (v2Pix), Performance the
+    // re-picked and cleaned field (v2Clean). estSub: Settings::subpixel at the estimate.
+    bool estSub = true, v2Pix = false, v2Clean = false;
+    bool v2Perf() const { return set.motionVersion == MotionVersion::V2 && set.v2Mode == V2Mode::Performance; }
+    void v2Tail(VkCommandBuffer cb, bool perf);
+    bool v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Frame curr, Frame out, const float* ts, int n, bool gauss);
 
     // size dependent
     uint32_t W = 0, H = 0;
@@ -331,7 +363,7 @@ struct Interpolator::Impl {
     UiBox computeBox() const;
     UiBox computeWork(const UiBox& box) const;
     uint32_t localType(uint32_t bits) const;
-    bool allocBuf(UiBuf& b, VkDeviceSize bytes);
+    bool allocBuf(UiBuf& b, VkDeviceSize bytes, VkBufferUsageFlags extra = 0);
     void freeBuf(UiBuf& b);
     bool growBuf(UiBuf& b, VkDeviceSize bytes);
     bool allocImage(VkFormat f, uint32_t w, uint32_t h, VkImage& img, VkDeviceMemory& mem, VkImageView& view);
@@ -507,11 +539,11 @@ uint32_t Interpolator::Impl::localType(uint32_t bits) const {
     return UINT32_MAX;
 }
 
-bool Interpolator::Impl::allocBuf(UiBuf& b, VkDeviceSize bytes) {
+bool Interpolator::Impl::allocBuf(UiBuf& b, VkDeviceSize bytes, VkBufferUsageFlags extra) {
     b = UiBuf{};
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra;
     if (CreateBuffer(info.device, &bci, nullptr, &b.b) != VK_SUCCESS) { b.b = VK_NULL_HANDLE; return false; }
     VkMemoryRequirements req;
     GetBufferMemoryRequirements(info.device, b.b, &req);
@@ -845,9 +877,10 @@ bool Interpolator::init(const InitInfo& ii) {
     if (m->CreateSampler(d, &sci, nullptr, &m->sampler) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
 
     // bindings 0-2 buffers, 3-4 prev/curr, 5 out; 6-7: motion-blur scratch (only the blur passes use them);
-    // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out; 11-12 (synth sets): the V2 masks of prev / curr (ui_reject.glsl)
+    // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out; 11-12 (synth sets): the V2 masks of prev / curr (ui_reject.glsl);
+    // 13: MotionVersion::V2's cleaned block field (written only to V2's sets, shaders/v2_motion.glsl)
     uint32_t nb = m->yuv ? 11 : 8;
-    VkDescriptorSetLayoutBinding b[13]{};
+    VkDescriptorSetLayoutBinding b[14]{};
     VkDescriptorType types[11] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -861,7 +894,7 @@ bool Interpolator::init(const InitInfo& ii) {
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         if (i == 3 || i == 4 || i == 8 || i == 9) b[i].pImmutableSamplers = &m->sampler;
     }
-    for (uint32_t k = 11; k <= 12; k++, nb++) {
+    for (uint32_t k = 11; k <= 13; k++, nb++) {
         b[nb].binding = k;
         b[nb].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         b[nb].descriptorCount = 1;
@@ -1107,16 +1140,25 @@ void Interpolator::releaseUnusedMotion() {
 bool Interpolator::Impl::motionEnsure() {
     MotionGroup& g = mg();
     if (g.live) return true;
-    // V1 (and V2 while it aliases V1): the motion estimate is the same code for every format; the four colour passes of the
-    // estimate/synth set are the format's, as are the two colour passes of the blur
+    // V1: the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's,
+    // as are the two colour passes of the blur. V2 (Rgba8 only): both modes' pipelines (see MotionGroup); empty slots are skipped.
     struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
         {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
         {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
         {SPV(lookup), nullptr}};
+    if (set.motionVersion == MotionVersion::V2) {
+        spv[P_MEDHIST].sp = spv[P_SEARCH].sp = spv[P_SUBPIX].sp = Spv{};   // replaced by V2's faster passes of the same field
+        spv[P_V2_MEDHIST].sp = SPV(v2_medhist);
+        spv[P_V2_SEARCH].sp = SPV(v2_search);
+        spv[P_V2_SUBPIX].sp = SPV(v2_subpix);
+        spv[P_V2_CLEAN].sp = SPV(v2_clean);
+        spv[P_V2_MORPH].sp = SPV(v2_morph);
+        spv[P_V2_REPICK].sp = SPV(v2_repick);
+    }
     struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
     bool ok = true;
-    for (int i = 0; ok && i < P_COUNT; i++) ok = makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
+    for (int i = 0; ok && i < P_COUNT; i++) ok = !spv[i].sp.code || makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
     for (int i = 0; ok && i < B_COUNT_; i++) ok = makePipe(bspv[i].sp, blurLayout, g.blurPipes[i], bspv[i].sc);
     ok = ok && (!W || motionSized(g));
     if (!ok) { motionFree(g); return false; }
@@ -1125,10 +1167,15 @@ bool Interpolator::Impl::motionEnsure() {
 }
 
 // The size-dependent buffers of one motion version, beside the shared buf[] (called while a size is held: by motionEnsure and
-// createSizeDependent; destroySizeDependent frees them). V1 and today's V2 have none of their own.
+// createSizeDependent; destroySizeDependent frees them). V1 has none of its own; V2: V2B_*.
 bool Interpolator::Impl::motionSized(MotionGroup& g) {
-    (void)g;
-    return true;
+    if (&g != &mo[(int)MotionVersion::V2] || !g.bufs.empty()) return true;
+    g.bufs.resize(V2B_COUNT);
+    // the cleaned field, then the search's fitted finest field (v2_est.glsl); recordDebugMaps copies the cleaned one
+    if (allocBuf(g.bufs[V2B_FIELD], (VkDeviceSize)lv[0].bw * lv[0].bh * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return true;
+    for (UiBuf& b : g.bufs) freeBuf(b);
+    g.bufs.clear();
+    return false;
 }
 
 // Frees one motion version's resources (retire rule of resize()/destroy()).
@@ -1205,8 +1252,10 @@ bool Interpolator::recordDebugCounters(VkCommandBuffer cb, VkBuffer dst, VkDevic
     // clearCounters barrier (CS RW -> transfer write) already orders its fill after this read
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    VkBufferCopy c{0, dstOffset, 8};   // u[U_UNTRUSTED], u[U_SADSUM]
-    I.CmdCopyBuffer(cb, I.buf[2], dst, 1, &c);
+    // u[U_UNTRUSTED], u[U_SADSUM]; V2 Performance: its own scene-cut sum u[3] (v2_est.glsl U_V2SAD; u[1] is Quality's, written by
+    // its sub-pixel pass)
+    VkBufferCopy c[2] = {{0, dstOffset, 4}, {I.v2Perf() ? 12u : 4u, dstOffset + 4, 4}};
+    I.CmdCopyBuffer(cb, I.buf[2], dst, 2, c);
     return true;
 }
 
@@ -1233,6 +1282,13 @@ bool Interpolator::recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSiz
     Impl& I = *m;
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    const MotionGroup& v2g = I.mo[(int)MotionVersion::V2];
+    if (I.v2Perf() && I.v2Clean && !v2g.bufs.empty()) {   // V2 Performance: the cleaned block field it morphs with; no pixel field, no e
+        VkBufferCopy f{0, dstOffset + L.blockOff, L.pixOff - L.blockOff};
+        I.CmdCopyBuffer(cb, v2g.bufs[V2B_FIELD].b, dst, 1, &f);
+        I.CmdFillBuffer(cb, dst, dstOffset + L.pixOff, L.size - L.pixOff, 0);
+        return true;
+    }
     int blockIn = I.set.subpixel ? I.fieldSub : I.lv[0].fM;   // == pc.fIn of the pixel-field pass
     VkBufferCopy f[2] = {{(VkDeviceSize)blockIn * 8, dstOffset + L.blockOff, L.pixOff - L.blockOff},
                          {(VkDeviceSize)I.fieldPF * 8, dstOffset + L.pixOff, L.eOff - L.pixOff}};
@@ -1254,7 +1310,9 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
                                    {VK_NULL_HANDLE, curr.chroma, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, out.chroma, VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorBufferInfo rj[2] = {{rej.a ? rej.a : rejNone.b, 0, VK_WHOLE_SIZE}, {rej.c ? rej.c : rejNone.b, 0, VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet wr[13]{};
+    const MotionGroup& v2g = mo[(int)MotionVersion::V2];
+    VkDescriptorBufferInfo vb = {v2g.bufs.empty() ? VK_NULL_HANDLE : v2g.bufs[V2B_FIELD].b, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet wr[14]{};
     uint32_t n = 0;
     auto add = [&](uint32_t binding, VkDescriptorType t) -> VkWriteDescriptorSet& {
         VkWriteDescriptorSet& w = wr[n++];
@@ -1288,6 +1346,7 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
         add(11, BUF).pBufferInfo = &rj[0];
         add(12, BUF).pBufferInfo = &rj[1];
     }
+    if (this->set.motionVersion == MotionVersion::V2 && vb.buffer) add(13, BUF).pBufferInfo = &vb;   // V2's sets only (V1's stay as they were)
     UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
     return set;
 }
@@ -1335,6 +1394,21 @@ struct Rec {
         I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().pipes[p]);
         I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
         I.CmdDispatch(cb, gx, gy, 1);
+    }
+    // V2 Performance's synthesis passes: their own block (V2PC) over the same range
+    void runV2(Pipe p, const V2PC& v, uint32_t gx, uint32_t gy) {
+        I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().pipes[p]);
+        I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(V2PC), &v);
+        I.CmdDispatch(cb, gx, gy, 1);
+    }
+    V2PC v2pc() const {
+        V2PC v{};
+        v.W = (int)I.W; v.H = (int)I.H; v.fw = I.fw; v.fh = I.fh;
+        v.bw = I.lv[0].bw; v.bh = I.lv[0].bh; v.fscale = (int)I.set.flowScale;
+        v.cutSad = I.set.sceneCutSad; v.globalFrac = I.set.globalFallback;
+        v.sigma2Inv = 1.0f / (kV2CleanSigma * kV2CleanSigma);
+        v.trustMid = 0.5f * (I.set.trustLow + I.set.trustHigh);
+        return v;
     }
 };
 }  // namespace
@@ -1752,6 +1826,38 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     // 3-5. per level, coarse -> fine
     static const char* lvNames[] = {"level 0 (finest)", "level 1", "level 2", "level 3", "level 4", "level 5", "level 6", "level 7"};
     int n = (int)I.lv.size();
+    if (I.set.motionVersion == MotionVersion::V2) {
+        // V1's block field, faster (shaders/v2_est.glsl): no median3 passes, each consumer takes the 3x3 median of the raw search
+        // output itself; medhist's histogram is weighted per parent and scanned in parallel
+        for (int i = n - 1; i >= 0; i--) {
+            const Level& l = I.lv[i];
+            pc.w = l.w; pc.h = l.h; pc.bw = l.bw; pc.bh = l.bh;
+            pc.offA = l.offA; pc.offC = l.offC;
+            if (i == n - 1) {
+                pc.medIdx = -1;
+                pc.radius = 6;   // TOP_RADIUS
+            } else {
+                const Level& p = I.lv[i + 1];
+                pc.pw = p.bw; pc.ph = p.bh; pc.fPar = p.fS;   // the parent's RAW search output
+                pc.medIdx = 4 + 2 * i;
+                pc.radius = 2;   // RADIUS
+                r.run(P_V2_MEDHIST, 1, 1);
+                r.cbar();
+            }
+            pc.fOut = l.fS;
+            // finest level (bits): 1 = V1's scene-cut sum (sub-pixel refinement off: the search's SAD is final), 2 = Performance's
+            // block field (V2B_FIELD at bw * bh) and its own scene-cut sum, 4 = with the equiangular sub-pixel fit
+            pc.sadAcc = i == 0 ? (!I.set.subpixel ? 1 : 0) | 2 | (I.set.subpixel ? 4 : 0) : 0;
+            r.run(P_V2_SEARCH, l.bw, l.bh);
+            r.cbar();
+            r.stamp(lvNames[std::min(i, 7)]);
+        }
+        // the rest is each mode's: Quality's sub-pixel refinement and pixel field, Performance's re-pick and clean-up (v2Tail)
+        I.estSub = I.set.subpixel;
+        I.v2Pix = I.v2Clean = false;
+        I.v2Tail(cb, I.set.v2Mode == V2Mode::Performance);
+        return true;
+    }
     for (int i = n - 1; i >= 0; i--) {
         const Level& l = I.lv[i];
         pc.w = l.w; pc.h = l.h; pc.bw = l.bw; pc.bh = l.bh;
@@ -1793,6 +1899,89 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     return true;
 }
 
+// V2: what the selected mode derives from the estimate (V1's raw finest search in l0.fS, and Performance's fitted field), if this
+// estimate has not recorded it yet. Recorded where the estimate or synth set is bound (with `layout`) and every earlier record's use of
+// the buffers is ordered (the estimate's / synth's counter clear).
+//   Quality: V1's sub-pixel refinement (v2_subpix: V1's subpix.comp with the 3x3 median taken in place; its scene-cut sum into
+//            u[U_SADSUM] as V1's) and pixel field, or V1's median3 and pixel field when sub-pixel refinement was off: V1's field.
+//   Performance: the block re-pick of the fitted field (V2B_FIELD at bw * bh) into l0.fM (free in V2: V1's median3 output, written
+//            otherwise only by Quality's tail with sub-pixel refinement off, which never reads it after its pixel field), then the
+//            clean-up into V2B_FIELD.
+void Interpolator::Impl::v2Tail(VkCommandBuffer cb, bool perf) {
+    Rec r(*this, cb);
+    const Level& l0 = lv[0];
+    PC& pc = r.pc;
+    pc.w = l0.w; pc.h = l0.h; pc.bw = l0.bw; pc.bh = l0.bh; pc.offA = l0.offA; pc.offC = l0.offC;
+    if (perf) {
+        if (v2Clean) return;
+        pc.fIn = l0.bw * l0.bh; pc.fOut = l0.fM;
+        r.run(P_V2_REPICK, divUp(l0.bw, 2), divUp(l0.bh, 2));   // 2x2 blocks per workgroup
+        r.cbar();
+        V2PC v = r.v2pc();
+        v.fIn = l0.fM;
+        r.runV2(P_V2_CLEAN, v, divUp(l0.bw, 8), divUp(l0.bh, 8));
+        r.cbar();
+        r.stamp("field clean");
+        v2Clean = true;
+        return;
+    }
+    if (v2Pix) return;
+    pc.fIn = l0.fS;
+    if (estSub) {
+        pc.fOut = fieldSub;
+        r.run(P_V2_SUBPIX, l0.bw, l0.bh);
+        r.cbar();
+        r.stamp("subpixel");
+        pc.fIn = fieldSub;
+    } else {
+        pc.fOut = l0.fM;
+        r.run(P_MEDIAN3, divUp(l0.bw, 8), divUp(l0.bh, 8));
+        r.cbar();
+        pc.fIn = l0.fM;
+    }
+    r.run(P_PIXFIELD, divUp(fw, 16), divUp(fh, 16));
+    r.cbar();
+    r.stamp("pixel field");
+    v2Pix = true;
+}
+
+// V2 Performance: recordSynth (n = 1, ts = {t}) and recordSynthBlur (n samples at ts) in one pass, v2_morph.comp, after the field
+// clean-up if this estimate has none yet; then the UI patch as V1's. The caller has checked the pair, the rings and the UI entries.
+bool Interpolator::Impl::v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Frame curr, Frame out, const float* ts, int n, bool gauss) {
+    VkDescriptorSet set_ = takeSet(R_SYNTH, srcP, srcC, out, false, rejectMasks(cb));
+    Rec r(*this, cb);
+    // orders this record after every earlier one (shared buffers), zeroes the untrusted count(s): recordSynth's in u[U_UNTRUSTED]
+    // (recordDebugCounters reads it), the blur's per sample in u[kBlurCnt0 + k] as V1's blur
+    V2PC v = r.v2pc();
+    v.cnt = n == 1 ? 0 : kBlurCnt0;
+    r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    CmdFillBuffer(cb, buf[2], (VkDeviceSize)v.cnt * 4, n == 1 ? 4 : 16 * 4, 0);
+    r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
+    CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set_, 0, nullptr);
+    v2Tail(cb, true);
+    v.n = n;
+    v.gauss = gauss;
+    for (int k = 0; k < n; k++) v.t[k] = ts[k];
+    r.runV2(P_V2_MORPH, v, divUp((int)W, 8), divUp((int)H, 8));
+    r.cbar();
+    const char* name = n == 1 ? "morph" : "blur morph";
+    r.stamp(name);
+    v.fix = 1;   // exits at once unless a sample turned out to have too many untrusted pixels
+    r.runV2(P_V2_MORPH, v, divUp((int)W, 64), divUp((int)H, 64));
+    name = "fallback";
+    if (estUi) {
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
+        r.stamp(name);
+        uiRecordPatch(cb, curr, out, uiE[estEnt[1]]);   // the real UI pixels back over the generated frame
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
+        r.stamp("ui_patch");
+        return true;
+    }
+    r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
+    r.stamp(name);
+    return true;
+}
+
 bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t) {
     if (!m || !m->W || !(t > 0.0f && t < 1.0f)) return false;
     Impl& I = *m;
@@ -1807,12 +1996,14 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
         if (I.uiFrameSets + 2 > kUiSets) return false;
         if (I.estClean) { srcP = ep.frame(); srcC = ec.frame(); }
     }
+    if (I.v2Perf()) return I.v2Synth(cb, srcP, srcC, curr, out, &t, 1, false);
     VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out, false, I.rejectMasks(cb));
 
     Rec r(I, cb);
     // Serialises this synth after the estimate and after any earlier synth (shared field-at-t, mismatch and
     // counter scratch): the CS -> transfer -> CS chain orders all earlier reads/writes of our buffers.
     r.clearCounters(1, set);   // untrusted count only; the SAD sum belongs to the estimate
+    if (I.set.motionVersion == MotionVersion::V2) I.v2Tail(cb, false);   // Quality after a Performance estimate: its pixel field
     PC& pc = r.pc;
     if (t != 0.5f) {
         // numpy float32 constants of interp.synth / field_at (computed in double, then rounded); the warp
@@ -1881,6 +2072,7 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     for (int k = 0; k < n; k++)
         if (bp.t[k] > 0.0f && bp.t[k] < 1.0f) { lo = std::min(lo, k); hi = k; }
     const int nInt = hi - lo + 1;
+    if (I.v2Perf()) return I.v2Synth(cb, srcP, srcC, curr, out, bp.t, n, I.set.blurWeights == BlurWeights::Gaussian);
 
     // scratch: n slots of the field at t (flow res) and of the packed mismatch (full res)
     const VkDeviceSize errWords = (VkDeviceSize)((I.W + 3) / 4) * I.H;
@@ -1892,6 +2084,10 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     I.CmdFillBuffer(cb, I.buf[2], kBlurCnt0 * 4, 16 * 4, 0);
     r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
+    if (I.set.motionVersion == MotionVersion::V2 && !I.v2Pix) {   // Quality after a Performance estimate: its pixel field (own layout)
+        I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);
+        I.v2Tail(cb, false);
+    }
     I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.blurLayout, 0, 1, &set, 0, nullptr);
 
     const Settings& st = I.set;
