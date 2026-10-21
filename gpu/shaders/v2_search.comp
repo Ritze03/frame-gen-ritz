@@ -87,7 +87,18 @@ void main() {
         float best = cost[0];
         for (int ci = 1; ci < D * D; ci++)
             if (cost[ci] < best) { best = cost[ci]; bi = ci; }
-        field[pc.fOut + blk.y * pc.bw + blk.x] = vec2(s + ivec2(bi % D - R, bi / D - R));
-        if (pc.sadAcc != 0) atomicAdd(u[U_SADSUM], uint(roundEven(sadc[bi] * 256.0)));   // as subpix.comp
+        int x = bi % D, y = bi / D;
+        vec2 v = vec2(s + ivec2(x - R, y - R));
+        field[pc.fOut + blk.y * pc.bw + blk.x] = v;
+        if ((pc.sadAcc & 1) != 0) atomicAdd(u[U_SADSUM], uint(roundEven(sadc[bi] * 256.0)));   // as subpix.comp
+        if ((pc.sadAcc & 2) != 0) {
+            // V2, finest level: Performance's block vector, sub-pixel by an equiangular (V-shaped) fit of the SAD around the best
+            // integer candidate in x and in y (bit 4; none at the search window's edge)
+            if ((pc.sadAcc & 4) != 0) {
+                if (x > 0 && x < D - 1) v.x += vFit(sadc[bi - 1], sadc[bi], sadc[bi + 1]);
+                if (y > 0 && y < D - 1) v.y += vFit(sadc[bi - D], sadc[bi], sadc[bi + D]);
+            }
+            vf[pc.bw * pc.bh + blk.y * pc.bw + blk.x] = v;
+        }
     }
 }

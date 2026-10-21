@@ -25,7 +25,7 @@ layout(push_constant) uniform V2PC {
 layout(set = 0, binding = 13, std430) buffer V2Field { vec2 vf[]; };
 
 const int V2_BLOCK = 8;
-const int U_SADSUM_ = 1;   // == motion_v1.glsl U_SADSUM (the estimate's scene-cut sum)
+const int U_V2SAD_ = 3;   // == v2_est.glsl U_V2SAD: Performance's scene-cut sum (integer finest SADs; V1 / Quality: u[1])
 
 vec2 VF(ivec2 b) {
     b = clamp(b, ivec2(0), ivec2(pc.bw - 1, pc.bh - 1));

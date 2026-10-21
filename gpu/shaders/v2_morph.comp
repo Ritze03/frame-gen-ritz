@@ -50,20 +50,22 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     vec3 m = (1.0 - t) * wa + t * wc;
     // the zero vector where it fits clearly better: a pixel the two frames show unchanged (a HUD element, text, static background
     // next to a moving object, which the smooth field would drag along) keeps its place
-    vec4 s0 = texelFetch(texPrev, p, 0), s1 = texelFetch(texCurr, p, 0);
-    vec3 sa = FG_FETCH(s0.rgb), sc = FG_FETCH(s1.rgb);
-    vec3 dz = abs(sa - sc);
-    float z = max(dz.r, max(dz.g, dz.b));
-    // ... and so do both neighbours along x or along y (a stroke of text or of a HUD element): a lone pixel whose colours happen to
-    // match in a moving texture does not switch (it would be a speck)
-    float zh = max(zAt(p + ivec2(-1, 0)), zAt(p + ivec2(1, 0))), zv = max(zAt(p + ivec2(0, -1)), zAt(p + ivec2(0, 1)));
-    float zs = max(z, min(zh, zv));
-    float ws = clamp((em - zs - V2_Z0) * (1.0 / V2_Z1), 0.0, 1.0) * clamp(1.0 - zs * (1.0 / V2_ZMAX), 0.0, 1.0);
-    // not next to CrosshairV2's UI (its own patch and tap rejection handle it; a static crosshair would vouch for the pixels around it)
-    if (ws > 0.0 && (uiHitA(p - 1, p + 1) || uiHitC(p - 1, p + 1))) ws = 0.0;
-    m = mix(m, (1.0 - t) * sa + t * sc, ws);
-    al = mix(al, (1.0 - t) * s0.a + t * s1.a, ws);
-    em = mix(em, z, ws);
+    if (em > V2_Z0) {   // (only then can it win)
+        vec4 s0 = texelFetch(texPrev, p, 0), s1 = texelFetch(texCurr, p, 0);
+        vec3 sa = FG_FETCH(s0.rgb), sc = FG_FETCH(s1.rgb);
+        vec3 dz = abs(sa - sc);
+        float z = max(dz.r, max(dz.g, dz.b));
+        // ... and so do both neighbours along x or along y (a stroke of text or of a HUD element): a lone pixel whose colours happen to
+        // match in a moving texture does not switch (it would be a speck)
+        float zh = max(zAt(p + ivec2(-1, 0)), zAt(p + ivec2(1, 0))), zv = max(zAt(p + ivec2(0, -1)), zAt(p + ivec2(0, 1)));
+        float zs = max(z, min(zh, zv));
+        float ws = clamp((em - zs - V2_Z0) * (1.0 / V2_Z1), 0.0, 1.0) * clamp(1.0 - zs * (1.0 / V2_ZMAX), 0.0, 1.0);
+        // not next to CrosshairV2's UI (its own patch and tap rejection handle it; a static crosshair would vouch for the pixels around it)
+        if (ws > 0.0 && (uiHitA(p - 1, p + 1) || uiHitC(p - 1, p + 1))) ws = 0.0;
+        m = mix(m, (1.0 - t) * sa + t * sc, ws);
+        al = mix(al, (1.0 - t) * s0.a + t * s1.a, ws);
+        em = mix(em, z, ws);
+    }
     e = uint(em);
     return m;
 }
@@ -107,7 +109,7 @@ void pixelOut(ivec2 p, bool counting, bool cut) {
 
 void main() {
     int lid = int(gl_LocalInvocationIndex);
-    float meanSad = float(u[U_SADSUM_]) * (1.0 / 256.0) / float(pc.bw * pc.bh);
+    float meanSad = float(u[U_V2SAD_]) * (1.0 / 256.0) / float(pc.bw * pc.bh);
     bool cut = meanSad > pc.cutSad;
     if (pc.fix == 0) {
         if (lid < 16) esum[lid] = 0u;

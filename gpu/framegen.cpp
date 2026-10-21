@@ -254,7 +254,7 @@ struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 // (its own pipelines of V1's shaders: V1's output), Performance its field clean-up and one-pass morph (P_V2_CLEAN / MORPH) over its
 // own buffer (`bufs`, created by motionSized()).
 static const int kMotionVersions = 2;   // MotionVersion::V1, V2
-enum { V2B_FIELD, V2B_COUNT };          // MotionGroup::bufs of V2: the cleaned block field (bw x bh vec2, binding 13)
+enum { V2B_FIELD, V2B_COUNT };          // MotionGroup::bufs of V2: the cleaned block field + the fitted finest field (2 x bw x bh vec2, binding 13)
 struct MotionGroup {
     VkPipeline pipes[P_COUNT]{};
     VkPipeline blurPipes[B_COUNT_]{};
@@ -313,11 +313,10 @@ struct Interpolator::Impl {
     // latest recordEstimate (recordSynth uses its results)
     bool haveEst = false;
     VkImageView estPrev = VK_NULL_HANDLE, estCurr = VK_NULL_HANDLE;   // the Y / only views of the estimate's pair
-    // V2: the estimate ends in the block field (estBlock: offset in buf[1] of the field after sub-pixel refinement, or of the raw
-    // finest search when it was off); what each V2Mode derives from it is recorded once per estimate, by the estimate for the mode
-    // selected then, else by the first synth of the other mode (a switch of the mode keeps the estimate): Quality the pixel field
-    // (v2Pix), Performance the cleaned field (v2Clean).
-    int estBlock = 0;
+    // V2: the estimate ends after the search (V1's raw finest search, and Performance's fitted finest field); what each V2Mode derives
+    // from it (v2Tail) is recorded once per estimate, by the estimate for the mode selected then, else by the first synth of the other
+    // mode (a switch of the mode keeps the estimate): Quality V1's sub-pixel refinement and pixel field (v2Pix), Performance the
+    // re-picked and cleaned field (v2Clean). estSub: Settings::subpixel at the estimate.
     bool estSub = true, v2Pix = false, v2Clean = false;
     bool v2Perf() const { return set.motionVersion == MotionVersion::V2 && set.v2Mode == V2Mode::Performance; }
     void v2Tail(VkCommandBuffer cb, bool perf);
@@ -1172,7 +1171,8 @@ bool Interpolator::Impl::motionEnsure() {
 bool Interpolator::Impl::motionSized(MotionGroup& g) {
     if (&g != &mo[(int)MotionVersion::V2] || !g.bufs.empty()) return true;
     g.bufs.resize(V2B_COUNT);
-    if (allocBuf(g.bufs[V2B_FIELD], (VkDeviceSize)lv[0].bw * lv[0].bh * 8, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return true;   // (recordDebugMaps copies it)
+    // the cleaned field, then the search's fitted finest field (v2_est.glsl); recordDebugMaps copies the cleaned one
+    if (allocBuf(g.bufs[V2B_FIELD], (VkDeviceSize)lv[0].bw * lv[0].bh * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return true;
     for (UiBuf& b : g.bufs) freeBuf(b);
     g.bufs.clear();
     return false;
@@ -1252,8 +1252,10 @@ bool Interpolator::recordDebugCounters(VkCommandBuffer cb, VkBuffer dst, VkDevic
     // clearCounters barrier (CS RW -> transfer write) already orders its fill after this read
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    VkBufferCopy c{0, dstOffset, 8};   // u[U_UNTRUSTED], u[U_SADSUM]
-    I.CmdCopyBuffer(cb, I.buf[2], dst, 1, &c);
+    // u[U_UNTRUSTED], u[U_SADSUM]; V2 Performance: its own scene-cut sum u[3] (v2_est.glsl U_V2SAD; u[1] is Quality's, written by
+    // its sub-pixel pass)
+    VkBufferCopy c[2] = {{0, dstOffset, 4}, {I.v2Perf() ? 12u : 4u, dstOffset + 4, 4}};
+    I.CmdCopyBuffer(cb, I.buf[2], dst, 2, c);
     return true;
 }
 
@@ -1843,22 +1845,15 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
                 r.cbar();
             }
             pc.fOut = l.fS;
-            pc.sadAcc = i == 0 && !I.set.subpixel;
+            // finest level (bits): 1 = V1's scene-cut sum (sub-pixel refinement off: the search's SAD is final), 2 = Performance's
+            // block field (V2B_FIELD at bw * bh) and its own scene-cut sum, 4 = with the equiangular sub-pixel fit
+            pc.sadAcc = i == 0 ? (!I.set.subpixel ? 1 : 0) | 2 | (I.set.subpixel ? 4 : 0) : 0;
             r.run(P_V2_SEARCH, l.bw, l.bh);
             r.cbar();
             r.stamp(lvNames[std::min(i, 7)]);
         }
-        pc.w = l0.w; pc.h = l0.h; pc.bw = l0.bw; pc.bh = l0.bh; pc.offA = l0.offA; pc.offC = l0.offC;
+        // the rest is each mode's: Quality's sub-pixel refinement and pixel field, Performance's re-pick and clean-up (v2Tail)
         I.estSub = I.set.subpixel;
-        I.estBlock = l0.fS;   // without sub-pixel refinement: the raw finest search (each mode's tail takes its median)
-        if (I.estSub) {
-            pc.fIn = l0.fS;
-            pc.fOut = I.fieldSub;
-            r.run(P_V2_SUBPIX, l0.bw, l0.bh);
-            r.cbar();
-            r.stamp("subpixel");
-            I.estBlock = I.fieldSub;
-        }
         I.v2Pix = I.v2Clean = false;
         I.v2Tail(cb, I.set.v2Mode == V2Mode::Performance);
         return true;
@@ -1904,21 +1899,23 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     return true;
 }
 
-// V2: what the selected mode derives from the estimate's block field, if this estimate has not recorded it yet (see estBlock).
-// Recorded where the estimate or synth set is bound (with `layout`) and every earlier record's use of the buffers is ordered
-// (the estimate's / synth's counter clear). Quality: V1's pixel field (fieldPF, after V1's median3 when sub-pixel refinement was off);
-// Performance: the field clean-up into V2B_FIELD.
+// V2: what the selected mode derives from the estimate (V1's raw finest search in l0.fS, and Performance's fitted field), if this
+// estimate has not recorded it yet. Recorded where the estimate or synth set is bound (with `layout`) and every earlier record's use of
+// the buffers is ordered (the estimate's / synth's counter clear).
+//   Quality: V1's sub-pixel refinement (v2_subpix: V1's subpix.comp with the 3x3 median taken in place; its scene-cut sum into
+//            u[U_SADSUM] as V1's) and pixel field, or V1's median3 and pixel field when sub-pixel refinement was off: V1's field.
+//   Performance: the block re-pick of the fitted field (V2B_FIELD at bw * bh) into l0.fM (free in V2: V1's median3 output, written
+//            otherwise only by Quality's tail with sub-pixel refinement off, which never reads it after its pixel field), then the
+//            clean-up into V2B_FIELD.
 void Interpolator::Impl::v2Tail(VkCommandBuffer cb, bool perf) {
     Rec r(*this, cb);
     const Level& l0 = lv[0];
+    PC& pc = r.pc;
+    pc.w = l0.w; pc.h = l0.h; pc.bw = l0.bw; pc.bh = l0.bh; pc.offA = l0.offA; pc.offC = l0.offC;
     if (perf) {
         if (v2Clean) return;
-        // block re-pick into l0.fM (free in V2: V1's median3 output, written only by Quality's tail with sub-pixel refinement off,
-        // which reads the estimate's own block field), then the clean-up into V2B_FIELD
-        PC& pc = r.pc;
-        pc.w = l0.w; pc.h = l0.h; pc.bw = l0.bw; pc.bh = l0.bh; pc.offA = l0.offA; pc.offC = l0.offC;
-        pc.fIn = estBlock; pc.fOut = l0.fM;
-        r.run(P_V2_REPICK, l0.bw, l0.bh);
+        pc.fIn = l0.bw * l0.bh; pc.fOut = l0.fM;
+        r.run(P_V2_REPICK, divUp(l0.bw, 2), divUp(l0.bh, 2));   // 2x2 blocks per workgroup
         r.cbar();
         V2PC v = r.v2pc();
         v.fIn = l0.fM;
@@ -1929,11 +1926,15 @@ void Interpolator::Impl::v2Tail(VkCommandBuffer cb, bool perf) {
         return;
     }
     if (v2Pix) return;
-    PC& pc = r.pc;
-    pc.w = l0.w; pc.h = l0.h; pc.bw = l0.bw; pc.bh = l0.bh; pc.offA = l0.offA; pc.offC = l0.offC;
-    pc.fIn = estBlock;
-    if (!estSub) {
-        pc.fIn = l0.fS; pc.fOut = l0.fM;
+    pc.fIn = l0.fS;
+    if (estSub) {
+        pc.fOut = fieldSub;
+        r.run(P_V2_SUBPIX, l0.bw, l0.bh);
+        r.cbar();
+        r.stamp("subpixel");
+        pc.fIn = fieldSub;
+    } else {
+        pc.fOut = l0.fM;
         r.run(P_MEDIAN3, divUp(l0.bw, 8), divUp(l0.bh, 8));
         r.cbar();
         pc.fIn = l0.fM;
