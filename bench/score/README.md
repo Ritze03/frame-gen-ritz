@@ -16,4 +16,15 @@ Interpolator per window masks a static pixel only after `uiStillFrames` (8) stil
 explicit smaller `--warm` prints a warning. Frames are decoded per window and deleted after scoring in `bench/score/work/` (never /tmp, < 10 GB). Output:
 `bench/score/out/<run-id>/report.md` (all definitions included), `per_triple.csv` and `crops/` (prev | v1 | contestant | real |
 next strips of the worst sites). `--triples 40 --test60` is the quick self-test (`--test60` adds battlefield's even frames as a
-60 fps clip). Thread caps: OpenCV / OpenMP 8 threads, `ninja -j8`; the core mask is system-wide (no taskset).
+60 fps clip). No thread caps (ffmpeg, OpenCV / OpenMP and ninja use their defaults); CPU limits are system-wide.
+
+**Comparing builds in one run.** `FGTEST=/path/to/fgtest python3 bench/score/score.py ...` uses that binary as is: no
+rebuild, and the report records the binary's sha256 instead of the commit (the run id ends in that hash). A contestant may
+also name its own binary with a `bin=PATH` key in its set string, e.g.
+
+```sh
+FGTEST=builds/a/fgtest python3 bench/score/score.py -c 'v1: algo=v1' -c 'v2new: algo=v2,bin=builds/b/fgtest' --triples 40
+```
+
+`bin=` is stripped before `--set`; the reference `v1` may carry one too (`v1: algo=v1,bin=...`). The report's contestant
+table names every contestant's binary and its sha256 (the console prints them at the start).
