@@ -16,6 +16,8 @@ shared float ta[MAXT * MAXT], tc[MAXT * MAXT];
 shared float part[6][64];   // per-subgroup partial seed SADs (gl_NumSubgroups <= 64)
 shared vec2 nb[36];         // the 3x3 neighbourhoods of the 4 parent candidates
 shared float cost[MAXC], sadc[MAXC];
+const int ROWC = 25;           // radius 2
+shared float rows[ROWC * 8];   // per (candidate, block row) partial SADs
 shared ivec2 seedS;
 
 void main() {
@@ -72,14 +74,35 @@ void main() {
         tc[i] = L(pc.offC, b0.x + s.x - R + x, b0.y + s.y - R + y, pc.w, pc.h);
     }
     barrier();
-    for (int ci = lid; ci < D * D; ci += 64) {
-        int dx = ci % D - R, dy = ci / D - R;
-        float sum = 0.0;
-        for (int y = 0; y < 8; y++)
-            for (int x = 0; x < 8; x++)
-                sum += abs(ta[(y - dy + R) * T + (x - dx + R)] - tc[(y + dy + R) * T + (x + dx + R)]);
-        sadc[ci] = sum * (1.0 / 64.0);
-        cost[ci] = sadc[ci] + LAMBDA * float(abs(dx) + abs(dy));
+    if (D * D <= ROWC) {
+        // radius 2 (every level but the coarsest): one (candidate, block row) per thread and step, 25 x 8 rows, instead of 25
+        // threads summing 64 pixels each
+        for (int it = lid; it < D * D * 8; it += 64) {
+            int ci = it >> 3, y = it & 7;
+            int dx = ci % D - R, dy = ci / D - R;
+            int ra = (y - dy + R) * T - dx + R, rc = (y + dy + R) * T + dx + R;
+            float sum = 0.0;
+            for (int x = 0; x < 8; x++) sum += abs(ta[ra + x] - tc[rc + x]);
+            rows[it] = sum;
+        }
+        barrier();
+        for (int ci = lid; ci < D * D; ci += 64) {
+            int dx = ci % D - R, dy = ci / D - R;
+            float sum = 0.0;
+            for (int y = 0; y < 8; y++) sum += rows[ci * 8 + y];
+            sadc[ci] = sum * (1.0 / 64.0);
+            cost[ci] = sadc[ci] + LAMBDA * float(abs(dx) + abs(dy));
+        }
+    } else {
+        for (int ci = lid; ci < D * D; ci += 64) {
+            int dx = ci % D - R, dy = ci / D - R;
+            float sum = 0.0;
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 8; x++)
+                    sum += abs(ta[(y - dy + R) * T + (x - dx + R)] - tc[(y + dy + R) * T + (x + dx + R)]);
+            sadc[ci] = sum * (1.0 / 64.0);
+            cost[ci] = sadc[ci] + LAMBDA * float(abs(dx) + abs(dy));
+        }
     }
     barrier();
     if (lid == 0) {
