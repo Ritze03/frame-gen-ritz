@@ -1484,8 +1484,9 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const c
 }
 static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : "V1"; }
 // The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes.
-// V2 aliases V1 for now (its own pipelines of V1's shaders, both V2Modes): the same 14. Update when V2's own passes land.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 14 : 14; }
+// V2 = both V2Modes: its 3 faster estimate passes, V1's luma / down / median3 (sub-pixel off) / pixel field / mismatch / resolve /
+// fallback / lookup (Quality), Performance's field clean-up and morph, and V1's 3 motion-blur passes (Quality): 16.
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 16 : 14; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1592,18 +1593,20 @@ static void motionCheck(const Scene& sc) {
     expect(fg.setSettings(sTo), "switch accepted");
     const int64_t k = gLivePipes - p0;
     printf("    pipelines: %lld after init, +%lld for the first switch to %s\n", (long long)p0, (long long)k, algoName(to));
-    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 14 while it aliases V1)");
+    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 16)");
     expect(!run(fg, false, nullptr) && blurRefused(fg), "after the switch the old estimate is gone: recordSynth and recordSynthBlur return false");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "switching back creates nothing (the start version kept its pipelines)");
     expect(!run(fg, false, nullptr), "switching straight back does not revive the dropped estimate");
     expect(fg.setSettings(sTo) && run(fg, true, &outC), "a new estimate in the new version synthesises");
     expect(outC == outR, "the new version's output equals a fresh instance's in that version");
-    printf("    (%s output %s %s's: V2 aliases V1's passes for now)\n", algoName(to), outC == outA ? "equals" : "DIFFERS FROM", algoName(from));
+    // V2 Quality runs V1's pixel field and synthesis on V1's block field (computed faster): V1's output; Performance morphs
+    if (gMode == V2Mode::Quality) expect(outC == outA, "V2 Quality's output equals V1's (V1's block field, pixel field and synthesis)");
+    else expect(outC != outA, "V2 Performance's output differs from V1's (its own synthesis)");
     vkDeviceWaitIdle(dev);
     fg.releaseUnusedMotion();
-    expect(gLivePipes == p0, "releaseUnusedMotion frees the unselected version's pipelines");
+    expect(gLivePipes == p0 + k - versionPipes(from), "releaseUnusedMotion frees the unselected version's pipelines");
     fg.releaseUnusedMotion();
-    expect(gLivePipes == p0, "a second releaseUnusedMotion frees nothing (nothing unused)");
+    expect(gLivePipes == p0 + k - versionPipes(from), "a second releaseUnusedMotion frees nothing (nothing unused)");
     expect(run(fg, true, &outC) && outC == outR, "the selected version still works after the release");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "selecting the released version again re-creates its pipelines");
     expect(run(fg, true, &outD) && outD == outA, "the re-created version gives the same output as before the release");
@@ -1613,8 +1616,9 @@ static void motionCheck(const Scene& sc) {
     fg.destroy();
     expect(gLivePipes == 0, "destroy frees every pipeline");
 
-    {   // Settings::v2Mode: runtime (no pipelines created, no rebuild), a switch of the mode alone keeps the estimate; a switch of the
-        // version still drops it; V1 ignores the mode. While V2 aliases V1, both modes give V1's output.
+    {   // Settings::v2Mode: runtime (no pipelines created, no rebuild), a switch of the mode alone keeps the estimate (the other mode's
+        // part is derived from it by its first synth: the same output as with that mode's own estimate); a switch of the version still
+        // drops it; V1 ignores the mode. Quality gives V1's output, Performance its own.
         Settings q; q.motionVersion = MotionVersion::V2; q.v2Mode = V2Mode::Quality;
         Settings p = q; p.v2Mode = V2Mode::Performance;
         Settings v1p = p; v1p.motionVersion = MotionVersion::V1;
@@ -1624,18 +1628,38 @@ static void motionCheck(const Scene& sc) {
         InitInfo inf;
         inf.phys = phys; inf.device = dev; inf.gdpa = countingGdpa; inf.width = W; inf.height = H;
         inf.viewFormat = fmt(); inf.getMemProps = vkGetPhysicalDeviceMemoryProperties; inf.settings = q;
-        std::vector<uint8_t> oq, op, op2, o1p, o1q;
+        std::vector<uint8_t> oq, op, op2, oq2, oq3, o1p, o1q;
         expect(f.init(inf) && run(f, true, &oq), "v2Mode: V2 Quality estimate + synth");
         const int64_t pm = gLivePipes;
         expect(f.setSettings(p) && f.settings().v2Mode == V2Mode::Performance && gLivePipes == pm,
                "v2Mode: setSettings switches Quality -> Performance at runtime and creates no pipeline (no rebuild)");
-        expect(run(f, false, &op) && op == oq, "v2Mode: the switch of the mode alone keeps the estimate (synth without a new estimate, same output)");
-        expect(run(f, true, &op2) && op2 == oq, "v2Mode: Performance's own estimate gives Quality's output (both alias V1 for now)");
-        expect(f.setSettings(q) && run(f, false, nullptr), "v2Mode: Performance -> Quality keeps the estimate too");
+        expect(run(f, false, &op), "v2Mode: the switch of the mode alone keeps the estimate (Performance synthesises Quality's estimate)");
+        expect(run(f, true, &op2) && op2 == op, "v2Mode: ... with the same output as Performance's own estimate");
+        expect(op != oq, "v2Mode: Performance's output differs from Quality's (its own synthesis)");
+        expect(f.setSettings(q) && run(f, false, &oq2) && oq2 == oq, "v2Mode: Performance -> Quality keeps the estimate too (Quality's output)");
+        expect(f.setSettings(p) && run(f, false, &op) && op == op2 && f.setSettings(q) && run(f, false, &oq3) && oq3 == oq,
+               "v2Mode: switching back and forth on one estimate keeps each mode's output");
+        {   // the same through recordSynthBlur (4 samples): each mode's part derived on demand inside the blur record too
+            auto runBlur = [&](bool estimate, std::vector<uint8_t>* out) {
+                begin();
+                f.beginFrame();
+                bool ok = (!estimate || f.recordEstimate(cb, a.view, b.view)) && f.recordSynthBlur(cb, a.view, b.view, o.view, 0.25f, 0.75f);
+                submit();
+                if (ok && out) *out = download(o, W, H);
+                return ok;
+            };
+            Settings qb = q, pb = p;
+            qb.blurSamples = pb.blurSamples = 4;
+            std::vector<uint8_t> bq, bp, bq2, bp2;
+            expect(f.setSettings(qb) && runBlur(true, &bq) && f.setSettings(pb) && runBlur(false, &bp2) && runBlur(true, &bp) && bp2 == bp &&
+                   f.setSettings(qb) && runBlur(false, &bq2) && bq2 == bq && bp != bq,
+                   "v2Mode: recordSynthBlur after a switch of the mode alone gives that mode's own blur (both directions)");
+            expect(f.setSettings(q), "v2Mode: blur off again");
+        }
         Settings bad = q; bad.v2Mode = (V2Mode)2;
         expect(!f.setSettings(bad) && f.settings().v2Mode == V2Mode::Quality, "v2Mode: setSettings refuses an unknown mode and changes nothing");
         expect(f.setSettings(v1p) && !run(f, false, nullptr) && blurRefused(f), "v2Mode: a switch of the version (V2 -> V1) still drops the estimate");
-        expect(run(f, true, &o1p) && o1p == op2, "v2Mode: V1's output equals V2's (V2 aliases V1)");
+        expect(run(f, true, &o1p) && o1p == oq, "v2Mode: V1's output equals V2 Quality's");
         expect(f.setSettings(v1q) && run(f, false, &o1q) && o1q == o1p, "v2Mode: V1 ignores the mode (a switch keeps its estimate, same output)");
         vkDeviceWaitIdle(dev);
         f.destroy();

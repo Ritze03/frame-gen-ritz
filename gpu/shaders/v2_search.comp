@@ -1,0 +1,93 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// V2 estimate: search.comp (seed among 6 candidates, then integer search +-radius around it, one workgroup per 8x8 block), the same
+// vectors, faster: the 4 parent candidates are the parent's 3x3 medians taken here from its raw search output (fPar, see
+// v2_est.glsl; V1 reads them from a median3.comp pass), and the seed SADs are summed with subgroup adds instead of a 6-barrier tree.
+// All SADs are sums of 64 exact multiples of the pyramid's level step (<= 2^-10 levels, < 2^24 steps), so the summation order does
+// not change them. sadAcc (finest level, sub-pixel refinement off): also the scene-cut sum.
+#include "common.glsl"
+#include "motion_v1.glsl"
+#include "v2_est.glsl"
+layout(local_size_x = 64) in;
+
+const int MAXR = 6, MAXT = 8 + 2 * MAXR, MAXC = (2 * MAXR + 1) * (2 * MAXR + 1);
+shared float ta[MAXT * MAXT], tc[MAXT * MAXT];
+shared float part[6][64];   // per-subgroup partial seed SADs (gl_NumSubgroups <= 64)
+shared vec2 nb[36];         // the 3x3 neighbourhoods of the 4 parent candidates
+shared float cost[MAXC], sadc[MAXC];
+shared ivec2 seedS;
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 blk = ivec2(gl_WorkGroupID.xy);
+    ivec2 b0 = blk * BLOCK;
+    ivec2 q = b0 + ivec2(lid & 7, lid >> 3);
+    if (pc.medIdx < 0) {
+        if (lid == 0) seedS = ivec2(0);
+    } else {
+        int px = min(blk.x / 2, pc.pw - 1), py = min(blk.y / 2, pc.ph - 1);
+        int sy = (blk.y & 1) == 0 ? -1 : 1, sx = (blk.x & 1) == 0 ? -1 : 1;
+        ivec2 pp[4] = ivec2[4](ivec2(0, 0), ivec2(0, sy), ivec2(sx, 0), ivec2(sx, sy));
+        if (lid < 36) {
+            int k = lid / 9, j = lid % 9;
+            ivec2 c = clamp(ivec2(px, py) + pp[k], ivec2(0), ivec2(pc.pw - 1, pc.ph - 1));
+            nb[lid] = rawF(pc.fPar, c + ivec2(j % 3 - 1, j / 3 - 1), pc.pw, pc.ph);
+        }
+        barrier();
+        ivec2 cand[6];
+        for (int k = 0; k < 4; k++) {
+            int o = 9 * k;
+            cand[k] = 2 * ivec2(roundEven(med9v(nb[o], nb[o + 1], nb[o + 2], nb[o + 3], nb[o + 4], nb[o + 5], nb[o + 6], nb[o + 7], nb[o + 8])));
+        }
+        cand[4] = ivec2(0);
+        cand[5] = ivec2(roundEven(vec2(uintBitsToFloat(u[pc.medIdx]), uintBitsToFloat(u[pc.medIdx + 1]))));
+        for (int k = 0; k < 6; k++) {
+            float d = abs(L(pc.offA, q.x - cand[k].x, q.y - cand[k].y, pc.w, pc.h) - L(pc.offC, q.x + cand[k].x, q.y + cand[k].y, pc.w, pc.h));
+            float s = subgroupAdd(d);
+            if (subgroupElect()) part[k][gl_SubgroupID] = s;
+        }
+        barrier();
+        if (lid == 0) {
+            float red[6];
+            for (int k = 0; k < 6; k++) {
+                red[k] = 0.0;
+                for (uint g = 0u; g < gl_NumSubgroups; g++) red[k] += part[k][g];
+            }
+            int bi = 0;
+            float best = red[0] * (1.0 / 64.0);
+            for (int k = 1; k < 6; k++) {
+                float c = red[k] * (1.0 / 64.0) + LAMBDA;
+                if (c < best) { best = c; bi = k; }
+            }
+            seedS = cand[bi];
+        }
+    }
+    barrier();
+    ivec2 s = seedS;
+    int R = pc.radius, T = 8 + 2 * R, D = 2 * R + 1;
+    for (int i = lid; i < T * T; i += 64) {
+        int x = i % T, y = i / T;
+        ta[i] = L(pc.offA, b0.x - s.x - R + x, b0.y - s.y - R + y, pc.w, pc.h);
+        tc[i] = L(pc.offC, b0.x + s.x - R + x, b0.y + s.y - R + y, pc.w, pc.h);
+    }
+    barrier();
+    for (int ci = lid; ci < D * D; ci += 64) {
+        int dx = ci % D - R, dy = ci / D - R;
+        float sum = 0.0;
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+                sum += abs(ta[(y - dy + R) * T + (x - dx + R)] - tc[(y + dy + R) * T + (x + dx + R)]);
+        sadc[ci] = sum * (1.0 / 64.0);
+        cost[ci] = sadc[ci] + LAMBDA * float(abs(dx) + abs(dy));
+    }
+    barrier();
+    if (lid == 0) {
+        int bi = 0;
+        float best = cost[0];
+        for (int ci = 1; ci < D * D; ci++)
+            if (cost[ci] < best) { best = cost[ci]; bi = ci; }
+        field[pc.fOut + blk.y * pc.bw + blk.x] = vec2(s + ivec2(bi % D - R, bi / D - R));
+        if (pc.sadAcc != 0) atomicAdd(u[U_SADSUM], uint(roundEven(sadc[bi] * 256.0)));   // as subpix.comp
+    }
+}

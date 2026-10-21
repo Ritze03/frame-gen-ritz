@@ -1,0 +1,107 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// V2 Performance, the synthesis in one full-resolution pass (recordSynth: n = 1; recordSynthBlur: n sub-frames averaged in registers,
+// each exactly what recordSynth(t_k) gives), plus a fix-up pass that is a no-op unless the whole-frame flick fallback fired:
+//   g   = the cleaned block field upsampled bilinearly to this pixel (v2_motion.glsl hvAt), taken to time t by the fixed point
+//         g = h(q - (2t - 1) g) (2 steps from h(q): lookup.comp's, here per pixel on the smooth field);
+//   out = (1 - t) prev(q - 2t g) + t curr(q + 2(1 - t) g), both taps bilinear, CrosshairV2's tap rejection on the pair.
+// No per-pixel trust and no hold: where the two taps disagree (occlusion, a flash) the blend morphs between them; a real frame is never
+// shown locally. The only real-frame outputs are whole-frame decisions, uniform over the dispatch: a scene cut (mean finest SAD >
+// cutSad, known from the estimate) or a flick (more than globalFrac of the frame untrusted) present the nearer real frame (prev for
+// t <= 0.5, curr after), as fallback.comp does for V1; and a blur sub-frame at t <= 0 / t >= 1 is the real frame prev / curr
+// (blur_resolve.comp's rule).
+// The flick count needs the whole frame, so (as blur_resolve.comp does) the main pass (fix = 0) assumes no flick and counts: an 8x8
+// tile (= this workgroup) is untrusted when the mean of its per-pixel mismatch max-channel |warped prev - warped curr| exceeds
+// trustMid (V1: a 7x7 sliding mean past the trust ramp's midpoint); its valid pixels go to u[cnt + k]. The fix-up pass (fix = 1, one
+// workgroup per 64x64 region) exits at once unless some sample flicked, and then redoes the output with the final counts.
+#include "common.glsl"
+#include "v2_motion.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+shared uint esum[16];
+
+// One generated sub-frame at time t (0 < t < 1): 8-bit levels, unrounded; al = the taps' alpha, blended alike; e = the mismatch.
+vec3 morph(ivec2 p, float t, out float al, out uint e) {
+    vec2 q = vec2(p);
+    vec2 g = hvAt(q);
+    if (t != 0.5) {
+        float s = 2.0 * t - 1.0;
+        for (int k = 0; k < 2; k++) g = hvAt(q - s * g);
+    }
+    vec2 pa = q - (2.0 * t) * g;
+    vec2 pc_ = q + (2.0 - 2.0 * t) * g;
+    vec4 a = tapRaw(texPrev, pa), c = tapRaw(texCurr, pc_);
+    vec3 ra = a.rgb, rc = c.rgb;
+    uiReject(pa, pc_, ra, rc);
+    vec3 wa = FG_FETCH(ra), wc = FG_FETCH(rc);
+    vec3 d = abs(wa - wc);
+    e = uint(max(d.r, max(d.g, d.b)));
+    al = (1.0 - t) * a.a + t * c.a;
+    return (1.0 - t) * wa + t * wc;
+}
+
+// The output pixel p. counting: add each interior sample's mismatch to esum[k] (all invocations of the workgroup call it, p inside or
+// not: subgroup adds), flicks unknown (assumed none); else the flicks are read from the final counts.
+void pixelOut(ivec2 p, bool counting, bool cut) {
+    bool inside = p.x < pc.W && p.y < pc.H;
+    float limit = pc.globalFrac * float(pc.W) * float(pc.H);
+    vec3 acc = vec3(0.0);
+    float accA = 0.0, ws = 0.0;
+    for (int k = 0; k < pc.n; k++) {
+        float t = pc.t[k];
+        // midpoint rule: slice centres map to x = (2k + 1 - N) / N, the window ends to x = -+1 (blur_resolve.comp)
+        float x = (2.0 * float(k) + 1.0 - float(pc.n)) / float(pc.n);
+        float w = pc.gauss != 0 ? exp(-2.0 * x * x) : 1.0;
+        bool real = t <= 0.0 || t >= 1.0;
+        bool fb = cut || (!counting && float(u[pc.cnt + k]) > limit);   // uniform
+        vec3 v = vec3(0.0);
+        float a = 0.0;
+        uint e = 0u;
+        if (inside) {
+            if (real || fb) {   // a real frame: the nearer one (t <= 0: prev, t >= 1: curr)
+                vec4 r = t > 0.5 ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
+                v = FG_FETCH(r.rgb);
+                a = r.a;
+            } else {
+                v = clamp(floor(morph(p, t, a, e) + 0.5), 0.0, 255.0);   // the 8-bit sub-frame recordSynth(t) stores
+            }
+        }
+        if (counting && !real && !cut) {   // uniform
+            uint s = subgroupAdd(e);
+            if (subgroupElect()) atomicAdd(esum[k], s);
+        }
+        acc += w * v;
+        accA += w * a;
+        ws += w;
+    }
+    if (inside) imageStore(outImg, p, FG_STORE(acc / ws, accA / ws));
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    float meanSad = float(u[U_SADSUM_]) * (1.0 / 256.0) / float(pc.bw * pc.bh);
+    bool cut = meanSad > pc.cutSad;
+    if (pc.fix == 0) {
+        if (lid < 16) esum[lid] = 0u;
+        barrier();
+        pixelOut(ivec2(gl_GlobalInvocationID.xy), true, cut);
+        barrier();
+        if (lid < pc.n && !cut) {
+            ivec2 o = ivec2(gl_WorkGroupID.xy) * 8;
+            ivec2 nv = min(ivec2(8), ivec2(pc.W, pc.H) - o);
+            uint valid = uint(nv.x * nv.y);
+            if (float(esum[lid]) > pc.trustMid * float(valid)) atomicAdd(u[pc.cnt + lid], valid);
+        }
+        return;
+    }
+    // fix-up: only if some interpolated sample flicked (and no cut, which the main pass already applied)
+    if (cut) return;
+    bool flicked = false;
+    float limit = pc.globalFrac * float(pc.W) * float(pc.H);
+    for (int k = 0; k < pc.n; k++)
+        if (pc.t[k] > 0.0 && pc.t[k] < 1.0 && float(u[pc.cnt + k]) > limit) flicked = true;
+    if (!flicked) return;
+    for (int j = 0; j < 8; j++)
+        for (int i = 0; i < 8; i++)
+            pixelOut(ivec2(gl_WorkGroupID.xy) * 64 + ivec2(i, j) * 8 + ivec2(gl_LocalInvocationID.xy), false, false);
+}
