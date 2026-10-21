@@ -1,14 +1,17 @@
-// V2's synthesis (included by v2_morph.comp = Performance and v2_qmorph.comp = Quality, which defines V2_QUALITY), the synthesis in one full-resolution pass (recordSynth: n = 1; recordSynthBlur: n sub-frames averaged in registers,
-// each exactly what recordSynth(t_k) gives), plus a fix-up pass that is a no-op unless the whole-frame flick fallback fired:
-//   g   = the cleaned block field upsampled bilinearly to this pixel (v2_motion.glsl hvAt), taken to time t by the fixed point
-//         g = h(q - (2t - 1) g) (2 steps from h(q): lookup.comp's, here per pixel on the smooth field);
-//   out = (1 - t) prev(q - 2t g) + t curr(q + 2(1 - t) g), both taps bilinear, CrosshairV2's tap rejection on the pair;
+// V2's synthesis, included by v2_morph.comp (Performance) and v2_qmorph.comp (Quality, V2_QUALITY: the additions are described in
+// v2_quality.glsl). One full-resolution pass (recordSynth: n = 1; recordSynthBlur: n sub-frames averaged in registers, each exactly
+// what recordSynth(t_k) gives), plus a fix-up pass that is a no-op unless the whole-frame flick fallback fired:
+//   g   = the cleaned block field upsampled bilinearly to this pixel (v2_motion.glsl hvAt; Quality: its per-pixel field, hvQ), taken
+//         to time t by the fixed point g = h(q - (2t - 1) g) (2 steps from h(q): lookup.comp's, here per pixel on the smooth field);
+//   out = (1 - t) prev(q - 2t g) + t curr(q + 2(1 - t) g), both taps bilinear, CrosshairV2's tap rejection on the pair (Quality:
+//         the weights lean to the frame that still shows the content, a tap on a static overlay takes the other, a blur along the
+//         motion where the taps disagree);
 //   blended toward the zero vector's (1 - t) prev(q) + t curr(q) where the two frames show q (and a line of its neighbours) the same
 //   but the morph's taps disagree: HUD text and other static overlays, static background that the smooth field would drag along.
 // No per-pixel trust and no hold: where the two taps disagree (occlusion, a flash) the blend morphs between them; a real frame is never
-// shown locally (the zero vector only where both frames AGREE). The only real-frame outputs are whole-frame decisions, uniform over the
-// dispatch: a scene cut (mean finest SAD >
-// cutSad, known from the estimate) or a flick (more than globalFrac of the frame untrusted) present the nearer real frame (prev for
+// shown locally (the zero vector only where both frames AGREE; Quality's one-sided blend still takes its tap along the motion). The only
+// real-frame outputs are whole-frame decisions, uniform over the dispatch: a scene cut (mean finest SAD > cutSad, known from the
+// estimate) or a flick (more than globalFrac of the frame untrusted) present the nearer real frame (prev for
 // t <= 0.5, curr after), as fallback.comp does for V1; and a blur sub-frame at t <= 0 / t >= 1 is the real frame prev / curr
 // (blur_resolve.comp's rule).
 // The flick count needs the whole frame, so (as blur_resolve.comp does) the main pass (fix = 0) assumes no flick and counts: an 8x8
@@ -50,23 +53,25 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     uiReject(pa, pc_, ra, rc);
     vec3 wa = FG_FETCH(ra), wc = FG_FETCH(rc);
 #ifdef V2_QUALITY
-    if (pc.gauss >= 2) qRejectStatic(pa, pc_, wa, wc);   // TEMP knob: a tap on a static overlay (subtitle text) takes the other tap
+    qRejectStatic(pa, pc_, wa, wc);   // a tap on a static overlay (subtitle text) takes the other tap
 #endif
     vec3 d = abs(wa - wc);
     float em = max(d.r, max(d.g, d.b));
 #ifdef V2_QUALITY
-    float wt = qWeightC(q, g, t);   // the visible side: curr's share of the blend
+    vec3 cq = qCovAt(q);   // this pixel's coverage word (its z: the static-overlay mask)
+    float wt = qWeightC(t == 0.5 ? cq : qCovAt(q - (2.0 * t - 1.0) * g), t);   // the visible side: curr's share of the blend
 #else
     float wt = t;
 #endif
     al = (1.0 - wt) * a.a + wt * c.a;
     vec3 m = (1.0 - wt) * wa + wt * wc;
 #ifdef V2_QUALITY
-    // TEMP experiment: blur along the motion where the taps disagree
-    if (pc.fIn > 0 && em > Q_B0) {
+    // where the taps still disagree (an occlusion seam, content the field does not follow): a blur along the motion, 4 more tap pairs
+    // over +-Q_BLEN of it, so a seam reads as motion blur instead of a hard double edge
+    if (em > Q_B0) {
         float beta = clamp((em - Q_B0) * (1.0 / Q_B1), 0.0, 1.0);
-        vec2 st = (float(pc.fIn) * 0.01) * (2.0 * g);   // half-length of the streak
-        vec3 acc = vec3(0.0);
+        vec2 st = (Q_BLEN * 2.0) * g;   // half-length of the streak (2 g = the motion between the real frames)
+        vec3 acc = m;
         for (int j = -2; j <= 2; j++) {
             if (j == 0) continue;
             vec2 o = st * (float(j) * 0.5);
@@ -74,10 +79,10 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
             vec3 xa = tapRaw(texPrev, qa).rgb, xc = tapRaw(texCurr, qc).rgb;
             uiReject(qa, qc, xa, xc);
             vec3 ya = FG_FETCH(xa), yc = FG_FETCH(xc);
-            if (pc.gauss >= 2) qRejectStatic(qa, qc, ya, yc);
+            qRejectStatic(qa, qc, ya, yc);
             acc += (1.0 - wt) * ya + wt * yc;
         }
-        m = mix(m, (m + acc) * 0.2, beta);
+        m = mix(m, acc * 0.2, beta);
     }
 #endif
     // the zero vector where it fits clearly better: a pixel the two frames show unchanged (a HUD element, text, static background
@@ -86,7 +91,7 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     // Quality: its field matches the moving background well, so over a static overlay (subtitle text over a moving scene) both taps
     // can agree on the background and em is small: a pixel with strong local structure counts as disagreeing that much
     float emz = em < V2_Z0 + V2_Z1 + V2_ZMAX ? max(em, qStructure(p)) : em;
-    float zq = qZeroMask(q);   // v2_qfield's static-overlay mask
+    float zq = cq.z;   // v2_qfield's static-overlay mask: the real frames' own pixels
 #else
     float emz = em, zq = 0.0;
 #endif
@@ -121,7 +126,7 @@ void pixelOut(ivec2 p, bool counting, bool cut) {
         float t = pc.t[k];
         // midpoint rule: slice centres map to x = (2k + 1 - N) / N, the window ends to x = -+1 (blur_resolve.comp)
         float x = (2.0 * float(k) + 1.0 - float(pc.n)) / float(pc.n);
-        float w = (pc.gauss & 1) != 0 ? exp(-2.0 * x * x) : 1.0;
+        float w = pc.gauss != 0 ? exp(-2.0 * x * x) : 1.0;
         bool real = t <= 0.0 || t >= 1.0;
         bool fb = cut || (!counting && float(u[pc.cnt + k]) > limit);   // uniform
         vec3 v = vec3(0.0);

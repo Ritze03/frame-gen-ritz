@@ -897,7 +897,11 @@ static int v2Check(int W, int H) {
             double eo = meanErr(a.out[0]), ef = meanErr(b.out[0]);
             printf(" estimate fill, hard-edged moving background, arm %d: mean error within 24 px of the crosshair: Off %.2f, V2 + fill %.2f\n", arm, eo, ef);
             expect(uiDiffers(sh, b.out[0], real, 1, all) == 0, "V2 + estimate fill: crosshair pixels equal the real ones");
-            expect(ef <= eo + 0.5, "V2 + estimate fill: the background near the crosshair is not worse than Off");
+            // V2 Quality: its blur along the motion depends on how much the taps disagree, i.e. on the field, which the fill changes;
+            // on this hard-edged background the field is wrong with and without the fill (Off ~70 levels) and the blur moves the
+            // mean by about a level either way (without the blur: Off 64.2, fill 57.6): 2 % of Off's error
+            const double tol = gAlgo == MotionVersion::V2 && gMode == V2Mode::Quality ? std::max(0.5, 0.02 * eo) : 0.5;
+            expect(ef <= eo + tol, "V2 + estimate fill: the background near the crosshair is not worse than Off");
         }
     }
 
@@ -973,14 +977,15 @@ static int v2Check(int W, int H) {
         size_t bo, b2;
         const double mo = windowErr(ro.out[0], bo), m2 = windowErr(r2.out[0], b2);
         printf("   window: mean error / px > 32  Off %.2f / %zu   V2 %.2f / %zu\n", mo, bo, m2, b2);
-        // MotionVersion::V2 Performance: no per-pixel field, so on this harsh random pattern the static crosshair (a zero-vector vote,
+        // MotionVersion::V2 (both modes): no V1 pixel field, so on this harsh random pattern the static crosshair (a zero-vector vote,
         // the estimate sees it as with Off) leaves the block field around it wrong with or without protection (Off's window mean is
-        // ~70 levels) and the tap rejection only re-deals that error pixel by pixel: judged on the window as a whole instead, V2 must
-        // not be worse than Off.
-        const bool perf = gAlgo == MotionVersion::V2 && gMode == V2Mode::Performance;
+        // 55-70 levels) and the tap rejection only re-deals that error pixel by pixel (Quality: its edge-aware per-pixel field, the
+        // coverage weights and the blur along the motion re-deal it too, ~10-30 such pixels against V1's 170-530): judged on the
+        // window as a whole instead, V2 must not be worse than Off.
+        const bool perf = gAlgo == MotionVersion::V2;
         const char* what = grow ? "V2: no artifact pixel when the arm ends appear" : "V2: no artifact pixel when the arm ends vanish";
-        if (perf) what = grow ? "V2 Performance: arm ends appear: the window is not worse than Off (mean, pixels > 32)"
-                              : "V2 Performance: arm ends vanish: the window is not worse than Off (mean, pixels > 32)";
+        if (perf) what = grow ? "V2: arm ends appear: the window is not worse than Off (mean, pixels > 32)"
+                              : "V2: arm ends vanish: the window is not worse than Off (mean, pixels > 32)";
         expect(perf ? m2 <= mo + 0.5 && b2 <= bo : a2 == 0, what);
         expect(a1 > 0, "control: V1 shows artifact pixels in the same pair (the test has teeth)");
         expect(x2 == 0, "V2: the unchanged part of the crosshair stays pixel-exact");
@@ -1517,9 +1522,9 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const c
 }
 static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : "V1"; }
 // The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes.
-// V2 = both V2Modes: its 3 faster estimate passes, V1's luma / down / median3 (sub-pixel off) / pixel field / mismatch / resolve /
-// fallback / lookup (Quality), Performance's block re-pick, field clean-up and morph, and V1's 3 motion-blur passes (Quality): 17.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 17 : 14; }
+// V2 = both V2Modes: V1's luma / down, its 2 faster estimate passes (medhist, search), the block re-pick and field clean-up (both
+// modes), Performance's morph, Quality's per-pixel field, splat, coverage and morph; no motion-blur passes (its morphs blur): 11.
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 11 : 14; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1626,15 +1631,15 @@ static void motionCheck(const Scene& sc) {
     expect(fg.setSettings(sTo), "switch accepted");
     const int64_t k = gLivePipes - p0;
     printf("    pipelines: %lld after init, +%lld for the first switch to %s\n", (long long)p0, (long long)k, algoName(to));
-    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 17)");
+    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 11)");
     expect(!run(fg, false, nullptr) && blurRefused(fg), "after the switch the old estimate is gone: recordSynth and recordSynthBlur return false");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "switching back creates nothing (the start version kept its pipelines)");
     expect(!run(fg, false, nullptr), "switching straight back does not revive the dropped estimate");
     expect(fg.setSettings(sTo) && run(fg, true, &outC), "a new estimate in the new version synthesises");
     expect(outC == outR, "the new version's output equals a fresh instance's in that version");
-    // V2 Quality runs V1's pixel field and synthesis on V1's block field (computed faster): V1's output; Performance morphs
-    if (gMode == V2Mode::Quality) expect(outC == outA, "V2 Quality's output equals V1's (V1's block field, pixel field and synthesis)");
-    else expect(outC != outA, "V2 Performance's output differs from V1's (its own synthesis)");
+    // both V2 modes morph (their own syntheses on V1's block field, computed faster)
+    expect(outC != outA, gMode == V2Mode::Quality ? "V2 Quality's output differs from V1's (its own synthesis)"
+                                                  : "V2 Performance's output differs from V1's (its own synthesis)");
     vkDeviceWaitIdle(dev);
     fg.releaseUnusedMotion();
     expect(gLivePipes == p0 + k - versionPipes(from), "releaseUnusedMotion frees the unselected version's pipelines");
@@ -1651,7 +1656,7 @@ static void motionCheck(const Scene& sc) {
 
     {   // Settings::v2Mode: runtime (no pipelines created, no rebuild), a switch of the mode alone keeps the estimate (the other mode's
         // part is derived from it by its first synth: the same output as with that mode's own estimate); a switch of the version still
-        // drops it; V1 ignores the mode. Quality gives V1's output, Performance its own.
+        // drops it; V1 ignores the mode. Each mode (and V1) gives its own output.
         Settings q; q.motionVersion = MotionVersion::V2; q.v2Mode = V2Mode::Quality;
         Settings p = q; p.v2Mode = V2Mode::Performance;
         Settings v1p = p; v1p.motionVersion = MotionVersion::V1;
@@ -1692,7 +1697,7 @@ static void motionCheck(const Scene& sc) {
         Settings bad = q; bad.v2Mode = (V2Mode)2;
         expect(!f.setSettings(bad) && f.settings().v2Mode == V2Mode::Quality, "v2Mode: setSettings refuses an unknown mode and changes nothing");
         expect(f.setSettings(v1p) && !run(f, false, nullptr) && blurRefused(f), "v2Mode: a switch of the version (V2 -> V1) still drops the estimate");
-        expect(run(f, true, &o1p) && o1p == oq, "v2Mode: V1's output equals V2 Quality's");
+        expect(run(f, true, &o1p) && o1p != oq && o1p != op, "v2Mode: V1's output differs from both V2 modes'");
         expect(f.setSettings(v1q) && run(f, false, &o1q) && o1q == o1p, "v2Mode: V1 ignores the mode (a switch keeps its estimate, same output)");
         vkDeviceWaitIdle(dev);
         f.destroy();

@@ -1,8 +1,9 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// V2 Quality, coverage step 2 (flow resolution, once per estimate): per midpoint location, does prev / curr still show its content
-// (it won its footprint there, nearly, or the winner moves the same way; a footprint outside the frame: no), box-filtered over
-// (2 Q_R + 1)^2 locations into the coverage (cP, cC) the gather weights its taps with. See v2_quality.glsl.
+// V2 Quality, coverage step 2 (flow resolution, once per estimate), see v2_quality.glsl: per midpoint location, does prev / curr
+// still show its content (it won its footprint there, nearly, the winner moves the same way, or the winner matches badly itself; a
+// footprint outside the frame: no), box-filtered over (2 Q_R + 1)^2 locations into the coverage (cP, cC) the gather weights its taps
+// with, packed with v2_qfield's static-overlay mask z (read from this location's own slot first).
 #include "common.glsl"
 #include "v2_motion.glsl"
 #include "v2_quality.glsl"
@@ -14,7 +15,8 @@ shared vec2 vis[TT * TT];
 bool sees(int off, int pix, uint own, vec2 hq) {
     if (pix < 0) return false;
     uint w = qb[off + pix];
-    return (own >> 20) <= (w >> 20) + uint(pc.t[0] * Q_KEY) || (w >> 20) > uint(pc.t[4] * Q_KEY) || all(lessThanEqual(abs(qVec(w) - hq), vec2(pc.t[1])));
+    return (own >> 20) <= (w >> 20) + uint(Q_MARGIN * Q_KEY) || (w >> 20) > uint(Q_WIN * Q_KEY) ||
+           all(lessThanEqual(abs(qVec(w) - hq), vec2(Q_TOL)));
 }
 
 void main() {
