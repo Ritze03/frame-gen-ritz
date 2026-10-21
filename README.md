@@ -32,6 +32,34 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 
 "Nearer real frame" means `prev` for `t <= 0.5` and `curr` otherwise. The docstring of `proto/interp.py` has the full pass description.
 
+## Motion version 2
+
+`Settings::motionVersion` picks the algorithm. `MotionVersion::V1` (the default) is everything described above, frozen: output byte-identical to a library without the choice. `MotionVersion::V2` is a second, "morphing" interpolator next to it, closer to how LSFG looks: image parts are moved along a smoothed motion field and gaps are filled with stretched content. There is **no local hold** (no per-pixel fallback to a real frame); only the whole-frame scene-cut / flick fallback remains. Single generated frames can look distorted; it is tuned for how it looks in motion. Same latency as V1 (a synth reads only the current pair). The earlier occlusion-based V2 is gone (git tag `v2-occlusion`).
+
+`Settings::v2Mode` (runtime, only used by V2) picks one of two modes:
+
+| Mode | What it does |
+|---|---|
+| `Quality` (default) | Performance's field, plus an edge-aware per-pixel field, a static-overlay (HUD / subtitle) mask, coverage (which real frame still sees each spot) so the blend leans to the visible side, and blur along the motion where the two frames still disagree. |
+| `Performance` | The cleaned block field (re-pick among neighbours + vector median + bilateral smoothing), upsampled, and one full-resolution two-tap gather. |
+
+V2 supports SDR `Rgba8` (RGBA/BGRA) only; with any other format `settingsError()` / `initError()` refuse it. All UI-protection modes (including `CrosshairV2`) and motion blur work with both modes. Switching `v2Mode` at runtime keeps the current estimate (no hitch); switching `motionVersion` drops it (the next synth returns false until the next estimate).
+
+Cost, RX 7900 XTX, 1080p, back-to-back median ms per real pair (one estimate + N-1 synths):
+
+| flowScale, mult | V1 | V2 Performance | V2 Quality |
+|---|---|---|---|
+| 2, 2x | 0.295 | 0.142 | 0.238 |
+| 2, 3x | 0.369 | 0.195 | 0.331 |
+| 2, 4x | 0.427 | 0.223 | 0.385 |
+| 4, 2x | 0.179 | 0.099 | 0.138 |
+| 4, 3x | 0.239 | 0.140 | 0.232 |
+| 4, 4x | 0.293 | 0.164 | 0.289 |
+
+1440p 2x flowScale 2: 0.448 / 0.227 / 0.392 ms; 4K 2x flowScale 2: 0.897 / 0.462 / 0.849 ms.
+
+Quality, preliminary (reference clips, 80-triple sample, PSNR vs V1): Performance +0.31 dB, Quality +0.50 dB. A fuller bench is pending; the final judgement is the user's blind comparison.
+
 ## Repository layout
 
 | Path | Contents |
@@ -191,7 +219,7 @@ fgtest [--bgra] [--split] [--t T1,T2,..] [--bench N [--mult M]] [--set k=v,..] [
 - `--split`: `recordEstimate` + `recordSynth` instead of `record`.
 - `--t`: generated times (default 0.5). With several values, the k-th output goes to `out.rgba.<k>`.
 - `--bench N --mult M`: benchmark N iterations, one estimate + M-1 synths per pair.
-- `--set`: `framegen::Settings` fields by name. `--then`: a `setSettings` change applied between two records (runtime-change test).
+- `--set`: `framegen::Settings` fields by name, plus `algo=v1|v2` (= `motionVersion`), `v2Mode=quality|performance`, `ui=...` (e.g. `--set algo=v2,v2Mode=performance,flowScale=4`). `--then`: a `setSettings` change applied between two records (runtime-change test).
 
 `blurtest` (needs no footage) validates and benchmarks the motion blur on a synthetic scene (panning textured background, a moving object, a static crosshair):
 
@@ -214,6 +242,8 @@ gpu/build/uitest track [W H]             # recordTrack: UI protection kept warm 
 gpu/build/uitest trackbench [W H]        # GPU cost of recordTrack vs recordObserve
 gpu/build/uitest bench [W H]             # per-pass GPU times: moving / still / 70% still scenes, all modes
 ```
+
+`uitest`, `blurtest` and `formattest` take `--algo v1|v2` and `--mode quality|performance` to run their checks with motion version 2.
 
 `formattest` (needs no footage) checks every image format (Rgb10, RgbaF16 encoded and linear, NV12, P010) on the same kind of synthetic scene, single frames only (640x360 by default, a few milliseconds of GPU per format):
 
@@ -296,6 +326,8 @@ for (int k = 1; k < N; ++k)
 | `blurSamples` | 0 | Motion blur: sub-frames averaged by `recordSynthBlur()`. 0 or 1 = off, 2-16 on (see above). Runtime. |
 | `blurWeights` | Gaussian | `Even` (1/N each) or `Gaussian` (ends of the window at 2 sigma, weights taken at the slice centres). Runtime. |
 | `uiMaxStillFraction` | 0.75 | WholeScreen: above this still share (of cells outside the box) the whole-screen passes are skipped for that frame. 1 = never. |
+| `motionVersion` | V1 | `V1` or `V2` (see "Motion version 2"; V2 needs Rgba8). Runtime; a switch drops the current estimate. |
+| `v2Mode` | Quality | V2 only: `Quality` or `Performance`. Runtime; a switch keeps the estimate. |
 | `flowScale` | 2 | Motion estimation at 1/flowScale resolution: 1, 2 or 4. 4 is much cheaper but can miss thin, fine motion. 1 is much slower and was not better on the test clips. (structural) |
 
 `INTEGRATION.md` lists the accepted ranges, the measured cost of each setting, and a suggested user-facing subset.

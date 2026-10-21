@@ -113,6 +113,8 @@ A plain struct whose in-class defaults are the tuned values of `proto/interp.py`
 | `uiHistory` | 3 | 3-`kUiFramesMax` (65) | runtime | Observed real frames that keep their clean copy + mask (LRU). 3 = the newest pair and the one before it. A host that synthesises from an older pair (the lag-spike buffer plays pairs several frames back) sets it to `Pacer::HistoryDepth()`. Memory: 4 B/px per kept frame (4.9 MB at 1280x960, 14.7 MB at 1440p; WholeScreen +1 B/px). See "Static UI protection". |
 | `blurSamples` | 0 | 0, 1 (off), 2-16 | runtime | Interpolation-based motion blur: sub-frames averaged by `recordSynthBlur()` (see "Motion blur"). Off = byte-identical. |
 | `blurWeights` | Gaussian | Even, Gaussian | runtime | Weights of the sub-frames: 1/N each, or a Gaussian with the window ends at 2 sigma (weights at the slice centres). |
+| `motionVersion` | V1 | V1, V2 | runtime | The motion algorithm (see "Motion version 2"). V1 = byte-identical to before. V2 needs `Format::Rgba8` (`settingsError()`). A switch **drops** the current estimate: `recordSynth` / `recordSynthBlur` return false (show the real frame) until the next `recordEstimate`. The first switch to a version creates its pipelines at once (no GPU wait); `releaseUnusedMotion()` frees the unused version's resources (retire rule of `resize()`). |
+| `v2Mode` | Quality | Quality, Performance | runtime | V2's mode; V1 ignores it. A switch keeps the current estimate (no hitch). |
 | `flowScale` | 2 | 1, 2, 4 | structural | Motion estimation at 1/flowScale of the frame. 4 = performance mode (~40 % cheaper at 2×, ~30 % at 4×, see below; ~0.1 dB lower on the test clips, can miss thin/fine motion); 1 = full res, much slower (1080p 2×: 0.79 vs 0.35 ms), not better on the test clips. |
 
 - **Runtime** fields: `setSettings(s)` at any time, even between two records of one command buffer. Each record copies the values into its own push constants, so nothing in flight changes and no retire/wait is needed; every `record*()` recorded after the call uses the new values (a synth uses the values current when the synth is recorded, the estimate those current at its record). `setSettings` returns false and changes nothing if `s` is invalid or its `flowScale` differs from the active one.
@@ -136,6 +138,34 @@ The settings only change the per-pair estimate; the per-synth cost (~0.06 ms at 
 3. **Artifact safety: Low / Default / High** — trust ramp, e.g. High = (8, 28), Default = (12, 40), Low = (16, 56); optionally also `globalFallback` 0.10 / 0.15 / 0.25. Plain language: "Higher shows the real frame instead of guessing where motion is hard to track: fewer ghosting/smearing artefacts, but more spots that look like the base frame rate."
 4. **Static HUD protection: Off / Normal / Strong** — `hudBonus` 0 / 1 / 2.5. Plain language: "Keeps crosshairs, text and other fixed overlays from wobbling or being dragged along with the scene. Too strong can make slow-moving areas stutter."
 5. Expert only (config/convar, no overlay entry): `searchPenalty`, `smoothBonus`, `sceneCutSad`, `globalFallback` on its own, and a "scene-cut detection" toggle (`sceneCutSad` 255 = off). The Low/High preset values above are suggestions within the validated ranges; only the defaults were reviewed visually by the user.
+
+## Motion version 2 (`Settings::motionVersion`, `Settings::v2Mode`)
+`MotionVersion::V2` is a "morphing" interpolator next to V1 (V1 unchanged): content is moved along a smoothed motion field and gaps are filled with stretched content, LSFG-like. No local hold: there is no per-pixel trust ramp; only the whole-frame fallbacks (scene cut, `globalFallback`) show the nearer real frame. Individual frames may look distorted; tuned for the look in motion. Same latency as V1 (a synth reads only the current pair). Its estimate computes V1's block pyramid with faster passes, shared by both modes. An earlier occlusion-based V2 (presets, occlusion / rescue / refine) was never on main and is removed; it is kept as git tag `v2-occlusion`.
+
+- **Performance** ("grid morph"): finest block field re-picked among neighbours, refined, cleaned (vector median + bilateral smoothing), upsampled bilinearly; one full-res two-tap gather (with a zero-vector candidate where the frames agree, for static overlays).
+- **Quality** (default, "coverage morph"): Performance's field, plus an edge-aware per-pixel field (zero on static overlays: HUD, subtitles), the field splatted to both frames (coverage: which frame still shows each spot), one full-res gather that leans to the visible side (no 50/50 double image at occlusions and the frame border), taps that skip static overlays, blur along the motion where the two taps still disagree.
+- **Formats:** Rgba8 (RGBA/BGRA) only. `Interpolator::settingsError(s, format)` names the reason; `init()` refuses it (`initError()`), `setSettings()` / `reconfigure()` return false.
+- **Works with** every `uiProtection` mode (incl. `CrosshairV2` and its tap rejection) and `recordSynthBlur`, in both modes.
+- **Runtime:** a `v2Mode` switch keeps the estimate (what the other mode needs is derived by its first synth, same output as its own estimate). A `motionVersion` switch drops it (see the Settings table).
+- **Shaders** (plain, Rgba8 only): `v2_search`, `v2_medhist`, `v2_repick`, `v2_clean`, `v2_morph` (Performance), `v2_qfield`, `v2_qcov`, `v2_qown`, `v2_qmorph` (Quality), with the includes `v2_est.glsl`, `v2_motion.glsl`, `v2_morph.glsl`, `v2_quality.glsl`.
+- **Debug:** `recordDebugCounters` / `recordDebugMaps` work with V2 (same layout; see `framegen.h` and `gpu/fgmaps.py`).
+
+**Cost** (RX 7900 XTX, 1080p, back-to-back median ms per real pair, one estimate + N-1 synths):
+
+| flowScale, mult | V1 | V2 Performance | V2 Quality |
+|---|---|---|---|
+| 2, 2x | 0.295 | 0.142 | 0.238 |
+| 2, 3x | 0.369 | 0.195 | 0.331 |
+| 2, 4x | 0.427 | 0.223 | 0.385 |
+| 4, 2x | 0.179 | 0.099 | 0.138 |
+| 4, 3x | 0.239 | 0.140 | 0.232 |
+| 4, 4x | 0.293 | 0.164 | 0.289 |
+
+1440p 2x flowScale 2: 0.448 / 0.227 / 0.392 ms; 4K 2x flowScale 2: 0.897 / 0.462 / 0.849 ms.
+
+**Quality, preliminary** (reference clips, 80-triple sample, PSNR vs V1): Performance +0.31 dB, Quality +0.50 dB. A fuller bench is running; the final judgement is the user's blind arena.
+
+**Tests:** `fgtest --set algo=v2,v2Mode=quality|performance,flowScale=N`; `uitest`, `blurtest`, `formattest` take `--algo v1|v2` and `--mode quality|performance`.
 
 ## Formats (`InitInfo::viewFormat`, `framegen::Format`, `framegen::Frame`)
 
