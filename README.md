@@ -43,22 +43,22 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 | `Quality` (default) | Performance's field, plus an edge-aware per-pixel field, a static-overlay (HUD / subtitle) mask, coverage (which real frame still sees each spot) so the blend leans to the visible side, and blur along the motion where the two frames still disagree. |
 | `Performance` | The cleaned block field (re-pick among neighbours + vector median + bilateral smoothing), upsampled, and one full-resolution two-tap gather. |
 
-V2 supports SDR `Rgba8` (RGBA/BGRA) only; with any other format `settingsError()` / `initError()` refuse it. All UI-protection modes (including `CrosshairV2`) and motion blur work with both modes. Switching `v2Mode` at runtime keeps the current estimate (no hitch); switching `motionVersion` drops it (the next synth returns false until the next estimate).
+V2 supports SDR `Rgba8` (RGBA/BGRA) only; with any other format `settingsError()` / `initError()` refuse it. All UI-protection modes (including `CrosshairV2`) and motion blur work with both modes. `Settings::v2StaticMask` (default on, V2 only) adds a static-structure mask in both modes: HUD, text and static overlays, including semi-transparent panels and inverted-colour or blended crosshairs that `CrosshairV2` cannot lock on, stay in place; off = no such protection (the tests' unprotected reference). A change takes effect at the next estimate. V2 also tries block-vector candidates where its two taps disagree (fewer pasted / outlier artifacts and ring outlines), and a tap outside the frame takes the other tap. Switching `v2Mode` at runtime keeps the current estimate (no hitch); switching `motionVersion` drops it (the next synth returns false until the next estimate).
 
 Cost, RX 7900 XTX, 1080p, back-to-back median ms per real pair (one estimate + N-1 synths):
 
 | flowScale, mult | V1 | V2 Performance | V2 Quality |
 |---|---|---|---|
-| 2, 2x | 0.295 | 0.142 | 0.238 |
-| 2, 3x | 0.369 | 0.195 | 0.331 |
-| 2, 4x | 0.427 | 0.223 | 0.385 |
-| 4, 2x | 0.179 | 0.099 | 0.138 |
-| 4, 3x | 0.239 | 0.140 | 0.232 |
-| 4, 4x | 0.293 | 0.164 | 0.289 |
+| 2, 2x | 0.302 | 0.174 | 0.261 |
+| 2, 3x | 0.380 | 0.247 | 0.364 |
+| 2, 4x | 0.438 | 0.298 | 0.432 |
+| 4, 2x | 0.181 | 0.120 | 0.159 |
+| 4, 3x | 0.243 | 0.190 | 0.272 |
+| 4, 4x | 0.302 | 0.241 | 0.344 |
 
-1440p 2x flowScale 2: 0.448 / 0.227 / 0.392 ms; 4K 2x flowScale 2: 0.897 / 0.462 / 0.849 ms.
+Before the fix round (no static mask): 1440p 2x flowScale 2: 0.448 / 0.227 / 0.392 ms; 4K 2x flowScale 2: 0.897 / 0.462 / 0.849 ms.
 
-Quality, preliminary (reference clips, 80-triple sample, PSNR vs V1): Performance +0.31 dB, Quality +0.50 dB. A fuller bench is pending; the final judgement is the user's blind comparison.
+Quality, preliminary (reference clips, every 20th window, PSNR vs V1): Performance +0.46 dB, Quality +0.51 dB. The final judgement is the user's blind comparison.
 
 ## Repository layout
 
