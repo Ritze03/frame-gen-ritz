@@ -260,8 +260,12 @@ struct Result { std::vector<uint8_t> out[2]; };   // t = 0.5, 0.25 of the last p
 static MotionVersion gAlgo = MotionVersion::V1;
 static V2Mode gMode = V2Mode::Quality;   // --mode
 static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; return s; }
+static bool algoV2() { return gAlgo == MotionVersion::V2; }
+static bool algoV2Quality() { return algoV2() && gMode == V2Mode::Quality; }
 #else
 static Settings algo(Settings s) { return s; }
+static bool algoV2() { return false; }
+static bool algoV2Quality() { return false; }
 #endif
 static uint64_t fnv(const std::vector<uint8_t>& v) {
     uint64_t h = 1469598103934665603ull;
@@ -897,10 +901,13 @@ static int v2Check(int W, int H) {
             double eo = meanErr(a.out[0]), ef = meanErr(b.out[0]);
             printf(" estimate fill, hard-edged moving background, arm %d: mean error within 24 px of the crosshair: Off %.2f, V2 + fill %.2f\n", arm, eo, ef);
             expect(uiDiffers(sh, b.out[0], real, 1, all) == 0, "V2 + estimate fill: crosshair pixels equal the real ones");
-            // V2 Quality: its blur along the motion depends on how much the taps disagree, i.e. on the field, which the fill changes;
-            // on this hard-edged background the field is wrong with and without the fill (Off ~70 levels) and the blur moves the
-            // mean by about a level either way (without the blur: Off 64.2, fill 57.6): 2 % of Off's error
-            const double tol = gAlgo == MotionVersion::V2 && gMode == V2Mode::Quality ? std::max(0.5, 0.02 * eo) : 0.5;
+            // KNOWN V2 QUALITY WEAKNESS (tolerated here, not fixed): Quality blurs along the motion inside CrosshairV2's grown mask
+            // when uiEstimateFill is on (arm 16: Off 72.36, V2 Quality + fill 73.37). The blur depends on how much the taps
+            // disagree, i.e. on the field, which the fill changes; on this hard-edged background the field is wrong with and
+            // without the fill (Off ~70 levels) and the blur moves the mean by about a level either way (without the blur: Off
+            // 64.2, fill 57.6), so Quality gets 2 % of Off's error as tolerance. Possible later fix: suppress the `em > Q_B0`
+            // blur branch in v2_morph.glsl (~line 71) for taps inside the mask; then this tolerance can go back to 0.5.
+            const double tol = algoV2Quality() ? std::max(0.5, 0.02 * eo) : 0.5;
             expect(ef <= eo + tol, "V2 + estimate fill: the background near the crosshair is not worse than Off");
         }
     }
@@ -982,11 +989,18 @@ static int v2Check(int W, int H) {
         // 55-70 levels) and the tap rejection only re-deals that error pixel by pixel (Quality: its edge-aware per-pixel field, the
         // coverage weights and the blur along the motion re-deal it too, ~10-30 such pixels against V1's 170-530): judged on the
         // window as a whole instead, V2 must not be worse than Off.
-        const bool perf = gAlgo == MotionVersion::V2;
-        const char* what = grow ? "V2: no artifact pixel when the arm ends appear" : "V2: no artifact pixel when the arm ends vanish";
-        if (perf) what = grow ? "V2: arm ends appear: the window is not worse than Off (mean, pixels > 32)"
-                              : "V2: arm ends vanish: the window is not worse than Off (mean, pixels > 32)";
-        expect(perf ? m2 <= mo + 0.5 && b2 <= bo : a2 == 0, what);
+        // On top of the window check, a ceiling on the artifact count itself so a regression in it is caught (measured at
+        // 624c1f4, vanish / appear: Performance 34 / 10, Quality 15 / 11; ceilings ~1.5-2x that). V1 keeps a2 == 0.
+        const bool mv2 = algoV2();
+        if (mv2) {
+            const size_t cap = algoV2Quality() ? (grow ? 20 : 25) : (grow ? 20 : 50);
+            printf("   V2 %s: artifact px %zu, ceiling %zu\n", algoV2Quality() ? "quality" : "performance", a2, cap);
+            expect(m2 <= mo + 0.5 && b2 <= bo, grow ? "V2: arm ends appear: the window is not worse than Off (mean, pixels > 32)"
+                                                    : "V2: arm ends vanish: the window is not worse than Off (mean, pixels > 32)");
+            expect(a2 <= cap, grow ? "V2: arm ends appear: artifact px within the ceiling"
+                                   : "V2: arm ends vanish: artifact px within the ceiling");
+        } else
+            expect(a2 == 0, grow ? "V2: no artifact pixel when the arm ends appear" : "V2: no artifact pixel when the arm ends vanish");
         expect(a1 > 0, "control: V1 shows artifact pixels in the same pair (the test has teeth)");
         expect(x2 == 0, "V2: the unchanged part of the crosshair stays pixel-exact");
     }
