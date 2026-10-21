@@ -116,7 +116,7 @@ def probe(path):
 
 
 def genre_of(name):
-    g = name.split("_")[0]
+    g = name.split("_")[0].removesuffix("120")
     return g if g in GENRES else "other"
 
 
