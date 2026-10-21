@@ -479,7 +479,7 @@ static InitInfo baseInfo(Enc e, int W, int H, const Settings& s) {
     InitInfo info;
     info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
     info.viewFormat = planeFmt0(e);
-    info.getMemProps = vkGetPhysicalDeviceMemoryProperties;
+    info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2;
     info.getFormatProps = vkGetPhysicalDeviceFormatProperties;
     info.settings = s;
 #ifndef FORMATTEST_NO_MOTION

@@ -276,7 +276,7 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
 static bool makeInterp(Interpolator& fg, int W, int H, const Settings& s) {
     InitInfo info;
     info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
-    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = algo(s);
+    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2; info.settings = algo(s);
     return fg.init(info);
 }
 
@@ -696,6 +696,102 @@ static void ghostBackground(Scene& sc, int kind) {   // 0 = the scene's own smoo
                 }
             }
 }
+// One pair (prev, curr) through a fresh Interpolator: the frame generated at t = 0.5.
+static std::vector<uint8_t> runPair(int W, int H, const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, const Settings& s) {
+    Interpolator fg;
+    if (!makeInterp(fg, W, H, s)) { fprintf(stderr, "init failed\n"); exit(1); }
+    Img in[2];
+    for (auto& r : in) r = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    Img out = makeImage(W, H, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    begin();
+    for (auto& r : in) imgBarrier(r.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    imgBarrier(out.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    submit();
+    upload(a, in[0], W, H);
+    upload(b, in[1], W, H);
+    begin();
+    fg.beginFrame();
+    if (!fg.recordEstimate(cb, in[0].view, in[1].view) || !fg.recordSynth(cb, in[0].view, in[1].view, out.view, 0.5f)) {
+        fprintf(stderr, "estimate / synth failed\n");
+        exit(1);
+    }
+    submit();
+    auto o = download(out, W, H);
+    vkDeviceWaitIdle(dev);
+    fg.destroy();
+    for (auto& r : in) { vkDestroyImageView(dev, r.view, nullptr); vkDestroyImage(dev, r.img, nullptr); vkFreeMemory(dev, r.mem, nullptr); }
+    vkDestroyImageView(dev, out.view, nullptr); vkDestroyImage(dev, out.img, nullptr); vkFreeMemory(dev, out.mem, nullptr);
+    return o;
+}
+
+// V2's static-structure mask (Settings::v2StaticMask) must not cross-fade a moving object on static scenery (QC fix round 2, F1:
+// the mask's enclosure E holds inside an object up to ~12 cells wide whose surroundings are static texture, and the zero vector
+// took over there: object error 58 levels with the mask against 3 without). A textured 80 px square moves 8 px right per frame
+// over a static background: hard 6 px blocks (S everywhere around the object), a sparse 64 px grid, and the blocks under a
+// semi-transparent panel with a border and text-like strokes that the object moves behind. The mean max-channel error inside the
+// object (4 px in from its edges) against the true mid frame, mask on, must stay within 1.5 levels of the mask off.
+static void staticMaskMotionCheck() {
+    const int W = 1280, H = 720, S = 80, V = 8;
+    const int y0 = (H - S) / 2, xp = W / 2 - S / 2 - V / 2;
+    printf("\nV2 static mask vs a moving object on static scenery (%dx%d, %d px square, %d px/frame; object error vs the true mid frame):\n", W, H, S, V);
+    const char* names[] = {"6 px blocks", "64 px grid", "blocks under a panel"};
+    for (int bg = 0; bg < 3; bg++) {
+        auto frame = [&](int x0) {
+            std::vector<uint8_t> f((size_t)W * H * 4);
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) {
+                    uint8_t* p = &f[((size_t)y * W + x) * 4];
+                    float c[3];
+                    for (int k = 0; k < 3; k++) {
+                        if (bg == 1) c[k] = (x % 64 == 0 || y % 64 == 0) ? 220.0f : 60.0f;
+                        else c[k] = (float)(hash2(x / 6, y / 6, 11 + k) & 255u);
+                        if (x >= x0 && x < x0 + S && y >= y0 && y < y0 + S)   // the object: its own 5 px blocks, moving with it
+                            c[k] = 60.0f + 0.6f * (float)(hash2((x - x0) / 5, (y - y0) / 5, 31 + k) & 255u);
+                    }
+                    if (bg == 2) {   // the panel: x in [W/2 - S, W/2 + 2S), y in [y0 - 48, y0 + S + 16), 50 % dark blue
+                        const int px0 = W / 2 - S, px1 = W / 2 + 2 * S, py0 = y0 - 48, py1 = y0 + S + 16;
+                        if (x >= px0 && x < px1 && y >= py0 && y < py1) {
+                            const float tint[3] = {20.0f, 30.0f, 80.0f};
+                            for (int k = 0; k < 3; k++) c[k] = 0.5f * c[k] + 0.5f * tint[k];
+                            bool border = x < px0 + 2 || x >= px1 - 2 || y < py0 + 2 || y >= py1 - 2;
+                            bool stroke = false;
+                            for (int k = 0; k < 6; k++) {
+                                int sx = px0 + 12 + 22 * k;
+                                stroke = stroke || (y >= py0 + 10 && y < py0 + 30 && x >= sx && x < sx + 2) ||
+                                         (y >= py0 + 10 && y < py0 + 12 && x >= sx && x < sx + 12) ||
+                                         (y >= py0 + 19 && y < py0 + 21 && x >= sx && x < sx + 9);
+                            }
+                            if (border || stroke) c[0] = c[1] = c[2] = 235.0f;
+                        }
+                    }
+                    for (int k = 0; k < 3; k++) p[k] = (uint8_t)std::lround(std::min(255.0f, std::max(0.0f, c[k])));
+                    p[3] = 255;
+                }
+            return f;
+        };
+        const auto a = frame(xp), b = frame(xp + V), truth = frame(xp + V / 2);
+        auto objErr = [&](const std::vector<uint8_t>& o) {
+            double e = 0;
+            size_t n = 0;
+            for (int y = y0 + 4; y < y0 + S - 4; y++)
+                for (int x = xp + V / 2 + 4; x < xp + V / 2 + S - 4; x++, n++) {
+                    const size_t i = ((size_t)y * W + x) * 4;
+                    int d = 0;
+                    for (int k = 0; k < 3; k++) d = std::max(d, std::abs((int)o[i + k] - (int)truth[i + k]));
+                    e += d;
+                }
+            return e / (double)n;
+        };
+        Settings on, off;
+        off.v2StaticMask = false;
+        const double eOn = objErr(runPair(W, H, a, b, on)), eOff = objErr(runPair(W, H, a, b, off));
+        printf(" %-22s object error  mask on %6.2f  off %6.2f\n", names[bg], eOn, eOff);
+        char what[160];
+        snprintf(what, sizeof what, "v2StaticMask, %s: a moving object keeps its motion (error mask on <= off + 1.5)", names[bg]);
+        expect(eOn <= eOff + 1.5, what);
+    }
+}
+
 static void ghostCheck() {
     const int W = 1280, H = 960;
     printf("\nThe doubled crosshair (%dx%d, 8x7 px cyan plus, artifact px within 24 px of it vs the same run without the crosshair):\n", W, H);
@@ -1035,6 +1131,13 @@ static int v2Check(int W, int H) {
         expect(b4 == 0, "hysteresis: leave 4 keeps the arm masked through a 2-frame disturbance, exact on the first pair after it");
         expect(b1 > 0, "control: leave 1 loses the arm at the first change and has not got it back");
         expect(bv1 > 0, "control: V1 loses the arm (needs 8 still frames again)");
+        if (algoV2()) {   // the same with V2's static-structure mask on (the default): it must not break the state machine's result
+            Settings h4s = h4; h4s.v2StaticMask = true;
+            Result r4s = runSequence(sc, h4s, true, nullptr);
+            size_t b4s = uiDiffers(sc, r4s.out[0], real, 1, all);
+            printf("   with v2StaticMask: leave 4: %zu\n", b4s);
+            expect(b4s == 0, "hysteresis, v2StaticMask on: leave 4 keeps the arm exact on the first pair after it is back");
+        }
     }
 
     // 4. fast re-entry: the right arm cycles colours for 5 frames (14..18: it LEAVES the mask after 4 changed frames), is back
@@ -1059,6 +1162,12 @@ static int v2Check(int W, int H) {
         expect(b > 0, "(the pair before it is not: one matching frame is not enough)");
         expect(c > 0, "control: without re-entry the arm is still unprotected there");
         expect(d > 0 && e == 0, "without re-entry the arm needs uiStillFrames = 8 still frames after it came back: protected from pair (26, 27)");
+        if (algoV2()) {   // the same with V2's static-structure mask on (the default)
+            Settings re2s = re2; re2s.v2StaticMask = true;
+            size_t as = runAt(21, re2s);
+            printf("   with v2StaticMask: re-entry 2: pair(19,20) %zu\n", as);
+            expect(as == 0, "fast re-entry 2, v2StaticMask on: the arm is protected again on the pair 2 frames after it came back");
+        }
     }
 
     // 5. the pair gate: the right arm changes colour in the LAST pair only. V2 never pastes a pixel that changed in the pair
@@ -1162,6 +1271,7 @@ static int v2Check(int W, int H) {
         bad.uiProtection = (UiProtection)4; expect(!Interpolator::validate(bad), "validate rejects mode 4");
     }
     ghostCheck();
+    if (algoV2()) staticMaskMotionCheck();
     return fails ? 1 : 0;
 }
 #endif
@@ -1592,7 +1702,7 @@ static void motionCheck(const Scene& sc) {
             Interpolator fg;
             InitInfo info;
             info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
-            info.viewFormat = vfs[i]; info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = v2;
+            info.viewFormat = vfs[i]; info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2; info.settings = v2;
             if (i == 2) info.transfer = Transfer::Linear;
             Format f;
             formatOf(vfs[i], &f);
@@ -1637,7 +1747,7 @@ static void motionCheck(const Scene& sc) {
         Interpolator ref;
         InitInfo info;
         info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
-        info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = sTo;
+        info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2; info.settings = sTo;
         if (!ref.init(info) || !run(ref, true, &outR)) { expect(false, "reference instance"); }
         vkDeviceWaitIdle(dev);
         ref.destroy();
@@ -1646,7 +1756,7 @@ static void motionCheck(const Scene& sc) {
     Interpolator fg;
     InitInfo info;
     info.phys = phys; info.device = dev; info.gdpa = countingGdpa; info.width = W; info.height = H;
-    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = sFrom;
+    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2; info.settings = sFrom;
     if (!fg.init(info)) { expect(false, "init with the counting gdpa"); return; }
     const int64_t p0 = gLivePipes;
     expect(run(fg, true, &outA), "estimate + synth in the start version");
@@ -1688,7 +1798,7 @@ static void motionCheck(const Scene& sc) {
         Interpolator f;
         InitInfo inf;
         inf.phys = phys; inf.device = dev; inf.gdpa = countingGdpa; inf.width = W; inf.height = H;
-        inf.viewFormat = fmt(); inf.getMemProps = vkGetPhysicalDeviceMemoryProperties; inf.settings = q;
+        inf.viewFormat = fmt(); inf.getMemProps = vkGetPhysicalDeviceMemoryProperties; inf.getProps2 = vkGetPhysicalDeviceProperties2; inf.settings = q;
         std::vector<uint8_t> oq, op, op2, oq2, oq3, o1p, o1q;
         expect(f.init(inf) && run(f, true, &oq), "v2Mode: V2 Quality estimate + synth");
         const int64_t pm = gLivePipes;

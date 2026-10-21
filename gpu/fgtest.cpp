@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
     info.width = W;
     info.height = H;
     info.viewFormat = fmt;
-    info.getMemProps = vkGetPhysicalDeviceMemoryProperties;
+    info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2;
     info.settings = setA;
     if (!fg.init(info)) { fprintf(stderr, "fg.init failed (invalid --set?)\n"); return 1; }
     // --dump: host-visible copy of the debug maps

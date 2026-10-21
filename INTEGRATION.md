@@ -55,6 +55,7 @@ struct InitInfo {
   VkFormat viewFormat;            // default B8G8R8A8_UNORM; R8G8B8A8_UNORM, or another Format (see "Formats"); never _SRGB
   PFN_vkGetPhysicalDeviceMemoryProperties getMemProps;   // REQUIRED: g_device.vk.GetPhysicalDeviceMemoryProperties (H:1166)
   PFN_vkGetPhysicalDeviceFormatProperties getFormatProps;   // optional: lets init() check non-Rgba8 formats (see "Formats")
+  PFN_vkGetPhysicalDeviceProperties2 getProps2;   // optional (Vulkan 1.1): lets the library check V2's subgroup needs (see "Motion version 2")
   VkPipelineCache pipelineCache;  // optional
   Transfer transfer; float linearWhiteNits;   // RgbaF16 only (see "Formats")
   YuvMatrix yuvMatrix; bool yuvFullRange;     // Nv12 / P010 only
@@ -68,6 +69,8 @@ public:
   void destroy();
   bool resize(uint32_t w, uint32_t h, VkFormat viewFormat);   // re-create on size/format change
   static bool validate(const Settings&);
+  static const char* settingsError(const Settings&, Format);   // null = valid for that Format, else why not
+  const char* settingsError(const Settings&) const;            // the same plus this device's rules (getProps2): what setSettings / reconfigure refuse
   bool setSettings(const Settings&);   // runtime knobs, any time, applies to later records
   bool reconfigure(const Settings&);   // also flowScale: re-creates buffers (retire rule of resize)
   Settings settings() const;
@@ -148,6 +151,7 @@ The settings only change the per-pair estimate; the per-synth cost (~0.06 ms at 
 - **Static mask** (`v2StaticMask`, default on, both modes): a static-structure mask of each pair keeps HUD, text and static overlays in place, including semi-transparent panels and crosshairs whose pixels change every frame (inverted-colour Minecraft crosshair, blended CS2 crosshair), which `CrosshairV2` never locks on (see its Limits). A change applies from the next `recordEstimate`.
 - **Tap disagreement:** where the two taps disagree, V2 tries block-vector candidates (fewer pasted / outlier artifacts and ring outlines); a tap outside the frame takes the other tap.
 - **Formats:** Rgba8 (RGBA/BGRA) only. `Interpolator::settingsError(s, format)` names the reason; `init()` refuses it (`initError()`), `setSettings()` / `reconfigure()` return false.
+- **Device:** compute-stage subgroups with the basic, vote, arithmetic, shuffle and clustered operations, at least 16 lanes (every current desktop GPU). With `InitInfo::getProps2` (`vkGetPhysicalDeviceProperties2`) set, `init()` refuses V2 on a device without them (`initError()`) and `setSettings()` / `reconfigure()` return false (`settingsError(s)` names the reason); null = no check, the host vouches for it.
 - **Works with** every `uiProtection` mode (incl. `CrosshairV2` and its tap rejection) and `recordSynthBlur`, in both modes.
 - **Runtime:** a `v2Mode` switch keeps the estimate (what the other mode needs is derived by its first synth, same output as its own estimate). A `motionVersion` switch drops it (see the Settings table).
 - **Shaders** (plain, Rgba8 only): `v2_search`, `v2_medhist`, `v2_repick`, `v2_clean`, `v2_morph` (Performance), `v2_qfield`, `v2_qcov`, `v2_qown`, `v2_qmorph` (Quality), `v2_static`, `v2_enclose` (static mask), `v2_morph_s`, `v2_qmorph_s` (static-mask variants of the gathers), with the includes `v2_est.glsl`, `v2_motion.glsl`, `v2_morph.glsl`, `v2_quality.glsl`.

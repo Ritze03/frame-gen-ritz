@@ -282,6 +282,7 @@ struct Interpolator::Impl {
     ColourSpv cs{};
     VkFormat cleanFmt = VK_FORMAT_R8G8B8A8_UNORM, cleanFmtC = VK_FORMAT_UNDEFINED;
     Settings set{};   // active settings (info.settings is only the init value)
+    const char* v2Why = nullptr;   // why the device cannot run MotionVersion::V2 (InitInfo::getProps2), null = it can / unchecked
     VkPhysicalDeviceMemoryProperties memProps{};
 
     VkSampler sampler = VK_NULL_HANDLE;
@@ -845,6 +846,23 @@ bool formatUsable(PFN_vkGetPhysicalDeviceFormatProperties fp, VkPhysicalDevice p
                                       VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
     return (p.optimalTilingFeatures & need) == need;
 }
+
+// Device support of MotionVersion::V2's subgroup use (null = supported): v2_search.comp (arithmetic), v2_repick.comp (clusters of
+// 16), v2_enclose.comp (clusters of 8, shuffles), v2_morph.glsl (vote, arithmetic, shuffles; its 4x4 groups need 32 lanes, else a
+// per-pixel choice), all in compute shaders.
+const char* v2SubgroupError(PFN_vkGetPhysicalDeviceProperties2 fp, VkPhysicalDevice phys) {
+    VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &sg;
+    fp(phys, &p2);
+    const VkSubgroupFeatureFlags need = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+                                        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+                                        VK_SUBGROUP_FEATURE_CLUSTERED_BIT;
+    if (!(sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) || (sg.supportedOperations & need) != need)
+        return "MotionVersion::V2 needs compute-stage subgroups with the basic, vote, arithmetic, shuffle and clustered operations; use MotionVersion::V1";
+    if (sg.subgroupSize < 16) return "MotionVersion::V2 needs subgroups of at least 16 lanes; use MotionVersion::V1";
+    return nullptr;
+}
 }  // namespace
 
 bool Interpolator::init(const InitInfo& ii) {
@@ -856,6 +874,8 @@ bool Interpolator::init(const InitInfo& ii) {
     ColourSpv cs{};
     if (!colourSpv(fmt, cs)) { err_ = "the shader variants of this format are not built into the library (meson option 'formats')"; return false; }
     if (const char* e = settingsError(ii.settings, fmt)) { err_ = e; return false; }
+    const char* v2Why = ii.getProps2 ? v2SubgroupError(ii.getProps2, ii.phys) : nullptr;
+    if (ii.settings.motionVersion == MotionVersion::V2 && v2Why) { err_ = v2Why; return false; }
     if (fmt == Format::RgbaF16 && ii.transfer == Transfer::Linear && !(ii.linearWhiteNits > 0.0f && ii.linearWhiteNits <= 10000.0f)) {
         err_ = "linearWhiteNits must be in (0, 10000]";
         return false;
@@ -869,6 +889,7 @@ bool Interpolator::init(const InitInfo& ii) {
     m->info = ii;
     m->set = ii.settings;
     m->fmt = fmt;
+    m->v2Why = v2Why;
     m->yuv = isYuv(fmt);
     m->cs = cs;
     m->cleanFmt = cleanFormat(fmt);
@@ -1106,8 +1127,13 @@ const char* Interpolator::settingsError(const Settings& s, Format f) {
     return nullptr;
 }
 
+const char* Interpolator::settingsError(const Settings& s) const {
+    if (const char* e = settingsError(s, m ? m->fmt : Format::Rgba8)) return e;
+    return m && s.motionVersion == MotionVersion::V2 ? m->v2Why : nullptr;
+}
+
 bool Interpolator::setSettings(const Settings& s) {
-    if (!m || settingsError(s, m->fmt) || s.flowScale != m->set.flowScale) return false;
+    if (!m || settingsError(s) || s.flowScale != m->set.flowScale) return false;
     // UI protection, and a motion version selected for the first time: creating what the new settings need is allowed here (it
     // frees nothing, so no GPU wait); false = the creation failed and nothing changed (a version created before a later failure
     // is kept, unused, for releaseUnusedMotion()).
@@ -1122,7 +1148,7 @@ bool Interpolator::setSettings(const Settings& s) {
 }
 
 bool Interpolator::reconfigure(const Settings& s) {
-    if (!m || settingsError(s, m->fmt)) return false;
+    if (!m || settingsError(s)) return false;
     bool structural = s.flowScale != m->set.flowScale;
     Settings old = m->set;
     m->set = s;
@@ -1853,7 +1879,9 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     if (I.mv2()) {
         // V2: its static-structure mask (v2_static.comp) from the real frames' luma, before CrosshairV2's estimate fill takes the UI
         // out of it (the mask sees the crosshair as the static overlay it is); reads only the luma, writes its own slot of V2B_QUAL:
-        // no barrier against the pyramid, one against the fill (which rewrites the luma)
+        // no barrier against the pyramid, one against the fill (which rewrites the luma). (Intended: syncval with its shader-accesses
+        // heuristic reports a WRITE_AFTER_READ on binding 0 here, the pyramid writing levels 1.. of the buffer this pass reads level 0
+        // of: disjoint ranges.)
         V2PC sv = r.v2pc();
         sv.fIn = I.set.v2StaticMask ? 0 : 1;   // v2_static.comp: 1 = write an empty mask (Settings::v2StaticMask off)
         r.runV2(P_V2_STATIC, sv, divUp(I.fw, 16), divUp(I.fh, 16));
@@ -1976,7 +2004,8 @@ void Interpolator::Impl::v2Tail(VkCommandBuffer cb) {
         r.cbar();
         v.fIn = l0.fM;
         r.runV2(P_V2_CLEAN, v, divUp(l0.bw, 8), divUp(l0.bh, 8));
-        r.runV2(P_V2_ENCLOSE, v, divUp(((fw + 7) / 8) * ((fh + 7) / 8), 8), 1);   // the static mask's cells (8 per workgroup): no barrier against the clean-up
+        r.cbar();
+        r.runV2(P_V2_ENCLOSE, v, divUp(((fw + 7) / 8) * ((fh + 7) / 8), 8), 1);   // the static mask's cells (8 per workgroup), on the cleaned field
         r.cbar();
         r.stamp("field clean");
         v2Clean = true;
@@ -2015,7 +2044,8 @@ bool Interpolator::Impl::v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     v.gauss = gauss;
     for (int k = 0; k < n; k++) v.t[k] = ts[k];
     // the tiles near a static overlay go to the static variant of the pass (V2's static-structure mask), the others to the plain
-    // one; both write disjoint tiles and only add to the counts: no barrier between them
+    // one; both write disjoint tiles and only add to the counts: no barrier between them. (Intended: syncval with its shader-accesses
+    // heuristic reports a WRITE_AFTER_WRITE on binding 5, the output image, between them: each 8x8 tile is stored by one of the two.)
     const Pipe morphS = set.v2Mode == V2Mode::Quality ? P_V2_QMORPH_S : P_V2_MORPH_S;
     r.runV2(morph, v, divUp((int)W, 8), divUp((int)H, 8));
     r.runV2(morphS, v, divUp((int)W, 8), divUp((int)H, 8));

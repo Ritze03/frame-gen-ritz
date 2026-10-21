@@ -13,9 +13,9 @@
 //   place may take over as a rigid motion of the pixel's 4x4 group (no blend of two very different vectors: ring outlines).
 // Static overlays (both modes, V2's static-structure mask S and its enclosure E, v2_static.comp / v2_enclose.comp; where both real
 // frames show the same structure, also a semi-transparent HUD panel whose background moves): a pixel on S (confirmed at full
-// resolution) or inside E whose taps leave it takes the zero vector, and a tap that lands on S / E while the field moves takes the
-// other tap. Most of a frame is far from every overlay, so the main pass (no V2_STATIC) has none of it; the static pass (fix = 2,
-// V2_STATIC) takes the 8x8 tiles whose pixels or taps come near one (v2_enclose.comp's C) and leaves the others at once; it runs
+// resolution) or inside E whose taps leave it takes the zero vector (inside E: unless the morph fits clearly better, a moving object
+// on static scenery), and a tap that lands on S / E while the field moves takes the other tap. Most of a frame is far from every
+// overlay, so the main pass (no V2_STATIC) has none of it; the static pass (fix = 2, V2_STATIC) takes the 8x8 tiles whose pixels or taps come near one (v2_enclose.comp's C) and leaves the others at once; it runs
 // beside the main pass (no barrier between them: each tile is written and counted by one of the two).
 // No per-pixel trust and no hold: where the two taps disagree (occlusion, a flash) the blend morphs between them; a real frame is never
 // shown locally (the zero vector only where both frames AGREE; Quality's one-sided blend still takes its tap along the motion). The only
@@ -41,6 +41,7 @@ const float V2_Z0 = 8.0, V2_Z1 = 12.0, V2_ZMAX = 6.0;
 const float V2_C0 = 24.0, V2_C1 = 8.0, V2_C2 = 16.0;
 // full-resolution structure agreement (the static-mask confirmation): ratio of the gradient mismatch to the gradients
 const float V2_SEPS = 8.0, V2_SR0 = 0.3, V2_SR1 = 0.6;
+const float V2_SD0 = 16.0, V2_SD1 = 24.0;   // ... where there is structure at all (sum of the 4 gradients, levels; v2_static.comp's)
 const float V2_SZMAX = 12.0;   // ... or the zero-vector mismatch of the pixel and a line of its neighbours (levels; lossy video adds noise)
 
 // A tap on a static overlay picks the overlay up at the wrong place (a dragged copy of HUD text) while the field moves: the tap takes
@@ -48,13 +49,24 @@ const float V2_SZMAX = 12.0;   // ... or the zero-vector mismatch of the pixel a
 // taps) it hits. Returns x: how much of the overlay the taps leave (1 - the overlay at the tap that hits it least; 0 at the zero
 // vector): seen from a pixel inside an overlay (E), a tap outside brings the untinted scene in through a semi-transparent panel;
 // y: both taps on the overlay (the overlay at the tap that hits it least): the content of this pixel is hidden in both frames and
-// either tap would paste a copy of the overlay; the overlay's own place (the zero vector) is the better guess.
-vec2 sReject(vec2 pa, vec2 pc_, inout vec3 wa, inout vec3 wc, float za, float zc) {
-    if (all(lessThan(abs(pc_ - pa), vec2(1.0)))) return vec2(0.0);   // (nearly) the zero vector: both taps are the overlay's own place
+// either tap would paste a copy of the overlay; the overlay's own place (the zero vector) is the better guess; z: the same for S
+// alone (both taps on static structure itself, not only inside an enclosure). za2, zc2: sOverAt of the taps (S dilated, E).
+// x and y hold for a moving object enclosed by static scenery too (E has no motion test): v2_morph's zero-vector test takes them
+// only where the morph does not fit clearly better than the zero vector; z (a copy of a stroke) always, its taps confirmed static.
+vec3 sReject(vec2 pa, vec2 pc_, inout vec3 wa, inout vec3 wc, vec2 za2, vec2 zc2) {
+    if (all(lessThan(abs(pc_ - pa), vec2(1.0)))) return vec3(0.0);   // (nearly) the zero vector: both taps are the overlay's own place
+    float za = max(za2.x, za2.y), zc = max(zc2.x, zc2.y);
     vec3 a = wa;
     wa = mix(wa, wc, clamp(2.0 * (za - zc), 0.0, 1.0));
     wc = mix(wc, a, clamp(2.0 * (zc - za), 0.0, 1.0));
-    return vec2(1.0 - min(za, zc), min(za, zc));
+    return vec3(1.0 - min(za, zc), min(za, zc), min(za2.x, zc2.x));
+}
+
+// Both taps on S: how surely the structure they hit is static (1: both frames show the same colours at each tap; a moving texture
+// that happens to match its structure in S does not); ra, rc: the taps' raw texels
+float tapsStatic(vec2 pa, vec2 pc_, vec3 ra, vec3 rc) {
+    vec3 d = max(abs(FG_FETCH(ra) - FG_FETCH(tapRaw(texCurr, pa).rgb)), abs(FG_FETCH(rc) - FG_FETCH(tapRaw(texPrev, pc_).rgb)));
+    return clamp(1.0 - max(d.r, max(d.g, d.b)) * (1.0 / V2_SZMAX), 0.0, 1.0);
 }
 
 // A tap outside the frame reads the clamped edge (a smeared copy of the border column / row): where content enters or leaves the
@@ -72,9 +84,10 @@ void edgeReject(vec2 pa, vec2 pc_, inout vec3 wa, inout vec3 wc) {
 }
 
 // The sum of x over the 4x4 pixels of this lane's group (8x8 workgroup tile, lanes in row order; subgroups of >= 32 lanes)
-// (subgroups of fewer lanes: the pixel's own value x 16, a per-pixel choice)
-float sum16(float x) {
-    if (gl_SubgroupSize < 32u) return 16.0 * x;
+// (subgroups of fewer lanes, or a group that the frame's right or bottom edge cuts: the pixel's own value x 16, a per-pixel
+// choice; the lanes outside the frame never run morph(), and a shuffle must not read them)
+float sum16(float x, bool full) {
+    if (gl_SubgroupSize < 32u || !full) return 16.0 * x;
     x += subgroupShuffleXor(x, 1u);
     x += subgroupShuffleXor(x, 2u);
     x += subgroupShuffleXor(x, 8u);
@@ -110,11 +123,15 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     edgeReject(pa, pc_, wa, wc);   // a tap outside the frame takes the other tap
     // a tap on a static overlay (HUD text) takes the other tap. Far from every overlay (most of a frame: whole subgroups, a uniform
     // branch) the taps leave no overlay: sout = 1 (0 at the zero vector), sboth = 0
-    float sout = all(lessThan(abs(pc_ - pa), vec2(1.0))) ? 0.0 : 1.0, sboth = 0.0;
+    float sout = all(lessThan(abs(pc_ - pa), vec2(1.0))) ? 0.0 : 1.0, sboth = 0.0, sbS = 0.0;
+    vec3 d0 = abs(wa - wc);
+    float em0 = max(d0.r, max(d0.g, d0.b));   // the taps' mismatch before the overlay's tap rejection (the morph's own fit)
     if (subgroupAny(nearT)) {
-        vec2 so = sReject(pa, pc_, wa, wc, sOverAt(pa, cla), sOverAt(pc_, clc));
+        vec3 so = sReject(pa, pc_, wa, wc, sOverAt(pa, cla), sOverAt(pc_, clc));
         sout = so.x;
         sboth = so.y;
+        sbS = so.z;
+        if (subgroupAny(sbS > 0.0)) { if (sbS > 0.0) sbS *= tapsStatic(pa, pc_, a.rgb, c.rgb); }
         if (subgroupAny(sboth > 0.0)) {   // (not where both taps are on CrosshairV2's UI: its patch and its own tap rule decide there)
             bool ha, hc;
             uiRejectHits(pa, pc_, ha, hc);
@@ -124,7 +141,12 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     vec3 d = abs(wa - wc);
     float em = max(d.r, max(d.g, d.b));
     vec2 sp = vec2(0.0);
-    if (subgroupAny((sbits & 1u) != 0u)) sp = sAt(q, sbits);   // the static-structure mask S and its enclosure E here
+    float sxd = 0.0;   // S dilated by ~1 flow px (sOverAt's): the anti-aliased rim of a stroke
+    if (subgroupAny((sbits & 1u) != 0u)) {
+        vec3 s3 = sAt(q, sbits);   // the static-structure mask S, its enclosure E and S dilated here
+        sp = s3.xy;
+        sxd = s3.z;
+    }
     // Where the taps disagree badly: the block vectors around the content's place, each as one rigid motion. Between two
     // blocks whose vectors differ a lot (a periodic texture matched a period apart, an outlier block, a motion edge) the bilinear
     // blend of them is neither motion and its taps sweep the content into ring-shaped outlines; one of the blocks' own vectors often
@@ -136,10 +158,12 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
         vec2 xm = q - (2.0 * t - 1.0) * g;   // the content's midpoint location
         float S = float(pc.fscale);
         ivec2 i0 = ivec2(floor((xm + 0.5) * (1.0 / (float(V2_BLOCK) * S)) - 0.5));
-        float s0 = sum16(em), sb = s0;
+        bool full = (p.x | 3) < pc.W && (p.y | 3) < pc.H;   // the whole 4x4 group is in the frame (uniform in the group)
+        float s0 = sum16(em, full), sb = s0;
         vec3 ba = wa, bc = wc;
         float baa = a.a, bca = c.a;
-        vec2 bso = vec2(sout, sboth);   // the overlay test of the winner's taps (sReject's), for the zero-vector test below
+        vec3 bso = vec3(sout, sboth, sbS);   // the overlay test of the winner's taps (sReject's), for the zero-vector test below
+        float be0 = em0;
         for (int k = 0; k < 4; k++) {
             vec2 gk = S * VF(i0 + ivec2(k & 1, k >> 1));
             vec2 qa = q - (2.0 * t) * gk, qc = q + (2.0 - 2.0 * t) * gk;
@@ -148,23 +172,29 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
             uiReject(qa, qc, ya, yc);
             ya = FG_FETCH(ya); yc = FG_FETCH(yc);
             edgeReject(qa, qc, ya, yc);
-            vec2 sok = vec2(all(lessThan(abs(qc - qa), vec2(1.0))) ? 0.0 : 1.0, 0.0);
+            vec3 sok = vec3(all(lessThan(abs(qc - qa), vec2(1.0))) ? 0.0 : 1.0, 0.0, 0.0);
+            vec3 dk0 = abs(ya - yc);
+            float ek0 = max(dk0.r, max(dk0.g, dk0.b));
             if (subgroupAny(nearT)) {   // (the static pass, near an overlay: its tap rejection as for the main taps)
                 ivec2 ka = sCell(qa), kc = sCell(qc);
                 sok = sReject(qa, qc, ya, yc, sOverAt(qa, ka), sOverAt(qc, kc));
+                if (subgroupAny(sok.z > 0.0)) { if (sok.z > 0.0) sok.z *= tapsStatic(qa, qc, xa.rgb, xc.rgb); }
             }
             vec3 dk = abs(ya - yc);
-            float sk = sum16(max(dk.r, max(dk.g, dk.b)));   // (the same for the group's 16 lanes: a uniform choice in the group)
-            if (sk < sb) { sb = sk; ba = ya; bc = yc; baa = xa.a; bca = xc.a; bso = sok; }
+            float sk = sum16(max(dk.r, max(dk.g, dk.b)), full);   // (the same for the group's 16 lanes: a uniform choice in the group)
+            if (sk < sb) { sb = sk; ba = ya; bc = yc; baa = xa.a; bca = xc.a; bso = sok; be0 = ek0; }
         }
-        // (not on an overlay or inside one, S / E: a rigid vector there pastes the scene behind a semi-transparent panel in blocks)
-        float wb = clamp((s0 - sb - 16.0 * V2_C1) * (1.0 / (16.0 * V2_C2)), 0.0, 1.0) * (1.0 - clamp(2.0 * max(sp.x, sp.y), 0.0, 1.0));
+        // (not on an overlay, S, nor inside one, E, where the winner's taps leave it: a rigid vector there pastes the scene behind a
+        // semi-transparent panel in blocks; inside E with its taps inside too, a moving object on static scenery, it may)
+        float wb = clamp((s0 - sb - 16.0 * V2_C1) * (1.0 / (16.0 * V2_C2)), 0.0, 1.0) * (1.0 - clamp(2.0 * max(sp.x, sp.y * bso.x), 0.0, 1.0));
         vec3 da = abs(ba - bc);
         wa = mix(wa, ba, wb); wc = mix(wc, bc, wb);
         a.a = mix(a.a, baa, wb); c.a = mix(c.a, bca, wb);
         em = mix(em, max(da.r, max(da.g, da.b)), wb);
         sout = mix(sout, bso.x, wb);
         sboth = mix(sboth, bso.y, wb);
+        sbS = mix(sbS, bso.z, wb);
+        em0 = mix(em0, be0, wb);
     }
 #ifdef V2_QUALITY
     vec3 cq = qCovAt(q);   // this pixel's coverage word (its z: the static-overlay mask)
@@ -205,7 +235,7 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
 #else
     float emz = em;
 #endif
-    if (emz > V2_Z0 || sp.x > 0.0 || sp.y * sout > 0.0 || sboth > 0.0) {   // (only then can it win)
+    if (emz > V2_Z0 || sxd > 0.0 || sp.y * sout > 0.0 || sboth > 0.0) {   // (only then can it win)
         vec4 s0 = texelFetch(texPrev, p, 0), s1 = texelFetch(texCurr, p, 0);
         vec3 sa = FG_FETCH(s0.rgb), sc = FG_FETCH(s1.rgb);
         vec3 dz = abs(sa - sc);
@@ -215,7 +245,7 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
         // agreement (v2_static.comp's measure, max-channel): the gradients of prev and curr at p against them
         float zn[4];
         float num = 0.0, den = 0.0;
-        const bool inS = subgroupAny(sp.x > 0.0);   // (the structure agreement only matters inside the mask; uniform)
+        const bool inS = subgroupAny(sxd > 0.0);   // (the structure agreement only matters inside the mask; uniform)
         for (int k = 0; k < 4; k++) {
             ivec2 o = k < 2 ? ivec2(2 * k - 1, 0) : ivec2(0, 2 * k - 5);
             ivec2 pn = clamp(p + o, ivec2(0), ivec2(pc.W - 1, pc.H - 1));
@@ -234,22 +264,30 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
         float ws = clamp((emz - zs - V2_Z0) * (1.0 / V2_Z1), 0.0, 1.0) * clamp(1.0 - zs * (1.0 / V2_ZMAX), 0.0, 1.0);
         // not next to CrosshairV2's UI (its own patch and tap rejection handle it; a static crosshair would vouch for the pixels around it)
         if (ws > 0.0 && (uiHitA(p - 1, p + 1) || uiHitC(p - 1, p + 1))) ws = 0.0;
-        // a static structure (the mask), confirmed at full resolution: the pixel and its neighbours agree, or their structure does
-        // (a semi-transparent overlay). A thin moving object inside a masked flow pixel fails both and keeps the morph.
-        if (inS && sp.x > 0.0) {
+        // a static structure (the mask, dilated by ~1 flow px: the rim of a stroke), confirmed at full resolution: the pixel and its
+        // neighbours agree, or their structure does (a semi-transparent overlay) where there is structure at all (a flat place
+        // agrees with any flat place: the inside of a moving blocky texture). A thin moving object inside a masked flow pixel
+        // fails both and keeps the morph.
+        if (inS && sxd > 0.0) {
             float rf = num / (den + V2_SEPS);
             // On CrosshairV2's UI (its mask and grown rim; the patch pastes only what stayed within its still threshold) only the
             // plain agreement: next to an opaque crosshair the structure test is fooled by a slowly changing background (the big edge
             // step to the crosshair dominates the ratio) and would cross-fade the rim.
             bool onUi = uiHitA(p, p) || uiHitC(p, p);
-            float conf = max(onUi ? 0.0 : clamp((V2_SR1 - rf) * (1.0 / (V2_SR1 - V2_SR0)), 0.0, 1.0),
+            float conf = max(onUi ? 0.0 : clamp((V2_SR1 - rf) * (1.0 / (V2_SR1 - V2_SR0)), 0.0, 1.0) * clamp((den - V2_SD0) * (1.0 / V2_SD1), 0.0, 1.0),
                              clamp(1.0 - zs * (1.0 / V2_SZMAX), 0.0, 1.0));
-            ws = max(ws, sp.x * conf);
+            ws = max(ws, sxd * conf);
         }
         // inside an overlay (E, its tinted background between text and border) whose taps leave it: the scene they fetch is not
-        // behind the tint; the overlay's own place is (the zero vector)
-        ws = max(ws, sp.y * sout);
-        ws = max(ws, sboth);   // both taps on the overlay
+        // behind the tint; the overlay's own place is (the zero vector); and both taps on the overlay. Not where the morph's own
+        // taps (before the overlay's tap rejection) fit clearly better than the zero vector, by the zero-vector test's margin: E
+        // has no motion test, and a moving object whose surroundings are static textured scenery is enclosed too (it would
+        // cross-fade); a panel's tinted inside over a moving scene keeps the zero vector where its taps disagree (they leave the
+        // panel, or the scene behind it changed).
+        float fitM = clamp((zs - em0 - V2_Z0) * (1.0 / V2_Z1), 0.0, 1.0);
+        ws = max(ws, sp.y * sout * (1.0 - fitM));
+        ws = max(ws, sboth * (1.0 - fitM));
+        ws = max(ws, sbS);   // both taps on static structure itself (a stroke of text: either tap pastes a copy of it), always
         m = mix(m, (1.0 - t) * sa + t * sc, ws);
         al = mix(al, (1.0 - t) * s0.a + t * s1.a, ws);
         em = mix(em, z, ws);
@@ -296,7 +334,10 @@ void pixelOut(ivec2 p, bool counting, bool cut) {
 }
 
 void main() {
-    int lid = int(gl_LocalInvocationIndex);
+    // this invocation's place in the 8x8 tile, row order, from its subgroup lane (not gl_LocalInvocationID: sum16's shuffles pair
+    // lanes, so the lanes' order must be the pixels'; with full subgroups this is a permutation of the tile)
+    int lid = int(gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID);
+    ivec2 lxy = ivec2(lid & 7, lid >> 3);
     float meanSad = float(u[U_V2SAD_]) * (1.0 / 256.0) / float(pc.bw * pc.bh);
     bool cut = meanSad > pc.cutSad;
     if (pc.fix == 0) {
@@ -311,7 +352,7 @@ void main() {
 #endif
         if (lid < 16) esum[lid] = 0u;
         barrier();
-        pixelOut(ivec2(gl_GlobalInvocationID.xy), true, cut);
+        pixelOut(ivec2(gl_WorkGroupID.xy) * 8 + lxy, true, cut);
         barrier();
         if (lid < pc.n && !cut) {
             ivec2 o = ivec2(gl_WorkGroupID.xy) * 8;
@@ -330,5 +371,5 @@ void main() {
     if (!flicked) return;
     for (int j = 0; j < 8; j++)
         for (int i = 0; i < 8; i++)
-            pixelOut(ivec2(gl_WorkGroupID.xy) * 64 + ivec2(i, j) * 8 + ivec2(gl_LocalInvocationID.xy), false, false);
+            pixelOut(ivec2(gl_WorkGroupID.xy) * 64 + ivec2(i, j) * 8 + lxy, false, false);
 }
