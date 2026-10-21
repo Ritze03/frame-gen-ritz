@@ -38,8 +38,13 @@ enum class MotionVersion : uint32_t {
 // time, no rebuild, no pipeline creation; a switch keeps the current estimate (the part of the estimate the other mode needs is
 // derived by its first recordSynth / recordSynthBlur, with the same output as that mode's own estimate). V1 ignores it.
 enum class V2Mode : uint32_t {
-    Quality = 0,       // the default: the better picture for more GPU time. For now V1's per-pixel field and synthesis on V2's
-                       // estimate: V1's output, bit-identical (RX 7900 XTX, 1080p 2x: ~0.24 ms per pair vs V1's 0.34).
+    Quality = 0,       // the default: the better picture for more GPU time, the "coverage morph". Performance's cleaned block
+                       // field, upsampled per flow pixel with edge awareness (motion edges follow objects instead of ramping over
+                       // a block) and zero on static overlays (subtitles, HUD); the field splatted to both real frames to know which
+                       // frame still shows each piece of content; one full-resolution gather like Performance's whose blend leans
+                       // to that frame (no 50/50 double image at occlusions and at the frame border), whose taps skip static
+                       // overlays, blurred along the motion where the two taps still disagree. No per-pixel trust or hold.
+                       // RX 7900 XTX, 1080p 2x: ~0.22 ms per pair (V1 0.30, Performance 0.16).
     Performance = 1,   // the "grid morph": the finest block field (16x16 px cells at flowScale 2) re-picked among neighbours,
                        // refined and cleaned (vector median + light smoothing), upsampled bilinearly to full resolution and taken to
                        // time t per pixel; one full-resolution two-tap blend (and a zero-vector candidate where the two frames agree,
@@ -521,8 +526,9 @@ public:
     // "ui_inpaint" (both recorded by recordObserve; a profile opened by an observe is continued by the next
     // recordEstimate) and "ui_patch" (the paste-back, per recordSynth). recordSynthBlur adds "blur lookup", "blur mismatch", "blur resolve"
     // (the average of all samples) and "blur fixup" (the whole-frame fallback check, a no-op in the normal case), then "ui_patch".
-    // MotionVersion::V2: its estimate ends after the levels; Quality adds "subpixel" and "pixel field" (once per estimate), Performance
-    // "field clean" (once per estimate: re-pick, refinement, clean-up) and per synth "morph" / "blur morph" and "fallback" (its fix-up).
+    // MotionVersion::V2: its estimate ends after the levels, then "field clean" (once per estimate: re-pick, refinement, clean-up);
+    // Quality adds "pixel field", "splat" and "coverage" (once per estimate); per synth "morph" / "blur morph" and "fallback" (its
+    // fix-up).
     bool readTimings(std::vector<const char*>& names, std::vector<uint64_t>& ticks);
 
     // Debug / test only (bench/score), read-only: changes no output and no state. Records a copy of the latest recordSynth's
@@ -530,7 +536,7 @@ public:
     // ramp past its midpoint), finest-level SAD sum x 256 (from the estimate)]. Preceded by a COMPUTE write -> TRANSFER read
     // barrier; the caller adds its own TRANSFER -> HOST barrier. The global fallback fires when untrusted > globalFallback x W x H,
     // the scene cut when sadSum / 256 / debugSadBlocks() > sceneCutSad. Both counts are computed whatever those settings are.
-    // Not meaningful after recordSynthBlur. V2 Performance: untrusted = the pixels of the 8x8 tiles whose mean mismatch is past the
+    // Not meaningful after recordSynthBlur. V2 (both modes): untrusted = the pixels of the 8x8 tiles whose mean mismatch is past the
     // midpoint, SAD sum = its own (the re-picked, refined block vectors' SADs). False if not initialised.
     bool recordDebugCounters(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
     uint32_t debugSadBlocks() const;   // the scene-cut mean's block count (finest pyramid level); 0 if not initialised
@@ -540,7 +546,8 @@ public:
     // pixel, eStride words per row, 4 pixels per word, low byte first; e of the latest synth, before the 7x7 box). Preceded by a
     // COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
     // V2 Performance (same layout): the block slot holds the cleaned block field its morph uses; the per-pixel field and e (it has
-    // neither) are zero.
+    // neither) are zero. V2 Quality (same layout): the cleaned block field, its per-pixel field, and at the start of the e part its
+    // coverage, fw x fh uint32 (cP | cC << 11 | static-overlay mask << 22; flowScale >= 2, else zeros), see gpu/fgmaps.py.
     struct DebugMapLayout {
         uint32_t W, H, fw, fh, bw, bh, fscale, eStride;   // eStride in uint32 words
         VkDeviceSize blockOff, pixOff, eOff, size;          // byte offsets in dst (relative to dstOffset) and the total size

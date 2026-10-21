@@ -252,13 +252,14 @@ struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 // The resources of one motion version (Settings::motionVersion): created by motionEnsure() the first time the version is selected
 // (init, setSettings, reconfigure), kept while another one is selected, freed by releaseUnusedMotion() / destroy(). V1: the pipelines
 // of the estimate / synth passes and of the motion-blur passes over the shared layouts, set rings and scratch buffers. V2: the
-// pipelines of BOTH V2Modes (the mode is runtime: a switch creates nothing). Its estimate is V1's block field computed by its own,
-// faster passes (P_V2_MEDHIST / SEARCH / SUBPIX, shaders/v2_est.glsl); Quality then runs V1's pixel field and synthesis passes on it
-// (its own pipelines of V1's shaders: V1's output), Performance its field clean-up and one-pass morph (P_V2_CLEAN / MORPH) over its
-// own buffer (`bufs`, created by motionSized()).
+// pipelines of BOTH V2Modes (the mode is runtime: a switch creates nothing) and none of V1's but luma and pyramid. Its estimate is V1's
+// block field computed by its own, faster passes (P_V2_MEDHIST / SEARCH, shaders/v2_est.glsl); both modes then re-pick and clean it
+// (P_V2_REPICK / CLEAN); Performance morphs with it in one pass (P_V2_MORPH), Quality derives its per-pixel field and coverage
+// (P_V2_QFIELD / QOWN / QCOV, shaders/v2_quality.glsl) and morphs with those (P_V2_QMORPH). Its buffers (`bufs`, created by
+// motionSized()) are its own. No motion-blur pipelines: both morphs average the blur's sub-frames themselves.
 static const int kMotionVersions = 2;   // MotionVersion::V1, V2
-// MotionGroup::bufs of V2: the cleaned block field + the fitted finest field (2 x bw x bh vec2, binding 13); Quality's claims and
-// coverage (4 x fw x fh uint, binding 14, shaders/v2_quality.glsl)
+// MotionGroup::bufs of V2: binding 13 (vec2): the cleaned block field, the fitted finest field (bw x bh each), Quality's per-pixel
+// field (fw x fh); binding 14 (uint): Quality's claims, own claims and coverage (4 x fw x fh, shaders/v2_quality.glsl)
 enum { V2B_FIELD, V2B_QUAL, V2B_COUNT };
 struct MotionGroup {
     VkPipeline pipes[P_COUNT]{};
@@ -1942,7 +1943,8 @@ void Interpolator::Impl::v2ResetClaims(VkCommandBuffer cb) {
 // is ordered (the estimate's / synth's counter clear, which also reset Quality's claims if v2NeedCov()).
 //   both modes: the block re-pick of the fitted field into l0.fM (free in V2: V1's median3 output, which V2 never computes), then the
 //            clean-up into V2B_FIELD (v2Clean);
-//   Quality: then its coverage of that field (v2_qown: the splat to both real frames, v2_qcov: who still sees what), v2Cov.
+//   Quality: then its per-pixel field and static-overlay mask (v2_qfield) and its coverage (v2_qown: the splat to both real frames,
+//            v2_qcov: which frame still shows what), v2Cov.
 void Interpolator::Impl::v2Tail(VkCommandBuffer cb) {
     const bool cov = v2NeedCov();
     if (v2Clean && !cov) return;
