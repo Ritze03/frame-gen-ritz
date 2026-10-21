@@ -15,8 +15,8 @@
 // frames show the same structure, also a semi-transparent HUD panel whose background moves): a pixel on S (confirmed at full
 // resolution) or inside E whose taps leave it takes the zero vector, and a tap that lands on S / E while the field moves takes the
 // other tap. Most of a frame is far from every overlay, so the main pass (no V2_STATIC) has none of it; the static pass (fix = 2,
-// V2_STATIC, one workgroup per 8x8 cell of the flow grid) redoes the cells whose pixels or taps come near one (v2_enclose.comp's C)
-// and leaves the others at once. Its flick counts are the main pass's.
+// V2_STATIC) takes the 8x8 tiles whose pixels or taps come near one (v2_enclose.comp's C) and leaves the others at once; it runs
+// beside the main pass (no barrier between them: each tile is written and counted by one of the two).
 // No per-pixel trust and no hold: where the two taps disagree (occlusion, a flash) the blend morphs between them; a real frame is never
 // shown locally (the zero vector only where both frames AGREE; Quality's one-sided blend still takes its tap along the motion). The only
 // real-frame outputs are whole-frame decisions, uniform over the dispatch: a scene cut (mean finest SAD > cutSad, known from the
@@ -295,6 +295,15 @@ void main() {
     float meanSad = float(u[U_V2SAD_]) * (1.0 / 256.0) / float(pc.bw * pc.bh);
     bool cut = meanSad > pc.cutSad;
     if (pc.fix == 0) {
+        // the tiles near a static overlay (v2_enclose.comp's C of the tile's cell; a tile lies in one cell) are the V2_STATIC
+        // variant's, the others the plain one's: two dispatches over the whole frame with no barrier between them (each tile is
+        // written by one of them), the plain one without any of the overlay's tests (most of a frame: they cost it nothing)
+        bool nearTile = sCellBits(sCell(vec2(ivec2(gl_WorkGroupID.xy) * 8))) != 0u;
+#ifdef V2_STATIC
+        if (!nearTile) return;
+#else
+        if (nearTile) return;
+#endif
         if (lid < 16) esum[lid] = 0u;
         barrier();
         pixelOut(ivec2(gl_GlobalInvocationID.xy), true, cut);
@@ -305,18 +314,6 @@ void main() {
             uint valid = uint(nv.x * nv.y);
             if (float(esum[lid]) > pc.trustMid * float(valid)) atomicAdd(u[pc.cnt + lid], valid);
         }
-        return;
-    }
-    if (pc.fix == 2) {
-        // the static pass (V2_STATIC): the cells near a static overlay (v2_enclose.comp's C), redone with the overlay's tests (the
-        // main pass leaves them out: far from every overlay, most of a frame, they cost it nothing). One workgroup per cell. The
-        // flick counts are final here (the main pass counted with its own mismatch, which differs only near an overlay).
-        ivec2 c = ivec2(gl_WorkGroupID.xy);
-        if (cut || c.x >= s8W() || c.y >= s8H() || sCellBits(c) == 0u) return;
-        int span = V2_BLOCK * pc.fscale / 8;   // 8x8 tiles per cell side
-        for (int j = 0; j < span; j++)
-            for (int i = 0; i < span; i++)
-                pixelOut(c * (V2_BLOCK * pc.fscale) + ivec2(i, j) * 8 + ivec2(gl_LocalInvocationID.xy), false, false);
         return;
     }
     // fix-up: only if some interpolated sample flicked (and no cut, which the main pass already applied)

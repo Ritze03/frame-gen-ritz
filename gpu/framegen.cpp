@@ -2014,16 +2014,14 @@ bool Interpolator::Impl::v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     v.n = n;
     v.gauss = gauss;
     for (int k = 0; k < n; k++) v.t[k] = ts[k];
+    // the tiles near a static overlay go to the static variant of the pass (V2's static-structure mask), the others to the plain
+    // one; both write disjoint tiles and only add to the counts: no barrier between them
+    const Pipe morphS = set.v2Mode == V2Mode::Quality ? P_V2_QMORPH_S : P_V2_MORPH_S;
     r.runV2(morph, v, divUp((int)W, 8), divUp((int)H, 8));
+    r.runV2(morphS, v, divUp((int)W, 8), divUp((int)H, 8));
     r.cbar();
     const char* name = n == 1 ? "morph" : "blur morph";
     r.stamp(name);
-    // the static pass: the cells near a static overlay (V2's static-structure mask) again, with its tests; the main pass has none
-    const Pipe morphS = set.v2Mode == V2Mode::Quality ? P_V2_QMORPH_S : P_V2_MORPH_S;
-    v.fix = 2;
-    r.runV2(morphS, v, divUp(fw, 8), divUp(fh, 8));
-    r.cbar();
-    r.stamp("static");
     v.fix = 1;   // exits at once unless a sample turned out to have too many untrusted pixels
     r.runV2(morphS, v, divUp((int)W, 64), divUp((int)H, 64));
     name = "fallback";
