@@ -19,17 +19,15 @@ import subprocess
 import sys
 import time
 
-os.environ["OMP_NUM_THREADS"] = "8"
-
-import cv2  # noqa: E402
-import numpy as np  # noqa: E402
-
-cv2.setNumThreads(8)
+import cv2
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", ".."))
 GPU = os.path.join(REPO, "gpu")
-FGTEST = os.path.join(GPU, "build", "fgtest")
+# FGTEST=/path/to/fgtest in the environment: use that binary as is (no build; its sha256 identifies it, not the commit).
+FGTEST_ENV = os.environ.get("FGTEST")
+FGTEST = os.path.abspath(os.path.expanduser(FGTEST_ENV)) if FGTEST_ENV else os.path.join(GPU, "build", "fgtest")
 GENRES = ("fps", "racing", "minecraft", "indie", "realworld")
 REF = "v1"
 # Applied BEFORE every contestant's own set string (a contestant may override a key, e.g. ui=off), as the user plays:
@@ -75,16 +73,26 @@ def sh(cmd, **kw):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw).stdout
 
 
+def sha(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
 def build_and_hash():
+    if FGTEST_ENV:
+        if not os.access(FGTEST, os.X_OK):
+            sys.exit(f"FGTEST={FGTEST_ENV}: not an executable file")
+        bh = sha(FGTEST)
+        print(f"fgtest = {FGTEST} (binary sha256 {bh}), from FGTEST, not rebuilt", flush=True)
+        return bh, bh, ""   # run id suffix = the binary hash
     env = dict(os.environ, CCACHE_DISABLE="1")
     if not os.path.isdir(os.path.join(GPU, "build")):
         subprocess.run(["meson", "setup", "build"], cwd=GPU, env=env, check=True)
-    subprocess.run(["ninja", "-C", "build", "-j8", "fgtest"], cwd=GPU, env=env, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["ninja", "-C", "build", "fgtest"], cwd=GPU, env=env, check=True, stdout=subprocess.DEVNULL)
     head = sh(["git", "-C", REPO, "rev-parse", "HEAD"]).strip()
     dirty = sh(["git", "-C", REPO, "status", "--porcelain"]).rstrip()
     h = head + ("-dirty" if dirty else "")
-    with open(FGTEST, "rb") as f:
-        bh = hashlib.sha256(f.read()).hexdigest()[:16]
+    bh = sha(FGTEST)
     print(f"fgtest built from {h} (binary sha256 {bh})", flush=True)
     return h, bh, dirty
 
@@ -144,7 +152,7 @@ def decode(clip, start, count):
     step, w, h = clip["step"], clip["w"], clip["h"]
     srcfps = clip["fps"] * step
     t = (start * step - 0.25) / srcfps
-    p = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-threads", "8", "-ss", f"{max(t, 0):.6f}", "-i", clip["path"],
+    p = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-ss", f"{max(t, 0):.6f}", "-i", clip["path"],
                         "-frames:v", str(count * step), "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"],
                        check=True, capture_output=True).stdout
     fs = w * h * 3 // 2
@@ -256,13 +264,23 @@ def parse_contestants(args):
         if not re.fullmatch(r"[A-Za-z0-9_.+-]+", name):
             sys.exit(f"bad contestant name {name!r}")
         out[name] = s
+    bins = {}
+    for name, s in out.items():   # bin=PATH: this contestant runs that fgtest binary; the key never reaches --set
+        toks = [x.strip() for x in s.split(",") if x.strip()]
+        for x in toks:
+            if x.startswith("bin="):
+                b = os.path.abspath(os.path.expanduser(x[4:]))
+                if not os.access(b, os.X_OK):
+                    sys.exit(f"contestant {name}: bin={x[4:]} is not an executable file")
+                bins[name] = b
+        out[name] = ",".join(x for x in toks if not x.startswith("bin="))
     if not out:
         out = {"v1": "algo=v1", "v2": "algo=v2"}
     if REF not in out:
         out = {REF: "algo=v1", **out}
     if out[REF].replace(" ", "") != "algo=v1":
         sys.exit(f"the reference contestant {REF} must be exactly 'algo=v1', got {out[REF]!r}")
-    return {REF: out[REF], **{k: v for k, v in out.items() if k != REF}}
+    return {REF: out[REF], **{k: v for k, v in out.items() if k != REF}}, bins
 
 
 def ui_warm(setstrs):
@@ -277,9 +295,9 @@ def ui_warm(setstrs):
     return need
 
 
-def run_fgtest(clip, setstr, triples, window, work, state):
+def run_fgtest(clip, setstr, triples, window, work, state, exe=FGTEST):
     """triples: [(prev_path, curr_path, out_path)]. Returns per-pair (untrusted_frac, mean_sad)."""
-    cmd = [FGTEST, "--stats", "--window", str(window), "--set", setstr, str(clip["w"]), str(clip["h"])]
+    cmd = [exe, "--stats", "--window", str(window), "--set", setstr, str(clip["w"]), str(clip["h"])]
     for t in triples:
         cmd += list(t)
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -372,7 +390,7 @@ def score_clip(clip, args, cons, work, state, rows, crops):
         refmet = {}
         for name, setstr in cons.items():
             trip = [(d["prev"], d["curr"], os.path.join(bdir, f"{name}_w{d['w']}_p{d['p']}.out")) for d in pairs]
-            st = run_fgtest(clip, setstr, trip, Wp, work, state)
+            st = run_fgtest(clip, setstr, trip, Wp, work, state, args.bins[name])
             prevErr = {}   # (w) -> (k, signed luma error) of the previous kept triple, for flicker
             for d, (_, _, op), (unf, msad) in zip(pairs, trip, st):
                 if d["warm"]:
@@ -533,7 +551,7 @@ def main():
     args = ap.parse_args()
     args.nr_pairs = args.nr_pairs or args.triples
     t0 = time.time()
-    cons = parse_contestants(args)
+    cons, bins = parse_contestants(args)
     cons = {n: ",".join(x for x in (args.base_set, s) if x) for n, s in cons.items()}   # the effective fgtest --set strings
     uw = ui_warm(cons.values())
     if args.warm is None:
@@ -541,6 +559,10 @@ def main():
     elif args.warm < uw:
         print(f"warning: --warm {args.warm} < {uw}: UI protection is not warm in the first scored pairs of each window", flush=True)
     fghash, binhash, dirty = build_and_hash()
+    args.bins = {n: bins.get(n, FGTEST) for n in cons}   # every contestant's fgtest binary
+    args.binsha = {n: (binhash if b == FGTEST else sha(b)) for n, b in args.bins.items()}
+    for n in cons:
+        print(f"  {n}: {args.bins[n]} (sha256 {args.binsha[n]})", flush=True)
     footage = args.footage or default_footage()
     only = set(args.clips.split(",")) if args.clips else None
     clips, skipped = discover(footage, args.test60, only)
@@ -583,7 +605,9 @@ def main():
     refc = [c for c in clips if c["ref"] and "kept" in c]
     nrc = [c for c in clips if not c["ref"] and "kept" in c]
     L = [f"# frame-gen bench: {run_id}", "",
-         f"- **fgtest build**: `{fghash}` (fgtest binary sha256 {binhash}), rebuilt with CCACHE_DISABLE=1 at run start"
+         (f"- **fgtest build**: `{FGTEST}` from the FGTEST environment variable (binary sha256 {binhash}), not rebuilt"
+          if FGTEST_ENV else
+          f"- **fgtest build**: `{fghash}` (fgtest binary sha256 {binhash}), rebuilt with CCACHE_DISABLE=1 at run start")
          + (f"\n- dirty tree:\n```\n{dirty}\n```" if dirty else ""),
          f"- command: `{' '.join(sys.argv)}`",
          f"- seed {args.seed}; windows of {args.warm} warm-up + {args.pairs} scored consecutive pairs, a fresh Interpolator "
@@ -592,8 +616,8 @@ def main():
          f"- **base set**: `{args.base_set}`, applied before every contestant's own settings (global fallback off; UI protection as "
          f"the user plays); UI protection warm-up needs {uw} pairs per window, {args.warm} used",
          f"- footage: `{footage}`", f"- runtime {time.time() - t0:.0f} s; peak work dir {state['peak'] / 1e9:.2f} GB", "",
-         "## Contestants", "", "| name | settings |", "|---|---|"]
-    L += [f"| {n}{' (reference)' if n == REF else ''} | `{s}` |" for n, s in cons.items()]
+         "## Contestants", "", "| name | settings | fgtest binary | binary sha256 |", "|---|---|---|---|"]
+    L += [f"| {n}{' (reference)' if n == REF else ''} | `{s}` | `{args.bins[n]}` | {args.binsha[n]} |" for n, s in cons.items()]
     L += ["", "## Clips", "", "| clip | genre | fps | kind | windows | triples kept | dup-dropped |", "|---|---|---|---|---|---|---|"]
     L += [f"| {c['name']} | {c['genre']} | {c['fps']:g} | {'reference (held-out middle frame)' if c['ref'] else 'no-reference 60->120'} "
           f"| {c['windows']} | {c['kept']} | {c['dropped']} |" for c in refc + nrc]

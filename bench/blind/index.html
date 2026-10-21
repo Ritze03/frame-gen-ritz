@@ -219,12 +219,13 @@ function finish() {
   L.push(`Blind test results for frame-gen session ${S.id}: ${T.length} pairwise trials, voted ${new Date().toISOString().slice(0, 16).replace("T", " ")}.`);
   L.push(`The voter saw each pair unlabelled as Left/Right (sides randomised per trial); contestant names were revealed only after the last vote.`);
   L.push("");
-  L.push(`Builder: fgtest ${S.fgtest}; base set "${S.base_set}" applied before each contestant's set; ${S.warm ?? 0} unscored warm-up pairs before each clip, one continuous fgtest run per clip; seed ${S.seed}; clips ${S.clip_len} s at ${S.fps} fps (real 60 fps frames interleaved with generated in-betweens).`);
+  L.push(`Builder: fgtest ${S.fgtest}; base set "${S.base_set}" applied before each contestant's set; ${S.warm ?? 0} unscored warm-up pairs before each window, one continuous fgtest run per contestant per window; seed ${S.seed}; clips ${S.clip_len} s at ${S.fps} fps (real 60 fps frames interleaved with generated in-betweens).`);
   L.push(`Encode (identical for every clip, real included): ${S.encode}. Stills: lossless PNG.`);
   L.push("Contestants:");
   rev.forEach(r => L.push(`- ${r.name}: ${r.set}`));
-  L.push("Clips:");
-  S.clips.forEach(c => L.push(`- ${c.id}: ${c.source}, genre ${c.genre}, ${c.src_fps} fps source, start ${c.start} s, ${c.len} s, contestants ${c.contestants.map(nm).join(", ")}${c.has_real ? "" : " (no ground truth)"}`));
+  if (S.motion_check) L.push(`Windows (clips): several per source, non-overlapping, spread over the file; motion check: ${S.motion_check}.`);
+  L.push("Clips (one per window; time = source time in s):");
+  S.clips.forEach(c => L.push(`- ${c.id}: ${c.source}${c.window ? ` window ${c.window}/${c.windows}` : ""}, genre ${c.genre}, ${c.src_fps} fps source, ${c.start}-${(c.start + c.len).toFixed(2)} s${c.motion !== undefined ? `, motion ${c.motion}${c.motion_ok === false ? " (below the check)" : ""}` : ""}, contestants ${c.contestants.map(nm).join(", ")}${c.has_real ? "" : " (no ground truth)"}`));
   L.push("");
   L.push(`Trials (vote: L = left better, R = right better, = = can't tell; winner = contestant behind the chosen side):`);
   L.push("| # | type | clip | genre | time s | left | right | vote | winner | repeat of | note |");
