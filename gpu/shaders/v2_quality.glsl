@@ -111,11 +111,17 @@ float qWeightC(vec3 cv, float t) {
     return c / (a + c);
 }
 
+// The static-overlay mask at the flow pixel nearest to full-resolution position q
+float qZAt(vec2 q) {
+    ivec2 m = clamp(ivec2(floor((q + 0.5) * (1.0 / float(pc.fscale)))), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    return float(qb[3 * qN() + m.y * pc.fw + m.x] >> 22) * (1.0 / 1023.0);
+}
+
 // A tap on a static overlay that moves with the field picks the overlay up at the wrong place (a dragged copy of subtitle text): the
 // tap takes the other one (as ui_reject.glsl does with CrosshairV2's mask), softly by how much more of the mask it hits.
 void qRejectStatic(vec2 pa, vec2 pc_, inout vec3 wa, inout vec3 wc) {
     if (all(lessThan(abs(pc_ - pa), vec2(1.0)))) return;   // (nearly) the zero vector: both taps are the overlay's own place
-    float za = qCovAt(pa).z, zc = qCovAt(pc_).z;
+    float za = qZAt(pa), zc = qZAt(pc_);
     vec3 a = wa;
     wa = mix(wa, wc, clamp(2.0 * (za - zc), 0.0, 1.0));
     wc = mix(wc, a, clamp(2.0 * (zc - za), 0.0, 1.0));
