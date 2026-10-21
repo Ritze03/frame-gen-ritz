@@ -1070,8 +1070,13 @@ int main(int argc, char** argv) {
         vkDeviceWaitIdle(dev);
         return 0;
     }
+#ifndef FORMATTEST_NO_MOTION
+    const char* v2ModeName = gMode == V2Mode::Performance ? "performance" : "quality";
+#else
+    const char* v2ModeName = "-";
+#endif
     printf("formattest %dx%d on %s, motion version %s, v2Mode %s (YUV: %s)\n", W, H, props.deviceName, algoV2() ? "V2" : "V1",
-           gMode == V2Mode::Performance ? "performance" : "quality", separatePlanes ? "separate plane images" : "multi-planar image + plane views, falling back to separate images");
+           v2ModeName, separatePlanes ? "separate plane images" : "multi-planar image + plane views, falling back to separate images");
     apiChecks(W, H);
     Scene sc(W, H, 12);
     // reference: the Rgba8 path of the same scene
