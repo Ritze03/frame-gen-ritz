@@ -28,16 +28,22 @@ enum class UiProtection : uint32_t {
 enum class MotionVersion : uint32_t {
     V1 = 0,   // the algorithm of proto/interp.py (the frozen reference), every Format: output byte-identical to a library without the
               // choice. The default.
-    V2 = 1,   // the second algorithm, next to V1 (unchanged). Rgba8 only: settingsError() refuses it with any other Format. For now it
-              // runs V1's passes (its own pipelines of the same shaders), so its output equals V1's until its own shaders land.
-              // Settings::v2Mode picks between its two modes.
+    V2 = 1,   // the second algorithm, next to V1 (unchanged): a "morphing" interpolator (content is warped along a smooth field and
+              // stretched over gaps; no real frame is shown locally, only the whole-frame scene-cut / flick fallbacks). Rgba8 only:
+              // settingsError() refuses it with any other Format. Settings::v2Mode picks between its two modes. Its motion estimate
+              // computes V1's block field with faster passes (shared by both modes).
 };
 
 // The two modes of MotionVersion::V2 (Settings::v2Mode). Values are append-only and never renumbered. Runtime: setSettings() at any
-// time, no rebuild. V1 ignores it. For now both modes run V2's alias of V1's passes, so their output equals V1's.
+// time, no rebuild, no pipeline creation; a switch keeps the current estimate (the part of the estimate the other mode needs is
+// derived by its first recordSynth / recordSynthBlur, with the same output as that mode's own estimate). V1 ignores it.
 enum class V2Mode : uint32_t {
-    Quality = 0,       // the default: the better picture for more GPU time
-    Performance = 1,   // less GPU time per generated frame
+    Quality = 0,       // the default: the better picture for more GPU time. For now V1's per-pixel field and synthesis on V2's
+                       // estimate: V1's output, bit-identical (RX 7900 XTX, 1080p 2x: ~0.24 ms per pair vs V1's 0.34).
+    Performance = 1,   // the "grid morph": the finest block field (16x16 px cells at flowScale 2) re-picked among neighbours,
+                       // refined and cleaned (vector median + light smoothing), upsampled bilinearly to full resolution and taken to
+                       // time t per pixel; one full-resolution two-tap blend (and a zero-vector candidate where the two frames agree,
+                       // for HUD text and static overlays). No per-pixel trust or hold. RX 7900 XTX, 1080p 2x: ~0.15 ms per pair.
 };
 
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
@@ -515,6 +521,8 @@ public:
     // "ui_inpaint" (both recorded by recordObserve; a profile opened by an observe is continued by the next
     // recordEstimate) and "ui_patch" (the paste-back, per recordSynth). recordSynthBlur adds "blur lookup", "blur mismatch", "blur resolve"
     // (the average of all samples) and "blur fixup" (the whole-frame fallback check, a no-op in the normal case), then "ui_patch".
+    // MotionVersion::V2: its estimate ends after the levels; Quality adds "subpixel" and "pixel field" (once per estimate), Performance
+    // "field clean" (once per estimate: re-pick, refinement, clean-up) and per synth "morph" / "blur morph" and "fallback" (its fix-up).
     bool readTimings(std::vector<const char*>& names, std::vector<uint64_t>& ticks);
 
     // Debug / test only (bench/score), read-only: changes no output and no state. Records a copy of the latest recordSynth's
@@ -522,7 +530,8 @@ public:
     // ramp past its midpoint), finest-level SAD sum x 256 (from the estimate)]. Preceded by a COMPUTE write -> TRANSFER read
     // barrier; the caller adds its own TRANSFER -> HOST barrier. The global fallback fires when untrusted > globalFallback x W x H,
     // the scene cut when sadSum / 256 / debugSadBlocks() > sceneCutSad. Both counts are computed whatever those settings are.
-    // Not meaningful after recordSynthBlur. False if not initialised.
+    // Not meaningful after recordSynthBlur. V2 Performance: untrusted = the pixels of the 8x8 tiles whose mean mismatch is past the
+    // midpoint, SAD sum = its own (the re-picked, refined block vectors' SADs). False if not initialised.
     bool recordDebugCounters(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
     uint32_t debugSadBlocks() const;   // the scene-cut mean's block count (finest pyramid level); 0 if not initialised
     // Debug / test only (fgtest --dump), read-only like recordDebugCounters: copies the latest record's / recordSynth's maps into dst at
@@ -530,6 +539,8 @@ public:
     // sub-pixel), the per-pixel half-vector field on the midpoint grid (fw x fh vec2) and the packed full-res mismatch e (one byte per
     // pixel, eStride words per row, 4 pixels per word, low byte first; e of the latest synth, before the 7x7 box). Preceded by a
     // COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
+    // V2 Performance (same layout): the block slot holds the cleaned block field its morph uses; the per-pixel field and e (it has
+    // neither) are zero.
     struct DebugMapLayout {
         uint32_t W, H, fw, fh, bw, bh, fscale, eStride;   // eStride in uint32 words
         VkDeviceSize blockOff, pixOff, eOff, size;          // byte offsets in dst (relative to dstOffset) and the total size
