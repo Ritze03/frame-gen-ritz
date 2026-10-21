@@ -1,0 +1,41 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// V2 Quality, coverage step 2 (flow resolution, once per estimate): per midpoint location, does prev / curr still show its content
+// (it won its footprint there, nearly, or the winner moves the same way; a footprint outside the frame: no), box-filtered over
+// (2 Q_R + 1)^2 locations into the coverage (cP, cC) the gather weights its taps with. See v2_quality.glsl.
+#include "common.glsl"
+#include "v2_motion.glsl"
+#include "v2_quality.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const int TS = 8, TT = TS + 2 * Q_R;
+shared vec2 vis[TT * TT];
+
+bool sees(int off, int pix, uint own, vec2 hq) {
+    if (pix < 0) return false;
+    uint w = qb[off + pix];
+    return (own >> 20) <= (w >> 20) + uint(pc.t[0] * Q_KEY) || all(lessThanEqual(abs(qVec(w) - hq), vec2(pc.t[1])));
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - Q_R;
+    int N = qN();
+    for (int i = lid; i < TT * TT; i += TS * TS) {
+        ivec2 m = clamp(t0 + ivec2(i % TT, i / TT), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+        uint own = qb[2 * N + m.y * pc.fw + m.x];
+        vec2 hq = qVec(own);   // the vector m splatted with (quantized)
+        vec2 h = qF(m);
+        vis[i] = vec2(sees(0, qPix(vec2(m) - h), own, hq) ? 1.0 : 0.0, sees(N, qPix(vec2(m) + h), own, hq) ? 1.0 : 0.0);
+    }
+    barrier();
+    ivec2 m = ivec2(gl_GlobalInvocationID.xy);
+    if (m.x >= pc.fw || m.y >= pc.fh) return;
+    ivec2 l = ivec2(gl_LocalInvocationID.xy) + Q_R;
+    vec2 s = vec2(0.0);
+    for (int j = -Q_R; j <= Q_R; j++)
+        for (int i = -Q_R; i <= Q_R; i++) s += vis[(l.y + j) * TT + l.x + i];
+    int me = 3 * N + m.y * pc.fw + m.x;
+    float z = uintBitsToFloat(qb[me]);   // v2_qfield's static-overlay mask
+    qb[me] = qPackCov(s * (1.0 / float((2 * Q_R + 1) * (2 * Q_R + 1))), z);
+}
