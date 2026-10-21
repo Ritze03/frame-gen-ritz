@@ -49,6 +49,9 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     vec3 ra = a.rgb, rc = c.rgb;
     uiReject(pa, pc_, ra, rc);
     vec3 wa = FG_FETCH(ra), wc = FG_FETCH(rc);
+#ifdef V2_QUALITY
+    if (pc.gauss >= 2) qRejectStatic(pa, pc_, wa, wc);   // TEMP knob: a tap on a static overlay (subtitle text) takes the other tap
+#endif
     vec3 d = abs(wa - wc);
     float em = max(d.r, max(d.g, d.b));
 #ifdef V2_QUALITY
@@ -58,6 +61,25 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
 #endif
     al = (1.0 - wt) * a.a + wt * c.a;
     vec3 m = (1.0 - wt) * wa + wt * wc;
+#ifdef V2_QUALITY
+    // TEMP experiment: blur along the motion where the taps disagree
+    if (pc.fIn > 0 && em > Q_B0) {
+        float beta = clamp((em - Q_B0) * (1.0 / Q_B1), 0.0, 1.0);
+        vec2 st = (float(pc.fIn) * 0.01) * (2.0 * g);   // half-length of the streak
+        vec3 acc = vec3(0.0);
+        for (int j = -2; j <= 2; j++) {
+            if (j == 0) continue;
+            vec2 o = st * (float(j) * 0.5);
+            vec2 qa = pa + o, qc = pc_ + o;
+            vec3 xa = tapRaw(texPrev, qa).rgb, xc = tapRaw(texCurr, qc).rgb;
+            uiReject(qa, qc, xa, xc);
+            vec3 ya = FG_FETCH(xa), yc = FG_FETCH(xc);
+            if (pc.gauss >= 2) qRejectStatic(qa, qc, ya, yc);
+            acc += (1.0 - wt) * ya + wt * yc;
+        }
+        m = mix(m, (m + acc) * 0.2, beta);
+    }
+#endif
     // the zero vector where it fits clearly better: a pixel the two frames show unchanged (a HUD element, text, static background
     // next to a moving object, which the smooth field would drag along) keeps its place
 #ifdef V2_QUALITY
@@ -99,7 +121,7 @@ void pixelOut(ivec2 p, bool counting, bool cut) {
         float t = pc.t[k];
         // midpoint rule: slice centres map to x = (2k + 1 - N) / N, the window ends to x = -+1 (blur_resolve.comp)
         float x = (2.0 * float(k) + 1.0 - float(pc.n)) / float(pc.n);
-        float w = pc.gauss != 0 ? exp(-2.0 * x * x) : 1.0;
+        float w = (pc.gauss & 1) != 0 ? exp(-2.0 * x * x) : 1.0;
         bool real = t <= 0.0 || t >= 1.0;
         bool fb = cut || (!counting && float(u[pc.cnt + k]) > limit);   // uniform
         vec3 v = vec3(0.0);

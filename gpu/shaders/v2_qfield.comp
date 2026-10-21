@@ -45,10 +45,24 @@ void main() {
     vec2 fl = floor(s);
     vec2 f = s - fl;
     ivec2 i = ivec2(fl);
-    vec2 v[4] = vec2[4](VF(i), VF(i + ivec2(1, 0)), VF(i + ivec2(0, 1)), VF(i + ivec2(1, 1)));
-    float b[4] = float[4]((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
-    vec2 lo = min(min(v[0], v[1]), min(v[2], v[3])), hi = max(max(v[0], v[1]), max(v[2], v[3]));
-    vec2 h = b[0] * v[0] + b[1] * v[1] + b[2] * v[2] + b[3] * v[3];
+    vec2 v[9];
+    float b[9];
+    v[0] = VF(i); v[1] = VF(i + ivec2(1, 0)); v[2] = VF(i + ivec2(0, 1)); v[3] = VF(i + ivec2(1, 1));
+    b[0] = (1.0 - f.x) * (1.0 - f.y); b[1] = f.x * (1.0 - f.y); b[2] = (1.0 - f.x) * f.y; b[3] = f.x * f.y;
+    vec2 h = b[0] * v[0] + b[1] * v[1] + b[2] * v[2] + b[3] * v[3];   // the bilinear blend (where the candidates agree)
+    int nc = 4;
+    if (pc.t[15] > 0.5) {   // the 3x3 blocks around the nearest one, weighted by distance (a vector one block further is a candidate)
+        ivec2 c0 = ivec2(floor(s + 0.5));
+        nc = 9;
+        for (int k = 0; k < 9; k++) {
+            ivec2 bk = c0 + ivec2(k % 3 - 1, k / 3 - 1);
+            v[k] = VF(bk);
+            vec2 dd = vec2(bk) - s;
+            b[k] = exp(-dot(dd, dd) * pc.t[10]);
+        }
+    }
+    vec2 lo = v[0], hi = v[0];
+    for (int k = 1; k < nc; k++) { lo = min(lo, v[k]); hi = max(hi, v[k]); }
     bool moving = max(max(abs(lo.x), abs(hi.x)), max(abs(lo.y), abs(hi.y))) > 1.0;
     bool zc = false;   // the zero vector is a candidate: where the field moves and the pixel has structure (HUD, subtitle text)
     float e0 = 0.0, con = 1.0;
@@ -61,17 +75,17 @@ void main() {
     bool soft0 = zc && pc.t[9] < 1.5;   // QZ=1: the zero vector in the soft blend
     float emot = 0.0;
     if (soft0 || (pc.t[6] > 0.5 && max(hi.x - lo.x, hi.y - lo.y) > Q_FSAME)) {
-        float e[4];
+        float e[9];
         float emin = soft0 ? e0 : 1e9, em2 = 1e9;
-        for (int k = 0; k < 4; k++) { e[k] = err(vec2(m), v[k]); emin = min(emin, e[k]); em2 = min(em2, e[k]); }
+        for (int k = 0; k < nc; k++) { e[k] = err(vec2(m), v[k]); emin = min(emin, e[k]); em2 = min(em2, e[k]); }
         vec2 acc = vec2(0.0);
         float ws = 0.0;
-        for (int k = 0; k < 4; k++) {
-            float w = (b[k] + pc.t[8]) * exp(-(e[k] - emin) / pc.t[7]);
+        for (int k = 0; k < nc; k++) {
+            float w = (b[k] + pc.t[8]) * exp(-(e[k] - emin) / (pc.t[7] + pc.t[5] * emin));
             acc += w * v[k];
             ws += w;
         }
-        if (soft0) ws += (1.0 + pc.t[8]) * exp(-(e0 - emin) / pc.t[7]);   // (+ 0 * its weight)
+        if (soft0) ws += (1.0 + pc.t[8]) * exp(-(e0 - emin) / (pc.t[7] + pc.t[5] * emin));   // (+ 0 * its weight)
         h = acc / ws;
         emot = em2;
     } else if (zc) {

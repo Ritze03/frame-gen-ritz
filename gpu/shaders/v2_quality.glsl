@@ -20,6 +20,7 @@ const uint Q_MARGIN = 16u;    // 2 luma levels
 const float Q_TOL = 0.75;     // flow px of half-vector (max-abs): "moves the same way"
 const int Q_R = 2;            // box radius of the coverage (flow px)
 const float Q_EPS = 0.03;
+const float Q_B0 = 24.0, Q_B1 = 24.0;   // TEMP blur experiment
 const float Q_SGAIN = 0.5;    // qStructure: weight of the local contrast against the zero vector's own mismatch     // floor of a side's weight: both sides hidden -> the plain (1 - t, t) blend
 
 const float Q_FSAME = 0.5;   // v2_qfield: block vectors within this (flow px, max-abs) count as one motion
@@ -99,6 +100,17 @@ float qZeroMask(vec2 q) {
     float z00 = float(qb[o + i.y * pc.fw + i.x] >> 22), z01 = float(qb[o + i.y * pc.fw + j.x] >> 22);
     float z10 = float(qb[o + j.y * pc.fw + i.x] >> 22), z11 = float(qb[o + j.y * pc.fw + j.x] >> 22);
     return mix(mix(z00, z01, f.x), mix(z10, z11, f.x), f.y) * (1.0 / 1023.0);
+}
+
+// A tap on a static overlay (the mask of the frame pair, v2_qfield) that moves with the field picks up the overlay at the wrong place
+// (a dragged copy of subtitle text): the tap takes the other one (as ui_reject.glsl does for CrosshairV2's mask), softly by how much
+// more of the mask it hits.
+void qRejectStatic(vec2 pa, vec2 pc_, inout vec3 wa, inout vec3 wc) {
+    if (all(lessThan(abs(pc_ - pa), vec2(1.0)))) return;   // (nearly) the zero vector: both taps are the overlay's own place
+    float za = qZeroMask(pa), zc = qZeroMask(pc_);
+    vec3 a = wa;
+    wa = mix(wa, wc, clamp(2.0 * (za - zc), 0.0, 1.0));
+    wc = mix(wc, a, clamp(2.0 * (zc - za), 0.0, 1.0));
 }
 
 // The gather's share of curr at output pixel q (full resolution) at time t, g the half-vector there (full-res px): the coverage of

@@ -1965,15 +1965,18 @@ void Interpolator::Impl::v2Tail(VkCommandBuffer cb) {
     if (!cov) return;
     {   // TEMP tuning knobs (I5 experiments)
         auto ev = [](const char* n, float d) { const char* e = getenv(n); return e ? (float)atof(e) : d; };
-        v.t[0] = ev("QM", 2.0f); v.t[1] = ev("QT", 0.75f); v.t[2] = ev("QK", 0.0f); v.t[3] = ev("QS", 0.0f);
-        v.t[4] = ev("QS0", 2.0f); v.t[5] = ev("QS1", 8.0f);
+        v.t[0] = ev("QM", 8.0f); v.t[1] = ev("QT", 0.75f); v.t[2] = ev("QK", 0.0f); v.t[3] = ev("QS", 1.0f);
+        v.t[4] = ev("QW", 6.0f); v.t[5] = ev("QFK", 1.0f);
         v.t[6] = ev("QF", 1.0f); v.t[7] = ev("QFS", 2.0f); v.t[8] = ev("QFB", 0.1f);
-        v.t[9] = ev("QZ", 1.0f); v.t[10] = ev("QZP", 3.0f); v.t[11] = ev("QZC", 16.0f); v.t[12] = ev("QG", 1.0f); v.t[13] = ev("QZR0", 0.04f); v.t[14] = ev("QZR1", 0.08f);
+        v.t[9] = ev("QZ", 2.0f); v.t[11] = ev("QZC", 16.0f); v.t[12] = ev("QG", 1.0f); v.t[13] = ev("QZR0", 0.04f); v.t[14] = ev("QZR1", 0.08f);
+        v.t[15] = ev("QC9", 0.0f); v.t[10] = ev("QC9S", 1.0f);
     }
     r.runV2(P_V2_QFIELD, v, divUp(fw, 8), divUp(fh, 8));
     r.cbar();
+    r.stamp("pixel field");
     r.runV2(P_V2_QOWN, v, divUp(fw, 8), divUp(fh, 8));
     r.cbar();
+    r.stamp("splat");
     r.runV2(P_V2_QCOV, v, divUp(fw, 8), divUp(fh, 8));
     r.cbar();
     r.stamp("coverage");
@@ -1997,9 +2000,12 @@ bool Interpolator::Impl::v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set_, 0, nullptr);
     v2Tail(cb);
     const Pipe morph = set.v2Mode == V2Mode::Quality ? P_V2_QMORPH : P_V2_MORPH;
-    if (set.v2Mode == V2Mode::Quality) { const char* e = getenv("QE"); v.sigma2Inv = e ? (float)atof(e) : 0.03f; }   // TEMP knob
+    if (set.v2Mode == V2Mode::Quality) {   // TEMP knobs
+        const char* e = getenv("QE"); v.sigma2Inv = e ? (float)atof(e) : 0.03f;
+        e = getenv("QB"); v.fIn = e ? atoi(e) : 25;
+    }
     v.n = n;
-    v.gauss = gauss;
+    v.gauss = gauss + (set.v2Mode == V2Mode::Quality && !(getenv("QRJ") && !atoi(getenv("QRJ"))) ? 2 : 0);   // TEMP knob
     for (int k = 0; k < n; k++) v.t[k] = ts[k];
     r.runV2(morph, v, divUp((int)W, 8), divUp((int)H, 8));
     r.cbar();

@@ -14,7 +14,7 @@ shared vec2 vis[TT * TT];
 bool sees(int off, int pix, uint own, vec2 hq) {
     if (pix < 0) return false;
     uint w = qb[off + pix];
-    return (own >> 20) <= (w >> 20) + uint(pc.t[0] * Q_KEY) || all(lessThanEqual(abs(qVec(w) - hq), vec2(pc.t[1])));
+    return (own >> 20) <= (w >> 20) + uint(pc.t[0] * Q_KEY) || (w >> 20) > uint(pc.t[4] * Q_KEY) || all(lessThanEqual(abs(qVec(w) - hq), vec2(pc.t[1])));
 }
 
 void main() {
