@@ -29,25 +29,6 @@
 #include "blur_lookup_spv.h"
 #include "blur_error_spv.h"
 #include "blur_resolve_spv.h"
-#include "v2_occl_spv.h"
-#include "v2_resolve_spv.h"
-#include "v2_blur_resolve_spv.h"
-#include "v2_smooth_spv.h"
-#include "v2_refine_spv.h"
-#include "v2_lookup_spv.h"
-#include "v2_error_spv.h"
-#include "v2_seed_spv.h"
-#include "v2_cover_spv.h"
-#include "v2_rescue_spv.h"
-#include "v2_merge_spv.h"
-#include "v2_close_spv.h"
-#include "v2_hold_spv.h"
-#include "v2_blur_hold_spv.h"
-#include "v2_search_spv.h"
-#include "v2_blur_error_spv.h"
-#include "v2_gate_spv.h"
-#include "v2_rcheck_e_spv.h"
-#include "v2_rcheck_spv.h"
 
 // The colour shaders of the formats other than Rgba8 (shaders/format.glsl), when built.
 // rgb10: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
@@ -197,20 +178,6 @@ struct PC {
 static_assert(sizeof(PC) <= 128, "push constants beyond the guaranteed minimum");
 static const int kEOff = 64;   // == E_OFF in motion_v1.glsl
 
-// Must match the push-constant block in shaders/motion_v2.glsl. V2's own passes push it over the same range of the same pipeline
-// layout (sizeof(PC) bytes, so the layouts stay one and the descriptor set stays bound); V2's shared passes push PC.
-struct PC2 {
-    int32_t W, H, fw, fh, fscale, pf, offA, offC, reach, clsOff;
-    float s, wA, wC, trust0, trustScale, occ0, occScale, pickBias, edgeMin, confMax, zeroBonus;
-    int32_t rw, rh, rpf, rfOut, fE;
-    float edgeK;
-    int32_t tFlags;   // the temporal store: bit 0 parity of this estimate, bit 1 the previous estimate is usable (v2_temporal.glsl)
-    float tBonus;
-    int32_t lw, lh;   // v2_seed: the coarsest pyramid level
-    float rescue;     // v2_rescue: V2Knobs rescue
-};   // (full: the estimate's I12 passes take their parameter in occ0, which only the synth reads otherwise; motion_v2.glsl)
-static_assert(sizeof(PC2) == sizeof(PC), "PC2 is pushed over PC's range");
-
 // Must match the push-constant block in shaders/ui_common.glsl.
 struct UiPC {
     int32_t W, H, boxX, boxY, boxW, boxH, cell, cw, ch, wholeScreen, still;
@@ -232,19 +199,7 @@ struct BlurPC {
     float t[16];
 };
 static_assert(sizeof(BlurPC) <= 128, "push constants beyond the guaranteed minimum");
-// Must match the push-constant block in shaders/blur_motion_v2.glsl (v2_blur_resolve.comp; V2's blur lookup / error push BlurPC).
-// (V2's three blur passes push it: v2_blur_lookup, v2_blur_error, v2_blur_resolve.)
-struct BlurPC2 {
-    int32_t wh, fwh, rwh;   // W | H << 16, fw | fh << 16, rw | rh << 16 (the refinement grid)
-    int32_t misc;           // fscale | n << 4 | k0 << 9 | flags << 16 (flags: bit 0 Gaussian, bit 1 the fix-up pass)
-    int32_t blocks;
-    float cutSad, trust0, trustScale, globalFrac, occ0, occScale, pickBias, zeroBonus;
-    float t[16];
-    float feather, occSoft;   // V2Knobs holdFeather, occSoft
-    int32_t pad_;
-};
-static_assert(sizeof(BlurPC2) == sizeof(BlurPC), "BlurPC2 is pushed over BlurPC's range");
-enum BlurPipe { B_LOOKUP, B_ERROR, B_RESOLVE, B_HOLD, B_COUNT_ };   // B_HOLD: V2 only (v2_blur_hold.comp)
+enum BlurPipe { B_LOOKUP, B_ERROR, B_RESOLVE, B_COUNT_ };
 static const int kBlurCnt0 = 32;   // == CNT0 in blur_motion_v1.glsl: u[] words 32.. hold the per-sample untrusted counts
 
 struct UiBuf { VkBuffer b = VK_NULL_HANDLE; VkDeviceMemory m = VK_NULL_HANDLE; VkDeviceSize size = 0; };
@@ -266,29 +221,20 @@ struct UiEntry {
     bool active = false;                // in the LRU set (Settings::uiHistory of them); an inactive one keeps its memory
 };
 
-enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
-            P_V2OCCL, P_V2SMOOTH, P_V2REFINE,   // V2 only: v2_occl / v2_smooth / v2_refine.comp (V1's group leaves them null)
-            P_V2SEED,                           // V2 only: v2_seed.comp (the temporal store, D19)
-            P_V2COVER, P_V2RESCUE, P_V2MERGE, P_V2CLOSE,   // V2 only: the content rescue (I11): v2_cover / rescue / merge / close.comp
-            P_V2HOLD,                           // V2 only: the soft hold edge's map (I11): v2_hold.comp
-            P_V2GATE,                           // V2 only: the occlusion gate (I12): v2_gate.comp
-            P_V2RCHECKE, P_V2RCHECK,            // V2 only: the content rescue's acceptance check (I12): v2_rcheck_e / v2_rcheck.comp
-            P_COUNT };
+enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP, P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
 // The resources of one motion version (Settings::motionVersion): created by motionEnsure() the first time the version is selected
 // (init, setSettings, reconfigure), kept while another one is selected, freed by releaseUnusedMotion() / destroy(). V1: the pipelines
-// of the estimate / synth passes and of the motion-blur passes over the shared layouts, set rings and scratch buffers. V2: its own
-// pipelines (of V1's shaders for the passes it shares, of v2_*.comp for its own: P_V2SEED, P_SEARCH (v2_search), P_V2OCCL, P_V2SMOOTH,
-// P_V2REFINE, P_LOOKUP, P_ERROR, P_RESOLVE, B_ERROR, B_RESOLVE; no B_LOOKUP: its blur computes the field at t_k on the fly) and its
-// buffers (bufs[0], binding 13: the occlusion map + the class map + the temporal store, v2_temporal.glsl; bufs[1], binding 14: the
-// refined fields, packed (v2_pack.glsl); motion_v2.glsl; created by motionSized(), bufs[1] grown by recordEstimate()).
+// of the estimate / synth passes and of the motion-blur passes over the shared layouts, set rings and scratch buffers. V2 aliases V1
+// for now: its group holds its own pipelines of V1's shaders, so the switch, the release and the re-creation are the real ones; its
+// own shaders (v2_*.comp) replace them, and its own size-dependent buffers go into `bufs` (created by motionSized()).
 static const int kMotionVersions = 2;   // MotionVersion::V1, V2
 struct MotionGroup {
     VkPipeline pipes[P_COUNT]{};
     VkPipeline blurPipes[B_COUNT_]{};
-    std::vector<UiBuf> bufs;   // size-dependent buffers of this version only (V2: bufs[0], bufs[1]), freed with the size like buf[]
+    std::vector<UiBuf> bufs;   // size-dependent buffers of this version only (none yet), freed with the size like buf[]
     bool live = false;         // created (the pipelines; the buffers whenever a size is held)
 };
 
@@ -343,13 +289,6 @@ struct Interpolator::Impl {
     // latest recordEstimate (recordSynth uses its results)
     bool haveEst = false;
     VkImageView estPrev = VK_NULL_HANDLE, estCurr = VK_NULL_HANDLE;   // the Y / only views of the estimate's pair
-    int estRw = 0, estRh = 0;          // V2: the refinement grid of the latest estimate (its synths read that grid)
-    // V2's temporal store (D19, shaders/v2_temporal.glsl): the field of the previous V2 estimate is kept in bufs[0] for the next one.
-    // v2SeedOk: a V2 estimate was recorded since the store was last invalidated (init, resize, reconfigure, a switch of the motion
-    // version: everything that drops the estimate); the shaders also check on the GPU that the new pair continues the last one.
-    // v2Par: the parity of the next V2 estimate (its store slot; the previous one's is the other).
-    bool v2SeedOk = false;
-    uint32_t v2Par = 0;
 
     // size dependent
     uint32_t W = 0, H = 0;
@@ -421,19 +360,6 @@ struct Interpolator::Impl {
     uint32_t qcount = 0;
 
     VkDescriptorSet takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur = false, RejPair rej = {});
-    // V2's buffer (binding 13) when V2 is selected and sized, else null (V1's sets leave binding 13 unwritten: no V1 shader declares it)
-    VkBuffer v2Buf() { MotionGroup& g = mg(); return set.motionVersion == MotionVersion::V2 && !g.bufs.empty() ? g.bufs[0].b : VK_NULL_HANDLE; }
-    VkDeviceSize v2OccWords() const { return (VkDeviceSize)4 * fw * fh; }   // V2's occlusion map, in words; the class map follows
-    // all of V2's buffer (binding 13), in words: the occlusion map, the class map, the temporal store (v2_temporal.glsl: two field slots,
-    // the compensated field, two slots of the coarsest pyramid level)
-    VkDeviceSize v2Words() const {
-        return v2OccWords() + (VkDeviceSize)((W + 3) / 4) * H + (VkDeviceSize)6 * fw * fh + (VkDeviceSize)2 * lv.back().w * lv.back().h +
-               (VkDeviceSize)((W + 3) / 4) * ((H + 3) / 4);
-    }
-    // V2's refined-field buffer (binding 14) when V2 is selected and sized, else null
-    VkBuffer v2Field() { MotionGroup& g = mg(); return set.motionVersion == MotionVersion::V2 && g.bufs.size() > 1 ? g.bufs[1].b : VK_NULL_HANDLE; }
-    // V2's refinement grid for the current settings (V2Knobs refineRes % of W x H per axis, at least 1)
-    void refineDims(int& rw, int& rh) const;
     bool framesOk(const Frame& a) const { return a.view && (!yuv || a.chroma); }
     bool createSizeDependent();
     bool rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force);
@@ -585,7 +511,7 @@ bool Interpolator::Impl::allocBuf(UiBuf& b, VkDeviceSize bytes) {
     b = UiBuf{};
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // src: recordDebugMaps
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (CreateBuffer(info.device, &bci, nullptr, &b.b) != VK_SUCCESS) { b.b = VK_NULL_HANDLE; return false; }
     VkMemoryRequirements req;
     GetBufferMemoryRequirements(info.device, b.b, &req);
@@ -919,10 +845,9 @@ bool Interpolator::init(const InitInfo& ii) {
     if (m->CreateSampler(d, &sci, nullptr, &m->sampler) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
 
     // bindings 0-2 buffers, 3-4 prev/curr, 5 out; 6-7: motion-blur scratch (only the blur passes use them);
-    // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out; 11-12 (synth sets): the V2 masks of prev / curr (ui_reject.glsl);
-    // 13, 14: MotionVersion::V2's buffers (motion_v2.glsl; written only into the sets of V2 records)
+    // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out; 11-12 (synth sets): the V2 masks of prev / curr (ui_reject.glsl)
     uint32_t nb = m->yuv ? 11 : 8;
-    VkDescriptorSetLayoutBinding b[15]{};
+    VkDescriptorSetLayoutBinding b[13]{};
     VkDescriptorType types[11] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -936,7 +861,7 @@ bool Interpolator::init(const InitInfo& ii) {
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         if (i == 3 || i == 4 || i == 8 || i == 9) b[i].pImmutableSamplers = &m->sampler;
     }
-    for (uint32_t k = 11; k <= 14; k++, nb++) {
+    for (uint32_t k = 11; k <= 12; k++, nb++) {
         b[nb].binding = k;
         b[nb].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         b[nb].descriptorCount = 1;
@@ -1097,7 +1022,6 @@ bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool forc
     destroySizeDependent();
     W = H = 0;
     haveEst = false;
-    v2SeedOk = false;
     if (!ok) return false;
     info.viewFormat = fmt;
     W = w; H = h;
@@ -1109,7 +1033,6 @@ bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool forc
     return true;
 }
 
-static bool v2Valid(const Settings& s);
 bool Interpolator::validate(const Settings& s) {
     auto in = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
     return in(s.trustLow, 0.0f, 255.0f) && in(s.trustHigh, 0.0f, 255.0f) && s.trustHigh - s.trustLow >= 1.0f &&
@@ -1118,6 +1041,7 @@ bool Interpolator::validate(const Settings& s) {
            in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V2 &&
+           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
            in(s.uiBoxHeightFrac, 0.0f, 1.0f) &&
@@ -1127,53 +1051,7 @@ bool Interpolator::validate(const Settings& s) {
            s.uiInpaintReach >= 1 && s.uiInpaintReach <= 16 &&
            in(s.uiMaxStillFraction, 0.0f, 1.0f) && s.uiMaxStillFraction > 0.0f &&
            in(s.uiContrastThreshold, 0.0f, 255.0f) && s.uiLeaveFrames >= 1 && s.uiLeaveFrames <= 255 && s.uiReentryFrames <= 255 &&
-           s.uiHistory >= kUiFrames && s.uiHistory <= kUiFramesMax && v2Valid(s);
-}
-
-// MotionVersion::V2: the knob values of each preset (MotionPreset A-D, in order). -1 for the trust ramp = Settings::trustLow / trustHigh,
-// -1 for the occlusion ramp = the effective trust ramp. Fields: occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow,
-// trustHigh, refineRes, edgeSigma, temporal, temporalBonus, rescue, holdFeather, occSoft, occGate, seedMargin, rescueCheck (V2Knobs).
-// (I12: A and D take the occlusion gate and the rescue check; B and C stay as in round 1; the seed margin is off everywhere.)
-static const V2Knobs kV2Presets[4] = {
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f, 1.0f, 0.0f, 256.0f},     // A balanced
-    {4.0f, 3.0f, 6.0f, -1.0f, -1.0f, 2.0f, -1.0f, -1.0f, 100.0f, 12.0f, 1.0f, 1.0f, 12.0f, 12.0f, 4.0f, 0.0f, 0.0f, 0.0f},   // B safe (soft hold edge)
-    {1.0f, 6.0f, 16.0f, -1.0f, -1.0f, 0.5f, 16.0f, 48.0f, 100.0f, 5.0f, 1.0f, 3.0f, 24.0f, 0.0f, 4.0f, 0.0f, 0.0f, 0.0f},    // C bold
-    {2.0f, 4.0f, 12.0f, -1.0f, -1.0f, 1.0f, 16.0f, 48.0f, 100.0f, 8.0f, 1.0f, 2.0f, 16.0f, 0.0f, 4.0f, 1.0f, 0.0f, 256.0f},    // D = A + trust 16 / 48
-};
-
-V2Knobs Interpolator::v2Knobs(const Settings& s) {
-    V2Knobs k = kV2Presets[std::min((uint32_t)s.v2Preset, 3u)];
-    auto ov = [](float& knob, float v) { if (v != -1.0f) knob = v; };
-    ov(k.occlWidth, s.v2OcclWidth); ov(k.reach, s.v2Reach); ov(k.confidence, s.v2Confidence);
-    ov(k.occLow, s.v2OccLow); ov(k.occHigh, s.v2OccHigh); ov(k.pickBias, s.v2PickBias);
-    ov(k.trustLow, s.v2TrustLow); ov(k.trustHigh, s.v2TrustHigh);
-    ov(k.refineRes, s.v2RefineRes); ov(k.edgeSigma, s.v2EdgeSigma);
-    ov(k.temporal, s.v2Temporal); ov(k.temporalBonus, s.v2TemporalBonus);
-    ov(k.rescue, s.v2Rescue); ov(k.holdFeather, s.v2HoldFeather); ov(k.occSoft, s.v2OccSoft);
-    ov(k.occGate, s.v2OccGate); ov(k.seedMargin, s.v2SeedMargin); ov(k.rescueCheck, s.v2RescueCheck);
-    if (k.trustLow == -1.0f) k.trustLow = s.trustLow;
-    if (k.trustHigh == -1.0f) k.trustHigh = s.trustHigh;
-    if (k.occLow == -1.0f) k.occLow = k.trustLow;
-    if (k.occHigh == -1.0f) k.occHigh = k.trustHigh;
-    k.reach = std::nearbyint(k.reach);
-    k.refineRes = std::nearbyint(k.refineRes);
-    k.temporal = k.temporal >= 0.5f ? 1.0f : 0.0f;
-    return k;
-}
-
-// The V2 fields: each -1 (the preset's value) or in its range; the effective ramps are proper (high >= low + 1).
-static bool v2Valid(const Settings& s) {
-    auto in = [](float v, float lo, float hi) { return v == -1.0f || (std::isfinite(v) && v >= lo && v <= hi); };
-    if ((uint32_t)s.v2Preset > (uint32_t)MotionPreset::D) return false;
-    if (!in(s.v2OcclWidth, 0.5f, 64.0f) || !in(s.v2Reach, 1.0f, 16.0f) || !in(s.v2Confidence, 1.0f, 255.0f) ||
-        !in(s.v2OccLow, 0.0f, 255.0f) || !in(s.v2OccHigh, 0.0f, 255.0f) || !in(s.v2PickBias, 0.0f, 255.0f) ||
-        !in(s.v2TrustLow, 0.0f, 255.0f) || !in(s.v2TrustHigh, 0.0f, 255.0f) || !in(s.v2RefineRes, 1.0f, 100.0f) ||
-        !in(s.v2EdgeSigma, 1.0f, 255.0f) || !in(s.v2Temporal, 0.0f, 1.0f) || !in(s.v2TemporalBonus, 0.0f, 255.0f) ||
-        !in(s.v2Rescue, 0.0f, 64.0f) || !in(s.v2HoldFeather, 0.0f, 32.0f) || !in(s.v2OccSoft, 0.0f, 64.0f) ||
-        !in(s.v2OccGate, 0.0f, 1.0f) || !in(s.v2SeedMargin, 0.0f, 64.0f) || !in(s.v2RescueCheck, 0.0f, 4096.0f))
-        return false;
-    const V2Knobs k = Interpolator::v2Knobs(s);
-    return k.trustHigh - k.trustLow >= 1.0f && k.occHigh - k.occLow >= 1.0f;
+           s.uiHistory >= kUiFrames && s.uiHistory <= kUiFramesMax;
 }
 
 const char* Interpolator::settingsError(const Settings& s, Format f) {
@@ -1194,7 +1072,7 @@ bool Interpolator::setSettings(const Settings& s) {
     m->uiAdopted(old);
     // A switch of the motion version drops the estimate, the way the library already has for "no estimate" (after init/resize):
     // recordSynth / recordSynthBlur return false until the next recordEstimate, which runs the new version.
-    if (s.motionVersion != old.motionVersion) m->haveEst = m->v2SeedOk = false;
+    if (s.motionVersion != old.motionVersion) m->haveEst = false;
     return true;
 }
 
@@ -1209,7 +1087,6 @@ bool Interpolator::reconfigure(const Settings& s) {
     if (!m->uiEnsure()) { m->set = old; return false; }
     m->uiAdopted(old);
     if (s.motionVersion != old.motionVersion) m->haveEst = false;   // as in setSettings
-    m->v2SeedOk = false;   // V2's temporal seed: reconfigure always starts a new frame stream
     return true;
 }
 
@@ -1230,41 +1107,17 @@ void Interpolator::releaseUnusedMotion() {
 bool Interpolator::Impl::motionEnsure() {
     MotionGroup& g = mg();
     if (g.live) return true;
-    // V1: the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's,
-    // as are the two colour passes of the blur. V2 (Rgba8 only: settingsError()): V1's estimate passes up to the pixel field and its
-    // fallback; its own edge-aware field, occlusion analysis and refinement (in the estimate), and its own lookup / mismatch / resolve
-    // and blur passes (they read the refined field).
+    // V1 (and V2 while it aliases V1): the motion estimate is the same code for every format; the four colour passes of the
+    // estimate/synth set are the format's, as are the two colour passes of the blur
     struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
         {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
         {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
-        {SPV(lookup), nullptr}, {Spv{}, nullptr}, {Spv{}, nullptr}, {Spv{}, nullptr}, {Spv{}, nullptr}};
+        {SPV(lookup), nullptr}};
     struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
-    if (set.motionVersion == MotionVersion::V2) {
-        spv[P_V2OCCL] = {SPV(v2_occl), nullptr};
-        spv[P_V2SMOOTH] = {SPV(v2_smooth), nullptr};
-        spv[P_V2REFINE] = {SPV(v2_refine), nullptr};
-        spv[P_V2SEED] = {SPV(v2_seed), nullptr};
-        spv[P_V2COVER] = {SPV(v2_cover), nullptr};
-        spv[P_V2RESCUE] = {SPV(v2_rescue), nullptr};
-        spv[P_V2MERGE] = {SPV(v2_merge), nullptr};
-        spv[P_V2CLOSE] = {SPV(v2_close), nullptr};
-        spv[P_V2HOLD] = {SPV(v2_hold), nullptr};
-        spv[P_V2GATE] = {SPV(v2_gate), nullptr};
-        spv[P_V2RCHECKE] = {SPV(v2_rcheck_e), nullptr};
-        spv[P_V2RCHECK] = {SPV(v2_rcheck), nullptr};
-        spv[P_SEARCH] = {SPV(v2_search), nullptr};   // search.comp + the temporal seed
-        spv[P_LOOKUP] = {SPV(v2_lookup), nullptr};
-        spv[P_ERROR] = {SPV(v2_error), nullptr};
-        spv[P_RESOLVE] = {SPV(v2_resolve), nullptr};
-        bspv[B_LOOKUP] = {Spv{}, nullptr};   // none: V2's blur passes compute the field at t_k on the fly (blur_motion_v2.glsl)
-        bspv[B_ERROR] = {SPV(v2_blur_error), nullptr};
-        bspv[B_RESOLVE] = {SPV(v2_blur_resolve), nullptr};
-        bspv[B_HOLD] = {SPV(v2_blur_hold), nullptr};
-    }
     bool ok = true;
-    for (int i = 0; ok && i < P_COUNT; i++) ok = !spv[i].sp.code || makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
-    for (int i = 0; ok && i < B_COUNT_; i++) ok = !bspv[i].sp.code || makePipe(bspv[i].sp, blurLayout, g.blurPipes[i], bspv[i].sc);
+    for (int i = 0; ok && i < P_COUNT; i++) ok = makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
+    for (int i = 0; ok && i < B_COUNT_; i++) ok = makePipe(bspv[i].sp, blurLayout, g.blurPipes[i], bspv[i].sc);
     ok = ok && (!W || motionSized(g));
     if (!ok) { motionFree(g); return false; }
     g.live = true;
@@ -1272,24 +1125,10 @@ bool Interpolator::Impl::motionEnsure() {
 }
 
 // The size-dependent buffers of one motion version, beside the shared buf[] (called while a size is held: by motionEnsure and
-// createSizeDependent; destroySizeDependent frees them). V1 has none of its own; V2 its buffer (motion_v2.glsl): the occlusion map
-// (one uvec4 per flow pixel) and the class map (one byte per pixel).
+// createSizeDependent; destroySizeDependent frees them). V1 and today's V2 have none of their own.
 bool Interpolator::Impl::motionSized(MotionGroup& g) {
-    if (&g != &mo[(int)MotionVersion::V2] || !g.bufs.empty()) return true;
-    UiBuf b, f;
-    int rw, rh;
-    refineDims(rw, rh);
-    if (!allocBuf(b, v2Words() * 4)) return false;
-    if (!allocBuf(f, (VkDeviceSize)2 * rw * rh * 4)) { freeBuf(b); return false; }
-    g.bufs.push_back(b);
-    g.bufs.push_back(f);
+    (void)g;
     return true;
-}
-
-void Interpolator::Impl::refineDims(int& rw, int& rh) const {
-    const double r = Interpolator::v2Knobs(set).refineRes / 100.0;
-    rw = std::max(1, (int)std::lround(W * r));
-    rh = std::max(1, (int)std::lround(H * r));
 }
 
 // Frees one motion version's resources (retire rule of resize()/destroy()).
@@ -1385,19 +1224,6 @@ bool Interpolator::debugMapLayout(DebugMapLayout& l) const {
     l.pixOff = (VkDeviceSize)l.bw * l.bh * 8;
     l.eOff = l.pixOff + (VkDeviceSize)l.fw * l.fh * 8;
     l.size = l.eOff + (VkDeviceSize)l.eStride * l.H * 4;
-    l.clsOff = l.edgeOff = l.refOff = 0;
-    l.rw = l.rh = 0;
-    if (I.set.motionVersion == MotionVersion::V2) {   // + the class map of V2's resolve, its edge-aware and its refined field
-        l.clsOff = l.size;
-        l.size += (VkDeviceSize)l.eStride * l.H * 4;
-        l.edgeOff = l.size;
-        l.size += (VkDeviceSize)l.fw * l.fh * 8;
-        int rw, rh;
-        I.refineDims(rw, rh);
-        l.rw = (uint32_t)rw; l.rh = (uint32_t)rh;
-        l.refOff = l.size;
-        l.size += (VkDeviceSize)rw * rh * 4;
-    }
     return true;
 }
 
@@ -1411,20 +1237,8 @@ bool Interpolator::recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSiz
     VkBufferCopy f[2] = {{(VkDeviceSize)blockIn * 8, dstOffset + L.blockOff, L.pixOff - L.blockOff},
                          {(VkDeviceSize)I.fieldPF * 8, dstOffset + L.pixOff, L.eOff - L.pixOff}};
     I.CmdCopyBuffer(cb, I.buf[1], dst, 2, f);
-    VkBufferCopy e{(VkDeviceSize)kEOff * 4, dstOffset + L.eOff, (VkDeviceSize)L.eStride * L.H * 4};
+    VkBufferCopy e{(VkDeviceSize)kEOff * 4, dstOffset + L.eOff, L.size - L.eOff};
     I.CmdCopyBuffer(cb, I.buf[2], dst, 1, &e);
-    if (L.clsOff) {
-        VkBuffer vb = I.v2Buf();
-        if (!vb) return false;
-        VkBufferCopy c{I.v2OccWords() * 4, dstOffset + L.clsOff, (VkDeviceSize)L.eStride * L.H * 4};
-        I.CmdCopyBuffer(cb, vb, dst, 1, &c);
-        VkBuffer fb = I.v2Field();
-        if (!fb || I.estRw != (int)L.rw || I.estRh != (int)L.rh) return false;
-        VkBufferCopy ce{(VkDeviceSize)I.fieldT * 8, dstOffset + L.edgeOff, (VkDeviceSize)L.fw * L.fh * 8};
-        I.CmdCopyBuffer(cb, I.buf[1], dst, 1, &ce);
-        VkBufferCopy cr{0, dstOffset + L.refOff, (VkDeviceSize)L.rw * L.rh * 4};
-        I.CmdCopyBuffer(cb, fb, dst, 1, &cr);
-    }
     return true;
 }
 
@@ -1432,8 +1246,7 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
     VkDescriptorSet set = sets[ring][setIdx[ring]];
     setIdx[ring] = (setIdx[ring] + 1) % kSetRing;
     frameSets[ring]++;
-    // (V2's blur keeps no field scratch: binding 6 gets a placeholder its shaders never read)
-    VkDescriptorBufferInfo bi[3], bb[2] = {{blurField.b ? blurField.b : rejNone.b, 0, VK_WHOLE_SIZE}, {blurErr.b, 0, VK_WHOLE_SIZE}};
+    VkDescriptorBufferInfo bi[3], bb[2] = {{blurField.b, 0, VK_WHOLE_SIZE}, {blurErr.b, 0, VK_WHOLE_SIZE}};
     VkDescriptorImageInfo ii[6] = {{VK_NULL_HANDLE, prev.view, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, curr.view, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -1441,8 +1254,7 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
                                    {VK_NULL_HANDLE, curr.chroma, VK_IMAGE_LAYOUT_GENERAL},
                                    {VK_NULL_HANDLE, out.chroma, VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorBufferInfo rj[2] = {{rej.a ? rej.a : rejNone.b, 0, VK_WHOLE_SIZE}, {rej.c ? rej.c : rejNone.b, 0, VK_WHOLE_SIZE}};
-    VkDescriptorBufferInfo v2i{v2Buf(), 0, VK_WHOLE_SIZE}, v2f{v2Field(), 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet wr[15]{};
+    VkWriteDescriptorSet wr[13]{};
     uint32_t n = 0;
     auto add = [&](uint32_t binding, VkDescriptorType t) -> VkWriteDescriptorSet& {
         VkWriteDescriptorSet& w = wr[n++];
@@ -1476,8 +1288,6 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
         add(11, BUF).pBufferInfo = &rj[0];
         add(12, BUF).pBufferInfo = &rj[1];
     }
-    if (v2i.buffer) add(13, BUF).pBufferInfo = &v2i;   // V2 records only
-    if (v2f.buffer) add(14, BUF).pBufferInfo = &v2f;
     UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
     return set;
 }
@@ -1524,31 +1334,6 @@ struct Rec {
     void run(Pipe p, uint32_t gx, uint32_t gy) {
         I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().pipes[p]);
         I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
-        I.CmdDispatch(cb, gx, gy, 1);
-    }
-    // V2's own passes: motion_v2.glsl's block, from this record's PC and the V2 knobs
-    PC2 pc2() const {
-        const V2Knobs k = Interpolator::v2Knobs(I.set);
-        PC2 q{};
-        q.W = pc.W; q.H = pc.H; q.fw = pc.fw; q.fh = pc.fh; q.fscale = pc.fscale; q.pf = pc.pf;
-        q.reach = (int)k.reach;
-        q.clsOff = (int)I.v2OccWords();
-        q.s = pc.s; q.wA = pc.wA; q.wC = pc.wC;
-        q.trust0 = k.trustLow; q.trustScale = 1.0f / (k.trustHigh - k.trustLow);
-        q.occ0 = k.occLow; q.occScale = 1.0f / (k.occHigh - k.occLow);
-        q.pickBias = k.pickBias;
-        q.edgeMin = k.occlWidth / (float)pc.fscale;
-        q.confMax = k.confidence;
-        q.zeroBonus = I.set.hudBonus;
-        q.rw = I.estRw; q.rh = I.estRh;
-        q.rpf = 0;
-        q.fE = I.fieldT;
-        q.edgeK = 1.0f / k.edgeSigma;
-        return q;
-    }
-    void run2(Pipe p, const PC2& q, uint32_t gx, uint32_t gy) {
-        I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().pipes[p]);
-        I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC2), &q);
         I.CmdDispatch(cb, gx, gy, 1);
     }
 };
@@ -1900,15 +1685,6 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         }
         if (ui && I.uiFrameSets + needObs * I.uiObserveSets() + (I.v2Fill() ? 2 : 0) > kUiSets) return false;   // V2 with the fill: + its two luma fills
     }
-    // V2: the refinement grid of this estimate; its buffer grows if the settings ask for a finer one than it holds (the old one waits
-    // in the blur graveyard: an earlier record may still read it)
-    const bool mv2 = I.set.motionVersion == MotionVersion::V2;
-    int rw = 0, rh = 0;
-    if (mv2) {
-        I.refineDims(rw, rh);
-        MotionGroup& g = I.mg();
-        if (g.bufs.size() < 2 || !I.growBlur(g.bufs[1], (VkDeviceSize)2 * rw * rh * 4)) return false;
-    }
 
     if (!I.profPending) {
         I.qcount = 0;
@@ -1940,7 +1716,6 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     I.haveEst = true;
     I.estPrev = prev.view;
     I.estCurr = curr.view;
-    I.estRw = rw; I.estRh = rh;
     I.estUi = ui;
     I.estClean = ui && !I.v2();
     if (ui) {
@@ -1974,19 +1749,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         r.cbar();
     }
     r.stamp("pyramid");
-    // V2: the previous pair's field for this estimate (v2_seed.comp: compensated to this midpoint; is this pair the continuation?)
-    const V2Knobs k2 = Interpolator::v2Knobs(I.set);
-    const int32_t tFlags = (int32_t)(I.v2Par & 1) | (I.v2SeedOk && k2.temporal >= 0.5f ? 2 : 0);
-    if (mv2) {
-        PC2 p2 = r.pc2();
-        const Level& lt = I.lv.back();
-        p2.offA = lt.offA; p2.offC = lt.offC; p2.lw = lt.w; p2.lh = lt.h;
-        p2.tFlags = tFlags;
-        r.run2(P_V2SEED, p2, divUp(I.fw, 16), divUp(I.fh, 16));
-        r.cbar();
-        r.stamp("v2 seed");
-    }
-    // 3-5. per level, coarse -> fine (V2: v2_search.comp, with the temporal seed)
+    // 3-5. per level, coarse -> fine
     static const char* lvNames[] = {"level 0 (finest)", "level 1", "level 2", "level 3", "level 4", "level 5", "level 6", "level 7"};
     int n = (int)I.lv.size();
     for (int i = n - 1; i >= 0; i--) {
@@ -2006,7 +1769,6 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         }
         pc.fOut = l.fS;
         pc.sadAcc = i == 0 && !I.set.subpixel;   // without sub-pixel refinement the search's SAD is final
-        if (mv2) std::memcpy(&pc.srcA, &k2.seedMargin, 4);   // v2_search.comp: the temporal seed's margin (srcA is down.comp's alone)
         r.run(P_SEARCH, l.bw, l.bh);
         r.cbar();
         pc.fIn = l.fS; pc.fOut = l.fM;
@@ -2028,63 +1790,6 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     r.run(P_PIXFIELD, divUp(I.fw, 16), divUp(I.fh, 16));
     r.cbar();
     r.stamp("pixel field");
-    if (mv2) {
-        PC2 p2 = r.pc2();
-        p2.offA = l0.offA; p2.offC = l0.offC;
-        p2.tFlags = tFlags;
-        p2.tBonus = k2.temporalBonus;
-        // V2: the edge-aware field (v2_smooth.comp: pixel field -> fieldT, the slot V1's field at t uses; V2 never needs that)
-        p2.pf = I.fieldPF;
-        r.run2(P_V2SMOOTH, p2, divUp(I.fw, 16), divUp(I.fh, 16));
-        r.cbar();
-        r.stamp("v2 edge field");
-        // the content rescue (I11): content both frames show and the field would show at neither place gets its vector back
-        if (k2.rescue > 0.0f && (int64_t)I.fw * I.fh <= (1 << 23)) {   // (the vote's key holds a 23-bit source index)
-            p2.pf = I.fieldT;
-            p2.rescue = k2.rescue;
-            r.run2(P_V2COVER, p2, divUp(I.fw, 16), divUp(I.fh, 16));
-            r.cbar();
-            r.stamp("v2 cover");
-            r.run2(P_V2RESCUE, p2, divUp(I.fw, 8), divUp(I.fh, 8));   // (one workgroup per 8 x 8 block)
-            r.cbar();
-            r.stamp("v2 rescue");
-            r.run2(P_V2MERGE, p2, divUp(I.fw, 16), divUp(I.fh, 16));
-            r.cbar();
-            r.stamp("v2 merge");
-            r.run2(P_V2CLOSE, p2, divUp(I.fw, 16), divUp(I.fh, 16));
-            r.cbar();
-            r.stamp("v2 close");
-            if (k2.rescueCheck > 0.0f) {   // the rescue's acceptance check (v2_rcheck_e / v2_rcheck.comp)
-                PC2 pr = p2;
-                pr.occ0 = k2.rescueCheck / (float)(pc.fscale * pc.fscale);   // the smallest area kept, flow pixels
-                r.run2(P_V2RCHECKE, pr, divUp(I.fw, 16), divUp(I.fh, 16));
-                r.cbar();
-                r.run2(P_V2RCHECK, pr, divUp(I.fw, 16), divUp(I.fh, 16));
-                r.cbar();
-                r.stamp("v2 rescue check");
-            }
-        }
-        // occlusion analysis of the edge-aware midpoint field (v2_occl.comp)
-        p2.pf = I.fieldT;
-        if (k2.rescue > 0.0f && k2.rescueCheck > 0.0f) p2.tFlags |= 4;   // the rescue check on: the soft edge of rescued objects
-        r.run2(P_V2OCCL, p2, divUp(I.fw, 16), divUp(I.fh, 16));
-        r.cbar();
-        r.stamp("v2 occlusion");
-        if (k2.occGate > 0.0f) {   // the occlusion gate (v2_gate.comp)
-            PC2 pg = p2;
-            pg.occ0 = k2.occGate;
-            r.run2(P_V2GATE, pg, divUp(I.fw, 16), divUp(I.fh, 16));
-            r.cbar();
-            r.stamp("v2 gate");
-        }
-        // the refined field on the refinement grid (v2_refine.comp -> rf[0..rw rh))
-        p2.rfOut = 0;
-        r.run2(P_V2REFINE, p2, divUp(rw, 8), divUp(rh, 8));
-        r.cbar();
-        r.stamp("v2 refine");
-        I.v2SeedOk = true;   // the next V2 estimate may use this one's field (v2_occl.comp stored it in slot v2Par)
-        I.v2Par ^= 1u;
-    }
     return true;
 }
 
@@ -2109,7 +1814,6 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
     // counter scratch): the CS -> transfer -> CS chain orders all earlier reads/writes of our buffers.
     r.clearCounters(1, set);   // untrusted count only; the SAD sum belongs to the estimate
     PC& pc = r.pc;
-    const bool mv2 = I.set.motionVersion == MotionVersion::V2;
     if (t != 0.5f) {
         // numpy float32 constants of interp.synth / field_at (computed in double, then rounded); the warp
         // factors float32(2t), float32(2(1 - t)) are exactly 2 wC, 2 wA (scaling by 2 commutes with rounding)
@@ -2117,48 +1821,21 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
         pc.s = (float)(2.0 * td - 1.0);
         pc.wA = (float)(1.0 - td);
         pc.wC = (float)td;
+        // 9a. field lookup at time t (flow res)
+        pc.fIn = I.fieldPF; pc.fOut = I.fieldT;
+        r.run(P_LOOKUP, divUp(I.fw, 8), divUp(I.fh, 8));
+        r.cbar();
+        pc.pf = I.fieldT;
+        r.stamp("lookup");
     }
-    if (mv2) {   // V2: its lookup / mismatch / resolve on the refined field (rf[], the estimate's refinement grid)
-        PC2 q = r.pc2();
-        const V2Knobs k2 = Interpolator::v2Knobs(I.set);
-        q.edgeMin = k2.holdFeather; q.confMax = k2.occSoft;   // (synth: motion_v2.glsl's edgeMin / confMax carry them)
-        const int rn = I.estRw * I.estRh;
-        if (t != 0.5f) {   // 9a. field lookup at time t (refinement grid): rf[0..rn) -> rf[rn..2 rn)
-            q.rpf = 0; q.rfOut = rn;
-            r.run2(P_LOOKUP, q, divUp(I.estRw, 8), divUp(I.estRh, 8));
-            r.cbar();
-            q.rpf = rn;
-            r.stamp("lookup");
-        }
-        r.run2(P_ERROR, q, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8));   // 9. full-res mismatch
-        r.cbar();
-        r.stamp("mismatch");
-        if (k2.holdFeather > 0.0f) {   // the soft hold edge's map (v2_hold.comp, 4 x 4 px cells)
-            r.run2(P_V2HOLD, q, divUp(((int)I.W + 3) / 4, 16), divUp(((int)I.H + 3) / 4, 16));
-            r.cbar();
-            r.stamp("hold edge");
-        }
-        r.run2(P_RESOLVE, q, divUp((int)I.W, 16), divUp((int)I.H, 16));   // 10-11. the three-class resolve (v2_resolve.comp)
-        r.cbar();
-        r.stamp("resolve");
-    } else {
-        if (t != 0.5f) {
-            // 9a. field lookup at time t (flow res)
-            pc.fIn = I.fieldPF; pc.fOut = I.fieldT;
-            r.run(P_LOOKUP, divUp(I.fw, 8), divUp(I.fh, 8));
-            r.cbar();
-            pc.pf = I.fieldT;
-            r.stamp("lookup");
-        }
-        // 9. full-res mismatch
-        r.run(P_ERROR, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8));
-        r.cbar();
-        r.stamp("mismatch");
-        // 10-11. box + trust + resolve
-        r.run(P_RESOLVE, divUp((int)I.W, 16), divUp((int)I.H, 16));
-        r.cbar();
-        r.stamp("resolve");
-    }
+    // 9. full-res mismatch
+    r.run(P_ERROR, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8));
+    r.cbar();
+    r.stamp("mismatch");
+    // 10-11. box + trust + resolve
+    r.run(P_RESOLVE, divUp((int)I.W, 16), divUp((int)I.H, 16));
+    r.cbar();
+    r.stamp("resolve");
     // global fallbacks (scene cut / too much untrusted) -> the nearer real frame
     r.run(P_FALLBACK, divUp((int)I.W, 64), divUp((int)I.H, 64));
     if (I.estUi) {
@@ -2206,13 +1883,8 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     const int nInt = hi - lo + 1;
 
     // scratch: n slots of the field at t (flow res) and of the packed mismatch (full res)
-    // (V2: the field at t_k on the estimate's refinement grid)
-    const bool v2 = I.set.motionVersion == MotionVersion::V2;
     const VkDeviceSize errWords = (VkDeviceSize)((I.W + 3) / 4) * I.H;
-    // V2 keeps no field scratch: its blur passes compute the field at t_k on the fly from the refined midpoint field
-    // (V2: + n maps of the soft hold edge, one float per 4 x 4 px cell: v2_blur_hold.comp)
-    const VkDeviceSize holdWords = v2 ? (VkDeviceSize)((I.W + 3) / 4) * ((I.H + 3) / 4) : 0;
-    if ((!v2 && !I.growBlur(I.blurField, (VkDeviceSize)n * I.fw * I.fh * 8)) || !I.growBlur(I.blurErr, (VkDeviceSize)n * (errWords + holdWords) * 4)) return false;
+    if (!I.growBlur(I.blurField, (VkDeviceSize)n * I.fw * I.fh * 8) || !I.growBlur(I.blurErr, (VkDeviceSize)n * errWords * 4)) return false;
     VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out, true, I.rejectMasks(cb));
 
     Rec r(I, cb);
@@ -2228,41 +1900,18 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     bp.gauss = st.blurWeights == BlurWeights::Gaussian;
     bp.cutSad = st.sceneCutSad; bp.trust0 = st.trustLow; bp.trustScale = 1.0f / (st.trustHigh - st.trustLow);
     bp.globalFrac = st.globalFallback;
-    // V2's blur passes (v2_blur_lookup / error / resolve.comp) push blur_motion_v2.glsl's block instead
-    BlurPC2 bq{};
-    if (v2) {
-        const V2Knobs k = Interpolator::v2Knobs(st);
-        bq.wh = bp.W | bp.H << 16; bq.fwh = bp.fw | bp.fh << 16; bq.rwh = I.estRw | I.estRh << 16;
-        bq.blocks = bp.bw * bp.bh;
-        bq.cutSad = bp.cutSad; bq.trust0 = k.trustLow; bq.trustScale = 1.0f / (k.trustHigh - k.trustLow); bq.globalFrac = bp.globalFrac;
-        bq.occ0 = k.occLow; bq.occScale = 1.0f / (k.occHigh - k.occLow); bq.pickBias = k.pickBias; bq.zeroBonus = st.hudBonus;
-        bq.feather = k.holdFeather; bq.occSoft = k.occSoft;
-        std::memcpy(bq.t, bp.t, sizeof bq.t);
-    }
     auto run = [&](BlurPipe p, uint32_t gx, uint32_t gy, uint32_t gz) {
         I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().blurPipes[p]);
-        if (v2) {
-            bq.misc = bp.fscale | bp.n << 4 | bp.k0 << 9 | ((bp.gauss ? 1 : 0) | (bp.fix ? 2 : 0)) << 16;
-            I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC2), &bq);
-        } else {
-            I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC), &bp);
-        }
+        I.CmdPushConstants(cb, I.blurLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BlurPC), &bp);
         I.CmdDispatch(cb, gx, gy, gz);
     };
     if (nInt > 0) {
-        if (!v2) {   // (V2: none, see above)
-            run(B_LOOKUP, divUp(I.fw, 8), divUp(I.fh, 8), (uint32_t)nInt);
-            r.cbar();
-            r.stamp("blur lookup");
-        }
+        run(B_LOOKUP, divUp(I.fw, 8), divUp(I.fh, 8), (uint32_t)nInt);
+        r.cbar();
+        r.stamp("blur lookup");
         run(B_ERROR, divUp(((int)I.W + 3) / 4, 8), divUp((int)I.H, 8), (uint32_t)nInt);
         r.cbar();
         r.stamp("blur mismatch");
-        if (v2 && bq.feather > 0.0f) {   // the soft hold edge's map of every sample (v2_blur_hold.comp)
-            run(B_HOLD, divUp(((int)I.W + 3) / 4, 16), divUp(((int)I.H + 3) / 4, 16), (uint32_t)nInt);
-            r.cbar();
-            r.stamp("blur hold edge");
-        }
     }
     bp.fix = 0;
     run(B_RESOLVE, divUp((int)I.W, 16), divUp((int)I.H, 16), 1);

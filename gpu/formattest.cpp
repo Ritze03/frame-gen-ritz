@@ -5,6 +5,7 @@
 //   options: --separate-planes  YUV: two single-plane images instead of one multi-planar image with plane views
 //            --algo v1|v2       the motion version (Settings::motionVersion), default v1. V2 is Rgba8 only: with v2, check runs
 //                               Rgba8 in V2 and checks that every other format refuses V2 (init and setSettings, with a reason)
+//            --mode quality|performance  Settings::v2Mode (default quality; V1 ignores it)
 //            --hash             check: print an FNV-1a hash of every output of each format's Off run (t = 0.5, 0.25, blur) and
 //                               WholeScreen run (t = 0.5, 0.25), raw bytes of both planes: diff two library builds
 //
@@ -39,6 +40,7 @@ static bool separatePlanes = false;
 static bool hashOut = false;   // --hash
 #ifndef FORMATTEST_NO_MOTION   // define it to build against a library without Settings::motionVersion
 static MotionVersion gAlgo = MotionVersion::V1;   // --algo
+static V2Mode gMode = V2Mode::Quality;             // --mode
 static bool algoV2() { return gAlgo == MotionVersion::V2; }
 #else
 static bool algoV2() { return false; }
@@ -482,6 +484,7 @@ static InitInfo baseInfo(Enc e, int W, int H, const Settings& s) {
     info.settings = s;
 #ifndef FORMATTEST_NO_MOTION
     info.settings.motionVersion = gAlgo;
+    info.settings.v2Mode = gMode;
 #endif
     if (e == Enc::F16Lin) { info.transfer = Transfer::Linear; info.linearWhiteNits = 80.0f; }
     return info;
@@ -755,13 +758,9 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     expect(xh == 0 && xh2 == 0, "crosshair pixels equal the real ones (WholeScreen, t = 0.5 and 0.25)");
     expect(hud == 0 && hud2 == 0, "HUD box pixels equal the real ones (WholeScreen)");
     expect(xhOff > 0 || hudOff > 0, "(the scene disturbs the UI without protection: the check has teeth)");
-    {   // recordTrack: 8 frames tracked instead of observed leave the same counters, so the last pair's outputs are bit-identical.
-        // MotionVersion::V2's temporal seed (Settings::v2Temporal) is off in both runs: the tracked run estimates fewer pairs, so its
-        // estimate history differs by design; the UI state is what is compared here.
-        Settings wn = w; wn.v2Temporal = 0.0f;
-        Result rwn = runSequence(e, sc, wn, false);
-        Result rt = runSequence(e, sc, wn, false, true);
-        expect(rwn.ok && rt.ok && rt.out[0].p0 == rwn.out[0].p0 && rt.out[0].p1 == rwn.out[0].p1 && rt.out[1].p0 == rwn.out[1].p0 && rt.out[1].p1 == rwn.out[1].p1,
+    {   // recordTrack: 8 frames tracked instead of observed leave the same counters, so the last pair's outputs are bit-identical
+        Result rt = runSequence(e, sc, w, false, true);
+        expect(rt.ok && rt.out[0].p0 == rw.out[0].p0 && rt.out[0].p1 == rw.out[0].p1 && rt.out[1].p0 == rw.out[1].p0 && rt.out[1].p1 == rw.out[1].p1,
                "recordTrack (WholeScreen): frames tracked instead of observed give bit-identical output");
     }
     Settings c; c.uiProtection = UiProtection::Crosshair; c.uiBoxWidth = c.uiBoxHeight = 64;
@@ -798,10 +797,8 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         if (isYuv(e)) printf("    (%zu crosshair edge pixels change with the chroma of the moving background in this pair and are not judged)\n", nChanged);
         expect(xh3 == 0 && xh4 == 0, isYuv(e) ? "crosshair pixels that did not change in the pair equal the real ones (CrosshairV2, t = 0.5 and 0.25)"
                                               : "crosshair pixels equal the real ones (CrosshairV2, t = 0.5 and 0.25)");
-        Settings vn = v; vn.v2Temporal = 0.0f;   // (as for WholeScreen above: the estimate history differs by design)
-        Result rvn = runSequence(e, sc, vn, false);
-        Result rvt = runSequence(e, sc, vn, false, true);
-        expect(rvn.ok && rvt.ok && rvt.out[0].p0 == rvn.out[0].p0 && rvt.out[0].p1 == rvn.out[0].p1 && rvt.out[1].p0 == rvn.out[1].p0 && rvt.out[1].p1 == rvn.out[1].p1,
+        Result rvt = runSequence(e, sc, v, false, true);
+        expect(rvt.ok && rvt.out[0].p0 == rv.out[0].p0 && rvt.out[0].p1 == rv.out[0].p1 && rvt.out[1].p0 == rv.out[1].p0 && rvt.out[1].p1 == rv.out[1].p1,
                "recordTrack (CrosshairV2): frames tracked instead of observed give bit-identical output");
         expect(psnr(v05, truth, &near, false) >= pOff - 0.5, "CrosshairV2 does not cost background quality (-0.5 dB)");
         // the optional luma fill of the motion estimate (uiEstimateFill): its own pass, compiled per format
@@ -1014,10 +1011,16 @@ int main(int argc, char** argv) {
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
             else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
         }
+        else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
+            const char* a = argv[++i];
+            if (!strcmp(a, "quality")) gMode = V2Mode::Quality;
+            else if (!strcmp(a, "performance")) gMode = V2Mode::Performance;
+            else { fprintf(stderr, "--mode quality|performance\n"); return 2; }
+        }
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [--hash] [--algo v1|v2] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [--hash] [--algo v1|v2] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -1067,7 +1070,8 @@ int main(int argc, char** argv) {
         vkDeviceWaitIdle(dev);
         return 0;
     }
-    printf("formattest %dx%d on %s, motion version %s (YUV: %s)\n", W, H, props.deviceName, algoV2() ? "V2" : "V1", separatePlanes ? "separate plane images" : "multi-planar image + plane views, falling back to separate images");
+    printf("formattest %dx%d on %s, motion version %s, v2Mode %s (YUV: %s)\n", W, H, props.deviceName, algoV2() ? "V2" : "V1",
+           gMode == V2Mode::Performance ? "performance" : "quality", separatePlanes ? "separate plane images" : "multi-planar image + plane views, falling back to separate images");
     apiChecks(W, H);
     Scene sc(W, H, 12);
     // reference: the Rgba8 path of the same scene

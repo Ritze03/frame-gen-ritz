@@ -245,8 +245,8 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
 // --algo: the motion version every Interpolator of the run is created and set with
 #ifndef BLURTEST_NO_MOTION
 static MotionVersion gAlgo = MotionVersion::V1;
-static MotionPreset gPreset = MotionPreset::A;   // --preset (V2's tuning: B exercises the soft hold edge's per-sample maps)
-static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Preset = gPreset; return s; }
+static V2Mode gMode = V2Mode::Quality;   // --mode: Settings::v2Mode (V1 ignores it)
+static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; return s; }
 #else
 static Settings algo(Settings s) { return s; }
 #endif
@@ -666,7 +666,8 @@ static Edge modelEdge(const BScene& bs, const std::vector<float>& t, const std::
 
 static int check(int W, int H) {
 #ifndef BLURTEST_NO_MOTION
-    printf("check %dx%d %s, motion version %s (--algo)\n", W, H, bgra ? "BGRA8" : "RGBA8", gAlgo == MotionVersion::V2 ? "V2" : "V1");
+    printf("check %dx%d %s, motion version %s (--algo), v2Mode %s (--mode)\n", W, H, bgra ? "BGRA8" : "RGBA8",
+           gAlgo == MotionVersion::V2 ? "V2" : "V1", gMode == V2Mode::Performance ? "performance" : "quality");
 #else
     printf("check %dx%d %s\n", W, H, bgra ? "BGRA8" : "RGBA8");
 #endif
@@ -828,8 +829,8 @@ static int check(int W, int H) {
             for (auto& wd : std::vector<std::array<float, 2>>{{0.5f, 1.0f}, {0.25f, 0.75f}, {0.0f, 1.0f}}) {
                 auto t = sampleTimes(N, wd[0], wd[1]);
                 // the edges of the single frames this window is made of, measured (their own position, spread and extent:
-                // an interpolated frame's edge need not sit at the ideal xr10 + speed t, e.g. V2's soft hold edge, preset B,
-                // spreads a semi-transparent strip on both sides of it, biased toward the nearer real frame)
+                // an interpolated frame's edge need not sit at the ideal xr10 + speed t, e.g. a soft hold edge spreads a
+                // semi-transparent strip on both sides of it, biased toward the nearer real frame)
                 std::vector<Edge> se(N);
                 for (int k = 0; k < N; k++) {
                     if (t[k] <= 0.0f) se[k] = measureEdge(c.bs, c.real10);
@@ -1003,15 +1004,16 @@ int main(int argc, char** argv) {
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
             else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
         }
-        else if (!strcmp(argv[i], "--preset") && i + 1 < argc) {
-            const char c = argv[++i][0];
-            if (c < 'a' || c > 'd') { fprintf(stderr, "--preset a|b|c|d\n"); return 2; }
-            gPreset = (MotionPreset)(c - 'a');
+        else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
+            const char* a = argv[++i];
+            if (!strcmp(a, "quality")) gMode = V2Mode::Quality;
+            else if (!strcmp(a, "performance")) gMode = V2Mode::Performance;
+            else { fprintf(stderr, "--mode quality|performance\n"); return 2; }
         }
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2] [--preset a|b|c|d] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
