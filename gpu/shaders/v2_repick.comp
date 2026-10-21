@@ -1,0 +1,44 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// V2 Performance, field clean-up step 1 (block grid, once per estimate): block-level re-pick. One workgroup per finest block (64
+// threads = its 8x8 flow pixels): each of the 9 vectors of the 3x3 neighbourhood (own first) is scored by the block's mean
+// |a(q - v) - c(q + v)| (bilinear luma, flow res), plus LAMBDA (searchPenalty) for a neighbour's; the cheapest wins (own on ties).
+// A block whose search went wrong (a local minimum on a repetitive or aliased texture: on a hard random pattern a third of the
+// blocks, see uitest's doubled-crosshair scenes) takes a neighbour's vector; the field stays a block field (no per-pixel choice, so
+// nothing tears). Reads field[fIn], writes field[fOut]. V1's estimate has the per-pixel field for this, which Performance drops.
+#include "common.glsl"
+#include "motion_v1.glsl"
+layout(local_size_x = 64) in;
+shared vec2 cv[9];
+shared float part[9][64];   // per-subgroup partial sums (gl_NumSubgroups <= 64)
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 blk = ivec2(gl_WorkGroupID.xy);
+    if (lid < 9) {
+        int k = lid == 0 ? 4 : (lid <= 4 ? lid - 1 : lid);   // own first, then the 8 neighbours
+        ivec2 b = clamp(blk + ivec2(k % 3 - 1, k / 3 - 1), ivec2(0), ivec2(pc.bw - 1, pc.bh - 1));
+        cv[lid] = field[pc.fIn + b.y * pc.bw + b.x];
+    }
+    barrier();
+    vec2 q = vec2(blk * BLOCK + ivec2(lid & 7, lid >> 3));
+    for (int k = 0; k < 9; k++) {
+        vec2 v = cv[k];
+        float d = abs(sampleL(pc.offA, q - v, pc.w, pc.h) - sampleL(pc.offC, q + v, pc.w, pc.h));
+        float s = subgroupAdd(d);
+        if (subgroupElect()) part[k][gl_SubgroupID] = s;
+    }
+    barrier();
+    if (lid == 0) {
+        int bi = 0;
+        float best = 0.0;
+        for (int k = 0; k < 9; k++) {
+            float s = 0.0;
+            for (uint g = 0u; g < gl_NumSubgroups; g++) s += part[k][g];
+            float c = s * (1.0 / 64.0) + (k == 0 ? 0.0 : LAMBDA);
+            if (k == 0 || c < best) { best = c; bi = k; }
+        }
+        field[pc.fOut + blk.y * pc.bw + blk.x] = cv[bi];
+    }
+}

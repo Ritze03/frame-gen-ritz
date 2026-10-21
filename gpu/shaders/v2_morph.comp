@@ -5,9 +5,12 @@
 // each exactly what recordSynth(t_k) gives), plus a fix-up pass that is a no-op unless the whole-frame flick fallback fired:
 //   g   = the cleaned block field upsampled bilinearly to this pixel (v2_motion.glsl hvAt), taken to time t by the fixed point
 //         g = h(q - (2t - 1) g) (2 steps from h(q): lookup.comp's, here per pixel on the smooth field);
-//   out = (1 - t) prev(q - 2t g) + t curr(q + 2(1 - t) g), both taps bilinear, CrosshairV2's tap rejection on the pair.
+//   out = (1 - t) prev(q - 2t g) + t curr(q + 2(1 - t) g), both taps bilinear, CrosshairV2's tap rejection on the pair;
+//   blended toward the zero vector's (1 - t) prev(q) + t curr(q) where the two frames show q (and a line of its neighbours) the same
+//   but the morph's taps disagree: HUD text and other static overlays, static background that the smooth field would drag along.
 // No per-pixel trust and no hold: where the two taps disagree (occlusion, a flash) the blend morphs between them; a real frame is never
-// shown locally. The only real-frame outputs are whole-frame decisions, uniform over the dispatch: a scene cut (mean finest SAD >
+// shown locally (the zero vector only where both frames AGREE). The only real-frame outputs are whole-frame decisions, uniform over the
+// dispatch: a scene cut (mean finest SAD >
 // cutSad, known from the estimate) or a flick (more than globalFrac of the frame untrusted) present the nearer real frame (prev for
 // t <= 0.5, curr after), as fallback.comp does for V1; and a blur sub-frame at t <= 0 / t >= 1 is the real frame prev / curr
 // (blur_resolve.comp's rule).
@@ -19,6 +22,13 @@
 #include "v2_motion.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 shared uint esum[16];
+const float V2_Z0 = 8.0, V2_Z1 = 12.0, V2_ZMAX = 6.0;
+// max-channel |prev - curr| at pixel p (clamped to the frame), 8-bit levels
+float zAt(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(pc.W - 1, pc.H - 1));
+    vec3 d = abs(FG_FETCH(texelFetch(texPrev, p, 0).rgb) - FG_FETCH(texelFetch(texCurr, p, 0).rgb));
+    return max(d.r, max(d.g, d.b));
+}
 
 // One generated sub-frame at time t (0 < t < 1): 8-bit levels, unrounded; al = the taps' alpha, blended alike; e = the mismatch.
 vec3 morph(ivec2 p, float t, out float al, out uint e) {
@@ -35,9 +45,27 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     uiReject(pa, pc_, ra, rc);
     vec3 wa = FG_FETCH(ra), wc = FG_FETCH(rc);
     vec3 d = abs(wa - wc);
-    e = uint(max(d.r, max(d.g, d.b)));
+    float em = max(d.r, max(d.g, d.b));
     al = (1.0 - t) * a.a + t * c.a;
-    return (1.0 - t) * wa + t * wc;
+    vec3 m = (1.0 - t) * wa + t * wc;
+    // the zero vector where it fits clearly better: a pixel the two frames show unchanged (a HUD element, text, static background
+    // next to a moving object, which the smooth field would drag along) keeps its place
+    vec4 s0 = texelFetch(texPrev, p, 0), s1 = texelFetch(texCurr, p, 0);
+    vec3 sa = FG_FETCH(s0.rgb), sc = FG_FETCH(s1.rgb);
+    vec3 dz = abs(sa - sc);
+    float z = max(dz.r, max(dz.g, dz.b));
+    // ... and so do both neighbours along x or along y (a stroke of text or of a HUD element): a lone pixel whose colours happen to
+    // match in a moving texture does not switch (it would be a speck)
+    float zh = max(zAt(p + ivec2(-1, 0)), zAt(p + ivec2(1, 0))), zv = max(zAt(p + ivec2(0, -1)), zAt(p + ivec2(0, 1)));
+    float zs = max(z, min(zh, zv));
+    float ws = clamp((em - zs - V2_Z0) * (1.0 / V2_Z1), 0.0, 1.0) * clamp(1.0 - zs * (1.0 / V2_ZMAX), 0.0, 1.0);
+    // not next to CrosshairV2's UI (its own patch and tap rejection handle it; a static crosshair would vouch for the pixels around it)
+    if (ws > 0.0 && (uiHitA(p - 1, p + 1) || uiHitC(p - 1, p + 1))) ws = 0.0;
+    m = mix(m, (1.0 - t) * sa + t * sc, ws);
+    al = mix(al, (1.0 - t) * s0.a + t * s1.a, ws);
+    em = mix(em, z, ws);
+    e = uint(em);
+    return m;
 }
 
 // The output pixel p. counting: add each interior sample's mismatch to esum[k] (all invocations of the workgroup call it, p inside or

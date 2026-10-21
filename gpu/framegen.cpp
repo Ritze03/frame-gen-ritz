@@ -35,6 +35,7 @@
 #include "v2_subpix_spv.h"
 #include "v2_clean_spv.h"
 #include "v2_morph_spv.h"
+#include "v2_repick_spv.h"
 
 // The colour shaders of the formats other than Rgba8 (shaders/format.glsl), when built.
 // rgb10: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
@@ -241,7 +242,7 @@ struct UiEntry {
 
 // P_V2_*: MotionVersion::V2's own passes (empty in V1's group; V2's group leaves V1's P_MEDHIST / P_SEARCH / P_SUBPIX empty instead).
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
-            P_V2_MEDHIST, P_V2_SEARCH, P_V2_SUBPIX, P_V2_CLEAN, P_V2_MORPH, P_COUNT };
+            P_V2_MEDHIST, P_V2_SEARCH, P_V2_SUBPIX, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
@@ -1153,6 +1154,7 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2_SUBPIX].sp = SPV(v2_subpix);
         spv[P_V2_CLEAN].sp = SPV(v2_clean);
         spv[P_V2_MORPH].sp = SPV(v2_morph);
+        spv[P_V2_REPICK].sp = SPV(v2_repick);
     }
     struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
@@ -1911,8 +1913,15 @@ void Interpolator::Impl::v2Tail(VkCommandBuffer cb, bool perf) {
     const Level& l0 = lv[0];
     if (perf) {
         if (v2Clean) return;
+        // block re-pick into l0.fM (free in V2: V1's median3 output, written only by Quality's tail with sub-pixel refinement off,
+        // which reads the estimate's own block field), then the clean-up into V2B_FIELD
+        PC& pc = r.pc;
+        pc.w = l0.w; pc.h = l0.h; pc.bw = l0.bw; pc.bh = l0.bh; pc.offA = l0.offA; pc.offC = l0.offC;
+        pc.fIn = estBlock; pc.fOut = l0.fM;
+        r.run(P_V2_REPICK, l0.bw, l0.bh);
+        r.cbar();
         V2PC v = r.v2pc();
-        v.fIn = estBlock;
+        v.fIn = l0.fM;
         r.runV2(P_V2_CLEAN, v, divUp(l0.bw, 8), divUp(l0.bh, 8));
         r.cbar();
         r.stamp("field clean");
