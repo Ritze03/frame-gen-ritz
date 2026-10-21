@@ -253,7 +253,7 @@ static Settings algo(Settings s) { return s; }
 static bool makeInterp(Interpolator& fg, int W, int H, const Settings& s) {
     InitInfo info;
     info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
-    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.settings = algo(s);
+    info.viewFormat = fmt(); info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2; info.settings = algo(s);
     return fg.init(info);
 }
 static void destroyImg(Img& i) { vkDestroyImageView(dev, i.view, nullptr); vkDestroyImage(dev, i.img, nullptr); vkFreeMemory(dev, i.mem, nullptr); }

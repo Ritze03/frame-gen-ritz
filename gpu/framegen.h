@@ -272,6 +272,11 @@ struct InitInfo {
     // filtering and storage, for the views you pass and for the library's own clean copies) and refuse it with a reason
     // (Interpolator::initError()). Null = no check, the host vouches for it. Never consulted for Rgba8.
     PFN_vkGetPhysicalDeviceFormatProperties getFormatProps = nullptr;
+    // Optional (instance-level, Vulkan 1.1): lets the library check that the device's subgroups can run MotionVersion::V2 (the
+    // compute stage with the basic, vote, arithmetic, shuffle and clustered subgroup operations, subgroups of at least 16 lanes)
+    // and refuse V2 with a reason (initError(); setSettings() / reconfigure() refuse it too, settingsError(const Settings&) says
+    // why). Null = no check, the host vouches for it. V1 never needs it.
+    PFN_vkGetPhysicalDeviceProperties2 getProps2 = nullptr;
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;
     // RgbaF16 only. Fixed at init (it is baked into the pipelines): a stream does not change its encoding.
     Transfer transfer = Transfer::Encoded;
@@ -308,6 +313,9 @@ public:
     // literal). init(), setSettings() and reconfigure() refuse what it refuses (init() with this as initError()); a host whose
     // setSettings() returned false can ask it why. Today's only Format rule: MotionVersion::V2 needs Format::Rgba8.
     static const char* settingsError(const Settings&, Format format);
+    // The same for this object: the active format's rules plus the device's (InitInfo::getProps2: MotionVersion::V2 needs the
+    // subgroup support listed there). What setSettings() and reconfigure() refuse; null if not initialised and the settings are valid.
+    const char* settingsError(const Settings&) const;
     // The box size (pixels) a frame of w x h gets under these settings: the explicit uiBoxWidth/uiBoxHeight, else the
     // square from uiBoxHeightFrac (or the legacy uiCrosshairArea). The same numbers the library protects; for a host
     // preview. Does not check validity.

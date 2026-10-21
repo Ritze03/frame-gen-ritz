@@ -68,10 +68,10 @@ vec2 sAt(vec2 x, uint bits) {   // bits: sCellBits of x's cell
 }
 // The overlay at full-resolution position x for the tap rejection: the largest of the 4 S texels around x (S dilated by about one
 // flow pixel: the anti-aliased rim of a stroke, a gap in its mask), or E of its cell
-float sOverAt(vec2 x, ivec2 c) {   // c = sCell(x)
-    if (!sNear(c)) return 0.0;
+vec2 sOverAt(vec2 x, ivec2 c) {   // c = sCell(x)
+    if (!sNear(c)) return vec2(0.0);
     ivec2 i = ivec2(floor((x + 0.5) * (1.0 / float(pc.fscale)) - 0.5));   // the 4 S texels around x (S dilated by ~1 flow px)
-    return max(max(max(sF(i), sF(i + ivec2(1, 0))), max(sF(i + ivec2(0, 1)), sF(i + ivec2(1, 1)))), eF(c));
+    return vec2(max(max(sF(i), sF(i + ivec2(1, 0))), max(sF(i + ivec2(0, 1)), sF(i + ivec2(1, 1)))), eF(c));
 }
 const int U_V2SAD_ = 3;   // == v2_est.glsl U_V2SAD: Performance's scene-cut sum (integer finest SADs; V1 / Quality: u[1])
 

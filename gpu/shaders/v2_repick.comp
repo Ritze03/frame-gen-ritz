@@ -20,7 +20,7 @@ shared float sums[4][9];
 const int V2_REFINE = 2;
 
 void main() {
-    int lid = int(gl_LocalInvocationIndex);
+    int lid = int(gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID);   // (from the subgroup lane: a block's 16 threads are one cluster)
     int bl = lid >> 4, i = lid & 15;
     ivec2 blk = ivec2(gl_WorkGroupID.xy) * 2 + ivec2(bl & 1, bl >> 1);
     bool live = blk.x < pc.bw && blk.y < pc.bh;
