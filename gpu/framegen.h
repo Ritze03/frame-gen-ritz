@@ -243,6 +243,11 @@ struct Settings {
     // setSettings() at any time, no rebuild; a switch of the mode alone keeps the current estimate (a switch of motionVersion
     // drops it, see there). validate() takes Quality or Performance.
     V2Mode v2Mode = V2Mode::Quality;
+    // MotionVersion::V2 (both modes): its own protection of static overlays (HUD text, a semi-transparent panel, a crosshair) whose
+    // background moves: a static-structure mask of each pair (where both real frames show the same structure) keeps those pixels at
+    // the zero vector and keeps warp taps off them, with or without uiProtection. On = the default; off = V2's synthesis as without
+    // it (the tests' unprotected reference). V1 ignores it. Runtime: setSettings() at any time, from the next recordEstimate on.
+    bool v2StaticMask = true;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
     // Motion estimation runs at 1/flowScale of the frame size: 1, 2 or 4. 2 = quality (default);

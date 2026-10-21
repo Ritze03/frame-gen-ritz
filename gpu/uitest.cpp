@@ -714,18 +714,23 @@ static void ghostCheck() {
                 const auto real = sc.frame(11), f10 = sc.frame(10);
                 Settings base;
                 if (prof == 1) { base.hudBonus = 2.5f; base.trustLow = 254; base.trustHigh = 255; base.globalFallback = 1.0f; base.sceneCutSad = 255; }
-                const Result ref = runSequence(sn, base, true, nullptr);
+                // Off: no protection at all, also not V2's own static-structure mask (Settings::v2StaticMask), each row measured
+                // against the crosshair-free run of its own settings' mask choice
+                Settings baseN = base;
+                baseN.v2StaticMask = false;
+                const Result ref = runSequence(sn, base, true, nullptr), refN = runSequence(sn, baseN, true, nullptr);
                 struct Row { size_t art05 = 0, art025 = 0, uiBad = 0; };
                 auto measureRow = [&](const Settings& st) {
                     const Result r = runSequence(sc, st, true, nullptr);
+                    const Result& rf = st.v2StaticMask ? ref : refN;
                     Row m;
                     for (int y = sc.cy - 24; y <= sc.cy + 24; y++)
                         for (int x = sc.cx - 24; x <= sc.cx + 24; x++) {
                             const size_t i = (size_t)y * W + x;
                             int d05 = 0, d025 = 0, dr = 0;
                             for (int c = 0; c < 3; c++) {
-                                d05 = std::max(d05, std::abs((int)r.out[0][i * 4 + c] - (int)ref.out[0][i * 4 + c]));
-                                d025 = std::max(d025, std::abs((int)r.out[1][i * 4 + c] - (int)ref.out[1][i * 4 + c]));
+                                d05 = std::max(d05, std::abs((int)r.out[0][i * 4 + c] - (int)rf.out[0][i * 4 + c]));
+                                d025 = std::max(d025, std::abs((int)r.out[1][i * 4 + c] - (int)rf.out[1][i * 4 + c]));
                                 dr = std::max(dr, std::abs((int)r.out[0][i * 4 + c] - (int)real[i * 4 + c]));
                             }
                             if (sc.ui[i]) { m.uiBad += dr > 1; continue; }
@@ -737,7 +742,7 @@ static void ghostCheck() {
                         }
                     return m;
                 };
-                Settings off = base, v1 = base, v2 = base, v2f = base;
+                Settings off = baseN, v1 = base, v2 = base, v2f = base;
                 v1.uiProtection = UiProtection::Crosshair;
                 v2.uiProtection = v2f.uiProtection = UiProtection::CrosshairV2;
                 v2f.uiEstimateFill = true;
@@ -883,7 +888,9 @@ static int v2Check(int W, int H) {
             Scene sh(W, H, 12, 0, 0, arm, 0);
             harshBackground(sh);
             auto truth = sh.frame(10.5, false), real = sh.frame(11);
-            Result a = runSequence(sh, off, true, nullptr);
+            Settings offN = off;
+            offN.v2StaticMask = false;   // Off = no protection at all (also not V2's own static-structure mask)
+            Result a = runSequence(sh, offN, true, nullptr);
             Settings vf = v2; vf.uiEstimateFill = true;
             Result b = runSequence(sh, vf, true, nullptr);
             auto meanErr = [&](const std::vector<uint8_t>& out) {
@@ -1017,6 +1024,7 @@ static int v2Check(int W, int H) {
         };
         auto real = sc.frame(NF - 1);
         Settings h4 = v2; h4.uiReentryFrames = 0;   // isolate the hysteresis from fast re-entry
+        h4.v2StaticMask = false;   // ... and CrosshairV2's own mask from V2's static-structure mask (which keeps a static arm by itself)
         Settings h1 = h4; h1.uiLeaveFrames = 1;
         Result r4 = runSequence(sc, h4, true, nullptr), r1 = runSequence(sc, h1, true, nullptr);
         size_t n, b4 = uiDiffers(sc, r4.out[0], real, 1, all, &n), b1 = uiDiffers(sc, r1.out[0], real, 1, all);
@@ -1044,6 +1052,7 @@ static int v2Check(int W, int H) {
             return uiDiffers(sc, r.out[0], sc.frame(nf - 1), 1, [&](int x, int y) { return subsetPx(sc, x, y); });
         };
         Settings re2 = v2, re0 = v2; re0.uiReentryFrames = 0;
+        re2.v2StaticMask = re0.v2StaticMask = false;   // CrosshairV2's own state machine (V2's static mask keeps a static arm by itself)
         size_t a = runAt(21, re2), b = runAt(20, re2), c = runAt(21, re0), d = runAt(27, re0), e = runAt(28, re0);
         printf(" fast re-entry (arm leaves at 17, back at 19): wrong arm px  re-entry 2: pair(19,20) %zu, pair(18,19) %zu | re-entry 0: pair(19,20) %zu, pair(25,26) %zu, pair(26,27) %zu\n", a, b, c, d, e);
         expect(a == 0, "fast re-entry 2: the arm is protected again on the pair 2 frames after it came back");
@@ -1538,7 +1547,7 @@ static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "
 // The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes.
 // V2 = both V2Modes: V1's luma / down, its 2 faster estimate passes (medhist, search), the block re-pick and field clean-up (both
 // modes), Performance's morph, Quality's per-pixel field, splat, coverage and morph; no motion-blur passes (its morphs blur): 11.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 11 : 14; }
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : 14; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1645,7 +1654,7 @@ static void motionCheck(const Scene& sc) {
     expect(fg.setSettings(sTo), "switch accepted");
     const int64_t k = gLivePipes - p0;
     printf("    pipelines: %lld after init, +%lld for the first switch to %s\n", (long long)p0, (long long)k, algoName(to));
-    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 11)");
+    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 15)");
     expect(!run(fg, false, nullptr) && blurRefused(fg), "after the switch the old estimate is gone: recordSynth and recordSynthBlur return false");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "switching back creates nothing (the start version kept its pipelines)");
     expect(!run(fg, false, nullptr), "switching straight back does not revive the dropped estimate");

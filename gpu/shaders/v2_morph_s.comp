@@ -1,0 +1,9 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// V2 Performance's synthesis with the static-overlay tests (v2_morph.glsl V2_STATIC): its static pass (the cells near an overlay) and
+// its flick fix-up.
+#define V2_STATIC 1
+#include "v2_morph.glsl"

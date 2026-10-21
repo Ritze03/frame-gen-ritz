@@ -615,8 +615,12 @@ static void ghostFormat(Enc e, const Scene& base, GhostRow* off, GhostRow* v2) {
     sv.uiProtection = UiProtection::CrosshairV2;
     sv.uiBoxWidth = sv.uiBoxHeight = 16;
     sv.uiEstimateFill = true;
-    const Result rr = runSequence(e, gn, so, true), ro = runSequence(e, g, so, true), rv = runSequence(e, g, sv, true);
-    if (!rr.ok || !ro.ok || !rv.ok) { off->ok = v2->ok = false; return; }
+    // Off: no protection at all, also not V2's own static-structure mask (Settings::v2StaticMask), against its own crosshair-free run
+    Settings sn = so;
+    sn.v2StaticMask = false;
+    const Result rr = runSequence(e, gn, so, true), rrN = runSequence(e, gn, sn, true), ro = runSequence(e, g, sn, true),
+                 rv = runSequence(e, g, sv, true);
+    if (!rr.ok || !rrN.ok || !ro.ok || !rv.ok) { off->ok = v2->ok = false; return; }
     const auto real = decode(e, encode(e, g.frame(11), W, H), W, H), prev = decode(e, encode(e, g.frame(10), W, H), W, H);
     const float tol = isYuv(e) ? 2.5f : 1.0f;
     auto isUi = [&](int x, int y) {
@@ -629,13 +633,14 @@ static void ghostFormat(Enc e, const Scene& base, GhostRow* off, GhostRow* v2) {
         return false;
     };
     for (int k : {0, 2}) {   // t = 0.5, blurred
-        const auto ref = decode(e, rr.out[k], W, H), dOff = decode(e, ro.out[k], W, H), dV2 = decode(e, rv.out[k], W, H);
+        const auto ref = decode(e, rr.out[k], W, H), refN = decode(e, rrN.out[k], W, H), dOff = decode(e, ro.out[k], W, H),
+                   dV2 = decode(e, rv.out[k], W, H);
         for (int y = g.cy - 40; y <= g.cy + 40; y++)
             for (int x = g.cx - 40; x <= g.cx + 40; x++) {
                 const size_t i = (size_t)y * W + x;
                 float d0 = 0, d2 = 0, dr = 0, dp = 0;
                 for (int c = 0; c < 3; c++) {
-                    d0 = std::max(d0, std::fabs(dOff[i * 3 + c] - ref[i * 3 + c]));
+                    d0 = std::max(d0, std::fabs(dOff[i * 3 + c] - refN[i * 3 + c]));
                     d2 = std::max(d2, std::fabs(dV2[i * 3 + c] - ref[i * 3 + c]));
                     dr = std::max(dr, std::fabs(dV2[i * 3 + c] - real[i * 3 + c]));
                     dp = std::max(dp, std::fabs(real[i * 3 + c] - prev[i * 3 + c]));
