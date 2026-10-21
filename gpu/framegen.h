@@ -44,7 +44,7 @@ enum class V2Mode : uint32_t {
                        // frame still shows each piece of content; one full-resolution gather like Performance's whose blend leans
                        // to that frame (no 50/50 double image at occlusions and at the frame border), whose taps skip static
                        // overlays, blurred along the motion where the two taps still disagree. No per-pixel trust or hold.
-                       // RX 7900 XTX, 1080p 2x: ~0.22 ms per pair (V1 0.30, Performance 0.16).
+                       // RX 7900 XTX, 1080p 2x: ~0.24 ms per pair (V1 0.30, Performance 0.14).
     Performance = 1,   // the "grid morph": the finest block field (16x16 px cells at flowScale 2) re-picked among neighbours,
                        // refined and cleaned (vector median + light smoothing), upsampled bilinearly to full resolution and taken to
                        // time t per pixel; one full-resolution two-tap blend (and a zero-vector candidate where the two frames agree,
