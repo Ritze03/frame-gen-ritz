@@ -1041,6 +1041,7 @@ bool Interpolator::validate(const Settings& s) {
            in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V2 &&
+           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
            in(s.uiBoxHeightFrac, 0.0f, 1.0f) &&

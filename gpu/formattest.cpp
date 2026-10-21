@@ -5,6 +5,7 @@
 //   options: --separate-planes  YUV: two single-plane images instead of one multi-planar image with plane views
 //            --algo v1|v2       the motion version (Settings::motionVersion), default v1. V2 is Rgba8 only: with v2, check runs
 //                               Rgba8 in V2 and checks that every other format refuses V2 (init and setSettings, with a reason)
+//            --mode quality|performance  Settings::v2Mode (default quality; V1 ignores it)
 //            --hash             check: print an FNV-1a hash of every output of each format's Off run (t = 0.5, 0.25, blur) and
 //                               WholeScreen run (t = 0.5, 0.25), raw bytes of both planes: diff two library builds
 //
@@ -39,6 +40,7 @@ static bool separatePlanes = false;
 static bool hashOut = false;   // --hash
 #ifndef FORMATTEST_NO_MOTION   // define it to build against a library without Settings::motionVersion
 static MotionVersion gAlgo = MotionVersion::V1;   // --algo
+static V2Mode gMode = V2Mode::Quality;             // --mode
 static bool algoV2() { return gAlgo == MotionVersion::V2; }
 #else
 static bool algoV2() { return false; }
@@ -482,6 +484,7 @@ static InitInfo baseInfo(Enc e, int W, int H, const Settings& s) {
     info.settings = s;
 #ifndef FORMATTEST_NO_MOTION
     info.settings.motionVersion = gAlgo;
+    info.settings.v2Mode = gMode;
 #endif
     if (e == Enc::F16Lin) { info.transfer = Transfer::Linear; info.linearWhiteNits = 80.0f; }
     return info;
@@ -1008,10 +1011,16 @@ int main(int argc, char** argv) {
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
             else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
         }
+        else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
+            const char* a = argv[++i];
+            if (!strcmp(a, "quality")) gMode = V2Mode::Quality;
+            else if (!strcmp(a, "performance")) gMode = V2Mode::Performance;
+            else { fprintf(stderr, "--mode quality|performance\n"); return 2; }
+        }
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [--hash] [--algo v1|v2] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [--hash] [--algo v1|v2] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -1061,7 +1070,8 @@ int main(int argc, char** argv) {
         vkDeviceWaitIdle(dev);
         return 0;
     }
-    printf("formattest %dx%d on %s, motion version %s (YUV: %s)\n", W, H, props.deviceName, algoV2() ? "V2" : "V1", separatePlanes ? "separate plane images" : "multi-planar image + plane views, falling back to separate images");
+    printf("formattest %dx%d on %s, motion version %s, v2Mode %s (YUV: %s)\n", W, H, props.deviceName, algoV2() ? "V2" : "V1",
+           gMode == V2Mode::Performance ? "performance" : "quality", separatePlanes ? "separate plane images" : "multi-planar image + plane views, falling back to separate images");
     apiChecks(W, H);
     Scene sc(W, H, 12);
     // reference: the Rgba8 path of the same scene

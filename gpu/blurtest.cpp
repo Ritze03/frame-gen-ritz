@@ -245,7 +245,8 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
 // --algo: the motion version every Interpolator of the run is created and set with
 #ifndef BLURTEST_NO_MOTION
 static MotionVersion gAlgo = MotionVersion::V1;
-static Settings algo(Settings s) { s.motionVersion = gAlgo; return s; }
+static V2Mode gMode = V2Mode::Quality;   // --mode: Settings::v2Mode (V1 ignores it)
+static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; return s; }
 #else
 static Settings algo(Settings s) { return s; }
 #endif
@@ -665,7 +666,8 @@ static Edge modelEdge(const BScene& bs, const std::vector<float>& t, const std::
 
 static int check(int W, int H) {
 #ifndef BLURTEST_NO_MOTION
-    printf("check %dx%d %s, motion version %s (--algo)\n", W, H, bgra ? "BGRA8" : "RGBA8", gAlgo == MotionVersion::V2 ? "V2" : "V1");
+    printf("check %dx%d %s, motion version %s (--algo), v2Mode %s (--mode)\n", W, H, bgra ? "BGRA8" : "RGBA8",
+           gAlgo == MotionVersion::V2 ? "V2" : "V1", gMode == V2Mode::Performance ? "performance" : "quality");
 #else
     printf("check %dx%d %s\n", W, H, bgra ? "BGRA8" : "RGBA8");
 #endif
@@ -1002,10 +1004,16 @@ int main(int argc, char** argv) {
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
             else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
         }
+        else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
+            const char* a = argv[++i];
+            if (!strcmp(a, "quality")) gMode = V2Mode::Quality;
+            else if (!strcmp(a, "performance")) gMode = V2Mode::Performance;
+            else { fprintf(stderr, "--mode quality|performance\n"); return 2; }
+        }
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

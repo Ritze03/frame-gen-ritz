@@ -30,6 +30,14 @@ enum class MotionVersion : uint32_t {
               // choice. The default.
     V2 = 1,   // the second algorithm, next to V1 (unchanged). Rgba8 only: settingsError() refuses it with any other Format. For now it
               // runs V1's passes (its own pipelines of the same shaders), so its output equals V1's until its own shaders land.
+              // Settings::v2Mode picks between its two modes.
+};
+
+// The two modes of MotionVersion::V2 (Settings::v2Mode). Values are append-only and never renumbered. Runtime: setSettings() at any
+// time, no rebuild. V1 ignores it. For now both modes run V2's alias of V1's passes, so their output equals V1's.
+enum class V2Mode : uint32_t {
+    Quality = 0,       // the default: the better picture for more GPU time
+    Performance = 1,   // less GPU time per generated frame
 };
 
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
@@ -220,6 +228,10 @@ struct Settings {
     // version creates its pipelines (and later its buffers) at once, no GPU wait (false from setSettings if that fails, nothing
     // changed); switching away keeps them for a later switch back, releaseUnusedMotion() frees them.
     MotionVersion motionVersion = MotionVersion::V1;
+    // The mode of MotionVersion::V2 (see V2Mode). Quality = the default. V1 ignores it (any valid value, no effect). Runtime:
+    // setSettings() at any time, no rebuild; a switch of the mode alone keeps the current estimate (a switch of motionVersion
+    // drops it, see there). validate() takes Quality or Performance.
+    V2Mode v2Mode = V2Mode::Quality;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
     // Motion estimation runs at 1/flowScale of the frame size: 1, 2 or 4. 2 = quality (default);

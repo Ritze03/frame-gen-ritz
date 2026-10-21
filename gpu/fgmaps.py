@@ -5,7 +5,9 @@
                                        colour coded), _flow.png (per-pixel half-vector, HSV coded)
 
 Layout (fgtest.cpp, Interpolator::recordDebugMaps): 64-byte header, block field (bw*bh vec2 f32), per-pixel half-vector field
-(fw*fh vec2 f32, midpoint grid), packed mismatch e (eStride*H uint32, 4 px per word, low byte first).
+(fw*fh vec2 f32, midpoint grid), packed mismatch e (eStride*H uint32, 4 px per word, low byte first). Header version 5: words
+14-15 = motionVersion, v2Mode (printed); version 1: the same maps; versions 2-4 (the old V2, tag v2-occlusion): the same maps
+first, its own extras after them are ignored.
 u = ramp(7x7 box of e (replicate border), trustLow..trustHigh) as resolve.comp computes it; the candidate index is recovered by
 matching the stored per-pixel vector against the 7 candidates of pixfield.comp (first match wins, as the first candidate wins ties):
 0 bilinear block field, 1 own block, 2 above, 3 below, 4 left, 5 right, 6 zero.
@@ -24,15 +26,18 @@ def load(path):
     raw = open(path, "rb").read()
     h = np.frombuffer(raw[:64], np.uint32)
     hf = np.frombuffer(raw[40:56], np.float32)
-    assert h[0] == 0x504D4746 and h[1] == 1, "not an fgmaps v1 file"
+    assert h[0] == 0x504D4746 and 1 <= h[1] <= 5, "not an fgmaps v1 - v5 file"
     W, H, fw, fh, bw, bh, fscale, es = (int(x) for x in h[2:10])
     o = 64
     block = np.frombuffer(raw, np.float32, bw * bh * 2, o).reshape(bh, bw, 2); o += bw * bh * 8
     pf = np.frombuffer(raw, np.float32, fw * fh * 2, o).reshape(fh, fw, 2); o += fw * fh * 8
     ew = np.frombuffer(raw, np.uint32, es * H, o).reshape(H, es)
     e = np.stack([(ew >> (8 * i)) & 255 for i in range(4)], -1).reshape(H, es * 4)[:, :W].astype(np.float32)
+    ver = int(h[1])
+    algo = ("v1", "v2")[min(int(h[14]), 1)] if ver >= 5 else ("v2" if ver >= 2 else "v1")
+    mode = ("quality", "performance")[min(int(h[15]), 1)] if ver >= 5 else None
     return dict(W=W, H=H, fw=fw, fh=fh, bw=bw, bh=bh, fscale=fscale, block=block, pf=pf, e=e,
-                trustLow=float(hf[0]), trustHigh=float(hf[1]))
+                trustLow=float(hf[0]), trustHigh=float(hf[1]), version=ver, algo=algo, mode=mode)
 
 
 def box(img, r):
@@ -100,6 +105,7 @@ def main():
     from PIL import Image
     d = load(sys.argv[1])
     pre = sys.argv[2]
+    print("fgmaps version %d, algo %s%s" % (d["version"], d["algo"], ", v2Mode " + d["mode"] if d["algo"] == "v2" and d["mode"] else ""))
     Image.fromarray((trust(d) * 255 + 0.5).astype(np.uint8)).save(pre + "_u.png")
     Image.fromarray(np.clip(d["e"] * 4, 0, 255).astype(np.uint8)).save(pre + "_e.png")
     idx, _ = cand_index(d)

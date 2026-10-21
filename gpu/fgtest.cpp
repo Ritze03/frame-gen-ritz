@@ -7,7 +7,7 @@
 // --bench N --mult M: per real pair one estimate + M-1 synths at t = k/M (M = 2: record(0.5)). --bgra uses B8G8R8A8_UNORM images/views for
 // inputs and output (the file data stays RGBA; channels are swizzled on upload/readback).
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
-// smoothBonus searchPenalty subpixel flowScale; algo=v1|v2 = motionVersion; ui=off|crosshair|wholescreen|crosshairv2 =
+// smoothBonus searchPenalty subpixel flowScale; algo=v1|v2 = motionVersion; v2Mode=quality|performance; ui=off|crosshair|wholescreen|crosshairv2 =
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill), passed to init.
 // UI protection (ui != off in --set or --then): every real frame is recordObserve'd once, in pair order, into a ring of 3 input
@@ -21,9 +21,11 @@
 // --window N: destroy + init the Interpolator before every N-th pair (pair 0, N, 2N, ..): independent windows of consecutive
 // pairs in one call, no state carried across (bench/score; UI protection warms up again per window). Neither changes any output.
 // --dump DIR (created if missing): after each pair write DIR/pair_NNNN.fgmaps (Interpolator::recordDebugMaps, read-only, output unchanged): a 64-byte
-// header (uint32 magic 'FGMP', version 1, W, H, fw, fh, bw, bh, fscale, eStride, float trustLow, trustHigh, smoothBonus, hudBonus,
-// 2 x 0), then the block field (bw*bh vec2 f32), the per-pixel half-vector field (fw*fh vec2 f32, midpoint grid) and the packed
-// mismatch e (eStride*H uint32, 4 px per word, low byte first) of the pair's last record. gpu/fgmaps.py turns it into PNG maps.
+// header (uint32 magic 'FGMP', version 5, W, H, fw, fh, bw, bh, fscale, eStride, float trustLow, trustHigh, smoothBonus, hudBonus,
+// uint32 motionVersion, v2Mode), then the block field (bw*bh vec2 f32), the per-pixel half-vector field (fw*fh vec2 f32, midpoint
+// grid) and the packed mismatch e (eStride*H uint32, 4 px per word, low byte first) of the pair's last record. gpu/fgmaps.py turns it
+// into PNG maps. (Version 1: the same maps, header words 14-15 = 0. Versions 2-4 were the old MotionVersion::V2's, tag v2-occlusion:
+// the same maps followed by its own, which no longer exist.)
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
 
@@ -50,6 +52,12 @@ static bool parseSettings(char* str, framegen::Settings& s) {
             if (a == "v1") s.motionVersion = framegen::MotionVersion::V1;
             else if (a == "v2") s.motionVersion = framegen::MotionVersion::V2;
             else { fprintf(stderr, "algo=v1|v2, not %s\n", eq + 1); return false; }
+        }
+        else if (k == "v2Mode") {   // MotionVersion::V2's mode: quality | performance
+            std::string a = eq + 1;
+            if (a == "quality") s.v2Mode = framegen::V2Mode::Quality;
+            else if (a == "performance") s.v2Mode = framegen::V2Mode::Performance;
+            else { fprintf(stderr, "v2Mode=quality|performance, not %s\n", eq + 1); return false; }
         }
         else if (k == "trustLow") s.trustLow = (float)v;
         else if (k == "trustHigh") s.trustHigh = (float)v;
@@ -403,9 +411,10 @@ int main(int argc, char** argv) {
             snprintf(path, sizeof path, "%s/pair_%04zu.fgmaps", dumpDir, pairIdx);
             FILE* f = fopen(path, "wb");
             if (!f) { fprintf(stderr, "cannot write %s\n", path); return 1; }
-            uint32_t hdr[16]{0x504d4746u, 1, dl.W, dl.H, dl.fw, dl.fh, dl.bw, dl.bh, dl.fscale, dl.eStride};
+            uint32_t hdr[16]{0x504d4746u, 5, dl.W, dl.H, dl.fw, dl.fh, dl.bw, dl.bh, dl.fscale, dl.eStride};
             float hf[4]{setB.trustLow, setB.trustHigh, setB.smoothBonus, setB.hudBonus};   // the settings of the last record
             memcpy(hdr + 10, hf, sizeof hf);
+            hdr[14] = (uint32_t)setB.motionVersion; hdr[15] = (uint32_t)setB.v2Mode;
             fwrite(hdr, 1, sizeof hdr, f);
             fwrite(dmpMap, 1, dl.size, f);
             fclose(f);
