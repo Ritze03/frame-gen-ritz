@@ -755,13 +755,9 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     expect(xh == 0 && xh2 == 0, "crosshair pixels equal the real ones (WholeScreen, t = 0.5 and 0.25)");
     expect(hud == 0 && hud2 == 0, "HUD box pixels equal the real ones (WholeScreen)");
     expect(xhOff > 0 || hudOff > 0, "(the scene disturbs the UI without protection: the check has teeth)");
-    {   // recordTrack: 8 frames tracked instead of observed leave the same counters, so the last pair's outputs are bit-identical.
-        // MotionVersion::V2's temporal seed (Settings::v2Temporal) is off in both runs: the tracked run estimates fewer pairs, so its
-        // estimate history differs by design; the UI state is what is compared here.
-        Settings wn = w; wn.v2Temporal = 0.0f;
-        Result rwn = runSequence(e, sc, wn, false);
-        Result rt = runSequence(e, sc, wn, false, true);
-        expect(rwn.ok && rt.ok && rt.out[0].p0 == rwn.out[0].p0 && rt.out[0].p1 == rwn.out[0].p1 && rt.out[1].p0 == rwn.out[1].p0 && rt.out[1].p1 == rwn.out[1].p1,
+    {   // recordTrack: 8 frames tracked instead of observed leave the same counters, so the last pair's outputs are bit-identical
+        Result rt = runSequence(e, sc, w, false, true);
+        expect(rt.ok && rt.out[0].p0 == rw.out[0].p0 && rt.out[0].p1 == rw.out[0].p1 && rt.out[1].p0 == rw.out[1].p0 && rt.out[1].p1 == rw.out[1].p1,
                "recordTrack (WholeScreen): frames tracked instead of observed give bit-identical output");
     }
     Settings c; c.uiProtection = UiProtection::Crosshair; c.uiBoxWidth = c.uiBoxHeight = 64;
@@ -798,10 +794,8 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         if (isYuv(e)) printf("    (%zu crosshair edge pixels change with the chroma of the moving background in this pair and are not judged)\n", nChanged);
         expect(xh3 == 0 && xh4 == 0, isYuv(e) ? "crosshair pixels that did not change in the pair equal the real ones (CrosshairV2, t = 0.5 and 0.25)"
                                               : "crosshair pixels equal the real ones (CrosshairV2, t = 0.5 and 0.25)");
-        Settings vn = v; vn.v2Temporal = 0.0f;   // (as for WholeScreen above: the estimate history differs by design)
-        Result rvn = runSequence(e, sc, vn, false);
-        Result rvt = runSequence(e, sc, vn, false, true);
-        expect(rvn.ok && rvt.ok && rvt.out[0].p0 == rvn.out[0].p0 && rvt.out[0].p1 == rvn.out[0].p1 && rvt.out[1].p0 == rvn.out[1].p0 && rvt.out[1].p1 == rvn.out[1].p1,
+        Result rvt = runSequence(e, sc, v, false, true);
+        expect(rvt.ok && rvt.out[0].p0 == rv.out[0].p0 && rvt.out[0].p1 == rv.out[0].p1 && rvt.out[1].p0 == rv.out[1].p0 && rvt.out[1].p1 == rv.out[1].p1,
                "recordTrack (CrosshairV2): frames tracked instead of observed give bit-identical output");
         expect(psnr(v05, truth, &near, false) >= pOff - 0.5, "CrosshairV2 does not cost background quality (-0.5 dB)");
         // the optional luma fill of the motion estimate (uiEstimateFill): its own pass, compiled per format

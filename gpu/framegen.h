@@ -28,46 +28,9 @@ enum class UiProtection : uint32_t {
 enum class MotionVersion : uint32_t {
     V1 = 0,   // the algorithm of proto/interp.py (the frozen reference), every Format: output byte-identical to a library without the
               // choice. The default.
-    V2 = 1,   // the second algorithm, next to V1 (unchanged). Rgba8 only: settingsError() refuses it with any other Format. V1's motion
-              // estimate (the same shaders) up to the per-pixel field, then an edge-aware field (a guided vector median that moves
-              // field discontinuities onto image edges) refined edge-preservingly to Settings::v2RefineRes of the frame (each
-              // full-resolution pixel picks among its neighbouring vectors by its own full-resolution mismatch, instead of V1's
-              // bilinear blend of them), an occlusion analysis of the symmetric field and a three-class resolve: trusted pixels
-              // blend as in V1, a clean occlusion between two confident, distinct vectors is warped from ONE side (covered: prev,
-              // uncovered: curr) with the background vector, everything else holds the nearer real frame as in V1. Settings::v2Preset
-              // picks its tuning (MotionPreset). Same latency as V1: it reads only prev and curr.
+    V2 = 1,   // the second algorithm, next to V1 (unchanged). Rgba8 only: settingsError() refuses it with any other Format. For now it
+              // runs V1's passes (its own pipelines of the same shaders), so its output equals V1's until its own shaders land.
 };
-
-// The tuning presets of MotionVersion::V2 (Settings::v2Preset). One algorithm, four settings of its knobs (the v2* fields of Settings
-// override single knobs). Values are append-only and never renumbered. Knob values per preset: Interpolator::v2Knobs().
-// Round 1 of the blind test against V1 (I11): the presets span the open choices, so the votes say which way to go. Every preset
-// refines at 100 %, keeps the temporal seed and the soft pick at clean occlusions (v2OccSoft 4: no single-pixel flips between the
-// candidates).
-//   A  balanced (default): occlusions of >= 2 px width, side vectors at 4 / 8 / 16 flow px, confidence 12, V1's trust ramp
-//      (12 / 40) and hard hold edge, edge sigma 8, temporal bonus 2, content rescue 16 (a thin / fast object both frames show is
-//      put back at its midpoint instead of vanishing).
-//   B  safe, closest to V1: only wide (>= 4 px), very confident (6) occlusions take the one-sided warp, reach 3, pick bias 2,
-//      edge sigma 12, temporal bonus 1, the strictest rescue (12); and the SOFT HOLD EDGE (v2HoldFeather 12 px): held patches
-//      fade out over 12 px instead of V1's hard ~4 px edge (the "too sharp islands" question; the bench prices it at about
-//      -0.2 dB / +0.1 ground-truth flicker: it holds more).
-//   C  bold: occlusions from 1 px, reach 6, less confident side vectors (16; I10's 30 warped a lighting change one-sided into
-//      orange blobs on fps_cs2_a), pick bias 0.5, edge sigma 5 (hardest picks), the
-//      wide trust ramp 16 / 48, temporal bonus 3, the most permissive rescue (24): the fewest pixels held, the most warped.
-//   D  A with the wider, softer trust ramp 16 / 48 (the user's blind test of V1 variants preferred it narrowly: "a bit crisper",
-//      "more motion clarity"): the A vs D vote repeats that question on V2.
-// Round 1's result (blind test, 2026-10-07): D best overall (10-6-1), A beat V1 most often (4-1), B weakest (2-7-4); V2 won on racing,
-// Minecraft and the indie clips and lost on Battlefield (3-0 for V1 against A, B, D) to rare hard-edged artifacts V1 does not make.
-// I12 adds three knobs, each switchable alone on top of any preset (0 = I11's output exactly):
-//   v2OccGate      the occlusion gate: a clean occlusion in a held neighbourhood (a muzzle flash, an explosion, tracer streaks) falls
-//                  back to V1's output instead of a blotchy one-sided patch of the other frame. A, D: 1. B, C: 0.
-//   v2RescueCheck  the content rescue's acceptance check: rescued blobs below this area (px), or matching worse than the trust
-//                  ramp's middle (stricter for small blobs), are dropped (a dark ring on a pillar, specks); the rescued edge is soft.
-//                  A, D: 256. B, C: 0.
-//   v2SeedMargin   the temporal seed must beat the other seed candidates by this block SAD margin (levels): fixes a recoiling
-//                  weapon's torn edge, but costs the seed's reach (holes in a fast trunk, ~-0.07 dB on the fps reference clips at
-//                  8): 0 in every preset, a round-2 contestant on its own (D + v2SeedMargin 8).
-// B and C are unchanged (B: likely dropped or reworked after round 1; C: not blind-tested).
-enum class MotionPreset : uint32_t { A = 0, B = 1, C = 2, D = 3 };
 
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
 enum class BlurWeights : uint32_t {
@@ -244,9 +207,8 @@ struct Settings {
     // "shutter" than a single instant. 0 or 1 = off (recordSynthBlur then equals recordSynth at the window's end t1).
     // 2..kBlurMaxSamples; any value works: the sub-frames sit at the MIDPOINTS of N equal slices of the window,
     // t_k = t0 + (t1 - t0)(k + 0.5)/N, k = 0..N-1 (a box-filter shutter; no sample on a window end), with the weights of blurWeights. Runtime: setSettings() at any time; the scratch it needs (per sample one
-    // field at t and one mismatch image: ~3 B per pixel at flowScale 2, 9 B at flowScale 1; MotionVersion::V2 keeps no field, only the
-    // mismatch and its soft hold edge map: 1.25 B per pixel per sample) is allocated by the first blurred record and only grows.
-    // Off = byte-identical to a library without it.
+    // field at t and one mismatch image: ~3 B per pixel at flowScale 2, 9 B at flowScale 1) is allocated by the first
+    // blurred record and only grows. Off = byte-identical to a library without it.
     // Cost (RX 7900 XTX, per output, on top of the pair's estimate): see "Motion blur" in INTEGRATION.md.
     uint32_t blurSamples = 0;
     BlurWeights blurWeights = BlurWeights::Gaussian;
@@ -255,18 +217,8 @@ struct Settings {
     // (settingsError()). Runtime: setSettings() at any time. A switch DROPS the current estimate: recordSynth / recordSynthBlur
     // return false (out untouched, the host shows the real frame, as with no estimate since init/resize) until the next
     // recordEstimate, which runs the new version; an estimate of one version is never synthesised by the other. The first switch to a
-    // version creates its pipelines and buffers at once, no GPU wait (false from setSettings if that fails, nothing changed);
-    // switching away keeps them for a later switch back, releaseUnusedMotion() frees them. V2's buffers: 40 B per flow-resolution
-    // pixel (the occlusion map, the content rescue's scratch, the temporal store of v2Temporal) + 1.25 B per pixel (the class map, the
-    // soft hold edge's map), ~23.3 MB at 1080p, flowScale 2, plus the refined fields, 8 B per pixel of the refinement grid
-    // (v2RefineRes: ~16.6 MB at 1080p and 100 %, ~4.1 MB at 50 %): ~40 MB in all at 1080p; its motion blur keeps 1.25 B per pixel
-    // per sample (the mismatch and the soft hold edge's map). Cost of V2 (RX 7900 XTX, 1080p 2x, 100 % refinement, I11): ~0.63 ms
-    // per pair for presets A / D, ~0.63-0.64 for B / C, against V1's ~0.33 (estimate: the temporal seed ~0.005 ms, edge-aware field
-    // ~0.075, content rescue ~0.06 (cover / rescue / merge / close), occlusion pass ~0.048, refinement ~0.052; synth: mismatch
-    // ~0.034 instead of ~0.028, soft hold edge ~0.010 (B), resolve ~0.072 instead of ~0.031). V2 reads only prev and curr: the same
-    // latency as V1 (v2Temporal reuses the previous pair's field, which already exists). I12: A / D ~0.64-0.65 ms (timestamp sum;
-    // back-to-back ~0.62) with the occlusion gate (~0.009 + ~0.009 of statistics in the occlusion pass, which every preset pays) and
-    // the rescue check (~0.012), B / C ~0.63.
+    // version creates its pipelines (and later its buffers) at once, no GPU wait (false from setSettings if that fails, nothing
+    // changed); switching away keeps them for a later switch back, releaseUnusedMotion() frees them.
     MotionVersion motionVersion = MotionVersion::V1;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
@@ -274,106 +226,6 @@ struct Settings {
     // 4 = performance (1440p: ~40 % less total time at 2x, ~30 % at 4x; can miss thin/fine motion detail);
     // 1 = full res (1080p 2x: ~2.3x the time, not better on the test clips).
     uint32_t flowScale = 2;
-
-    // ---- runtime, appended: MotionVersion::V2 only (V1 ignores them; setSettings() at any time) ----
-    // The V2 tuning preset (see MotionPreset). Default A.
-    MotionPreset v2Preset = MotionPreset::A;
-    // Single knobs of V2, each overriding the preset's value; -1 (the default) = the preset's value. Interpolator::v2Knobs() gives the
-    // effective values. validate() takes -1 or the range given.
-    //   v2OcclWidth: [0.5, 64] full-resolution pixels. A motion boundary is an occlusion only if the motion difference across it,
-    //   normal to it, is at least this wide (half-vector: the width of the occluded strip at the midpoint). Higher = fewer, wider
-    //   occlusions take the one-sided warp; smaller ones keep V1's hold.
-    float v2OcclWidth = -1.0f;
-    //   v2Reach: [1, 16] flow-resolution pixels (integer). The side vectors of a boundary are looked for at 1, 2 and 4 x this
-    //   distance from a pixel (4 directions): the widest occluded strip handled is about 4 x reach x flowScale px.
-    float v2Reach = -1.0f;
-    //   v2Confidence: [1, 255] luma levels. Both side vectors must match prev and curr at their own place (3x3 mean |a - c| at flow
-    //   resolution) to at most this, else the pixel is not a clean occlusion. Higher = more boundaries count as clean.
-    float v2Confidence = -1.0f;
-    //   v2OccLow / v2OccHigh: [0, 255], high >= low + 1, levels. At a clean occlusion the 3x3 mean mismatch of the best of {the
-    //   field's vector, the two side vectors} ramps from the two-sided blend (<= low) to the one-sided warp (>= high).
-    //   -1 = the effective trust ramp (v2TrustLow / v2TrustHigh).
-    float v2OccLow = -1.0f, v2OccHigh = -1.0f;
-    //   v2PickBias: [0, 255] levels. At a clean occlusion a side vector replaces the field's vector when its 3x3 mismatch is lower
-    //   by more than this.
-    float v2PickBias = -1.0f;
-    //   v2TrustLow / v2TrustHigh: the trust ramp of V2's held class (trustLow / trustHigh of V1), [0, 255], high >= low + 1.
-    //   -1 = the preset's; presets A and B use Settings::trustLow / trustHigh, C and D 16 / 48.
-    float v2TrustLow = -1.0f, v2TrustHigh = -1.0f;
-    //   v2RefineRes: [1, 100] % of the frame size per axis (rounded to an integer). The resolution of V2's refinement grid (D13): the
-    //   edge-aware flow field is upsampled to it edge-preservingly, with a per-pixel re-pick from full-resolution detail (two RGB
-    //   taps per candidate), and every full-resolution pass reads its vector from that grid (bilinear between grid points; at 100 %
-    //   each pixel has its own refined vector). Every preset uses 100 %. Cost and memory scale with the grid's pixel count (1080p 2x,
-    //   RX 7900 XTX, preset A: ~0.54 ms per pair at 100 %, ~0.49 at 50 %, ~0.48 at 25 %); on the bench (fps reference clips, PSNR
-    //   against V1) 50 % gains about half of what 100 % gains. Memory: 8 B per grid pixel (the refined midpoint field and the field
-    //   at t, 2 x 16-bit fixed point in 1/32 px each, grown at the first estimate that needs more; the motion blur computes its fields at
-    //   t_k on the fly and keeps none).
-    float v2RefineRes = -1.0f;
-    //   v2EdgeSigma: [1, 255] levels. The strength of the edge awareness (D17): the range scale of the guide (the midpoint image the
-    //   field predicts) in the edge-aware vector median of the flow field and of the candidate costs (mismatch + guide difference) in
-    //   the refinement's soft pick. Smaller = vectors follow image edges more strictly (and the pick is harder); larger = closer to a
-    //   plain median and a plain bilinear upsample.
-    float v2EdgeSigma = -1.0f;
-    //   v2Temporal: 0 or 1 (>= 0.5 = on). The previous pair's field (D19): V2 keeps the edge-aware field of each estimate and the next
-    //   estimate uses it, motion-compensated to its own midpoint, (1) as one more seed candidate of the block search at every pyramid
-    //   level (reach: steady fast motion beyond the search's +-6 / +-2 per level is found again from where the last pair found it),
-    //   (2) as a temporal prior of the edge-aware field (v2TemporalBonus) and (3) to tell which side of a clean occlusion is the
-    //   background (a motion boundary moves with the foreground; else the side nearer the global median, as before). No latency (the
-    //   previous field already exists) and no host call: it applies only when the pair continues the last estimated one (its prev is
-    //   the last estimate's curr, which the library checks on the GPU by content: a skipped, repeated or out-of-order pair, or a cut
-    //   between pairs, drops it for that estimate) and never to the first estimate after init, resize, reconfigure or a switch of
-    //   motionVersion. Every preset: on. 0 = the estimate of I9 (the field is still stored, and the same work done).
-    float v2Temporal = -1.0f;
-    //   v2TemporalBonus: [0, 255] levels. The temporal prior: where the compensated previous vector differs from the edge-aware field's
-    //   (by more than 1/4 flow px) it replaces it if its 3x3 mean |a - c| (flow res) is at most this much higher. Higher = steadier
-    //   field from pair to pair (less vector jitter where the content does not decide), lower = the content decides more often.
-    float v2TemporalBonus = -1.0f;
-    //   v2Rescue: [0, 64] levels (I11). The content rescue: content that both frames show but the field would show at neither
-    //   place (a thin or fast object whose midpoint the field gives a vector that maps background to background, so it vanishes) is
-    //   found again (an unused, structured patch of prev that a vector from its neighbourhood maps onto an unused patch of curr) and
-    //   put back at its midpoint with that vector. The largest 3x3 mean luma difference of such a match; 0 = off. Higher = more
-    //   rescues (and more risk of a wrong one).
-    float v2Rescue = -1.0f;
-    //   v2HoldFeather: [0, 32] full-resolution pixels (I11). The soft edge of held regions (V1's hold of the nearer real frame
-    //   where the warp failed): the hold weight falls off linearly over this distance outside a held region instead of V1's hard
-    //   ~4 px edge (the "too sharp islands"). 0 = V1's edge.
-    float v2HoldFeather = -1.0f;
-    //   v2OccSoft: [0, 64] levels (I11). At a clean occlusion the candidate vectors (the field's, the background's, the
-    //   foreground's, zero) are weighted softly by their 3x3 mismatch, w = exp(-(e - e_best) / v2OccSoft), instead of the hard pick of
-    //   the best (single pixels flipping between candidates: specks on silhouette edges). 0 = the hard pick.
-    float v2OccSoft = -1.0f;
-    // (I12: three fixes of the round-1 blind test's losses to V1 on the shooter clips, each its own knob, each 0 = off = I11's
-    // output exactly, independent of each other and of the preset.)
-    //   v2OccGate: [0, 1] (I12). The occlusion gate: a clean occlusion whose surroundings are held (within +-12 flow px, the share of
-    //   the pixels without a clean occlusion whose own vector leaves a colour mismatch at or above the middle of the trust ramp, ramp
-    //   0.6 .. 0.85) is given back to V1's output, its one-sided warp AND its candidate pick, by that ramp x this strength. A real
-    //   occlusion lies between two regions its vectors explain; one inside a region nothing explains is the noise of a wrong field: a
-    //   muzzle flash or an explosion (the next frame's colour in blotchy, hard-edged patches over V1's soft hold), specks of the
-    //   other frame on tracer streaks. 0 = off. Cost ~0.009 ms (1080p 2x) + ~0.009 ms of statistics in the occlusion pass (always).
-    float v2OccGate = -1.0f;
-    //   v2SeedMargin: [0, 64] levels (I12). The temporal seed (v2Temporal) wins the block search's seed choice only if its block mean
-    //   SAD is lower than the best other candidate's by more than this (at every pyramid level; 0 = strictly lower, I11). Last pair's
-    //   motion is stale where the motion changes (a swaying, recoiling weapon: a torn box edge and a black speck where V1 moves it as
-    //   one rectangle); higher = the seed only where it clearly explains the content better, lower = more of its reach (steady fast
-    //   motion, thin fast objects). No cost.
-    float v2SeedMargin = -1.0f;
-    //   v2RescueCheck: [0, 4096] full-resolution pixels (I12). The content rescue's acceptance check (v2Rescue): the smallest rescued
-    //   blob kept (its area counted within +-10 flow px of each rescued pixel), and its mean colour mismatch (the rescued vector's,
-    //   at full resolution) at most the middle of the trust ramp, x min(area / (4 x this), 1) (a small blob must match better); a
-    //   blob that fails gets its own vector back and is held or trusted as usual. The rescue's misses are small hard-edged blobs of
-    //   the other content (a dark ring on a light pillar, a dark speck under a tree, a grey rectangle over tracers); a whole object
-    //   (a tree trunk) passes. Also softens the rescued object's edge (its hold exemption fades over the outer flow pixel). 0 = off.
-    //   Cost ~0.012 ms (1080p 2x, only where something was rescued).
-    float v2RescueCheck = -1.0f;
-};
-
-// The effective V2 knobs of a Settings (Interpolator::v2Knobs(): the preset with the v2* overrides applied).
-struct V2Knobs {
-    float occlWidth, reach, confidence, occLow, occHigh, pickBias, trustLow, trustHigh;
-    float refineRes, edgeSigma;   // refineRes rounded to an integer percentage
-    float temporal, temporalBonus;   // temporal 0 / 1
-    float rescue, holdFeather, occSoft;   // (I11)
-    float occGate, seedMargin, rescueCheck;   // (I12)
 };
 
 struct InitInfo {
@@ -428,9 +280,6 @@ public:
     // literal). init(), setSettings() and reconfigure() refuse what it refuses (init() with this as initError()); a host whose
     // setSettings() returned false can ask it why. Today's only Format rule: MotionVersion::V2 needs Format::Rgba8.
     static const char* settingsError(const Settings&, Format format);
-    // The effective knobs of MotionVersion::V2 for these settings: Settings::v2Preset's values, each replaced by its v2* field
-    // unless that is -1. Does not check validity.
-    static V2Knobs v2Knobs(const Settings&);
     // The box size (pixels) a frame of w x h gets under these settings: the explicit uiBoxWidth/uiBoxHeight, else the
     // square from uiBoxHeightFrac (or the legacy uiCrosshairArea). The same numbers the library protects; for a host
     // preview. Does not check validity.
@@ -667,21 +516,11 @@ public:
     // Debug / test only (fgtest --dump), read-only like recordDebugCounters: copies the latest record's / recordSynth's maps into dst at
     // dstOffset, laid out as debugMapLayout() says: the block field the per-pixel choice read (bw x bh vec2, finest level after
     // sub-pixel), the per-pixel half-vector field on the midpoint grid (fw x fh vec2) and the packed full-res mismatch e (one byte per
-    // pixel, eStride words per row, 4 pixels per word, low byte first; e of the latest synth, before the 7x7 box). MotionVersion::V2
-    // adds the class map of the latest synth at clsOff (same packing as e; per pixel bits 0-2 = class: 0 trusted, 1 held (V1's ramp),
-    // 2 clean occlusion with the field's vector, 3 with the background vector, 4 with the foreground vector, 5 with zero; bit 3 = the one-sided side
-    // is curr (else prev); bits 4-7 = weight x 15 of the held frame (0-1) or of the one-sided warp (2-4)). V1: clsOff = 0, no class map.
-    // MotionVersion::V2 also adds its fields: the edge-aware field (fw x fh vec2, flow-resolution half-vector units, like the per-pixel
-    // field) at edgeOff and the refined midpoint field (rw x rh uint32, the refinement grid of the settings at layout time, full-resolution
-    // half-vector units, packed: x and y as int16 in 1/32 px, x in the low half) at refOff; recordDebugMaps fails if the latest estimate
-    // used another grid. V1: edgeOff = refOff = 0, rw = rh = 0.
-    // Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
+    // pixel, eStride words per row, 4 pixels per word, low byte first; e of the latest synth, before the 7x7 box). Preceded by a
+    // COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised.
     struct DebugMapLayout {
         uint32_t W, H, fw, fh, bw, bh, fscale, eStride;   // eStride in uint32 words
         VkDeviceSize blockOff, pixOff, eOff, size;          // byte offsets in dst (relative to dstOffset) and the total size
-        VkDeviceSize clsOff;                                // V2: the class map (eStride * H words) before `size`; 0 = none (V1)
-        VkDeviceSize edgeOff, refOff;                       // V2: the edge-aware and the refined field; 0 = none (V1)
-        uint32_t rw, rh;                                    // V2: the refinement grid of refOff
     };
     bool debugMapLayout(DebugMapLayout& l) const;
     bool recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
