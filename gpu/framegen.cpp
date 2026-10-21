@@ -39,6 +39,10 @@
 #include "v2_clean_spv.h"
 #include "v2_morph_spv.h"
 #include "v2_repick_spv.h"
+#include "v2_static_spv.h"
+#include "v2_enclose_spv.h"
+#include "v2_morph_s_spv.h"
+#include "v2_qmorph_s_spv.h"
 
 // The colour shaders of the formats other than Rgba8 (shaders/format.glsl), when built.
 // rgb10: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
@@ -245,7 +249,7 @@ struct UiEntry {
 
 // P_V2_*: MotionVersion::V2's own passes (empty in V1's group; V2's group leaves V1's P_MEDHIST / P_SEARCH / P_SUBPIX empty instead).
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
-            P_V2_MEDHIST, P_V2_SEARCH, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_COUNT };
+            P_V2_MEDHIST, P_V2_SEARCH, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S, P_COUNT };
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
@@ -1166,6 +1170,10 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2_QOWN].sp = SPV(v2_qown);
         spv[P_V2_QCOV].sp = SPV(v2_qcov);
         spv[P_V2_QMORPH].sp = SPV(v2_qmorph);
+        spv[P_V2_STATIC].sp = SPV(v2_static);
+        spv[P_V2_ENCLOSE].sp = SPV(v2_enclose);
+        spv[P_V2_MORPH_S].sp = SPV(v2_morph_s);
+        spv[P_V2_QMORPH_S].sp = SPV(v2_qmorph_s);
     }
     struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
@@ -1186,7 +1194,7 @@ bool Interpolator::Impl::motionSized(MotionGroup& g) {
     g.bufs.resize(V2B_COUNT);
     // the cleaned field, then the search's fitted finest field (v2_est.glsl); recordDebugMaps copies the cleaned one
     if (allocBuf(g.bufs[V2B_FIELD], ((VkDeviceSize)lv[0].bw * lv[0].bh * 2 + (VkDeviceSize)fw * fh) * 8, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) &&
-        allocBuf(g.bufs[V2B_QUAL], (VkDeviceSize)fw * fh * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+        allocBuf(g.bufs[V2B_QUAL], ((VkDeviceSize)fw * fh * 5 + (VkDeviceSize)3 * ((fw + 7) / 8) * ((fh + 7) / 8)) * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
         return true;
     for (UiBuf& b : g.bufs) freeBuf(b);
     g.bufs.clear();
@@ -1842,6 +1850,15 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     r.run(P_LUMA, divUp(l0.w, lt), divUp(l0.h, lt));
     r.cbar();
     r.stamp("luma");
+    if (I.mv2()) {
+        // V2: its static-structure mask (v2_static.comp) from the real frames' luma, before CrosshairV2's estimate fill takes the UI
+        // out of it (the mask sees the crosshair as the static overlay it is); reads only the luma, writes its own slot of V2B_QUAL:
+        // no barrier against the pyramid, one against the fill (which rewrites the luma)
+        V2PC sv = r.v2pc();
+        sv.fIn = I.set.v2StaticMask ? 0 : 1;   // v2_static.comp: 1 = write an empty mask (Settings::v2StaticMask off)
+        r.runV2(P_V2_STATIC, sv, divUp(I.fw, 16), divUp(I.fh, 16));
+        if (ui && I.v2Fill()) r.cbar();
+    }
     if (ui && I.v2Fill()) {   // CrosshairV2, uiEstimateFill: the UI pixels of both frames are missing for the estimate (luma only, never the colour passes)
         I.uiRecordLumaFill(cb, prev, I.uiE[ep], l0.offA);
         I.uiRecordLumaFill(cb, curr, I.uiE[ec], l0.offC);
@@ -1959,6 +1976,7 @@ void Interpolator::Impl::v2Tail(VkCommandBuffer cb) {
         r.cbar();
         v.fIn = l0.fM;
         r.runV2(P_V2_CLEAN, v, divUp(l0.bw, 8), divUp(l0.bh, 8));
+        r.runV2(P_V2_ENCLOSE, v, divUp(((fw + 7) / 8) * ((fh + 7) / 8), 8), 1);   // the static mask's cells (8 per workgroup): no barrier against the clean-up
         r.cbar();
         r.stamp("field clean");
         v2Clean = true;
@@ -2000,8 +2018,14 @@ bool Interpolator::Impl::v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     r.cbar();
     const char* name = n == 1 ? "morph" : "blur morph";
     r.stamp(name);
+    // the static pass: the cells near a static overlay (V2's static-structure mask) again, with its tests; the main pass has none
+    const Pipe morphS = set.v2Mode == V2Mode::Quality ? P_V2_QMORPH_S : P_V2_MORPH_S;
+    v.fix = 2;
+    r.runV2(morphS, v, divUp(fw, 8), divUp(fh, 8));
+    r.cbar();
+    r.stamp("static");
     v.fix = 1;   // exits at once unless a sample turned out to have too many untrusted pixels
-    r.runV2(morph, v, divUp((int)W, 64), divUp((int)H, 64));
+    r.runV2(morphS, v, divUp((int)W, 64), divUp((int)H, 64));
     name = "fallback";
     if (estUi) {
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);

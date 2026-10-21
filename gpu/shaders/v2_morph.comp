@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_vote : require
 // V2 Performance's synthesis (the grid morph): see v2_morph.glsl.
 #include "v2_morph.glsl"

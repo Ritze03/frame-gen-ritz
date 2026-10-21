@@ -7,7 +7,7 @@
 // --bench N --mult M: per real pair one estimate + M-1 synths at t = k/M (M = 2: record(0.5)). --bgra uses B8G8R8A8_UNORM images/views for
 // inputs and output (the file data stays RGBA; channels are swizzled on upload/readback).
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
-// smoothBonus searchPenalty subpixel flowScale; algo=v1|v2 = motionVersion; v2Mode=quality|performance; ui=off|crosshair|wholescreen|crosshairv2 =
+// smoothBonus searchPenalty subpixel flowScale v2StaticMask; algo=v1|v2 = motionVersion; v2Mode=quality|performance; ui=off|crosshair|wholescreen|crosshairv2 =
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill), passed to init.
 // UI protection (ui != off in --set or --then): every real frame is recordObserve'd once, in pair order, into a ring of 3 input
@@ -68,6 +68,7 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         else if (k == "smoothBonus") s.smoothBonus = (float)v;
         else if (k == "searchPenalty") s.searchPenalty = (float)v;
         else if (k == "subpixel") s.subpixel = v != 0;
+        else if (k == "v2StaticMask") s.v2StaticMask = v != 0;
         else if (k == "flowScale") s.flowScale = (uint32_t)v;
         else if (k == "ui") {   // Settings::uiProtection: off | crosshair | wholescreen | crosshairv2
             std::string a = eq + 1;

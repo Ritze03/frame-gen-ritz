@@ -1,0 +1,59 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// V2 (both modes), per 8x8 cell of the flow grid (= the block grid), once per estimate, beside the field clean-up (it reads only
+// v2_static.comp's cell maxima s8 and the search's fitted block field), see v2_motion.glsl:
+//   E: the cell lies between static structure on all four sides, within E_R cells to its left, right, above and below: the inside
+//      of an overlay (the tinted, nearly flat background of a HUD panel or chat box between its text lines and its border), which S
+//      alone cannot see. All four sides: two would also hold between two unrelated static edges (or stray matches of a moving
+//      texture) left and right of a moving scene. v2_morph.glsl lets the zero vector win there where the morph's taps leave it.
+//   C: bit 0: E, or static structure in the cell or one of its 8 neighbours: where the synthesis reads S and E of a place at all;
+//      bit 1: a warp tap of a pixel of this cell can land near static structure: where the synthesis looks at its taps' S and E at
+//      all. The taps lie on the segment m -+ 2 v (v the half-vector of the cell's block, flow px; the cleaned and the per-pixel
+//      fields stay near the search's fitted vector, and the 3x3 of cells around each step covers that and the pixel's place in its
+//      cell), walked in steps of at most one cell. (An E cell has structure within E_R on every side, so a tap deep inside a large
+//      panel, more than a cell from any structure, is not seen: there only S near it rejects taps.)
+// 8 threads per cell (a subgroup cluster) share the reads: each cell's are short serial chains, the grid is small.
+// Writes E (float bits) and C (bits) to qb[eOff() + cell], qb[cOff() + cell].
+#include "common.glsl"
+#include "v2_motion.glsl"
+layout(local_size_x = 64) in;
+
+const int E_R = 6;   // reach in cells (8 flow px each): 96 px at flowScale 2 (helpers 0..3 steps 1..3, 4..7 steps 4..6)
+
+float s8(ivec2 c) {
+    if (c.x < 0 || c.y < 0 || c.x >= s8W() || c.y >= s8H()) return 0.0;
+    return uintBitsToFloat(qb[s8Off() + c.y * s8W() + c.x]);
+}
+void main() {
+    int lid = int(gl_LocalInvocationIndex), h = lid & 7;   // helper h of the cell's cluster
+    int ci = int(gl_WorkGroupID.x) * 8 + (lid >> 3);
+    ivec2 c = ivec2(ci % s8W(), ci / s8W());
+    bool live = ci < s8W() * s8H();
+    // E: helper h scans direction h & 3 (left, right, up, down) over steps 1..3 (h < 4) or 4..6
+    const ivec2 dirs[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    float d = 0.0;
+    for (int k = 1 + 3 * (h >> 2); k <= 3 + 3 * (h >> 2); k++) d = max(d, s8(c + k * dirs[h & 3]));
+    d = max(d, subgroupShuffleXor(d, 4u));   // both halves of the direction (helpers h and h ^ 4)
+    uint b0 = gl_SubgroupInvocationID & ~7u;
+    float e = min(min(subgroupShuffle(d, b0), subgroupShuffle(d, b0 + 1u)), min(subgroupShuffle(d, b0 + 2u), subgroupShuffle(d, b0 + 3u)));
+    // near: the 3x3 of cells around c; the tap walk: steps -ns..ns over the segment, each with its 3x3 of cells. All these reads
+    // are spread over the 8 helpers (task t: t < 9 the near read t, else walk step (t - 9) / 9, offset (t - 9) % 9)
+    ivec2 cb = clamp(c, ivec2(0), ivec2(pc.bw - 1, pc.bh - 1));
+    vec2 v = vf[pc.bw * pc.bh + cb.y * pc.bw + cb.x] * (2.0 / float(V2_BLOCK));   // 2 v in cells
+    int ns = int(ceil(max(abs(v.x), abs(v.y)))) + 1;
+    float nb = 0.0, tap = 0.0;
+    for (int t = h; t < 9 + (2 * ns + 1) * 9; t += 8) {
+        int st = t < 9 ? 0 : (t - 9) / 9, of = t < 9 ? t : (t - 9) % 9;
+        ivec2 o = ivec2(of % 3 - 1, of / 3 - 1);
+        if (t < 9) nb = max(nb, s8(c + o));
+        else tap = max(tap, s8(ivec2(floor(vec2(c) + 0.5 + v * (float(st - ns) / float(ns)))) + o));
+    }
+    bool near = max(e, subgroupClusteredMax(nb, 8u)) > 0.0;
+    tap = subgroupClusteredMax(tap, 8u);
+    if (live && h == 0) {
+        qb[eOff() + c.y * s8W() + c.x] = floatBitsToUint(e);
+        qb[cOff() + c.y * s8W() + c.x] = (near ? 1u : 0u) | (tap > 0.0 ? 2u : 0u);
+    }
+}

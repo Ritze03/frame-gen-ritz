@@ -7,9 +7,9 @@
 //              keeps the best-matching claim; a static-overlay pixel claims its own place in both frames;
 //   v2_qcov    the coverage: does each frame still show the content of each midpoint location (cP, cC), packed with z.
 // Per output (v2_qmorph = v2_morph.glsl with V2_QUALITY): one gather like Performance's, on the per-pixel field, whose blend leans to
-// the frame that still shows the content (qWeightC) instead of the fixed (1 - t, t); a tap that lands on a static overlay while the
-// field moves takes the other tap (qRejectStatic); where the two taps still disagree, the result is blurred along the motion; and the
-// static-overlay mask shows the real frames' own pixels at the zero vector (the frames agree there, so this is no hold).
+// the frame that still shows the content (qWeightC) instead of the fixed (1 - t, t); where the two taps still disagree, the result is
+// blurred along the motion. Static overlays (the zero vector on them, taps that land on them rejected) are both modes' (V2's
+// static-structure mask, v2_morph.glsl); z here only zeroes the field and claims the overlay's place in the splat.
 //
 // Why coverage on the midpoint grid: the field is estimated at t = 0.5 (prev(m - h) = curr(m + h)). Where something is covered or
 // revealed between the two real frames, one of those two taps shows another object, the one in front, whose own midpoint location
@@ -24,7 +24,7 @@
 //   luma levels; reset to 0xFFFFFFFF before the splat), [2N, 3N) each location's own claim, [3N, 4N) the coverage word: cP, cC
 //   (11 bits each), z (10 bits) (v2_qfield writes z there as a float first, v2_qcov packs it).
 // The per-pixel field: vf[qPF() + m] (binding 13, after the cleaned and the fitted block fields), flow px of half-vector.
-layout(set = 0, binding = 14, std430) buffer V2Q { uint qb[]; };
+// (qb: binding 14, declared in v2_motion.glsl)
 
 // v2_qfield: the edge-aware upsample
 const float Q_FSAME = 0.5;    // block vectors within this (flow px, max-abs) count as one motion: the plain bilinear blend
@@ -109,22 +109,6 @@ vec3 qCovAt(vec2 q) {
 float qWeightC(vec3 cv, float t) {
     float a = (1.0 - t) * (cv.x + Q_EPS), c = t * (cv.y + Q_EPS);
     return c / (a + c);
-}
-
-// The static-overlay mask at the flow pixel nearest to full-resolution position q
-float qZAt(vec2 q) {
-    ivec2 m = clamp(ivec2(floor((q + 0.5) * (1.0 / float(pc.fscale)))), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
-    return float(qb[3 * qN() + m.y * pc.fw + m.x] >> 22) * (1.0 / 1023.0);
-}
-
-// A tap on a static overlay that moves with the field picks the overlay up at the wrong place (a dragged copy of subtitle text): the
-// tap takes the other one (as ui_reject.glsl does with CrosshairV2's mask), softly by how much more of the mask it hits.
-void qRejectStatic(vec2 pa, vec2 pc_, inout vec3 wa, inout vec3 wc) {
-    if (all(lessThan(abs(pc_ - pa), vec2(1.0)))) return;   // (nearly) the zero vector: both taps are the overlay's own place
-    float za = qZAt(pa), zc = qZAt(pc_);
-    vec3 a = wa;
-    wa = mix(wa, wc, clamp(2.0 * (za - zc), 0.0, 1.0));
-    wc = mix(wc, a, clamp(2.0 * (zc - za), 0.0, 1.0));
 }
 
 // Local structure at full-res pixel p, 8-bit levels x Q_SGAIN: the largest max-channel difference of prev's pixel to its right and

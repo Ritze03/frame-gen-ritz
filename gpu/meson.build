@@ -18,7 +18,8 @@ shaders = shader_gen.process(
   'shaders/ui_inpaint.comp', 'shaders/ui_patch.comp', 'shaders/ui_v2_update.comp', 'shaders/ui_v2_mask.comp', 'shaders/ui_v2_lumafill.comp',
   'shaders/blur_lookup.comp', 'shaders/blur_error.comp', 'shaders/blur_resolve.comp',
   'shaders/v2_medhist.comp', 'shaders/v2_search.comp', 'shaders/v2_clean.comp', 'shaders/v2_morph.comp', 'shaders/v2_repick.comp',
-  'shaders/v2_qfield.comp', 'shaders/v2_qown.comp', 'shaders/v2_qcov.comp', 'shaders/v2_qmorph.comp')
+  'shaders/v2_qfield.comp', 'shaders/v2_qown.comp', 'shaders/v2_qcov.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_static.comp', 'shaders/v2_enclose.comp',
+  'shaders/v2_morph_s.comp', 'shaders/v2_qmorph_s.comp')
 
 # Per-format variants of the colour shaders (README.md "Formats"): the same sources, compiled once per format with
 # -DFG_FORMAT_<FMT>=1 into <name>_<fmt>_spv.h / <name>_<fmt>_spv. Rgba8 is the plain build above and keeps its names.
