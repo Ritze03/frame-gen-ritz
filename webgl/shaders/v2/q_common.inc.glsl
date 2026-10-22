@@ -5,11 +5,10 @@
 //              mask z (the field is zero where z >= 0.5)                                                         -> v2.qf (xy = h, z)
 //   v2/qclaim  each midpoint location's own claim: key = |luma_a(m - h) - luma_c(m + h)| in 1/Q_KEY levels, the quantised vector,
 //              and its footprint pixels in prev (m - h) and curr (m + h)                                        -> v2.qclaim
-//   v2/qown    the coverage splat (the library's atomicMin of key << 20 | vector): two MIN-blended point draws, keys first (v2.qkey),
-//              then the vectors of the claims whose key won (v2.qvec); the pair (key, vector) is the library's packed word
+//   v2/qown    the coverage splat (the library's atomicMin of key << 20 | vector): per side the static-overlay claims (v2/qown_z),
+//              then one MIN-blended point per location carrying the word as float bits (v2.qownA / v2.qownC, see v2/qown.vert.glsl)
 //   v2/qvis    does each frame still show the content of each location (0 / 1 per side)                         -> v2.qvis
 //   v2/qcov    the coverage: qvis box-filtered over (2 Q_R + 1)^2, quantised as the library packs it, with z     -> v2.qcov
-// Claim textures: fw x 2fh R32F, rows [0, fh) = prev's claims, rows [fh, 2fh) = curr's.
 
 const float Q_FSAME = 0.5;
 const float Q_FS = 2.0;

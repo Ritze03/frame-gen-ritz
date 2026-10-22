@@ -183,11 +183,13 @@ uint fgLuma8(uvec3 rgb) {
 }
 
 // median3.comp:7-13 -- median of 9 (partial selection sort; v is a by-value copy)
-float fgMed9(float v[9]) {
-    for (int i = 0; i <= 4; i++)
-        for (int j = i + 1; j < 9; j++)
-            if (v[j] < v[i]) { float t = v[i]; v[i] = v[j]; v[j] = t; }
-    return v[4];
+float fgMed9(float v[9]) {   // the 19-exchange median-of-9 network (fixed indices: no dynamic array access)
+    float p0 = v[0], p1 = v[1], p2 = v[2], p3 = v[3], p4 = v[4], p5 = v[5], p6 = v[6], p7 = v[7], p8 = v[8], t;
+#define FG_S(a, b) t = min(a, b); b = max(a, b); a = t;
+    FG_S(p1, p2) FG_S(p4, p5) FG_S(p7, p8) FG_S(p0, p1) FG_S(p3, p4) FG_S(p6, p7) FG_S(p1, p2) FG_S(p4, p5) FG_S(p7, p8)
+    FG_S(p0, p3) FG_S(p5, p8) FG_S(p4, p7) FG_S(p3, p6) FG_S(p1, p4) FG_S(p2, p5) FG_S(p4, p7) FG_S(p4, p2) FG_S(p6, p4) FG_S(p4, p2)
+#undef FG_S
+    return p4;
 }
 
 // Extra (estimate-internal): raw SAD over the 64 pixels of block blk (y outer, x inner) for the integer

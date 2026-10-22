@@ -53,6 +53,8 @@
       return { info };
     },
     setSettings(p) { try { return engine.setSettings(p); } catch (e) { return err(e); } },
+    _gl() { return gl; },
+    _engine() { return engine; },
 
     // job: { pair, W, H, settings, ts, ref: 'vkref/<cfg>/<pair>', mode }
     async run(job) {

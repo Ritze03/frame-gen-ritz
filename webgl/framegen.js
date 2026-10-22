@@ -33,12 +33,13 @@
   const PROGRAMS = [
     ['luma', 'estimate/luma.frag.glsl', null, ['uFrame']],
     ['down', 'estimate/down.frag.glsl', null, ['uSrc']],
-    ['medhist', 'estimate/medhist.frag.glsl', 'estimate/medhist.vert.glsl', ['uParent']],
+    ['medhist', 'estimate/medhist.frag.glsl', null, ['uParent']],
     ['medsel', 'estimate/medsel.frag.glsl', null, ['uHist']],
     ['seed_sad', 'estimate/seed_sad.frag.glsl', null, ['uLumaA', 'uLumaC', 'uParent', 'uMedian']],
     ['seed_pick', 'estimate/seed_pick.frag.glsl', null, ['uSeedSad', 'uParent', 'uMedian']],
     ['search_sad', 'estimate/search_sad.frag.glsl', null, ['uLumaA', 'uLumaC', 'uSeed']],
     ['search_pick', 'estimate/search_pick.frag.glsl', null, ['uSearchSad', 'uSeed']],
+    ['median3', 'estimate/median3.frag.glsl', null, ['uRaw']],
     ['subpix_sad', 'estimate/subpix_sad.frag.glsl', null, ['uLumaA', 'uLumaC', 'uBase']],
     ['subpix_pick', 'estimate/subpix_pick.frag.glsl', null, ['uSubSad', 'uBase']],
     ['reduce_sad', 'estimate/reduce_sad.frag.glsl', null, ['uSrc']],
@@ -80,8 +81,9 @@
     // V2 Quality (the coverage morph): its estimate tail and its synthesis (the Performance programs with V2_QUALITY)
     ['v2_qfield', 'v2/qfield.frag.glsl', null, ['uLumaA', 'uLumaC', 'uVf'], Q_INC],
     ['v2_qclaim', 'v2/qclaim.frag.glsl', null, ['uLumaA', 'uLumaC', 'uQf'], Q_INC],
-    ['v2_qown', 'v2/qown.frag.glsl', 'v2/qown.vert.glsl', ['uClaim', 'uQf', 'uKey']],
-    ['v2_qvis', 'v2/qvis.frag.glsl', null, ['uClaim', 'uKeyA', 'uKeyC', 'uVecA', 'uVecC'], Q_INC],
+    ['v2_qown_z', 'v2/qown_z.frag.glsl', null, ['uQf']],
+    ['v2_qown', 'v2/qown.frag.glsl', 'v2/qown.vert.glsl', ['uClaim']],
+    ['v2_qvis', 'v2/qvis.frag.glsl', null, ['uClaim', 'uOwnA', 'uOwnC'], Q_INC],
     ['v2_qcov', 'v2/qcov.frag.glsl', null, ['uVis', 'uQf'], Q_INC],
     ['v2_qem', 'v2/em.frag.glsl', null, MORPH_S.concat(Q_S), V2_INC, Q_DEF],
     ['v2_qgroup', 'v2/group.frag.glsl', null, MORPH_S.concat(Q_S, ['uEm']), V2_INC, Q_DEF],
@@ -130,7 +132,7 @@
     'uCutSad', 'uTrust0', 'uTrustScale', 'uGlobalFrac', 'uTrustMid'];
   const U_TIME = ['uT', 'uS', 'uWA', 'uWC', 'uNearC', 'uMid'];
   const U_PASS = ['uBlocks', 'uCount', 'uRadius', 'uStep', 'uSrcSize', 'uChan', 'uMode',
-    'uVpOrigin', 'uVpSize', 'uFlipY', 'uExact', 'uStaticOff', 'uPass', 'uSide'];
+    'uVpOrigin', 'uVpSize', 'uFlipY', 'uExact', 'uStaticOff', 'uSide', 'uFan'];
   const U_ALL = U_STATIC.concat(U_TIME, U_PASS);
 
   const DEFAULTS = {
@@ -151,6 +153,7 @@
     linearWhiteNits: 80,    // rgba16f + linear: the luminance of the value 1.0 (80 = scRGB), (0, 10000]
     debug: false,
   };
+  const MH_ROWS = 4;   // parent rows per band of the median histogram (estimate/medhist.frag.glsl's)
   const STRING_KEYS = { v2Mode: ['quality', 'performance'], inputFormat: ['rgba8', 'rgba16f'], transfer: ['encoded', 'linear'] };
   const BOOL_KEYS = { debug: 1, v2StaticMask: 1 };
   fg.defaultSettings = function () { return Object.assign({}, DEFAULTS); };
@@ -242,8 +245,6 @@
     let settings = mergeSettings(DEFAULTS, settingsIn);
     let debug = settings.debug;
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    const ZERO4 = new Float32Array(4);
-    const BIG4 = new Float32Array([1e30, 1e30, 1e30, 1e30]);   // "unclaimed" for the Quality splat's MIN blend
 
     // ---- internal formats -------------------------------------------------------------------
     // read: how debugRead pulls the texture back (format, type, typed array constructor).
@@ -468,13 +469,31 @@
       resetCache();
     }
 
-    function reduceChain(w, h) {
+    // sizes of a sum-reduction chain down to 1x1: the first step's fan-in fan0 per axis, then 16 (at least one step)
+    function reduceChain(w, h, fan0) {
       const sizes = [];
+      let f = fan0 || 16;
       do {
-        w = Math.ceil(w / 16); h = Math.ceil(h / 16);
-        sizes.push([w, h]);
+        w = Math.ceil(w / f); h = Math.ceil(h / f);
+        sizes.push([w, h, f]);
+        f = 16;
       } while (w > 1 || h > 1);
       return sizes;
+    }
+    function mkChain(name, w, h, fan0) {
+      return reduceChain(w, h, fan0).map(function (sz, k) { const t = mk(name + '[' + k + ']', 'R32F', sz[0], sz[1]); t.fan = sz[2]; return t; });
+    }
+    // run a reduction chain: step 0 reads src (channel chan; reduce_untrusted: mode0 for the first step), the last output is the sum
+    function runChain(prog, chain, src, first, rest) {
+      for (let k = 0; k < chain.length; k++) {
+        const s = k === 0 ? src : chain[k - 1];
+        begin(prog, chain[k], s);
+        gl.uniform2i(prog.u.uSrcSize, s.w, s.h);
+        gl.uniform1i(prog.u.uFan, chain[k].fan);
+        if (prog.u.uChan) gl.uniform1i(prog.u.uChan, k === 0 ? first : rest);
+        if (prog.u.uMode) gl.uniform1i(prog.u.uMode, k === 0 ? first : rest);
+        tri(prog.name);
+      }
     }
 
     // Motion version 2 (Performance) textures. Sizes: flow grid fw x fh, block grid bw x bh (= the static mask's 8x8 cells), full W x H.
@@ -498,19 +517,17 @@
       v.e = mk('v2.e', 'R16F', W, H);                  // per-pixel mismatch e (integer levels)
       v.morphMrt = mkMrt('v2_morph', [v.morph, v.e]);
       v.tile = mk('v2.tile', 'R32F', tw, th);          // per 8x8 tile: valid pixel count if untrusted
-      v.untrRed = reduceChain(tw, th).map(function (sz, k) { return mk('v2.untrRed[' + k + ']', 'R32F', sz[0], sz[1]); });
+      v.untrRed = mkChain('v2.untrRed', tw, th, 16);
       return v;
     }
 
-    // V2 Quality textures (flow grid fw x fh), allocated the first time Quality runs (about 72 bytes per flow pixel).
+    // V2 Quality textures (flow grid fw x fh), allocated the first time Quality runs (about 56 bytes per flow pixel).
     function allocQ() {
       const q = {};
       q.qf = mk('v2.qf', 'RGBA32F', FW, FH);           // per-pixel field xy, static-overlay mask z
       q.claim = mk('v2.qclaim', 'RGBA32I', FW, FH);    // own claim: key, vector bits, prev / curr footprint
-      q.keyA = mk('v2.qkeyA', 'R32F', FW, FH);         // winning key per pixel of prev / curr (MIN blend)
-      q.keyC = mk('v2.qkeyC', 'R32F', FW, FH);
-      q.vecA = mk('v2.qvecA', 'R32F', FW, FH);         // winning vector bits among the claims with that key
-      q.vecC = mk('v2.qvecC', 'R32F', FW, FH);
+      q.ownA = mk('v2.qownA', 'R32F', FW, FH);         // winning claim word per pixel of prev / curr (MIN blend of float bits)
+      q.ownC = mk('v2.qownC', 'R32F', FW, FH);
       q.vis = mk('v2.qvis', 'RG32F', FW, FH);          // does prev / curr still show the location's content
       q.cov = mk('v2.qcov', 'RGBA32F', FW, FH);        // coverage cP, cC, z (quantised)
       return q;
@@ -528,8 +545,9 @@
         for (let s = 0; s < 2; s++) {
           for (let i = 0; i < L; i++) t.luma[s].push(mk('luma[' + s + '][' + i + ']', 'R32F', levels[i].w, levels[i].h));
         }
-        t.hist = L > 1 ? mk('hist', 'R32F', 256, 2) : null;
-        t.median = []; t.seedSad = []; t.seed = []; t.searchSad = []; t.field = [];
+        t.hist = [];   // per level i < L-1: 64 x (2 x bands of MH_ROWS parent rows), 4 bins per texel
+        for (let i = 0; i + 1 < L; i++) t.hist.push(mk('hist[' + i + ']', 'RGBA32F', 64, 2 * Math.ceil(levels[i + 1].bh / MH_ROWS)));
+        t.median = []; t.seedSad = []; t.seed = []; t.searchSad = []; t.field = []; t.fieldRaw = [];
         for (let i = 0; i < L; i++) {
           const lv = levels[i], D = 2 * lv.radius + 1;
           if (i < L - 1) {
@@ -539,11 +557,12 @@
           t.seed.push(mk('seed[' + i + ']', 'RG32F', lv.bw, lv.bh));   // seed[L-1] is never rendered: stays zero
           t.searchSad.push(mk('searchSad[' + i + ']', 'R32F', D * lv.bw, D * lv.bh));
           t.field.push(mk('field[' + i + ']', 'RG32F', lv.bw, lv.bh));
+          t.fieldRaw.push(mk('fieldRaw[' + i + ']', 'RG32F', lv.bw, lv.bh));   // the search's argmin before the 3x3 median
         }
         t.subSad = mk('subSad', 'R32F', 3 * lv0.bw, 3 * lv0.bh);
         t.sub1 = mk('sub1', 'RGBA32F', lv0.bw, lv0.bh);
         t.sub2 = mk('sub2', 'RGBA32F', lv0.bw, lv0.bh);
-        t.sadRed = reduceChain(lv0.bw, lv0.bh).map(function (sz, k) { return mk('sadRed[' + k + ']', 'R32F', sz[0], sz[1]); });
+        t.sadRed = mkChain('sadRed', lv0.bw, lv0.bh, 16);
         t.pfErr0 = mk('pfErr0', 'RGBA32F', FW, FH);
         t.pfErr1 = mk('pfErr1', 'RGBA32F', FW, FH);
         t.pfErrMrt = mkMrt('pf_err', [t.pfErr0, t.pfErr1]);
@@ -555,7 +574,7 @@
         t.errMrt = mkMrt('error', [t.mismatch, t.warpA, t.warpC]);
         t.hsum = mk('hsum', 'R16UI', W, H);
         t.trust = mk('trust', 'R32F', W, H);
-        t.untrRed = reduceChain(W, H).map(function (sz, k) { return mk('untrRed[' + k + ']', 'R32F', sz[0], sz[1]); });
+        t.untrRed = mkChain('untrRed', W, H, 8);   // (8x8 first: more fragments over the full-res trust)
         t.out = mk('out', colorFmt(), W, H, true);
         if (settings.motionVersion === 2) t.v2 = allocV2();
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -640,8 +659,14 @@
       for (let k = 2; k < arguments.length; k++) if (arguments[k]) bindIn(k - 2, arguments[k]);
     }
 
+    let passHook = null;   // engine.setPassHook (profiling only): called before / after every draw
+    function draw(name, mode, n) {
+      if (passHook) passHook(name, 0);
+      gl.drawArrays(mode, 0, n);
+      if (passHook) passHook(name, 1);
+    }
     function tri(name) {
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      draw(name, gl.TRIANGLES, 3);
       nDraw++;
       if (debug) chk(name);
     }
@@ -791,14 +816,7 @@
       gl.uniform1f(P.v2_refine_pick.u.uStep, 0.25);
       tri('v2_refine_pick');
       // scene-cut sum: the final per-block roundEven(256 * mean SAD) / 256 (w), reduced into sadRed[last] (= sadSum)
-      const sr = T.sadRed;
-      for (let k = 0; k < sr.length; k++) {
-        const src = k === 0 ? v.rep2 : sr[k - 1];
-        begin(P.reduce_sad, sr[k], src);
-        gl.uniform2i(P.reduce_sad.u.uSrcSize, src.w, src.h);
-        gl.uniform1i(P.reduce_sad.u.uChan, k === 0 ? 3 : 0);
-        tri('reduce_sad');
-      }
+      runChain(P.reduce_sad, T.sadRed, v.rep2, 3, 0);
       begin(P.v2_clean, v.vf, v.rep2);
       tri('v2_clean');
       begin(P.v2_enclose, v.ec, v.s8, v.vf);
@@ -815,31 +833,25 @@
       tri('v2_qfield');
       begin(P.v2_qclaim, q.claim, A, C, q.qf);
       tri('v2_qclaim');
-      // the splat: per side, MIN of the keys, then MIN of the vector bits of the claims whose key won (the library's atomicMin)
-      const po = P.v2_qown, n = 2 * FW * FH;
-      use(po);
-      gl.enable(gl.BLEND);
-      gl.blendEquation(gl.MIN);
-      for (let pass = 0; pass < 2; pass++) {
-        gl.uniform1i(po.u.uPass, pass);
-        for (let side = 0; side < 2; side++) {
-          const dst = pass === 0 ? (side === 0 ? q.keyA : q.keyC) : (side === 0 ? q.vecA : q.vecC);
-          bindFbo(dst.fbo);
-          setVp(0, 0, FW, FH);
-          gl.clearBufferfv(gl.COLOR, 0, BIG4);
-          nClear++;
-          bindIn(0, q.claim);
-          bindIn(1, q.qf);
-          bindIn(2, pass === 0 ? q.cov : (side === 0 ? q.keyA : q.keyC));   // (pass 0 reads no key: any texture that is not the target)
-          gl.uniform1i(po.u.uSide, side);
-          gl.drawArrays(gl.POINTS, 0, n);
-          nDraw++;
-          if (debug) chk('v2_qown');
-        }
+      // the splat (the library's atomicMin of key << 20 | vector): per side, the static-overlay claims initialise the target
+      // (v2_qown_z), then one MIN-blended point per location (v2/qown.vert.glsl: the words as float bits)
+      const po = P.v2_qown, pz = P.v2_qown_z, n = FW * FH;
+      for (let side = 0; side < 2; side++) {
+        const dst = side === 0 ? q.ownA : q.ownC;
+        begin(pz, dst, q.qf);
+        tri('v2_qown_z');
+        use(po);
+        bindIn(0, q.claim);
+        gl.uniform1i(po.u.uSide, side);
+        gl.enable(gl.BLEND);
+        gl.blendEquation(gl.MIN);
+        draw('v2_qown', gl.POINTS, n);
+        gl.disable(gl.BLEND);
+        gl.blendEquation(gl.FUNC_ADD);
+        nDraw++;
+        if (debug) chk('v2_qown');
       }
-      gl.disable(gl.BLEND);
-      gl.blendEquation(gl.FUNC_ADD);
-      begin(P.v2_qvis, q.vis, q.claim, q.keyA, q.keyC, q.vecA, q.vecC);
+      begin(P.v2_qvis, q.vis, q.claim, q.ownA, q.ownC);
       tri('v2_qvis');
       begin(P.v2_qcov, q.cov, q.vis, q.qf);
       tri('v2_qcov');
@@ -870,13 +882,7 @@
       begin(P.v2_tile, v.tile, v.e);
       tri('v2_tile');
       const ur = v.untrRed;
-      for (let k = 0; k < ur.length; k++) {
-        const src = k === 0 ? v.tile : ur[k - 1];
-        begin(P.reduce_untrusted, ur[k], src);
-        gl.uniform2i(P.reduce_untrusted.u.uSrcSize, src.w, src.h);
-        gl.uniform1i(P.reduce_untrusted.u.uMode, 0);
-        tri('reduce_untrusted');
-      }
+      runChain(P.reduce_untrusted, ur, v.tile, 0, 0);
       begin(P.v2_final, T.out, pf, cf, v.morph, T.sadRed[T.sadRed.length - 1], ur[ur.length - 1]);
       tri('v2_final');
     }
@@ -896,26 +902,11 @@
       for (let i = L - 1; i >= 0; i--) {
         const lv = levels[i];
         if (i < L - 1) {
-          const par = T.field[i + 1], hist = T.hist, med = T.median[i], ss = T.seedSad[i];
-          // E1 clear
-          bindFbo(hist.fbo);
-          gl.clearBufferfv(gl.COLOR, 0, ZERO4);
-          nClear++;
-          if (debug) chk('hist clear');
-          // E2 medhist scatter
-          let p = P.medhist;
-          use(p);
-          bindFbo(hist.fbo);
-          setVp(0, 0, 256, 2);
-          bindIn(0, par);
-          gl.uniform2i(p.u.uBlocks, lv.bw, lv.bh);
-          gl.enable(gl.BLEND);
-          gl.blendEquation(gl.FUNC_ADD);
-          gl.blendFunc(gl.ONE, gl.ONE);
-          gl.drawArrays(gl.POINTS, 0, 2 * lv.bw * lv.bh);
-          nDraw++;
-          gl.disable(gl.BLEND);
-          if (debug) chk('medhist');
+          const par = T.field[i + 1], hist = T.hist[i], med = T.median[i], ss = T.seedSad[i];
+          // E2 medhist: the banded histogram of the parent vectors (a gather; every texel written)
+          begin(P.medhist, hist, par);
+          gl.uniform2i(P.medhist.u.uBlocks, lv.bw, lv.bh);
+          tri('medhist');
           // E3 medsel
           begin(P.medsel, med, hist);
           gl.uniform1i(P.medsel.u.uCount, lv.bw * lv.bh);
@@ -937,9 +928,11 @@
           gl.uniform1i(P.v2_search_pick0.u.uRadius, lv.radius);
           tri('v2_search_pick0');
         } else {
-          begin(P.search_pick, T.field[i], T.searchSad[i], T.seed[i]);
+          begin(P.search_pick, T.fieldRaw[i], T.searchSad[i], T.seed[i]);
           gl.uniform1i(P.search_pick.u.uRadius, lv.radius);
           tri('search_pick');
+          begin(P.median3, T.field[i], T.fieldRaw[i]);
+          tri('median3');
         }
       }
 
@@ -970,14 +963,7 @@
       tri('subpix_pick');
 
       // E12 SAD reduction chain (last = sadSum)
-      const sr = T.sadRed;
-      for (let k = 0; k < sr.length; k++) {
-        const src = k === 0 ? T.sub2 : sr[k - 1];
-        begin(P.reduce_sad, sr[k], src);
-        gl.uniform2i(P.reduce_sad.u.uSrcSize, src.w, src.h);
-        gl.uniform1i(P.reduce_sad.u.uChan, k === 0 ? 2 : 0);
-        tri('reduce_sad');
-      }
+      runChain(P.reduce_sad, T.sadRed, T.sub2, 2, 0);
 
       // E13/E14 pixel field
       begin(P.pf_err, T.pfErrMrt, A[0], C[0], T.sub2);
@@ -1027,13 +1013,7 @@
         tri('vbox');
         // Y5 untrusted count reduction
         const ur = T.untrRed;
-        for (let k = 0; k < ur.length; k++) {
-          const src = k === 0 ? T.trust : ur[k - 1];
-          begin(P.reduce_untrusted, ur[k], src);
-          gl.uniform2i(P.reduce_untrusted.u.uSrcSize, src.w, src.h);
-          gl.uniform1i(P.reduce_untrusted.u.uMode, k === 0 ? 1 : 0);
-          tri('reduce_untrusted');
-        }
+        runChain(P.reduce_untrusted, ur, T.trust, 1, 0);
         // Y6 final
         begin(P.final, T.out, T.frame[prevS], T.frame[currS], T.warpA, T.warpC, T.trust,
           T.sadRed[T.sadRed.length - 1], ur[ur.length - 1]);
@@ -1075,6 +1055,9 @@
       blit(T.frame[which === 'prev' ? prevS : currS], framebuffer, x, y, w, h, flip);
       return true;
     };
+
+    // Profiling / test only: fn(passName, 0 before | 1 after) around every draw call (null = off). Not for the hot path.
+    engine.setPassHook = function (fn) { passHook = typeof fn === 'function' ? fn : null; };
 
     engine.passCounts = function () {
       return { pushFrame: counts.pushFrame, estimate: counts.estimate, synth: counts.synth, clears: counts.clears };
@@ -1127,10 +1110,8 @@
           if (count < (w === 'prev' ? 2 : 1)) throw new Error('framegen: debugRead("' + name + '"): frame not pushed yet');
           return T.luma[w === 'prev' ? prevS : currS][level(parts, 2, L, name)];
         }
-        case 'hist':
-          needEstimate(name);
-          if (!T.hist) throw new Error('framegen: debugRead("hist"): single-level pyramid has no histogram');
-          return T.hist;
+        case 'hist': needEstimate(name); return T.hist[level(parts, 1, L - 1, name)];
+        case 'fieldRaw': needEstimate(name); return T.fieldRaw[level(parts, 1, L, name)];
         case 'median': needEstimate(name); return T.median[level(parts, 1, L - 1, name)];
         case 'seedSad': needEstimate(name); return T.seedSad[level(parts, 1, L - 1, name)];
         case 'seed': needEstimate(name); return T.seed[level(parts, 1, L, name)];
@@ -1164,8 +1145,8 @@
           const est = ['sRaw', 's', 's8', 'vfit', 'rep0', 'rep1', 'rep2', 'vf', 'ec'];
           if (est.indexOf(key) >= 0) { needEstimate(name); return T.v2[key]; }
           if (['em', 'grp', 'morph', 'e', 'tile'].indexOf(key) >= 0) { needSynth(name); return T.v2[key]; }
-          // Quality: v2.qf v2.qclaim v2.qkeyA v2.qkeyC v2.qvecA v2.qvecC v2.qvis v2.qcov (its estimate tail)
-          const qk = { qf: 'qf', qclaim: 'claim', qkeyA: 'keyA', qkeyC: 'keyC', qvecA: 'vecA', qvecC: 'vecC', qvis: 'vis', qcov: 'cov' }[key];
+          // Quality: v2.qf v2.qclaim v2.qownA v2.qownC v2.qvis v2.qcov (its estimate tail)
+          const qk = { qf: 'qf', qclaim: 'claim', qownA: 'ownA', qownC: 'ownC', qvis: 'vis', qcov: 'cov' }[key];
           if (qk) {
             needEstimate(name);
             if (!qDone) throw new Error('framegen: debugRead("' + name + '"): no Quality estimate tail for this estimate yet');
