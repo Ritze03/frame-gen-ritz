@@ -1,10 +1,10 @@
 # frame-gen-ritz
 
-frame-gen-ritz is an image-only frame interpolation library, similar in kind to Lossless Scaling's LSFG or AMD AFMF. It sees only finished frames, with no motion vectors or depth from the game. From two real frames it generates the frames in between, for 2x, 3x or 4x the base frame rate. It is a set of Vulkan compute shaders behind a small C++ API, plus the Python/NumPy reference implementation it was ported from.
+frame-gen-ritz is an image-only frame interpolation library, similar in kind to other image-only frame generators such as AMD AFMF. It sees only finished frames, with no motion vectors or depth from the game. From two real frames it generates the frames in between, for 2x, 3x or 4x the base frame rate. It is a set of Vulkan compute shaders behind a small C++ API, plus the Python/NumPy reference implementation it was ported from.
 
 It was written for gamescope-ritz, a gamescope fork. There it is meant to run as a compute pass on the game's layer-0 image, before scaling and before the overlay layers (Steam overlay, cursor, performance HUD) are composited on top, so those are never interpolated. This repository contains only the library. The pacing decisions (which frame to show when, when to turn generation off) live here too, in `gpu/pacing.h`. The gamescope side is only the glue that feeds the pacer and presents what it decides. `INTEGRATION.md` is the spec for that integration.
 
-frame-gen-ritz is original code. It is not derived from LSFG, lsfg-vk or FidelityFX source.
+frame-gen-ritz is original code. It is not derived from other frame-generation projects or FidelityFX source.
 
 ## Design goal
 
@@ -34,7 +34,7 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 
 ## Motion version 2
 
-`Settings::motionVersion` picks the algorithm. `MotionVersion::V1` (the default) is everything described above, frozen: output byte-identical to a library without the choice. `MotionVersion::V2` is a second, "morphing" interpolator next to it, closer to how LSFG looks: image parts are moved along a smoothed motion field and gaps are filled with stretched content. There is **no local hold** (no per-pixel fallback to a real frame); only the whole-frame scene-cut / flick fallback remains. Single generated frames can look distorted; it is tuned for how it looks in motion. Same latency as V1 (a synth reads only the current pair). The earlier occlusion-based V2 is gone (git tag `v2-occlusion`).
+`Settings::motionVersion` picks the algorithm. `MotionVersion::V1` (the default) is everything described above, frozen: output byte-identical to a library without the choice. `MotionVersion::V2` is a second, "morphing" interpolator next to it: image parts are moved along a smoothed motion field and gaps are filled with stretched content. There is **no local hold** (no per-pixel fallback to a real frame); only the whole-frame scene-cut / flick fallback remains. Single generated frames can look distorted; it is tuned for how it looks in motion. Same latency as V1 (a synth reads only the current pair). The earlier occlusion-based V2 is gone (git tag `v2-occlusion`).
 
 `Settings::v2Mode` (runtime, only used by V2) picks one of two modes:
 
