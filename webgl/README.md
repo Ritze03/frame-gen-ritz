@@ -118,10 +118,10 @@ the tap rounded as cv2's uint8 remap), `FG_D` / `FG_G` are the distance / differ
 stores (RGBA8: rounded levels). The host defines `FG_F16`, `FG_XF_LINEAR`, `FG_XF_WHITE`; RGBA8 compiles to the same arithmetic as
 before. Memory per full-res pixel doubles for the frame, warp and output textures.
 
-The library's V2 is Rgba8-only on `framegen-v2` (its HDR formats are in progress on `v2-formats`); the WebGL2 V2 with rgba16f uses
-the same conventions as that work (`V2_LEVELS`, `V2_D`, `V2_G`, `V2_LV`, `V2_QUANT` = the half-float store) and is tested against
-the library's Rgba8 V2 on the identity encoding (see "Tests"); against the library's RgbaF16 V2 once that lands (`tests/hdr.mjs`
-picks it up automatically: it asks the library for RgbaF16 V2 and only reports "no Vulkan reference" while the library refuses).
+The library's V2 is Rgba8-only on `framegen-v2`; its formats work (`v2-formats` @ e215f83, "V2 for every format") uses the same
+conventions as this backend (`V2_LEVELS`, `V2_D`, `V2_G`, `V2_LV`, `V2_QUANT` = the half-float store), and the WebGL2 V2 with rgba16f
+matches it (see "Results"). `tests/hdr.mjs` asks whichever library it is built against for RgbaF16 V2 and reports "no Vulkan
+reference" while that library refuses.
 
 ## Tests
 
@@ -166,18 +166,51 @@ Diagnostics that do not gate: block-field / per-pixel-field endpoint error and c
 
 ### Results (2026-10-22, framegen-v2 @ 4bdf179, RX 7900 XTX RADV, Chromium 156 headless)
 
-RESULTS_PLACEHOLDER
+| Test | Rows | Result |
+|---|---|---|
+| validate | 143 shaders (3 format variants) | all OK |
+| golden (V1 vs interp.py, 640 × 384, flowScale 2) | 5 pairs × 3 t | PASS, MAE ≤ 0.22 (objects t = 0.5), decisions identical |
+| xbackend, SwiftShader | 312 (19 pairs, V1 / V2 P / V2 Q, flowScale 1 / 2 / 4, 2 t) | all PASS; decisions identical everywhere (72 fallbacks); mean MAE ≤ 0.0001, worst MAE 0.0036 (V2 P), worst % > 4 levels 0.04 %, worst single pixel 83 levels (mc_sprint, flowScale 1: a block-vector candidate tie) |
+| xbackend, hardware GL (ANGLE on RADV) | 318 (+ 8K at flowScale 4) | all PASS; 270 of 318 bit-identical, every other row max 1 level; block field, per-pixel field exact (≤ 0.001 px) |
+| per stage (SwiftShader) | | block field identical on synthetic pairs; on footage 0.15–0.56 % of V2's blocks differ (fp ties in the refinement SADs, mean EPE ≤ 0.0005 px); V1 pixel field: ≤ 0.024 % of flow pixels pick another candidate (ties); Quality's coverage: identical except a few locations at key ties (mean ≤ 3e-4) |
+| switch semantics, API | | PASS: a motionVersion switch drops the estimate, a v2Mode switch keeps it and gives the same output as that mode's own estimate (bit-identical), sizes refused with the reason |
+| hdr vs the library on `framegen-v2` (V1 RgbaF16) | 8 pairs × {scRGB, PQ} × 2 t | PASS: MAE ≤ 0.05 levels, max ≤ 5.4, decisions identical |
+| hdr vs `v2-formats` @ e215f83 (V1 + V2 P + V2 Q RgbaF16) | 144 | all PASS: V2 MAE ≤ 0.001 levels, untrusted counts and scene-cut sums identical |
+| hdr identity encoding vs Rgba8 | 48 | PASS: MAE 0.2–0.3 (unrounded float taps vs rounded 8-bit taps), ≤ 0.6 % > 4 |
+| blur (V2 P / Q, 4 pairs × 3 windows) | 24 | all PASS: MAE ≤ 0.08, max 1 level |
+
+To compare against another library version: build it out of tree (e.g. `git archive <rev> gpu | tar -x -C <dir>`, `meson setup
+<dir>/build <dir>/gpu`, `ninja -C <dir>/build fgtest`) and run `FG_VKTAG=<name> FG_GPU=<dir>/gpu FG_GPU_BUILD=<dir>/build node
+webgl/tests/hdr.mjs` (or `blur.mjs`); `vkref.mjs` takes `FGTEST=<dir>/build/fgtest` (use a fresh `$FG_WORK` for its references).
 
 ## Performance
 
-PERF_PLACEHOLDER
+1080p (battlefield), 2x (one estimate + one synth per pair), flowScale 2 unless noted. GPU times from
+`EXT_disjoint_timer_query_webgl2`; "back-to-back" = 20 estimate + synth in one query (the GPU kept busy, like the library's own
+benchmark), "per pair" = one pair with a sync before it. The upload of a raw RGBA frame from JS (`pushFrame` with `{data}`, 8 MB)
+costs another ~0.7 ms of GPU time; a `<video>` source is a GPU copy instead.
+
+| | V1 fs1 | V1 fs2 | V1 fs4 | V2 P fs1 | V2 P fs2 | V2 P fs4 | V2 Q fs1 | V2 Q fs2 | V2 Q fs4 |
+|---|---|---|---|---|---|---|---|---|---|
+| WebGL2, RX 7900 XTX (ANGLE / Vulkan / RADV), back-to-back ms | 1.38 | 0.89 | 0.57 | 1.15 | 0.90 | 0.77 | 1.79 | 1.09 | 0.90 |
+| — of which estimate / synth | 0.94 / 0.18 | 0.49 / 0.20 | 0.26 / 0.21 | 0.86 / 0.27 | 0.44 / 0.28 | 0.32 / 0.32 | 1.34 / 0.30 | 0.67 / 0.29 | 0.46 / 0.34 |
+| WebGL2, one pair with a sync (estimate + synth) | 2.50 | 1.34 | 0.93 | 2.32 | 1.52 | 1.20 | 3.52 | 1.92 | 1.36 |
+| Vulkan library (fgtest --bench, incl. luma), back-to-back | | 0.31 | | | 0.20 | | | 0.28 | |
+| SwiftShader (CPU), wall ms per pair | | 800 | | | 990 | | | 1730 | |
+
+Where the time goes: ~40–50 draws per pair, each its own render pass in ANGLE. With a timer query around every draw (which adds
+its own overhead) no pass stands out any more after the cheap wins (the fused argmin + median was 0.6 ms alone; the histogram
+scatter, the serial median scan and the coverage splat's 4 point draws were the next): the rest is many small passes of
+0.01–0.15 ms. Further wins would be structural (merging passes: e.g. `seed_sad` + `seed_pick`, the sub-pixel pairs, `em` +
+`group`), not shader tweaks. `bench.mjs --gpu --passes` prints the per-pass table.
 
 ## Gaps
 
 - V1's motion blur (`blur_*.comp`, `recordSynthBlur` with V1) is not ported: `synthBlur` throws for V1 with blur on.
 - UI protection (`uiProtection`: Crosshair, WholeScreen, CrosshairV2) is not ported; V2's own static mask (`v2StaticMask`) is.
-- RGBA16F with V2 has no Vulkan reference yet (the library refuses V2 outside Rgba8 until `v2-formats` lands); tested on the
-  identity encoding against Rgba8 and for finite, unclamped output on scRGB / PQ pairs.
+- RGBA16F with V2 is checked against `v2-formats` @ e215f83 (not yet on `framegen-v2`, whose library refuses V2 outside Rgba8:
+  `hdr.mjs` against this branch's own build reports those rows as "no Vulkan reference"). V2's motion blur with RGBA16F is not
+  tested (the library rounds each sub-frame to the nearest half explicitly; here the render target's conversion does).
 - Rgb10 and the YUV formats (Nv12, P010) are not offered: a page gets RGBA8 or float textures.
 - A frame needs every texture within `MAX_TEXTURE_SIZE`: the widest is the top pyramid level's search tile, 13 × its block count;
   extreme aspect ratios (8192 × 64 at flowScale 1) are refused by `frameSizeError` with the size it needs.
