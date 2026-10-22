@@ -116,9 +116,9 @@ float qWeightC(vec3 cv, float t) {
 // structure there counts as that much disagreement for the zero-vector test (v2_morph.glsl).
 float qStructure(ivec2 p) {
     ivec2 mx = ivec2(pc.W - 1, pc.H - 1);
-    vec3 c = FG_FETCH(texelFetch(texPrev, p, 0).rgb);
-    vec3 r = FG_FETCH(texelFetch(texPrev, min(p + ivec2(1, 0), mx), 0).rgb);
-    vec3 d = FG_FETCH(texelFetch(texPrev, min(p + ivec2(0, 1), mx), 0).rgb);
+    vec3 c = V2_LV(V2_LEVELS(V2_PX(texPrev, texPrevC, p).rgb));
+    vec3 r = V2_LV(V2_LEVELS(V2_PX(texPrev, texPrevC, min(p + ivec2(1, 0), mx)).rgb));
+    vec3 d = V2_LV(V2_LEVELS(V2_PX(texPrev, texPrevC, min(p + ivec2(0, 1), mx)).rgb));
     vec3 a = max(abs(c - r), abs(c - d));
     return Q_SGAIN * max(a.r, max(a.g, a.b));
 }

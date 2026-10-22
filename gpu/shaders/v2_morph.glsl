@@ -65,7 +65,7 @@ vec3 sReject(vec2 pa, vec2 pc_, inout vec3 wa, inout vec3 wc, vec2 za2, vec2 zc2
 // Both taps on S: how surely the structure they hit is static (1: both frames show the same colours at each tap; a moving texture
 // that happens to match its structure in S does not); ra, rc: the taps' raw texels
 float tapsStatic(vec2 pa, vec2 pc_, vec3 ra, vec3 rc) {
-    vec3 d = max(abs(FG_FETCH(ra) - FG_FETCH(tapRaw(texCurr, pa).rgb)), abs(FG_FETCH(rc) - FG_FETCH(tapRaw(texPrev, pc_).rgb)));
+    vec3 d = max(V2_D(V2_LEVELS(ra), V2_LEVELS(V2_TAP(texCurr, texCurrC, pa).rgb)), V2_D(V2_LEVELS(rc), V2_LEVELS(V2_TAP(texPrev, texPrevC, pc_).rgb)));
     return clamp(1.0 - max(d.r, max(d.g, d.b)) * (1.0 / V2_SZMAX), 0.0, 1.0);
 }
 
@@ -116,15 +116,15 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     vec2 pc_ = q + (2.0 - 2.0 * t) * g;
     ivec2 cla = sCell(pa), clc = sCell(pc_);
     bool nearT = (sbits & 2u) != 0u;   // can a tap of this pixel's cell land near an overlay at all (v2_enclose.comp)
-    vec4 a = tapRaw(texPrev, pa), c = tapRaw(texCurr, pc_);
+    vec4 a = V2_TAP(texPrev, texPrevC, pa), c = V2_TAP(texCurr, texCurrC, pc_);
     vec3 ra = a.rgb, rc = c.rgb;
-    uiReject(pa, pc_, ra, rc);
-    vec3 wa = FG_FETCH(ra), wc = FG_FETCH(rc);
+    uiReject(V2_UIP(pa), V2_UIP(pc_), ra, rc);
+    vec3 wa = V2_LEVELS(ra), wc = V2_LEVELS(rc);
     edgeReject(pa, pc_, wa, wc);   // a tap outside the frame takes the other tap
     // a tap on a static overlay (HUD text) takes the other tap. Far from every overlay (most of a frame: whole subgroups, a uniform
     // branch) the taps leave no overlay: sout = 1 (0 at the zero vector), sboth = 0
     float sout = all(lessThan(abs(pc_ - pa), vec2(1.0))) ? 0.0 : 1.0, sboth = 0.0, sbS = 0.0;
-    vec3 d0 = abs(wa - wc);
+    vec3 d0 = V2_D(wa, wc);
     float em0 = max(d0.r, max(d0.g, d0.b));   // the taps' mismatch before the overlay's tap rejection (the morph's own fit)
     if (subgroupAny(nearT)) {
         vec3 so = sReject(pa, pc_, wa, wc, sOverAt(pa, cla), sOverAt(pc_, clc));
@@ -134,11 +134,11 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
         if (subgroupAny(sbS > 0.0)) { if (sbS > 0.0) sbS *= tapsStatic(pa, pc_, a.rgb, c.rgb); }
         if (subgroupAny(sboth > 0.0)) {   // (not where both taps are on CrosshairV2's UI: its patch and its own tap rule decide there)
             bool ha, hc;
-            uiRejectHits(pa, pc_, ha, hc);
+            uiRejectHits(V2_UIP(pa), V2_UIP(pc_), ha, hc);
             if (ha && hc) sboth = 0.0;
         }
     }
-    vec3 d = abs(wa - wc);
+    vec3 d = V2_D(wa, wc);
     float em = max(d.r, max(d.g, d.b));
     vec2 sp = vec2(0.0);
     float sxd = 0.0;   // S dilated by ~1 flow px (sOverAt's): the anti-aliased rim of a stroke
@@ -167,27 +167,27 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
         for (int k = 0; k < 4; k++) {
             vec2 gk = S * VF(i0 + ivec2(k & 1, k >> 1));
             vec2 qa = q - (2.0 * t) * gk, qc = q + (2.0 - 2.0 * t) * gk;
-            vec4 xa = tapRaw(texPrev, qa), xc = tapRaw(texCurr, qc);
+            vec4 xa = V2_TAP(texPrev, texPrevC, qa), xc = V2_TAP(texCurr, texCurrC, qc);
             vec3 ya = xa.rgb, yc = xc.rgb;
-            uiReject(qa, qc, ya, yc);
-            ya = FG_FETCH(ya); yc = FG_FETCH(yc);
+            uiReject(V2_UIP(qa), V2_UIP(qc), ya, yc);
+            ya = V2_LEVELS(ya); yc = V2_LEVELS(yc);
             edgeReject(qa, qc, ya, yc);
             vec3 sok = vec3(all(lessThan(abs(qc - qa), vec2(1.0))) ? 0.0 : 1.0, 0.0, 0.0);
-            vec3 dk0 = abs(ya - yc);
+            vec3 dk0 = V2_D(ya, yc);
             float ek0 = max(dk0.r, max(dk0.g, dk0.b));
             if (subgroupAny(nearT)) {   // (the static pass, near an overlay: its tap rejection as for the main taps)
                 ivec2 ka = sCell(qa), kc = sCell(qc);
                 sok = sReject(qa, qc, ya, yc, sOverAt(qa, ka), sOverAt(qc, kc));
                 if (subgroupAny(sok.z > 0.0)) { if (sok.z > 0.0) sok.z *= tapsStatic(qa, qc, xa.rgb, xc.rgb); }
             }
-            vec3 dk = abs(ya - yc);
+            vec3 dk = V2_D(ya, yc);
             float sk = sum16(max(dk.r, max(dk.g, dk.b)), full);   // (the same for the group's 16 lanes: a uniform choice in the group)
             if (sk < sb) { sb = sk; ba = ya; bc = yc; baa = xa.a; bca = xc.a; bso = sok; be0 = ek0; }
         }
         // (not on an overlay, S, nor inside one, E, where the winner's taps leave it: a rigid vector there pastes the scene behind a
         // semi-transparent panel in blocks; inside E with its taps inside too, a moving object on static scenery, it may)
         float wb = clamp((s0 - sb - 16.0 * V2_C1) * (1.0 / (16.0 * V2_C2)), 0.0, 1.0) * (1.0 - clamp(2.0 * max(sp.x, sp.y * bso.x), 0.0, 1.0));
-        vec3 da = abs(ba - bc);
+        vec3 da = V2_D(ba, bc);
         wa = mix(wa, ba, wb); wc = mix(wc, bc, wb);
         a.a = mix(a.a, baa, wb); c.a = mix(c.a, bca, wb);
         em = mix(em, max(da.r, max(da.g, da.b)), wb);
@@ -215,9 +215,9 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
             if (j == 0) continue;
             vec2 o = st * (float(j) * 0.5);
             vec2 qa = pa + o, qc = pc_ + o;
-            vec3 xa = tapRaw(texPrev, qa).rgb, xc = tapRaw(texCurr, qc).rgb;
-            uiReject(qa, qc, xa, xc);
-            vec3 ya = FG_FETCH(xa), yc = FG_FETCH(xc);
+            vec3 xa = V2_TAP(texPrev, texPrevC, qa).rgb, xc = V2_TAP(texCurr, texCurrC, qc).rgb;
+            uiReject(V2_UIP(qa), V2_UIP(qc), xa, xc);
+            vec3 ya = V2_LEVELS(xa), yc = V2_LEVELS(xc);
             edgeReject(qa, qc, ya, yc);
             ivec2 ka = sCell(qa), kc = sCell(qc);
             if (subgroupAny(sNear(ka) || sNear(kc))) sReject(qa, qc, ya, yc, sOverAt(qa, ka), sOverAt(qc, kc));
@@ -236,9 +236,9 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
     float emz = em;
 #endif
     if (emz > V2_Z0 || sxd > 0.0 || sp.y * sout > 0.0 || sboth > 0.0) {   // (only then can it win)
-        vec4 s0 = texelFetch(texPrev, p, 0), s1 = texelFetch(texCurr, p, 0);
-        vec3 sa = FG_FETCH(s0.rgb), sc = FG_FETCH(s1.rgb);
-        vec3 dz = abs(sa - sc);
+        vec4 s0 = V2_PX(texPrev, texPrevC, p), s1 = V2_PX(texCurr, texCurrC, p);
+        vec3 sa = V2_LEVELS(s0.rgb), sc = V2_LEVELS(s1.rgb);
+        vec3 dz = V2_D(sa, sc);
         float z = max(dz.r, max(dz.g, dz.b));
         // ... and so do both neighbours along x or along y (a stroke of text or of a HUD element): a lone pixel whose colours happen to
         // match in a moving texture does not switch (it would be a speck). The same neighbours give the full-resolution structure
@@ -249,11 +249,11 @@ vec3 morph(ivec2 p, float t, out float al, out uint e) {
         for (int k = 0; k < 4; k++) {
             ivec2 o = k < 2 ? ivec2(2 * k - 1, 0) : ivec2(0, 2 * k - 5);
             ivec2 pn = clamp(p + o, ivec2(0), ivec2(pc.W - 1, pc.H - 1));
-            vec3 an = FG_FETCH(texelFetch(texPrev, pn, 0).rgb), cn = FG_FETCH(texelFetch(texCurr, pn, 0).rgb);
-            vec3 d = abs(an - cn);
+            vec3 an = V2_LEVELS(V2_PX(texPrev, texPrevC, pn).rgb), cn = V2_LEVELS(V2_PX(texCurr, texCurrC, pn).rgb);
+            vec3 d = V2_D(an, cn);
             zn[k] = max(d.r, max(d.g, d.b));
             if (inS) {
-                vec3 ga = sa - an, gc = sc - cn;
+                vec3 ga = V2_G(sa, an), gc = V2_G(sc, cn);
                 vec3 gd = abs(ga - gc), gm = max(abs(ga), abs(gc));
                 num += max(gd.r, max(gd.g, gd.b));
                 den += max(gm.r, max(gm.g, gm.b));
@@ -315,11 +315,11 @@ void pixelOut(ivec2 p, bool counting, bool cut) {
         uint e = 0u;
         if (inside) {
             if (real || fb) {   // a real frame: the nearer one (t <= 0: prev, t >= 1: curr)
-                vec4 r = t > 0.5 ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0);
-                v = FG_FETCH(r.rgb);
+                vec4 r = t > 0.5 ? V2_PX(texCurr, texCurrC, p) : V2_PX(texPrev, texPrevC, p);
+                v = V2_LEVELS(r.rgb);
                 a = r.a;
             } else {
-                v = clamp(floor(morph(p, t, a, e) + 0.5), 0.0, 255.0);   // the 8-bit sub-frame recordSynth(t) stores
+                v = V2_QUANT(morph(p, t, a, e));   // the sub-frame recordSynth(t) stores (Rgba8: 8 bit)
             }
         }
         if (counting && !real && !cut) {   // uniform
@@ -330,7 +330,17 @@ void pixelOut(ivec2 p, bool counting, bool cut) {
         accA += w * a;
         ws += w;
     }
+#ifdef FG_YUV
+    // the Y plane at p; the CbCr plane by the even-even pixel of each 2x2 block (its morph's chroma taps sit at the block centre)
+    if (inside) imageStore(outImg, p, vec4(fgOut(acc.x / ws), 0.0, 0.0, 1.0));
+    if (inside && ((p.x | p.y) & 1) == 0) imageStore(outImgC, p >> 1, vec4(fgOut2(acc.yz / ws), 0.0, 1.0));
+#elif defined(FG_FORMAT_F16)
+    // rounded to the nearest half here: the store's own conversion may truncate (AMD), so recordSynth's sub-frames and the blur's
+    // average are both rounded the same, documented way
+    if (inside) imageStore(outImg, p, FG_STORE(v2Half(acc / ws), accA / ws));
+#else
     if (inside) imageStore(outImg, p, FG_STORE(acc / ws, accA / ws));
+#endif
 }
 
 void main() {

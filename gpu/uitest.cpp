@@ -17,7 +17,7 @@
 // WholeScreen, the HUD box's only in WholeScreen, background PSNR does not drop; --hash prints an FNV-1a hash of
 // every generated frame of the Off run (compare against a build of the library before protection existed: build
 // this file with -DUITEST_NO_UI against it).
-// check also covers the motion version (motionCheck): V2 refused for every Format but Rgba8, a switch drops the estimate,
+// check also covers the motion version (motionCheck): both versions valid for every Format, a switch drops the estimate,
 // releaseUnusedMotion() frees the unselected version's pipelines and a later switch back re-creates them.
 #include "framegen.h"
 
@@ -1661,7 +1661,7 @@ static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 1
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
-//   V2 needs Rgba8: settingsError() refuses it for every other Format with a reason, init() refuses it with that reason.
+//   Both versions run every Format: settingsError() accepts V1 and V2 (both modes) for each (formattest runs them).
 //   A switch drops the estimate: recordSynth / recordSynthBlur of the pair return false until a new recordEstimate, also after
 //   switching straight back (an estimate of one version is never synthesised by the other); setSettings without a switch keeps it.
 //   The new version's output equals a fresh instance's in that version.
@@ -1673,45 +1673,20 @@ static void motionCheck(const Scene& sc) {
     const int W = sc.W, H = sc.H;
     const MotionVersion from = gAlgo, to = gAlgo == MotionVersion::V1 ? MotionVersion::V2 : MotionVersion::V1;
     printf("\n== motion version: start %s, switch to %s ==\n", algoName(from), algoName(to));
-    {   // V2 needs Rgba8
+    {   // every Format runs both versions
         Settings v1, v2; v2.motionVersion = MotionVersion::V2;
         Settings bad; bad.motionVersion = (MotionVersion)2;
         expect(Interpolator::validate(v2) && !Interpolator::validate(bad), "validate accepts V2 and rejects an unknown motion version");
-        const Format others[4] = {Format::Rgb10, Format::RgbaF16, Format::Nv12, Format::P010};
-        bool v1All = !Interpolator::settingsError(v1, Format::Rgba8), v2Refused = true;
-        for (Format f : others) {
-            v1All = v1All && !Interpolator::settingsError(v1, f);
-            v2Refused = v2Refused && Interpolator::settingsError(v2, f) != nullptr;
-        }
-        expect(v1All && !Interpolator::settingsError(v2, Format::Rgba8), "settingsError: V1 valid for every Format, V2 for Rgba8");
-        expect(v2Refused, "settingsError: V2 refused for Rgb10, RgbaF16, Nv12 and P010");
-        printf("    reason: %s\n", Interpolator::settingsError(v2, Format::Rgb10));
-        expect(Interpolator::settingsError(bad, Format::Rgba8) != nullptr, "settingsError refuses what validate refuses");
+        const Format all[5] = {Format::Rgba8, Format::Rgb10, Format::RgbaF16, Format::Nv12, Format::P010};
         Settings mq = v2, mp = v2, mb = v2, m1 = v1;
         mp.v2Mode = V2Mode::Performance; mb.v2Mode = (V2Mode)2; m1.v2Mode = V2Mode::Performance;
+        bool allOk = true;
+        for (Format f : all) allOk = allOk && !Interpolator::settingsError(v1, f) && !Interpolator::settingsError(mq, f) && !Interpolator::settingsError(mp, f);
+        expect(allOk, "settingsError: V1, V2 Quality and V2 Performance valid for every Format (Rgba8, Rgb10, RgbaF16, Nv12, P010)");
+        expect(Interpolator::settingsError(bad, Format::Rgba8) != nullptr, "settingsError refuses what validate refuses");
         expect(Interpolator::validate(mq) && Interpolator::validate(mp) && !Interpolator::validate(mb) && Interpolator::validate(m1),
                "validate: v2Mode Quality / Performance accepted (also with V1, which ignores it), an unknown mode rejected");
         expect(Settings{}.v2Mode == V2Mode::Quality, "v2Mode defaults to Quality");
-        expect(Interpolator::settingsError(mp, Format::Rgb10) && !strcmp(Interpolator::settingsError(mp, Format::Rgb10), Interpolator::settingsError(v2, Format::Rgb10)),
-               "settingsError: V2 Performance refused for Rgb10 with the same reason");
-        // init() of a non-SDR view format with V2: false before anything is created, with that reason (RgbaF16 also linear)
-        const VkFormat vfs[5] = {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
-                                 VK_FORMAT_R8_UNORM, VK_FORMAT_R16_UNORM};
-        bool initRefused = true;
-        for (int i = 0; i < 5; i++) {
-            Interpolator fg;
-            InitInfo info;
-            info.phys = phys; info.device = dev; info.gdpa = vkGetDeviceProcAddr; info.width = W; info.height = H;
-            info.viewFormat = vfs[i]; info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2; info.settings = v2;
-            if (i == 2) info.transfer = Transfer::Linear;
-            Format f;
-            formatOf(vfs[i], &f);
-            const bool ok = fg.init(info);
-            const char* e = fg.initError();
-            initRefused = initRefused && !ok && e && (!strcmp(e, Interpolator::settingsError(v2, f)) || strstr(e, "not built"));
-            fg.destroy();
-        }
-        expect(initRefused, "init refuses V2 for Rgb10, RgbaF16 (encoded and linear), Nv12 and P010, initError = settingsError's reason");
     }
 
     Img a = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);

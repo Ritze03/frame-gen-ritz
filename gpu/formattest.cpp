@@ -3,8 +3,7 @@
 //                               (the last pair interpolated at t = 0.5 / 0.25 / blurred), with and without UI protection
 //   formattest time [W H]       one estimate + one synth per format, GPU time per pass group (default 1920 1080)
 //   options: --separate-planes  YUV: two single-plane images instead of one multi-planar image with plane views
-//            --algo v1|v2       the motion version (Settings::motionVersion), default v1. V2 is Rgba8 only: with v2, check runs
-//                               Rgba8 in V2 and checks that every other format refuses V2 (init and setSettings, with a reason)
+//            --algo v1|v2       the motion version (Settings::motionVersion), default v1. Every check runs every format in it
 //            --mode quality|performance  Settings::v2Mode (default quality; V1 ignores it)
 //            --hash             check: print an FNV-1a hash of every output of each format's Off run (t = 0.5, 0.25, blur) and
 //                               WholeScreen run (t = 0.5, 0.25), raw bytes of both planes: diff two library builds
@@ -490,10 +489,12 @@ static InitInfo baseInfo(Enc e, int W, int H, const Settings& s) {
     return info;
 }
 
-struct Result { Raw out[3]; bool ok = false, notBuilt = false; };   // t = 0.5, 0.25, blur (0.45..0.55, 3 samples) of the last pair
-// Runs the sequence (frames 0..NF-1 of the scene) through a ring of 4 pics; synthesises from the last pair only.
+struct Result { std::vector<Raw> out; bool ok = false, notBuilt = false; };   // runSequence: t = 0.5, 0.25, blur (0.45..0.55) of the last pair
+// One output of the last pair: recordSynth(t1) (blur false) or recordSynthBlur(t0, t1)
+struct Op { float t0, t1; bool blur; };
+// Runs the sequence (frames 0..NF-1 of the scene) through a ring of 4 pics; synthesises from the last pair only, the outputs `ops`.
 // trackMid: frames 1..NF-4 go through recordTrack instead of recordObserve (and no pair touching one is estimated).
-static Result runSequence(Enc e, const Scene& sc, const Settings& s, bool doBlur, bool trackMid = false) {
+static Result runOutputs(Enc e, const Scene& sc, const Settings& s, const std::vector<Op>& ops, bool trackMid = false) {
     Result res;
     Interpolator fg;
     if (!fg.init(baseInfo(e, sc.W, sc.H, s))) {
@@ -501,7 +502,8 @@ static Result runSequence(Enc e, const Scene& sc, const Settings& s, bool doBlur
         res.notBuilt = fg.initError() && strstr(fg.initError(), "not built");
         return res;
     }
-    Pic ring[4], outs[3];
+    Pic ring[4];
+    std::vector<Pic> outs(ops.size());
     for (auto& r : ring) r = makePic(e, sc.W, sc.H);
     for (auto& o : outs) o = makePic(e, sc.W, sc.H);
     begin();
@@ -520,21 +522,30 @@ static Result runSequence(Enc e, const Scene& sc, const Settings& s, bool doBlur
         if (f > 0 && !(trackMid && f <= sc.NF - 3)) {
             Pic& prv = ring[(f - 1) % 4];
             if (!fg.recordEstimate(cb, prv.frame(), cur.frame())) { fprintf(stderr, "estimate failed\n"); exit(1); }
-            if (f == sc.NF - 1) {
-                if (!fg.recordSynth(cb, prv.frame(), cur.frame(), outs[0].frame(), 0.5f)) { fprintf(stderr, "synth failed\n"); exit(1); }
-                if (!fg.recordSynth(cb, prv.frame(), cur.frame(), outs[1].frame(), 0.25f)) { fprintf(stderr, "synth failed\n"); exit(1); }
-                if (doBlur && !fg.recordSynthBlur(cb, prv.frame(), cur.frame(), outs[2].frame(), 0.45f, 0.55f)) { fprintf(stderr, "blur failed\n"); exit(1); }
-            }
+            if (f == sc.NF - 1)
+                for (size_t k = 0; k < ops.size(); k++) {
+                    const Op& o = ops[k];
+                    if (!(o.blur ? fg.recordSynthBlur(cb, prv.frame(), cur.frame(), outs[k].frame(), o.t0, o.t1)
+                                 : fg.recordSynth(cb, prv.frame(), cur.frame(), outs[k].frame(), o.t1))) { fprintf(stderr, "synth failed\n"); exit(1); }
+                }
         }
         submit();
     }
-    for (int i = 0; i < 3; i++) res.out[i] = download(outs[i], e, sc.W, sc.H);
+    for (size_t i = 0; i < outs.size(); i++) res.out.push_back(download(outs[i], e, sc.W, sc.H));
     vkDeviceWaitIdle(dev);
     fg.destroy();
     for (auto& r : ring) destroyPic(r);
     for (auto& o : outs) destroyPic(o);
     res.ok = true;
     return res;
+}
+// t = 0.5, 0.25 and (doBlur) the blur 0.45..0.55 of the last pair; without doBlur out[2] stays the zero sentinel
+static Result runSequence(Enc e, const Scene& sc, const Settings& s, bool doBlur, bool trackMid = false) {
+    std::vector<Op> ops = {{0.5f, 0.5f, false}, {0.25f, 0.25f, false}};
+    if (doBlur) ops.push_back({0.45f, 0.55f, true});
+    Result r = runOutputs(e, sc, s, ops, trackMid);
+    if (r.ok && !doBlur) r.out.push_back(zeros(e, sc.W, sc.H));
+    return r;
 }
 
 static double psnr(const std::vector<float>& a, const std::vector<float>& b, const std::vector<uint8_t>* mask = nullptr, bool maskVal = true) {
@@ -656,30 +667,250 @@ static void ghostFormat(Enc e, const Scene& base, GhostRow* off, GhostRow* v2) {
     }
 }
 
+// Every channel sample of an output in the format's own stored values (codes; RgbaF16: the half floats), alpha left out; YUV: the
+// Y plane, then the CbCr plane
+static std::vector<double> storedValues(Enc e, const Raw& r, int W, int H) {
+    std::vector<double> v;
+    const size_t n = (size_t)W * H;
+    switch (e) {
+    case Enc::Rgba8:
+        for (size_t i = 0; i < n; i++) for (int c = 0; c < 3; c++) v.push_back(r.p0[i * 4 + c]);
+        break;
+    case Enc::Rgb10:
+        for (size_t i = 0; i < n; i++) { uint32_t w; memcpy(&w, &r.p0[i * 4], 4); for (int c = 0; c < 3; c++) v.push_back((w >> (10 * c)) & 1023u); }
+        break;
+    case Enc::F16Enc: case Enc::F16Lin:
+        for (size_t i = 0; i < n; i++) for (int c = 0; c < 3; c++) { uint16_t h; memcpy(&h, &r.p0[(i * 4 + c) * 2], 2); v.push_back(fromHalf(h)); }
+        break;
+    case Enc::Nv12:
+        for (uint8_t b : r.p0) v.push_back(b);
+        for (uint8_t b : r.p1) v.push_back(b);
+        break;
+    default:
+        for (size_t i = 0; i + 1 < r.p0.size(); i += 2) v.push_back((r.p0[i] | r.p0[i + 1] << 8) >> 6);
+        for (size_t i = 0; i + 1 < r.p1.size(); i += 2) v.push_back((r.p1[i] | r.p1[i + 1] << 8) >> 6);
+    }
+    return v;
+}
+
+// The motion blur in this format (Settings::blurSamples 4, even weights, window 0.3..0.7): recordSynthBlur's output is the average of
+// the sub-frames recordSynth(t_k) stores, rounded once as the format stores it (codes: within half a code; RgbaF16: within half a
+// unit of the last place of a half float). The other blur checks of this file run with blurSamples 0 (one instant).
+static void blurExact(Enc e, const Scene& sc) {
+    Settings s;
+    s.blurSamples = 4;
+    s.blurWeights = BlurWeights::Even;
+    const float t0 = 0.3f, t1 = 0.7f;
+    std::vector<Op> ops;
+    for (int k = 0; k < 4; k++) {   // the library's sample instants, computed the same way
+        float t = (float)(t0 + ((double)t1 - (double)t0) * (k + 0.5) / 4);
+        t = std::min(std::max(t, t0), t1);
+        ops.push_back({t, t, false});
+    }
+    ops.push_back({t0, t1, true});
+    Result r = runOutputs(e, sc, s, ops);
+    if (!r.ok) { expect(false, "blur (4 samples) init + sequence"); return; }
+    std::vector<double> sub[4], bl = storedValues(e, r.out[4], sc.W, sc.H);
+    for (int k = 0; k < 4; k++) sub[k] = storedValues(e, r.out[k], sc.W, sc.H);
+    const bool flt = e == Enc::F16Enc || e == Enc::F16Lin;
+    size_t bad = 0;
+    double worst = 0, spread = 0;
+    for (size_t i = 0; i < bl.size(); i++) {
+        const double avg = (sub[0][i] + sub[1][i] + sub[2][i] + sub[3][i]) * 0.25;
+        const double tol = flt ? std::max(std::fabs(avg) * (1.0 / 2048.0) * 1.001, 1e-7) : 0.5 + 1e-3;
+        const double d = std::fabs(bl[i] - avg);
+        worst = std::max(worst, flt ? d / std::max(std::fabs(avg), 1e-3) : d);
+        spread = std::max(spread, std::fabs(sub[0][i] - sub[3][i]));
+        bad += d > tol;
+    }
+    printf("    blur (4 samples, 0.3..0.7) vs the average of the 4 recordSynth sub-frames: %zu of %zu values off, worst %s %.4g (sub-frames differ by up to %.4g)\n",
+           bad, bl.size(), flt ? "relative" : "codes", worst, spread);
+    // V1 (frozen) rounds each sub-frame of its blur to 8-bit levels in every RGB format (blur_resolve.comp) and not at all in YUV:
+    // judged only in Rgba8 there
+    if (algoV2() || e == Enc::Rgba8)
+        expect(bad == 0 && spread > 0, "recordSynthBlur == the average of the recordSynth(t_k) sub-frames, rounded once as the format stores it");
+    else
+        printf("    INFO (V1, not judged: its blur rounds each sub-frame to 8-bit levels in Rgb10 / RgbaF16, not at all in Nv12 / P010)\n");
+}
+
+// ---------------------------------------------------------------- HDR highlights
+static double pqEnc(double nits) {
+    const double p = std::pow(std::min(std::max(nits, 0.0) / 10000.0, 1.0), 0.1593017578125);
+    return std::pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375);
+}
+static double pqDec(double code) {
+    const double e = std::pow(std::min(std::max(code, 0.0), 1.0), 1.0 / 78.84375);
+    return 10000.0 * std::pow(std::max(e - 0.8359375, 0.0) / (18.8515625 - 18.6875 * e), 1.0 / 0.1593017578125);
+}
+static const double kR2020 = 0.2627, kB2020 = 0.0593;
+// A frame given as PQ-coded R'G'B' (0..1, W*H*3) -> the format's bytes: Rgb10 / RgbaF16 encoded store the PQ codes, RgbaF16 linear
+// the linear light (1.0 = 80 nits, scRGB), P010 BT.2020 limited range (HDR10 video), chroma 2x2 averaged
+static Raw encodePq(Enc e, const std::vector<double>& pq, int W, int H) {
+    Raw r;
+    const size_t n = (size_t)W * H;
+    if (e == Enc::Rgb10) {
+        r.p0.resize(n * 4);
+        for (size_t i = 0; i < n; i++) {
+            uint32_t v = 3u << 30;
+            for (int c = 0; c < 3; c++) v |= (uint32_t)std::lround(pq[i * 3 + c] * 1023.0) << (10 * c);
+            memcpy(&r.p0[i * 4], &v, 4);
+        }
+    } else if (e == Enc::F16Enc || e == Enc::F16Lin) {
+        r.p0.resize(n * 8);
+        for (size_t i = 0; i < n; i++)
+            for (int c = 0; c < 4; c++) {
+                double v = c == 3 ? 1.0 : e == Enc::F16Lin ? pqDec(pq[i * 3 + c]) / 80.0 : pq[i * 3 + c];
+                uint16_t h = toHalf((float)v);
+                memcpy(&r.p0[(i * 4 + c) * 2], &h, 2);
+            }
+    } else {   // P010
+        const int cw = (W + 1) / 2, ch = (H + 1) / 2;
+        r.p0.resize(n * 2);
+        r.p1.resize((size_t)cw * ch * 4);
+        std::vector<double> cb(n), cr(n);
+        for (size_t i = 0; i < n; i++) {
+            const double R = pq[i * 3], G = pq[i * 3 + 1], B = pq[i * 3 + 2];
+            const double Y = kR2020 * R + (1 - kR2020 - kB2020) * G + kB2020 * B;
+            cb[i] = (B - Y) / (2 * (1 - kB2020));
+            cr[i] = (R - Y) / (2 * (1 - kR2020));
+            uint16_t w = (uint16_t)(std::lround(std::min(std::max(64 + 876 * Y, 0.0), 1023.0)) << 6);
+            memcpy(&r.p0[i * 2], &w, 2);
+        }
+        for (int y = 0; y < ch; y++)
+            for (int x = 0; x < cw; x++) {
+                double sb = 0, sr = 0;
+                for (int j = 0; j < 2; j++)
+                    for (int i = 0; i < 2; i++) {
+                        const size_t k = (size_t)std::min(2 * y + j, H - 1) * W + std::min(2 * x + i, W - 1);
+                        sb += cb[k]; sr += cr[k];
+                    }
+                uint16_t w[2] = {(uint16_t)(std::lround(std::min(std::max(512 + 896 * sb / 4, 0.0), 1023.0)) << 6),
+                                 (uint16_t)(std::lround(std::min(std::max(512 + 896 * sr / 4, 0.0), 1023.0)) << 6)};
+                memcpy(&r.p1[((size_t)y * cw + x) * 4], w, 4);
+            }
+    }
+    return r;
+}
+// ... and back to PQ codes (W*H*3)
+static std::vector<double> decodePq(Enc e, const Raw& r, int W, int H) {
+    const size_t n = (size_t)W * H;
+    std::vector<double> o(n * 3);
+    if (e == Enc::Rgb10) {
+        for (size_t i = 0; i < n; i++) { uint32_t v; memcpy(&v, &r.p0[i * 4], 4); for (int c = 0; c < 3; c++) o[i * 3 + c] = ((v >> (10 * c)) & 1023u) / 1023.0; }
+    } else if (e == Enc::F16Enc || e == Enc::F16Lin) {
+        for (size_t i = 0; i < n; i++)
+            for (int c = 0; c < 3; c++) {
+                uint16_t h;
+                memcpy(&h, &r.p0[(i * 4 + c) * 2], 2);
+                const double v = fromHalf(h);
+                o[i * 3 + c] = e == Enc::F16Lin ? pqEnc(v * 80.0) : v;
+            }
+    } else {
+        const int cw = (W + 1) / 2;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                const size_t i = (size_t)y * W + x, ci = (size_t)(y / 2) * cw + x / 2;
+                uint16_t w, c2[2];
+                memcpy(&w, &r.p0[i * 2], 2); memcpy(c2, &r.p1[ci * 4], 4);
+                const double Y = ((w >> 6) - 64) / 876.0, cb = ((c2[0] >> 6) - 512) / 896.0, cr = ((c2[1] >> 6) - 512) / 896.0;
+                const double R = Y + 2 * (1 - kR2020) * cr, B = Y + 2 * (1 - kB2020) * cb;
+                o[i * 3] = R; o[i * 3 + 1] = (Y - kR2020 * R - kB2020 * B) / (1 - kR2020 - kB2020); o[i * 3 + 2] = B;
+            }
+    }
+    return o;
+}
+
+// HDR: a textured highlight object (8x8 px cells of 1000..4000 nits, PQ 0.75..0.90: far above SDR white) moving 12 px per frame over the panning
+// SDR background (up to 203 nits), as HDR10 would carry it: Rgb10 / RgbaF16 with PQ codes, RgbaF16 linear (scRGB, 1.0 = 80 nits:
+// values up to 50), P010 BT.2020 PQ. At t = 0.5 the highlights must be interpolated, not clipped: at the object's true mid position
+// (its inside, 4 px from the edge) the output is within a few PQ levels (x 255) of the true mid frame (through the format's own
+// quantisation) and >= 0.74 (above 1000 nits ~ 0.75), the largest output code there reaches the true one's, and no highlight is
+// left at the object's old places (a cross-fade would leave two half-bright copies there). Compared in PQ levels in every format.
+static void checkHdrMotion(Enc e, const Scene& sc) {
+    const int W = sc.W, H = sc.H, ow = 64, oh = 64, ox = W / 3, oy = H / 3, ov = 12;
+    printf("\n== HDR highlights: %s, PQ (%s) ==\n", encName(e), e == Enc::F16Lin ? "linear light, 1.0 = 80 nits" : e == Enc::P010 ? "BT.2020 limited range" : "codes");
+    if (!formatSupported(e)) { printf("    SKIP: the device cannot sample + store this format\n"); return; }
+    auto frame = [&](double f) {   // f = 10 / 10.5 / 11 of the scene's pan; the object at ox + ov (f - 10)
+        std::vector<double> pq((size_t)W * H * 3);
+        const int bx = (int)std::lround(f * kPanX), by = (int)std::lround(f * kPanY), px = ox + (int)std::lround(ov * (f - 10));
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                for (int c = 0; c < 3; c++) {
+                    double v = sc.bg[((size_t)(y + by) * sc.bgW + x + bx) * 4 + c] / 255.0, nits = 203.0 * std::pow(v, 2.4);
+                    if (x >= px && x < px + ow && y >= oy && y < oy + oh) {
+                        const double cell = (hash2((x - px) / 8, (y - oy) / 8, 91) & 1023u) / 1023.0;   // not periodic
+                        nits = (1000.0 + 3000.0 * cell) * (c == 0 ? 1.0 : c == 1 ? 0.85 : 0.6);
+                    }
+                    pq[((size_t)y * W + x) * 3 + c] = pqEnc(nits);
+                }
+        return pq;
+    };
+    const auto fa = frame(10), fc = frame(11), truth = decodePq(e, encodePq(e, frame(10.5), W, H), W, H);
+    InitInfo info = baseInfo(e, W, H, Settings{});
+    if (e == Enc::P010) info.yuvMatrix = YuvMatrix::Bt2020;
+    Interpolator fg;
+    if (!fg.init(info)) { expect(false, fg.initError() ? fg.initError() : "init"); return; }
+    Pic a = makePic(e, W, H), c = makePic(e, W, H), o = makePic(e, W, H);
+    begin();
+    for (Pic* p : {&a, &c, &o}) barrierAll(*p, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    submit();
+    upload(a, encodePq(e, fa, W, H), W, H);
+    upload(c, encodePq(e, fc, W, H), W, H);
+    upload(o, zeros(e, W, H), W, H);
+    begin();
+    fg.beginFrame();
+    const bool ok = fg.recordEstimate(cb, a.frame(), c.frame()) && fg.recordSynth(cb, a.frame(), c.frame(), o.frame(), 0.5f);
+    submit();
+    const auto out = ok ? decodePq(e, download(o, e, W, H), W, H) : std::vector<double>();
+    vkDeviceWaitIdle(dev);
+    fg.destroy();
+    destroyPic(a); destroyPic(c); destroyPic(o);
+    if (!ok) { expect(false, "estimate + synth"); return; }
+    const int mx = ox + ov / 2;   // the object's true mid position
+    double errSum = 0, mxOut = 0, mxIn = 0;
+    size_t nIn = 0, bright = 0, ghost = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            const size_t i = (size_t)y * W + x;
+            double m = 0, d = 0;
+            for (int k = 0; k < 3; k++) {
+                m = std::max(m, out[i * 3 + k]);
+                d = std::max(d, std::fabs(out[i * 3 + k] - truth[i * 3 + k]));
+            }
+            const bool inside = x >= mx + 4 && x < mx + ow - 4 && y >= oy + 4 && y < oy + oh - 4;
+            const bool nearObj = x >= mx - 2 && x < mx + ow + 2 && y >= oy - 2 && y < oy + oh + 2;
+            if (inside) {
+                nIn++; errSum += d * 255.0; bright += m >= 0.74;
+                mxOut = std::max(mxOut, m);
+                for (int k = 0; k < 3; k++) mxIn = std::max(mxIn, truth[i * 3 + k]);
+            }
+            else if (!nearObj) ghost += m >= 0.62;   // brighter than ~400 nits: the background is at most 203 (PQ 0.58)
+        }
+    const double meanErr = errSum / nIn;
+    printf("    inside the moving highlight: mean error %.2f PQ levels, %zu of %zu px >= PQ 0.74; largest code there %.4f (%.0f nits), true %.4f (%.0f nits); "
+           "highlight px left elsewhere: %zu\n", meanErr, bright, nIn, mxOut, pqDec(mxOut), mxIn, pqDec(mxIn), ghost);
+    expect(meanErr < 3.0, "the highlight is interpolated to its mid position (mean error < 3 PQ levels inside it)");
+    expect(bright == nIn && mxOut >= mxIn - 3.0 / 1023.0, "highlights above SDR white are kept: every inside pixel >= PQ 0.74, the largest code there reaches the true one's");
+    expect(ghost <= (size_t)(ow * oh) / 100, "no highlight left at the object's old places (<= 1 % of its area: no cross-fade)");
+}
+
 static double blurRef8 = 0;   // Rgba8: PSNR of the blurred output vs the t = 0.5 output (the window is wider than it looks: the scene moves 15 px / frame)
 static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vector<float>& dec8out) {
     const int W = sc.W, H = sc.H;
     printf("\n== %s ==\n", encName(e));
     if (!formatSupported(e)) { printf("    SKIP: the device cannot sample + store this format\n"); return; }
 #ifndef FORMATTEST_NO_MOTION
-    if (algoV2() && e != Enc::Rgba8) {   // V2 is Rgba8 only: refused at init and by setSettings, with a reason; nothing else runs
-        Interpolator fg;
+    if (algoV2()) {   // V2 runs every format: no Format rule, and a V1 instance of this format switches to V2 at runtime
         InitInfo info = baseInfo(e, W, H, Settings{});
         Format f;
         formatOf(info.viewFormat, &f);
-        const char* why = Interpolator::settingsError(info.settings, f);
-        const bool initOk = fg.init(info);
-        expect(!initOk && why && fg.initError() && !strcmp(fg.initError(), why), "init refuses MotionVersion::V2, initError = settingsError()");
-        printf("      reason: %s\n", fg.initError() ? fg.initError() : "(none)");
-        fg.destroy();
+        expect(!Interpolator::settingsError(info.settings, f), "settingsError: MotionVersion::V2 is valid for this format");
+        Interpolator fg;
         info.settings.motionVersion = MotionVersion::V1;
         Settings v2 = info.settings;
         v2.motionVersion = MotionVersion::V2;
-        expect(fg.init(info) && !fg.setSettings(v2) && !fg.reconfigure(v2) && fg.settings().motionVersion == MotionVersion::V1,
-               "a V1 instance refuses setSettings / reconfigure to V2 and keeps V1");
+        expect(fg.init(info) && fg.setSettings(v2) && fg.settings().motionVersion == MotionVersion::V2, "a V1 instance of this format switches to V2 (setSettings)");
         fg.destroy();
-        printf("    SKIP the rest: V2 is Rgba8 only\n");
-        return;
     }
 #endif
     if (isYuv(e)) { destroyPic(*std::make_unique<Pic>(makePic(e, 16, 16)).get()); printf("    images: %s\n", mpUsed ? "one multi-planar image, plane views" : "separate plane images (multi-planar not usable here)"); }
@@ -865,6 +1096,7 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     }
     double pw = psnr(w05, truth, &near, false);
     expect(pw >= pOff - 0.5, "protection does not cost background quality (-0.5 dB)");
+    blurExact(e, sc);
 }
 
 // Rgb10 / F16 precision: a smooth slow gradient moving 2 px: distinct output values on one row
@@ -920,7 +1152,7 @@ static size_t gradientLevels(Enc e) {
 // linear float input above 1.0: the highlights of a scRGB-like frame survive (no clamp), and are still a sane picture
 static void checkHdr(const Scene& sc) {
     printf("\n== RgbaF16 linear: values above 1.0 ==\n");
-    if (!formatSupported(Enc::F16Lin) || algoV2()) { printf("    SKIP%s\n", algoV2() ? " (V2 is Rgba8 only)" : ""); return; }
+    if (!formatSupported(Enc::F16Lin)) { printf("    SKIP\n"); return; }
     Settings off;
     Result r = runSequence(Enc::F16Lin, sc, off, false);
     if (!r.ok) { expect(false, "sequence"); return; }
@@ -1103,14 +1335,13 @@ int main(int argc, char** argv) {
     for (Enc e : {Enc::Rgba8, Enc::Rgb10, Enc::F16Enc, Enc::F16Lin, Enc::Nv12, Enc::P010})
         checkFormat(e, sc, p8, dec8);
     checkHdr(sc);
+    for (Enc e : {Enc::Rgb10, Enc::F16Enc, Enc::F16Lin, Enc::P010}) checkHdrMotion(e, sc);
     printf("\n== precision (a smooth 0.2..0.3 gradient moving 2 px; distinct values on one output row) ==\n");
-    size_t g8 = gradientLevels(Enc::Rgba8), g10 = algoV2() ? 0 : gradientLevels(Enc::Rgb10), gf = algoV2() ? 0 : gradientLevels(Enc::F16Enc);
-    printf("    Rgba8 %zu, Rgb10 %zu, RgbaF16 %zu distinct values%s\n", g8, g10, gf, algoV2() ? " (V2: Rgba8 only)" : "");
+    size_t g8 = gradientLevels(Enc::Rgba8), g10 = gradientLevels(Enc::Rgb10), gf = gradientLevels(Enc::F16Enc);
+    printf("    Rgba8 %zu, Rgb10 %zu, RgbaF16 %zu distinct values\n", g8, g10, gf);
     expect(g8 <= 27, "Rgba8: at most the ~26 levels of 8 bits in that range (control)");
-    if (!algoV2()) {
-        expect(g10 >= 70, "Rgb10: about 4x as many values (>= 70 of ~100)");
-        expect(gf >= 70, "RgbaF16: at least as many as Rgb10");
-    }
+    expect(g10 >= 70, "Rgb10: about 4x as many values (>= 70 of ~100)");
+    expect(gf >= 70, "RgbaF16: at least as many as Rgb10");
     printf("\nRESULT: %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     vkDeviceWaitIdle(dev);
     return fails ? 1 : 0;

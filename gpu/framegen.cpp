@@ -29,7 +29,7 @@
 #include "blur_lookup_spv.h"
 #include "blur_error_spv.h"
 #include "blur_resolve_spv.h"
-// MotionVersion::V2 (Rgba8 only, settingsError(): no format variants)
+// MotionVersion::V2 (every format: only its synthesis, v2_morph / v2_morph_s / v2_qmorph / v2_qmorph_s, has format variants, below)
 #include "v2_medhist_spv.h"
 #include "v2_search_spv.h"
 #include "v2_qfield_spv.h"
@@ -60,6 +60,10 @@
 #include "ui_v2_lumafill_rgb10_spv.h"
 #include "blur_error_rgb10_spv.h"
 #include "blur_resolve_rgb10_spv.h"
+#include "v2_morph_rgb10_spv.h"
+#include "v2_morph_s_rgb10_spv.h"
+#include "v2_qmorph_rgb10_spv.h"
+#include "v2_qmorph_s_rgb10_spv.h"
 #endif
 // f16: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_f16_spv.h")
@@ -76,6 +80,10 @@
 #include "ui_v2_lumafill_f16_spv.h"
 #include "blur_error_f16_spv.h"
 #include "blur_resolve_f16_spv.h"
+#include "v2_morph_f16_spv.h"
+#include "v2_morph_s_f16_spv.h"
+#include "v2_qmorph_f16_spv.h"
+#include "v2_qmorph_s_f16_spv.h"
 #endif
 // nv12: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_nv12_spv.h")
@@ -92,6 +100,10 @@
 #include "ui_v2_lumafill_nv12_spv.h"
 #include "blur_error_nv12_spv.h"
 #include "blur_resolve_nv12_spv.h"
+#include "v2_morph_nv12_spv.h"
+#include "v2_morph_s_nv12_spv.h"
+#include "v2_qmorph_nv12_spv.h"
+#include "v2_qmorph_s_nv12_spv.h"
 #include "ui_inpaint_chroma_nv12_spv.h"
 #include "ui_patch_chroma_nv12_spv.h"
 #endif
@@ -110,6 +122,10 @@
 #include "ui_v2_lumafill_p010_spv.h"
 #include "blur_error_p010_spv.h"
 #include "blur_resolve_p010_spv.h"
+#include "v2_morph_p010_spv.h"
+#include "v2_morph_s_p010_spv.h"
+#include "v2_qmorph_p010_spv.h"
+#include "v2_qmorph_s_p010_spv.h"
 #include "ui_inpaint_chroma_p010_spv.h"
 #include "ui_patch_chroma_p010_spv.h"
 #endif
@@ -134,10 +150,11 @@ namespace {
 struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
-struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill; };
+struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill,
+    v2Morph, v2MorphS, v2QMorph, v2QMorphS; };
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
     SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
-    SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f)}
+    SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f), SPV(v2_morph##f), SPV(v2_morph_s##f), SPV(v2_qmorph##f), SPV(v2_qmorph_s##f)}
 // false = this format's variants were not built into the library (meson option `formats`)
 bool colourSpv(Format f, ColourSpv& c) {
     switch (f) {
@@ -1122,8 +1139,7 @@ bool Interpolator::validate(const Settings& s) {
 
 const char* Interpolator::settingsError(const Settings& s, Format f) {
     if (!validate(s)) return "invalid settings: a field is out of range or not finite (see Interpolator::validate)";
-    if (s.motionVersion == MotionVersion::V2 && f != Format::Rgba8)
-        return "MotionVersion::V2 supports only Format::Rgba8 (8-bit RGBA / BGRA views); Rgb10, RgbaF16 (encoded or linear), Nv12 and P010 need MotionVersion::V1";
+    (void)f;   // (no Format rule today: both motion versions run every Format)
     return nullptr;
 }
 
@@ -1179,7 +1195,8 @@ bool Interpolator::Impl::motionEnsure() {
     MotionGroup& g = mg();
     if (g.live) return true;
     // V1: the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's,
-    // as are the two colour passes of the blur. V2 (Rgba8 only): both modes' pipelines (see MotionGroup); empty slots are skipped.
+    // as are the two colour passes of the blur. V2: both modes' pipelines (see MotionGroup), the format's luma and synthesis; empty
+    // slots are skipped.
     struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
         {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
         {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
@@ -1190,16 +1207,16 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2_MEDHIST].sp = SPV(v2_medhist);
         spv[P_V2_SEARCH].sp = SPV(v2_search);
         spv[P_V2_CLEAN].sp = SPV(v2_clean);
-        spv[P_V2_MORPH].sp = SPV(v2_morph);
+        spv[P_V2_MORPH] = {cs.v2Morph, spec};   // (the synthesis: the format's own variant)
         spv[P_V2_REPICK].sp = SPV(v2_repick);
         spv[P_V2_QFIELD].sp = SPV(v2_qfield);
         spv[P_V2_QOWN].sp = SPV(v2_qown);
         spv[P_V2_QCOV].sp = SPV(v2_qcov);
-        spv[P_V2_QMORPH].sp = SPV(v2_qmorph);
+        spv[P_V2_QMORPH] = {cs.v2QMorph, spec};
         spv[P_V2_STATIC].sp = SPV(v2_static);
         spv[P_V2_ENCLOSE].sp = SPV(v2_enclose);
-        spv[P_V2_MORPH_S].sp = SPV(v2_morph_s);
-        spv[P_V2_QMORPH_S].sp = SPV(v2_qmorph_s);
+        spv[P_V2_MORPH_S] = {cs.v2MorphS, spec};
+        spv[P_V2_QMORPH_S] = {cs.v2QMorphS, spec};
     }
     struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};

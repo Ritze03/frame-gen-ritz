@@ -101,3 +101,61 @@ vec4 tapRaw(sampler2D t, vec2 p) {
     p = roundEven(p * 32.0) * (1.0 / 32.0);
     return textureLod(t, (p + 0.5) / vec2(pc.W, pc.H), 0.0);
 }
+
+// Formats (shaders/format.glsl; the synthesis, v2_morph.glsl / v2_quality.glsl, is built once per format, the other V2 passes read
+// only the luma, which luma.comp already gives in levels of a perceptually encoded 8-bit picture for every format). The synthesis
+// blends "working values" in the source's own space: V2_LEVELS of a raw sample (Rgba8 / Rgb10: 8-bit levels, RgbaF16: the value
+// itself, encoded or linear light, YUV: (Y, Cb, Cr) levels). Every threshold of it is in 8-bit levels, so every comparison is made
+// on V2_LV of working values: the levels of a perceptually encoded 8-bit picture (RgbaF16 linear: the PQ code of each channel x 255,
+// encoded: x 255; YUV: the R'G'B' the (Y, Cb, Cr) stand for, full range; V1's mismatch, FG_DIFF, measures the same). V2_D: the
+// per-channel distance of two working values, V2_G: their difference (a gradient). V2_TAP: a bilinear tap (vec4; YUV: Y at p, CbCr
+// at p + 0.5, see tapYuv), V2_PX: a texel (YUV: Y at p, CbCr of p's 2x2 block), V2_UIP: the position whose CrosshairV2 footprint
+// (ui_reject.glsl) covers both. V2_QUANT: a sub-frame exactly as recordSynth stores it, in working values (the blur averages those).
+// The Rgba8 spelling of every macro is the historical code (its SPIR-V is unchanged).
+#if defined(FG_YUV)
+// YUV: the Y tap at p and the CbCr tap at p + 0.5 (the centre of p's 2x2 block: for an even-even p, the block whose chroma texel this
+// pixel stores, at the zero vector that texel itself), both bilinear; alpha 1. The chroma plane is ceil(W / 2) x ceil(H / 2).
+vec4 tapYuv(sampler2D ty, sampler2D tc, vec2 p) {
+    p = roundEven(p * 32.0) * (1.0 / 32.0);
+    vec2 cs = 2.0 * vec2((pc.W + 1) >> 1, (pc.H + 1) >> 1);
+    return vec4(textureLod(ty, (p + 0.5) / vec2(pc.W, pc.H), 0.0).r, textureLod(tc, (p + 1.0) / cs, 0.0).rg, 1.0);
+}
+vec3 v2QL(vec3 l) { return clamp(floor(l / YU_QL + 0.5), 0.0, YU_CODES) * YU_QL; }   // levels -> the levels of the codes they store as
+#define V2_TAP(t, tc, p) tapYuv(t, tc, p)
+#define V2_PX(t, tc, p) vec4(texelFetch(t, p, 0).r, texelFetch(tc, (p) >> 1, 0).rg, 1.0)
+#define V2_LEVELS(x) ((x) * YU_SCALE)
+#define V2_LV(x) fgYuvDiff(x)
+#define V2_D(a, b) abs(fgYuvDiff((a) - (b)))
+#define V2_G(a, b) fgYuvDiff((a) - (b))
+#define V2_UIP(p) ((p) + 0.5)   // the chroma tap's 2x2 texels: 4x4 pixels that contain the Y tap's 2x2 too
+#define V2_QUANT(x) v2QL(x)
+#else
+#define V2_TAP(t, tc, p) tapRaw(t, p)
+#define V2_PX(t, tc, p) texelFetch(t, p, 0)
+#define V2_LEVELS(x) FG_FETCH(x)
+#define V2_UIP(p) (p)
+#if defined(FG_FORMAT_F16)
+#define V2_LV(x) fgMetric(x)
+#define V2_D(a, b) abs(fgMetric(a) - fgMetric(b))
+#define V2_G(a, b) (fgMetric(a) - fgMetric(b))
+// the nearest half float, round to nearest even, as a float (the store's conversion and packHalf2x16 may truncate instead: AMD's do;
+// v2_morph.glsl rounds its output with this before the store, so the store is exact)
+vec3 v2Half(vec3 x) {
+    x = clamp(x, -65504.0, 65504.0);
+    uvec3 b = floatBitsToUint(x);
+    vec3 n = uintBitsToFloat((b + 0xFFFu + ((b >> 13) & 1u)) & ~0x1FFFu);   // 10 mantissa bits
+    return mix(n, roundEven(x * 16777216.0) * (1.0 / 16777216.0), lessThan(abs(x), vec3(6.103515625e-05)));   // subnormals: 2^-24 steps
+}
+#define V2_QUANT(x) v2Half(x)   // the R16G16B16A16_SFLOAT store (no clamp of the range)
+#elif defined(FG_FORMAT_RGB10)
+#define V2_LV(x) (x)
+#define V2_D(a, b) abs((a) - (b))
+#define V2_G(a, b) ((a) - (b))
+#define V2_QUANT(x) (floor(clamp(x, 0.0, 255.0) * (1023.0 / 255.0) + 0.5) * (255.0 / 1023.0))   // the 10-bit code FG_STORE gives
+#else
+#define V2_LV(x) (x)
+#define V2_D(a, b) abs(a - b)
+#define V2_G(a, b) a - b
+#define V2_QUANT(x) clamp(floor(x + 0.5), 0.0, 255.0)
+#endif
+#endif
