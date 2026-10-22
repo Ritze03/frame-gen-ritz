@@ -110,6 +110,58 @@
       return R;
     },
 
+    // HDR job: { dir (under $FG_WORK, with a.f16 / c.f16), W, H, settings (inputFormat rgba16f, transfer, ...), ts, refs: {t: {file,
+    // fmt: 'f16' | 'rgba8', stats}} } -> per t: the output compared in levels of the perceptual encoding (linear: PQ x 255; encoded:
+    // x 255; an rgba8 reference: its levels), decisions, finiteness
+    async runHdr(job) {
+      const R = { t: {} };
+      const half = (h) => {
+        const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 31, f = h & 1023;
+        return e === 0 ? s * f * 2 ** -24 : e === 31 ? (f ? NaN : s * Infinity) : s * (1 + f / 1024) * 2 ** (e - 15);
+      };
+      const white = job.settings.linearWhiteNits || 80;
+      const pq = (v) => {
+        const y = Math.min(Math.max(v * white / 10000, 0), 1), p = y ** 0.1593017578125;
+        return ((0.8359375 + 18.8515625 * p) / (1 + 18.6875 * p)) ** 78.84375;
+      };
+      const lv = job.settings.transfer === 'linear' ? (v) => 255 * pq(v) : (v) => 255 * v;
+      try {
+        const a = new Uint16Array(await get(`${job.dir}/a.f16`)), c = new Uint16Array(await get(`${job.dir}/c.f16`));
+        R.setSettings = engine.setSettings(job.settings);
+        engine.pushFrame({ width: job.W, height: job.H, data: a });
+        engine.pushFrame({ width: job.W, height: job.H, data: c });
+        R.estimate = engine.estimate();
+        const n = job.W * job.H;
+        for (const t of job.ts) {
+          const T = R.t[t] = {};
+          T.synth = engine.synth(t, undefined);
+          if (!T.synth) continue;
+          T.stats = engine.stats();
+          const out = engine.debugRead('out').data;
+          let nonFinite = 0, over1 = 0;
+          for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) { const v = out[i * 4 + k]; if (!Number.isFinite(v)) nonFinite++; else if (v > 1) over1++; }
+          T.nonFinite = nonFinite; T.pctOver1 = 100 * over1 / (3 * n);
+          const ref = job.refs && job.refs[t];
+          if (!ref) continue;
+          const rb = await getOpt(ref.file);
+          if (!rb) { T.noRef = true; continue; }
+          const rv = ref.fmt === 'f16' ? new Uint16Array(rb) : new Uint8Array(rb);
+          const rlv = ref.fmt === 'f16' ? (i) => lv(half(rv[i])) : (i) => rv[i];
+          let sum = 0, mx = 0, big = 0;
+          for (let i = 0; i < n; i++) {
+            let m = 0;
+            for (let k = 0; k < 3; k++) { const d = Math.abs(lv(out[i * 4 + k]) - rlv(i * 4 + k)); sum += d; if (d > m) m = d; }
+            if (m > mx) mx = m;
+            if (m > 4) big++;
+          }
+          T.cmp = { mae: sum / (3 * n), max: mx, pct4: 100 * big / n };
+          if (ref.stats) T.libStats = new TextDecoder().decode(await get(ref.stats)).trim().split(/\s+/).slice(2).map(Number);
+        }
+        R.glError = gl.getError();
+      } catch (e) { R.error = err(e); }
+      return R;
+    },
+
     // a motionVersion switch drops the estimate; a v2Mode switch keeps it (and gives that mode's own output)
     async switchTest({ pair, W, H, t }) {
       const r = { steps: [] };
