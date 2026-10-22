@@ -47,6 +47,8 @@ let allOk = true;
 for (const mode of opt.modes) {
   for (const p of man.pairs) {
     if (opt.pairs && !opt.pairs.includes(p.name)) continue;
+    // above 4K only with hardware GL (--gpu): SwiftShader keeps every texture in system memory (8K: several GB)
+    if (!opt.gpu && p.width * p.height > 3840 * 2160) { if (mode === opt.modes[0]) console.log(`(${p.name} ${p.width}x${p.height}: skipped without --gpu)`); continue; }
     for (const S of p.flow_scales) {
       if (opt.fs && !opt.fs.includes(S)) continue;
       const cfg = `${mode}${mode !== 'v1' && !opt.staticMask ? '_s0' : ''}_fs${S}`;
@@ -100,6 +102,11 @@ const want = { estQ: true, synthQ: true, 'synthP-kept': true, estP: true, synthP
 const swOk = !sw.error && sw.steps.every(([k, v]) => want[k] === v) && sw.diff.pKeptVsOwn === 0 && sw.diff.qLazyVsOwn === 0 && sw.diff.qRoundTrip === 0 && !sw.glError;
 console.log(`\nswitch test on ${sp.name}: ${swOk ? 'PASS' : 'FAIL'} steps ${JSON.stringify(sw.steps)} diffs ${JSON.stringify(sw.diff)}${sw.error ? ' ERROR ' + sw.error.error : ''}`);
 if (!swOk) allOk = false;
+const api = await E.page.evaluate(() => window.__x.apiTest());
+const apiOk = !!api.tooSmall && api.minOk === null && !!api.tooBig && !!api.wide && api.support && !api.support.ok &&
+  !!api.badMode && !!api.badFormat && !!api.badBlur && !!api.bigResize && api.infoAfter && api.infoAfter[0] === 64 && !!api.v1Blur && !api.glError;
+console.log(`api test: ${apiOk ? 'PASS' : 'FAIL'} ${JSON.stringify(api)}`);
+if (!apiOk) allOk = false;
 if (E.consoleMsgs.size) { console.log('\npage console:'); for (const [k, v] of E.consoleMsgs) console.log(`  [x${v}] ${k}`); }
 await E.browser.close();
 

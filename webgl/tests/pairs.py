@@ -127,6 +127,7 @@ PAIRS = [
     ("mc_sprint", footage("cuts/minecraft120_10_forest_sprint.mp4", 8.0), (1920, 1080), FS),
     ("bf_odd", footage("battlefield.mp4", 14.0, crop=(301, 157)), (1279, 719), [2]),
     ("bf_4k", footage("battlefield.mp4", 10.0, scale=(3840, 2160)), (3840, 2160), [2, 4]),
+    ("bf_8k", footage("battlefield.mp4", 10.0, scale=(7680, 4320)), (7680, 4320), [4]),   # (xbackend.mjs --gpu: SwiftShader needs GBs)
 ]
 
 

@@ -93,7 +93,7 @@
             st.blockField = epe(engine.debugRead('v2.vf'), maps.block);
             if (job.mode === 'v2q') {
               st.pixField = epe(engine.debugRead('v2.qf'), maps.pix);
-              if (maps.fscale >= 2) {
+              if (maps.fscale >= 2 && maps.eStride * maps.H >= maps.fw * maps.fh) {   // (the library dumps the coverage only if it fits the e part)
                 const cov = engine.debugRead('v2.qcov');
                 let s = [0, 0, 0], mx = [0, 0, 0], k = maps.fw * maps.fh;
                 for (let i = 0; i < k; i++) {
@@ -110,6 +110,30 @@
         R.glError = gl.getError();
       } catch (e) { R.error = err(e); }
       return R;
+    },
+
+    // API checks: size limits reported cleanly, settings validation, a refused resize keeps the engine usable
+    apiTest() {
+      const r = {};
+      const throws = (f) => { try { f(); return false; } catch (e) { return String(e.message || e); } };
+      const max = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+      r.tooSmall = __fg.frameSizeError(gl, 8, 8, {});
+      r.minOk = __fg.frameSizeError(gl, 16, 16, {});
+      r.tooBig = __fg.frameSizeError(gl, max + 1, 64, {});
+      r.wide = __fg.frameSizeError(gl, max, 64, { flowScale: 1 });
+      r.support = __fg.checkSupport(gl, { width: max + 1, height: 64 });
+      r.badMode = throws(() => engine.setSettings({ v2Mode: 'fast' }));
+      r.badFormat = throws(() => engine.setSettings({ inputFormat: 'rgb565' }));
+      r.badBlur = throws(() => engine.setSettings({ blurSamples: 17 }));
+      engine.setSettings({ motionVersion: 1, flowScale: 2 });
+      engine.pushFrame({ width: 64, height: 48, data: new Uint8Array(64 * 48 * 4) });
+      r.bigResize = throws(() => engine.resize(max + 1, 64));
+      r.infoAfter = engine.info && [engine.info.W, engine.info.H];
+      r.v1Blur = throws(() => { engine.setSettings({ blurSamples: 4 }); engine.pushFrame({ width: 64, height: 48, data: new Uint8Array(64 * 48 * 4) }); engine.estimate(); engine.synthBlur(0.25, 0.75); });
+      engine.setSettings({ blurSamples: 0 });
+      r.version = __fg.version;
+      r.glError = gl.getError();
+      return r;
     },
 
     // motion blur job: { pair, W, H, settings (with blurSamples, blurWeights), windows: [{tag, t0, t1, ref}] } -> per window the

@@ -1,13 +1,40 @@
-// Headless Chromium with the engine loaded on http://fg.test/ (Playwright routes, no real server): /w/<path> serves files of
-// $FG_WORK, POST /dump/<name> stores a body (engine output) for the caller. Shared by xbackend.mjs and bench.mjs.
+// Headless Chromium with the engine loaded on a local HTTP server (127.0.0.1, random port; large frames do not fit through the
+// DevTools protocol): /w/<path> serves files of $FG_WORK, POST /dump/<name> stores a body (engine output) for the caller.
+// Shared by xbackend.mjs, hdr.mjs, blur.mjs and bench.mjs.
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { launch } from './browser.mjs';
 import { here, work, engineFile, shaderDir } from './paths.mjs';
 
+function serve(dumps) {
+  const srv = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    if (u.pathname === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><title>fg</title>'); return; }
+    if (u.pathname.startsWith('/w/')) {
+      const f = path.join(work, decodeURIComponent(u.pathname.slice(3)));
+      if (!f.startsWith(work) || !fs.existsSync(f)) { res.writeHead(404); res.end('missing'); return; }
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': fs.statSync(f).size });
+      fs.createReadStream(f).pipe(res);
+      return;
+    }
+    if (u.pathname.startsWith('/dump/') && req.method === 'POST') {
+      const parts = [];
+      req.on('data', (d) => parts.push(d));
+      req.on('end', () => { dumps.set(decodeURIComponent(u.pathname.slice(6)), Buffer.concat(parts)); res.writeHead(200); res.end('ok'); });
+      return;
+    }
+    res.writeHead(404); res.end('no route');
+  });
+  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () => resolve(srv)));
+}
+
 export async function openEngine({ gpu = false, settings = {}, engine = engineFile, shaders = shaderDir } = {}) {
-  const { browser, executablePath } = await launch({ gpu });
   const dumps = new Map();
+  const srv = await serve(dumps);
+  const { browser, executablePath } = await launch({ gpu });
+  const close = browser.close.bind(browser);
+  browser.close = async () => { await close(); srv.close(); };
   const consoleMsgs = new Map();
   const page = await browser.newPage();
   page.on('console', (m) => {
@@ -16,21 +43,7 @@ export async function openEngine({ gpu = false, settings = {}, engine = engineFi
     consoleMsgs.set(k, (consoleMsgs.get(k) || 0) + 1);
   });
   page.on('pageerror', (e) => consoleMsgs.set('pageerror: ' + String(e.stack || e).slice(0, 300), 1));
-  await page.route('http://fg.test/**', async (route) => {
-    const u = new URL(route.request().url());
-    if (u.pathname === '/') return route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>fg</title>' });
-    if (u.pathname.startsWith('/w/')) {
-      const f = path.join(work, decodeURIComponent(u.pathname.slice(3)));
-      if (!f.startsWith(work) || !fs.existsSync(f)) return route.fulfill({ status: 404, body: 'missing' });
-      return route.fulfill({ status: 200, contentType: 'application/octet-stream', body: fs.readFileSync(f) });
-    }
-    if (u.pathname.startsWith('/dump/')) {
-      dumps.set(decodeURIComponent(u.pathname.slice(6)), route.request().postDataBuffer());
-      return route.fulfill({ status: 200, body: 'ok' });
-    }
-    return route.fulfill({ status: 404, body: 'no route' });
-  });
-  await page.goto('http://fg.test/');
+  await page.goto(`http://127.0.0.1:${srv.address().port}/`);
   await page.addScriptTag({ content: fs.readFileSync(engine, 'utf8') });
   const files = await page.evaluate(() => Array.from(globalThis.__fg.shaderFiles));
   const sources = {};

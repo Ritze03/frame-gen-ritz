@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { openEngine } from './server.mjs';
-import { repo, work, here } from './paths.mjs';
+import { work, here, vkhdrBinary, vkTag } from './paths.mjs';
 
 const argv = process.argv.slice(2);
 const opt = { pairs: ['panel', 'objects', 'zoom', 'battlefield'], modes: ['v2p', 'v2q'] };
@@ -22,17 +22,11 @@ const WINDOWS = [
   { tag: 'w50_100_n5_gauss', t0: 0.5, t1: 1.0, n: 5, weights: 'gaussian' },
 ];
 const SET = { v2p: ['algo=v2,v2Mode=performance', { motionVersion: 2, v2Mode: 'performance' }], v2q: ['algo=v2,v2Mode=quality', { motionVersion: 2, v2Mode: 'quality' }] };
-const vkhdr = path.join(work, 'bin', 'vkhdr');
-if (!fs.existsSync(vkhdr)) {
-  fs.mkdirSync(path.dirname(vkhdr), { recursive: true });
-  const r = spawnSync('g++', ['-O2', '-std=c++17', '-I', path.join(repo, 'gpu'), path.join(here, 'vkhdr.cpp'),
-    path.join(repo, 'gpu', 'build-webgl', 'libframegen.a'), '-lvulkan', '-o', vkhdr], { stdio: 'inherit' });
-  if (r.status !== 0) process.exit(2);
-}
+const vkhdr = vkhdrBinary();
 const man = JSON.parse(fs.readFileSync(path.join(work, 'pairs', 'manifest.json'), 'utf8'));
 const pairs = man.pairs.filter((p) => opt.pairs.includes(p.name));
 for (const p of pairs) for (const mode of opt.modes) for (const w of WINDOWS) {
-  const d = path.join(work, 'vkblur', mode + '_fs2', p.name);
+  const d = path.join(work, 'vkblur-' + vkTag, mode + '_fs2', p.name);
   const f = path.join(d, w.tag + '.rgba');
   if (fs.existsSync(f)) continue;
   fs.mkdirSync(d, { recursive: true });
@@ -46,7 +40,7 @@ console.log(`browser : Chromium ${E.version}, renderer ${E.init.info.renderer}`)
 let allOk = true;
 const f3 = (v) => (Number.isFinite(v) ? v.toFixed(3) : String(v));
 for (const mode of opt.modes) for (const p of pairs) {
-  const windows = WINDOWS.map((w) => ({ ...w, ref: `vkblur/${mode}_fs2/${p.name}/${w.tag}.rgba` }));
+  const windows = WINDOWS.map((w) => ({ ...w, ref: `vkblur-${vkTag}/${mode}_fs2/${p.name}/${w.tag}.rgba` }));
   const r = await E.page.evaluate((j) => window.__x.runBlur(j), { pair: p.name, W: p.width, H: p.height, settings: { ...SET[mode][1], flowScale: 2 }, windows });
   if (r.error) { console.log(`${mode} ${p.name}: ENGINE ERROR ${r.error.error}\n${r.error.stack}`); allOk = false; continue; }
   for (const w of WINDOWS) {

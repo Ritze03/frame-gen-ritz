@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Vulkan reference of the cross-backend check: runs the library (gpu/, its test tool fgtest, on a real Vulkan GPU) on every pair of
 // $FG_WORK/pairs (pairs.py) for each mode x flowScale x t, once per t (so --stats holds that synth's decision inputs).
-//   node webgl/tests/vkref.mjs [--build] [--modes v1,v2p,v2q] [--pairs a,b] [--static 0|1] [--force]
+//   node webgl/tests/vkref.mjs [--build | --build-only] [--modes v1,v2p,v2q] [--pairs a,b] [--static 0|1] [--force]
 // Env FGTEST: a built fgtest (default <repo>/gpu/build-webgl/fgtest; --build = meson setup + ninja there, gitignored as gpu/build*/).
 // Output: $FG_WORK/vkref/<mode>[_s0]_fs<S>/<pair>/t<T>.rgba (W*H*4), .stats ("STATS <pair> <untrusted px> <SAD sum x256> <blocks>
 // <W*H>"), .fgmaps (fgtest --dump: the block field, V2 Quality's per-pixel field and coverage; gpu/fgmaps.py layout).
@@ -11,10 +11,11 @@ import { spawnSync } from 'node:child_process';
 import { repo, work } from './paths.mjs';
 
 const argv = process.argv.slice(2);
-const opt = { build: false, modes: ['v1', 'v2p', 'v2q'], pairs: null, staticMask: 1, force: false };
+const opt = { buildOnly: false, build: false, modes: ['v1', 'v2p', 'v2q'], pairs: null, staticMask: 1, force: false };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i], nx = () => argv[++i];
   if (a === '--build') opt.build = true;
+  else if (a === '--build-only') opt.build = opt.buildOnly = true;
   else if (a === '--modes') opt.modes = nx().split(',');
   else if (a === '--pairs') opt.pairs = nx().split(',');
   else if (a === '--static') opt.staticMask = Number(nx());
@@ -27,6 +28,7 @@ if (opt.build) {
   const r = spawnSync('ninja', ['-C', bdir, 'fgtest'], { stdio: 'inherit' });
   if (r.status !== 0) process.exit(2);
 }
+if (opt.buildOnly) process.exit(0);
 const fgtest = process.env.FGTEST || path.join(bdir, 'fgtest');
 if (!fs.existsSync(fgtest)) { console.error(`vkref: fgtest not found at ${fgtest} (set FGTEST or use --build)`); process.exit(2); }
 const pdir = path.join(work, 'pairs');

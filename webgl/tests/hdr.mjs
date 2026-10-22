@@ -3,14 +3,14 @@
 // Vulkan library in RgbaF16 (vkhdr.cpp) on the pairs of hdr_pairs.py, compared in levels of the perceptual encoding (PQ x 255 for
 // linear, value x 255 for encoded), plus the identity encoding (8-bit values / 255 as floats) vs the library's Rgba8 output (vkref).
 //   node webgl/tests/hdr.mjs [--modes v1,v2p,v2q] [--pairs a_lin,b_pq] [--fs 2] [--regen]
-// Needs pairs.py and vkref.mjs output first. Builds $FG_WORK/bin/vkhdr (g++, against gpu/build-webgl/libframegen.a) if missing.
+// Needs pairs.py and vkref.mjs output first. Builds $FG_WORK/bin/vkhdr-<tag> (g++; FG_GPU, FG_GPU_BUILD, FG_VKTAG: paths.mjs).
 // A mode the library refuses in RgbaF16 (V2 before the V2 formats work) is reported as "no Vulkan reference" and only checked for
 // finite output and against the identity encoding. Gate: identical decisions, MAE <= 0.5 levels, % px > 4 levels off <= 1.
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { openEngine } from './server.mjs';
-import { repo, work, here } from './paths.mjs';
+import { work, here, vkhdrBinary, vkTag } from './paths.mjs';
 
 const argv = process.argv.slice(2);
 const opt = { modes: ['v1', 'v2p', 'v2q'], pairs: null, fs: [2], regen: false };
@@ -28,13 +28,7 @@ if (opt.regen || !fs.existsSync(path.join(hdir, 'manifest.json'))) {
   const r = spawnSync('python3', [path.join(here, 'hdr_pairs.py')], { stdio: 'inherit' });
   if (r.status !== 0) process.exit(2);
 }
-const vkhdr = path.join(work, 'bin', 'vkhdr');
-if (!fs.existsSync(vkhdr)) {
-  fs.mkdirSync(path.dirname(vkhdr), { recursive: true });
-  const r = spawnSync('g++', ['-O2', '-std=c++17', '-I', path.join(repo, 'gpu'), path.join(here, 'vkhdr.cpp'),
-    path.join(repo, 'gpu', 'build-webgl', 'libframegen.a'), '-lvulkan', '-o', vkhdr], { stdio: 'inherit' });
-  if (r.status !== 0) { console.error('hdr: building vkhdr failed (run vkref.mjs --build first for libframegen.a)'); process.exit(2); }
-}
+const vkhdr = vkhdrBinary();
 const man = JSON.parse(fs.readFileSync(path.join(hdir, 'manifest.json'), 'utf8'));
 const SET = { v1: ['algo=v1', { motionVersion: 1 }], v2p: ['algo=v2,v2Mode=performance', { motionVersion: 2, v2Mode: 'performance' }],
   v2q: ['algo=v2,v2Mode=quality', { motionVersion: 2, v2Mode: 'quality' }] };
@@ -45,7 +39,7 @@ for (const p of man.pairs) {
   if (opt.pairs && !opt.pairs.includes(p.name)) continue;
   if (p.enc === 'id') continue;   // compared against the Rgba8 reference of vkref.mjs
   for (const mode of opt.modes) for (const S of opt.fs) for (const t of man.ts) {
-    const d = path.join(hdir, 'vk', `${mode}_fs${S}`, p.name);
+    const d = path.join(hdir, 'vk-' + vkTag, `${mode}_fs${S}`, p.name);
     const base = path.join(d, 't' + t);
     if (fs.existsSync(base + '.stats')) continue;
     fs.mkdirSync(d, { recursive: true });
@@ -71,7 +65,7 @@ for (const mode of opt.modes) for (const S of opt.fs) for (const p of man.pairs)
   const refs = {};
   for (const t of man.ts) {
     if (p.enc === 'id') refs[t] = { file: `vkref/${cfg}/${p.src}/t${t}.rgba`, fmt: 'rgba8', stats: `vkref/${cfg}/${p.src}/t${t}.stats` };
-    else if (fs.existsSync(path.join(hdir, 'vk', cfg, p.name, `t${t}.stats`))) refs[t] = { file: `hdr/vk/${cfg}/${p.name}/t${t}.f16`, fmt: 'f16', stats: `hdr/vk/${cfg}/${p.name}/t${t}.stats` };
+    else if (fs.existsSync(path.join(hdir, 'vk-' + vkTag, cfg, p.name, `t${t}.stats`))) refs[t] = { file: `hdr/vk-${vkTag}/${cfg}/${p.name}/t${t}.f16`, fmt: 'f16', stats: `hdr/vk-${vkTag}/${cfg}/${p.name}/t${t}.stats` };
   }
   const settings = { ...SET[mode][1], flowScale: S, inputFormat: 'rgba16f', transfer: p.transfer, linearWhiteNits: 80 };
   const r = await E.page.evaluate((j) => window.__x.runHdr(j), { dir: `hdr/${p.name}`, W: p.width, H: p.height, settings, ts: man.ts, refs });

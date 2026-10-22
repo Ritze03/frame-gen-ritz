@@ -26,7 +26,7 @@
   // Static tables
   // ---------------------------------------------------------------------------------------------
 
-  fg.version = '1';
+  fg.version = '2';   // 2: V2 Quality, RGBA16F input, synthBlur, frameSizeError (API of 1 unchanged otherwise)
   fg.requiredExtensions = ['EXT_color_buffer_float', 'EXT_float_blend', 'OES_texture_float_linear'];
 
   // Program table (LAYOUT 3.2). Sampler order = texture unit order. `vert` defaults to 'vert.glsl'.
@@ -190,7 +190,21 @@
     return { fw: fw, fh: fh, levels: levels };
   };
 
-  fg.checkSupport = function (gl) {
+  // Why a frame of w x h cannot run with these settings on this context (a string), or null: the library's minimum size 16 x 16,
+  // and every texture the engine allocates (frames, the per-level search tiles) within MAX_TEXTURE_SIZE.
+  fg.minSize = 16;
+  fg.frameSizeError = function (gl, w, h, settings) {
+    if (!(Number.isInteger(w) && Number.isInteger(h))) return 'frame size ' + w + 'x' + h + ' is not integer';
+    if (w < fg.minSize || h < fg.minSize) return 'frame ' + w + 'x' + h + ' is below the minimum ' + fg.minSize + 'x' + fg.minSize;
+    const max = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const S = (settings && settings.flowScale) || DEFAULTS.flowScale;
+    let need = Math.max(w, h);
+    for (const lv of fg.levelLayout(w, h, S).levels) need = Math.max(need, (2 * lv.radius + 1) * Math.max(lv.bw, lv.bh));
+    if (need > max) return 'frame ' + w + 'x' + h + ' at flowScale ' + S + ' needs ' + need + ' px textures, MAX_TEXTURE_SIZE is ' + max;
+    return null;
+  };
+
+  fg.checkSupport = function (gl, frame) {
     const missing = [];
     let isGl2;
     if (!gl) isGl2 = false;
@@ -202,6 +216,8 @@
     }
     if (!(gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 3)) missing.push('MAX_DRAW_BUFFERS>=3');
     if (!(gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) >= 1)) missing.push('MAX_VERTEX_TEXTURE_IMAGE_UNITS>=1');
+    // optional frame = { width, height, flowScale }: also the frame size (fg.frameSizeError)
+    if (frame) { const e = fg.frameSizeError(gl, frame.width, frame.height, frame); if (e) missing.push(e); }
     return { ok: missing.length === 0, missing: missing };
   };
 
@@ -539,6 +555,8 @@
     }
 
     function alloc(w, h) {
+      const sizeErr = fg.frameSizeError(gl, w, h, settings);
+      if (sizeErr) throw new RangeError('framegen: ' + sizeErr);   // (before freeing: the engine keeps its current size)
       freeTextures();
       const lay = fg.levelLayout(w, h, settings.flowScale);
       W = w; H = h; FW = lay.fw; FH = lay.fh; levels = lay.levels; L = levels.length;
