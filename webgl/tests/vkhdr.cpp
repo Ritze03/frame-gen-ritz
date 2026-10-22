@@ -1,6 +1,8 @@
 // vkhdr: the Vulkan library on one frame pair in a float or 10-bit format, for the WebGL2 backend's HDR reference test
 // (webgl/tests/hdr.mjs). A trimmed fgtest (gpu/fgtest.cpp) with the image format and InitInfo::transfer as options:
-//   vkhdr [--set k=v,..] [--t T] [--format f16|rgb10|rgba8] [--transfer encoded|linear] [--white NITS] W H prev curr out
+//   vkhdr [--set k=v,..] [--t T] [--blur N --t0 T0 [--weights even|gauss]] [--format f16|rgb10|rgba8] [--transfer encoded|linear]
+//         [--white NITS] W H prev curr out
+// --blur: recordSynthBlur(t0, T) with Settings::blurSamples = N instead of recordSynth(T).
 // Files: f16 = RGBA half floats (8 bytes per pixel, little endian), rgb10 = A2B10G10R10 words, rgba8 = RGBA8; out in the same format.
 // --set keys: algo=v1|v2, v2Mode=quality|performance, v2StaticMask, flowScale, trustLow, trustHigh, globalFallback, sceneCutSad.
 // Prints "STATS 0 <untrusted px> <SAD sum x256> <SAD blocks> <W*H>" (Interpolator::recordDebugCounters) as fgtest --stats.
@@ -63,7 +65,8 @@ static void imgBarrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkAc
 
 int main(int argc, char** argv) {
     framegen::Settings s;
-    float t = 0.5f, white = 80.0f;
+    float t = 0.5f, white = 80.0f, t0 = -1.0f;
+    int blur = 0;
     std::string fmtName = "f16", transfer = "encoded";
     std::vector<std::string> pos;
     for (int i = 1; i < argc; i++) {
@@ -71,6 +74,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--format") && i + 1 < argc) fmtName = argv[++i];
         else if (!strcmp(argv[i], "--transfer") && i + 1 < argc) transfer = argv[++i];
         else if (!strcmp(argv[i], "--white") && i + 1 < argc) white = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--blur") && i + 1 < argc) blur = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--t0") && i + 1 < argc) t0 = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--weights") && i + 1 < argc) s.blurWeights = strcmp(argv[++i], "even") ? framegen::BlurWeights::Gaussian : framegen::BlurWeights::Even;
         else if (!strcmp(argv[i], "--set") && i + 1 < argc) {
             for (char* tok = strtok(argv[++i], ","); tok; tok = strtok(nullptr, ",")) {
                 char* eq = strchr(tok, '=');
@@ -190,6 +196,7 @@ int main(int argc, char** argv) {
     info.getFormatProps = vkGetPhysicalDeviceFormatProperties;
     info.transfer = transfer == "linear" ? framegen::Transfer::Linear : framegen::Transfer::Encoded;
     info.linearWhiteNits = white;
+    if (blur) s.blurSamples = (uint32_t)blur;
     info.settings = s;
     if (!fg.init(info)) { fprintf(stderr, "fg.init failed: %s\n", fg.initError() ? fg.initError() : "?"); return 1; }
 
@@ -209,7 +216,11 @@ int main(int argc, char** argv) {
     upload(pos[2], prev);
     upload(pos[3], curr);
     begin();
-    if (!fg.recordEstimate(cb, prev.view, curr.view) || !fg.recordSynth(cb, prev.view, curr.view, out.view, t)) { fprintf(stderr, "record failed\n"); return 1; }
+    if (!fg.recordEstimate(cb, prev.view, curr.view) ||
+        !(blur ? fg.recordSynthBlur(cb, prev.view, curr.view, out.view, t0, t) : fg.recordSynth(cb, prev.view, curr.view, out.view, t))) {
+        fprintf(stderr, "record failed\n");
+        return 1;
+    }
     if (!fg.recordDebugCounters(cb, dbg, 0)) { fprintf(stderr, "recordDebugCounters failed\n"); return 1; }
     VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);

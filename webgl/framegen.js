@@ -78,6 +78,8 @@
     ['v2_morph', 'v2/morph.frag.glsl', null, ['uPrev', 'uCurr', 'uVf', 'uSmask', 'uEC', 'uEm', 'uGroup'], V2_INC],
     ['v2_tile', 'v2/tile.frag.glsl', null, ['uE']],
     ['v2_final', 'v2/final.frag.glsl', null, ['uPrev', 'uCurr', 'uMorph', 'uSadSum', 'uUntrusted']],
+    ['blur_accum', 'v2/blur_accum.frag.glsl', null, ['uSrc']],
+    ['blur_resolve', 'v2/blur_resolve.frag.glsl', null, ['uAcc']],
     // V2 Quality (the coverage morph): its estimate tail and its synthesis (the Performance programs with V2_QUALITY)
     ['v2_qfield', 'v2/qfield.frag.glsl', null, ['uLumaA', 'uLumaC', 'uVf'], Q_INC],
     ['v2_qclaim', 'v2/qclaim.frag.glsl', null, ['uLumaA', 'uLumaC', 'uQf'], Q_INC],
@@ -132,7 +134,7 @@
     'uCutSad', 'uTrust0', 'uTrustScale', 'uGlobalFrac', 'uTrustMid'];
   const U_TIME = ['uT', 'uS', 'uWA', 'uWC', 'uNearC', 'uMid'];
   const U_PASS = ['uBlocks', 'uCount', 'uRadius', 'uStep', 'uSrcSize', 'uChan', 'uMode',
-    'uVpOrigin', 'uVpSize', 'uFlipY', 'uExact', 'uStaticOff', 'uSide', 'uFan'];
+    'uVpOrigin', 'uVpSize', 'uFlipY', 'uExact', 'uStaticOff', 'uSide', 'uFan', 'uWeight', 'uWsum'];
   const U_ALL = U_STATIC.concat(U_TIME, U_PASS);
 
   const DEFAULTS = {
@@ -147,6 +149,8 @@
     motionVersion: 1,       // 1 = V1 (block matching + per-pixel trust, proto/interp.py), 2 = V2 (the morphing interpolator)
     v2Mode: 'quality',      // V2 only: 'quality' (the coverage morph, library default) or 'performance' (the grid morph)
     v2StaticMask: true,     // V2 only: keep static HUD / text / subtitles in place (Settings::v2StaticMask)
+    blurSamples: 0,         // synthBlur (V2): sub-frames per output, 0 / 1 = off, 2..16 (Settings::blurSamples)
+    blurWeights: 'gaussian', // synthBlur: 'gaussian' or 'even' (Settings::blurWeights)
     // ---- structural (re-allocate textures and recompile the programs; drop the frame history) ----
     inputFormat: 'rgba8',   // frame format: 'rgba8' (RGBA8 frames and output) or 'rgba16f' (HDR / float: RGBA16F frames and output)
     transfer: 'encoded',    // rgba16f only: 'encoded' (display-encoded values: PQ, HLG, sRGB, ...) or 'linear' (scRGB / linear light)
@@ -154,7 +158,7 @@
     debug: false,
   };
   const MH_ROWS = 4;   // parent rows per band of the median histogram (estimate/medhist.frag.glsl's)
-  const STRING_KEYS = { v2Mode: ['quality', 'performance'], inputFormat: ['rgba8', 'rgba16f'], transfer: ['encoded', 'linear'] };
+  const STRING_KEYS = { v2Mode: ['quality', 'performance'], blurWeights: ['gaussian', 'even'], inputFormat: ['rgba8', 'rgba16f'], transfer: ['encoded', 'linear'] };
   const BOOL_KEYS = { debug: 1, v2StaticMask: 1 };
   fg.defaultSettings = function () { return Object.assign({}, DEFAULTS); };
 
@@ -229,6 +233,7 @@
       if (typeof s[k] !== 'number' || !isFinite(s[k])) throw new TypeError('framegen: settings.' + k + ' must be a finite number');
     }
     if (!(s.trustHigh >= s.trustLow + 1)) throw new RangeError('framegen: settings.trustHigh must be >= trustLow + 1');
+    if (!(Number.isInteger(s.blurSamples) && s.blurSamples >= 0 && s.blurSamples <= 16)) throw new RangeError('framegen: settings.blurSamples must be an integer 0..16');
     if (!(s.linearWhiteNits > 0 && s.linearWhiteNits <= 10000)) throw new RangeError('framegen: settings.linearWhiteNits must be in (0, 10000]');
     return Object.freeze(s);
   }
@@ -979,12 +984,8 @@
       return true;
     };
 
-    engine.synth = function (t, framebuffer, viewport, opts) {
-      alive();
-      if (!(t > 0 && t < 1)) throw new RangeError('framegen: synth: t must be in (0,1), got ' + t);
-      if (!info || !estimatedPair) return false;
-      beginCall();
-      nDraw = 0;
+    // the time uniforms of t, then the generated frame at t into T.out (V1 / V2, with the whole-frame fallbacks)
+    function synthOut(t) {
       const mid = t === 0.5;
       tT = Math.fround(t);
       tS = Math.fround(2 * t - 1);
@@ -992,7 +993,6 @@
       tWC = Math.fround(t);
       tNear = t > 0.5 ? 1 : 0;
       tMid = mid ? 1 : 0;
-
       if (settings.motionVersion === 2) {
         synthV2();   // group choice, morph, flick count, final (the whole-frame fallbacks only)
       } else {
@@ -1019,12 +1019,13 @@
           T.sadRed[T.sadRed.length - 1], ur[ur.length - 1]);
         tri('final');
       }
-
       synthDone = true;
       synthMid = mid;
       lastT = t;
+    }
 
-      // Y7 blit
+    // Y7: T.out to the caller's framebuffer (undefined: none, the out FBO stays bound)
+    function present(framebuffer, viewport, opts) {
       if (framebuffer !== undefined) {
         const isNull = framebuffer === null;
         let x = 0, y = 0, w = W, h = H;
@@ -1036,6 +1037,58 @@
         bindFbo(T.out.fbo);
         setVp(0, 0, W, H);
       }
+    }
+
+    engine.synth = function (t, framebuffer, viewport, opts) {
+      alive();
+      if (!(t > 0 && t < 1)) throw new RangeError('framegen: synth: t must be in (0,1), got ' + t);
+      if (!info || !estimatedPair) return false;
+      beginCall();
+      nDraw = 0;
+      synthOut(t);
+      present(framebuffer, viewport, opts);
+      counts.synth = nDraw;
+      return true;
+    };
+
+    // Motion blur (the library's recordSynthBlur; V2 only here): one output = the weighted average of settings.blurSamples (N)
+    // sub-frames at the midpoints of N equal slices of [t0, t1], t_k = t0 + (t1 - t0)(k + 0.5)/N, weights settings.blurWeights
+    // ('gaussian': exp(-2 x_k^2), x_k = (2k + 1 - N)/N; 'even': 1/N). Each sub-frame is exactly synth(t_k)'s output (its own
+    // scene-cut / flick fallback); a sample at t <= 0 / t >= 1 is the real frame prev / curr. Blur off (N < 2) or t0 == t1: the
+    // instant t1 (synth(t1); t1 = 0 / 1: a copy of prev / curr). 0 <= t0 <= t1 <= 1, else false. V1 with blur on throws (the
+    // library's V1 blur, blur_*.comp, is a different algorithm and is not ported). stats() after it: the last sample's counts.
+    engine.synthBlur = function (t0, t1, framebuffer, viewport, opts) {
+      alive();
+      if (!(t0 >= 0 && t1 <= 1 && t0 <= t1)) return false;
+      const N = settings.blurSamples, blur = N >= 2 && t0 < t1;
+      if (!blur && t1 > 0 && t1 < 1) return engine.synth(t1, framebuffer, viewport, opts);
+      if (!info || !estimatedPair) return false;
+      if (blur && settings.motionVersion !== 2) throw new Error('framegen: synthBlur: motion blur is implemented for motionVersion 2 only');
+      beginCall();
+      nDraw = 0;
+      const n = blur ? N : 1, gauss = settings.blurWeights === 'gaussian';
+      if (!T.blurAcc) T.blurAcc = mk('blurAcc', 'RGBA32F', W, H);
+      let ws = 0;
+      for (let k = 0; k < n; k++) {
+        const t = blur ? Math.min(Math.max(Math.fround(t0 + (t1 - t0) * (k + 0.5) / n), t0), t1) : t1;
+        const x = Math.fround((2 * k + 1 - n) / n);
+        const w = Math.fround(gauss ? Math.exp(-2 * x * x) : 1);
+        ws = Math.fround(ws + w);
+        let src = T.out;
+        if (t <= 0) src = T.frame[prevS];
+        else if (t >= 1) src = T.frame[currS];
+        else synthOut(t);
+        begin(P.blur_accum, T.blurAcc, src);
+        gl.uniform1f(P.blur_accum.u.uWeight, w);
+        if (k > 0) { gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE); }
+        tri('blur_accum');
+        gl.disable(gl.BLEND);
+      }
+      begin(P.blur_resolve, T.out, T.blurAcc);
+      gl.uniform1f(P.blur_resolve.u.uWsum, ws);
+      tri('blur_resolve');
+      synthDone = true;
+      present(framebuffer, viewport, opts);
       counts.synth = nDraw;
       return true;
     };

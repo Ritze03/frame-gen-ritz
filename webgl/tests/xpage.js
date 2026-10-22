@@ -112,6 +112,30 @@
       return R;
     },
 
+    // motion blur job: { pair, W, H, settings (with blurSamples, blurWeights), windows: [{tag, t0, t1, ref}] } -> per window the
+    // synthBlur output vs the library's recordSynthBlur (rgba8)
+    async runBlur(job) {
+      const R = { w: {} };
+      try {
+        const a = new Uint8Array(await get(`pairs/${job.pair}/a.rgba`)), c = new Uint8Array(await get(`pairs/${job.pair}/c.rgba`));
+        engine.setSettings(job.settings);
+        engine.pushFrame({ width: job.W, height: job.H, data: a });
+        engine.pushFrame({ width: job.W, height: job.H, data: c });
+        engine.estimate();
+        for (const w of job.windows) {
+          const T = R.w[w.tag] = {};
+          engine.setSettings({ blurSamples: w.n, blurWeights: w.weights });   // (runtime keys: the estimate stays)
+          T.ok = engine.synthBlur(w.t0, w.t1, undefined);
+          const out = engine.debugRead('out').data;
+          const rb = await getOpt(w.ref);
+          if (rb) T.cmp = rgbCmp(out, new Uint8Array(rb), job.W * job.H);
+        }
+        engine.setSettings({ blurSamples: 0 });
+        R.glError = gl.getError();
+      } catch (e) { R.error = err(e); }
+      return R;
+    },
+
     // HDR job: { dir (under $FG_WORK, with a.f16 / c.f16), W, H, settings (inputFormat rgba16f, transfer, ...), ts, refs: {t: {file,
     // fmt: 'f16' | 'rgba8', stats}} } -> per t: the output compared in levels of the perceptual encoding (linear: PQ x 255; encoded:
     // x 255; an rgba8 reference: its levels), decisions, finiteness
