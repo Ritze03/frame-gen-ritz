@@ -29,7 +29,7 @@
 #include "blur_lookup_spv.h"
 #include "blur_error_spv.h"
 #include "blur_resolve_spv.h"
-// MotionVersion::V2 (Rgba8 only, settingsError(): no format variants)
+// MotionVersion::V2 (every format: only its synthesis, v2_morph / v2_morph_s / v2_qmorph / v2_qmorph_s, has format variants, below)
 #include "v2_medhist_spv.h"
 #include "v2_search_spv.h"
 #include "v2_qfield_spv.h"
@@ -61,6 +61,15 @@
 #include "blur_error_rgb10_spv.h"
 #include "blur_resolve_rgb10_spv.h"
 #endif
+// ... and MotionVersion::V2's synthesis of rgb10 (probed on its own: a host build that lists only the colour shaders above gets
+// V2 refused for this format, with a reason)
+#if __has_include("v2_morph_rgb10_spv.h") && defined(FG_HAVE_RGB10)
+#define FG_HAVE_V2_RGB10 1
+#include "v2_morph_rgb10_spv.h"
+#include "v2_morph_s_rgb10_spv.h"
+#include "v2_qmorph_rgb10_spv.h"
+#include "v2_qmorph_s_rgb10_spv.h"
+#endif
 // f16: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_f16_spv.h")
 #define FG_HAVE_F16 1
@@ -76,6 +85,15 @@
 #include "ui_v2_lumafill_f16_spv.h"
 #include "blur_error_f16_spv.h"
 #include "blur_resolve_f16_spv.h"
+#endif
+// ... and MotionVersion::V2's synthesis of f16 (probed on its own: a host build that lists only the colour shaders above gets
+// V2 refused for this format, with a reason)
+#if __has_include("v2_morph_f16_spv.h") && defined(FG_HAVE_F16)
+#define FG_HAVE_V2_F16 1
+#include "v2_morph_f16_spv.h"
+#include "v2_morph_s_f16_spv.h"
+#include "v2_qmorph_f16_spv.h"
+#include "v2_qmorph_s_f16_spv.h"
 #endif
 // nv12: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_nv12_spv.h")
@@ -95,6 +113,15 @@
 #include "ui_inpaint_chroma_nv12_spv.h"
 #include "ui_patch_chroma_nv12_spv.h"
 #endif
+// ... and MotionVersion::V2's synthesis of nv12 (probed on its own: a host build that lists only the colour shaders above gets
+// V2 refused for this format, with a reason)
+#if __has_include("v2_morph_nv12_spv.h") && defined(FG_HAVE_NV12)
+#define FG_HAVE_V2_NV12 1
+#include "v2_morph_nv12_spv.h"
+#include "v2_morph_s_nv12_spv.h"
+#include "v2_qmorph_nv12_spv.h"
+#include "v2_qmorph_s_nv12_spv.h"
+#endif
 // p010: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_p010_spv.h")
 #define FG_HAVE_P010 1
@@ -112,6 +139,15 @@
 #include "blur_resolve_p010_spv.h"
 #include "ui_inpaint_chroma_p010_spv.h"
 #include "ui_patch_chroma_p010_spv.h"
+#endif
+// ... and MotionVersion::V2's synthesis of p010 (probed on its own: a host build that lists only the colour shaders above gets
+// V2 refused for this format, with a reason)
+#if __has_include("v2_morph_p010_spv.h") && defined(FG_HAVE_P010)
+#define FG_HAVE_V2_P010 1
+#include "v2_morph_p010_spv.h"
+#include "v2_morph_s_p010_spv.h"
+#include "v2_qmorph_p010_spv.h"
+#include "v2_qmorph_s_p010_spv.h"
 #endif
 
 namespace framegen {
@@ -134,30 +170,53 @@ namespace {
 struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
-struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill; };
+struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill,
+    v2Morph, v2MorphS, v2QMorph, v2QMorphS; };
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
     SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
-    SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f)}
+    SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f), Spv{}, Spv{}, Spv{}, Spv{}}
+#define V2_SET(c, f) (c.v2Morph = SPV(v2_morph##f), c.v2MorphS = SPV(v2_morph_s##f), c.v2QMorph = SPV(v2_qmorph##f), c.v2QMorphS = SPV(v2_qmorph_s##f))
 // false = this format's variants were not built into the library (meson option `formats`)
 bool colourSpv(Format f, ColourSpv& c) {
     switch (f) {
-    case Format::Rgba8: c = COLOUR_SET(); return true;
+    case Format::Rgba8: c = COLOUR_SET(); V2_SET(c, ); return true;
 #ifdef FG_HAVE_RGB10
-    case Format::Rgb10: c = COLOUR_SET(_rgb10); return true;
+    case Format::Rgb10:
+        c = COLOUR_SET(_rgb10);
+#ifdef FG_HAVE_V2_RGB10
+        V2_SET(c, _rgb10);
+#endif
+        return true;
 #endif
 #ifdef FG_HAVE_F16
-    case Format::RgbaF16: c = COLOUR_SET(_f16); return true;
+    case Format::RgbaF16:
+        c = COLOUR_SET(_f16);
+#ifdef FG_HAVE_V2_F16
+        V2_SET(c, _f16);
+#endif
+        return true;
 #endif
 #ifdef FG_HAVE_NV12
-    case Format::Nv12: c = COLOUR_SET(_nv12); c.uiInpaintC = SPV(ui_inpaint_chroma_nv12); c.uiPatchC = SPV(ui_patch_chroma_nv12); return true;
+    case Format::Nv12:
+        c = COLOUR_SET(_nv12); c.uiInpaintC = SPV(ui_inpaint_chroma_nv12); c.uiPatchC = SPV(ui_patch_chroma_nv12);
+#ifdef FG_HAVE_V2_NV12
+        V2_SET(c, _nv12);
+#endif
+        return true;
 #endif
 #ifdef FG_HAVE_P010
-    case Format::P010: c = COLOUR_SET(_p010); c.uiInpaintC = SPV(ui_inpaint_chroma_p010); c.uiPatchC = SPV(ui_patch_chroma_p010); return true;
+    case Format::P010:
+        c = COLOUR_SET(_p010); c.uiInpaintC = SPV(ui_inpaint_chroma_p010); c.uiPatchC = SPV(ui_patch_chroma_p010);
+#ifdef FG_HAVE_V2_P010
+        V2_SET(c, _p010);
+#endif
+        return true;
 #endif
     default: return false;
     }
 }
 inline bool isYuv(Format f) { return f == Format::Nv12 || f == Format::P010; }
+const char* const kV2NotBuilt = "the MotionVersion::V2 shader variants of this format (v2_morph, v2_morph_s, v2_qmorph, v2_qmorph_s) are not built into the library";
 // the view / clean-copy formats of a Format: the library's own clean copies are in the source's own format, in logical channel order
 VkFormat cleanFormat(Format f) {
     switch (f) {
@@ -272,6 +331,72 @@ struct MotionGroup {
     bool live = false;         // created (the pipelines; the buffers whenever a size is held)
 };
 
+// The device limits a frame size must fit (InitInfo::getProps2; without it the guarantees of every Vulkan device, except the
+// storage-buffer range, whose guarantee of 128 MiB the library has always gone past on the host's word: the largest range a
+// device can report, 4 GiB - 1)
+struct DevLimits {
+    uint32_t img2D = 0;                          // maxImageDimension2D (0 = unknown: the host's images exist, so they fit)
+    uint64_t sbRange = 0xFFFFFFFFull;            // maxStorageBufferRange
+    uint32_t wg[3] = {65535u, 65535u, 65535u};   // maxComputeWorkGroupCount
+};
+// The motion estimate's layout of a size: the flow resolution, its pyramid (interp.flow(): luma at 1/flowScale, cv2 rounding, down to
+// MIN_SIDE), the luma words and the field entries (vec2) of the shared buffers. createSizeDependent and sizeLimitError use it.
+struct SizeLayout {
+    int fw = 0, fh = 0;
+    std::vector<Level> lv;
+    int lumaWords = 0, fieldSub = 0, fieldPF = 0, fieldT = 0, fieldEntries = 0;
+};
+static int rintHalfEven(double v) { return (int)std::nearbyint(v); }   // == cv2 saturate_cast<int>
+static SizeLayout sizeLayout(uint32_t W, uint32_t H, uint32_t flowScale) {
+    SizeLayout L;
+    L.fw = rintHalfEven(W * (1.0 / flowScale));
+    L.fh = rintHalfEven(H * (1.0 / flowScale));
+    int w = L.fw, h = L.fh, lumaOff = 0, fieldOff = 0;
+    for (;;) {
+        Level l{};
+        l.w = w; l.h = h;
+        l.bw = (w + 7) / 8; l.bh = (h + 7) / 8;   // pad_to_block
+        l.offA = lumaOff; l.offC = lumaOff + w * h;
+        lumaOff += 2 * w * h;
+        l.fS = fieldOff; l.fM = fieldOff + l.bw * l.bh;
+        fieldOff += 2 * l.bw * l.bh;
+        L.lv.push_back(l);
+        if (std::min(w, h) / 2 < 48) break;
+        w = rintHalfEven(w * 0.5);
+        h = rintHalfEven(h * 0.5);
+    }
+    L.fieldSub = fieldOff;
+    fieldOff += L.lv[0].bw * L.lv[0].bh;
+    L.fieldPF = fieldOff;
+    fieldOff += L.fw * L.fh;
+    L.fieldT = fieldOff;   // per-pixel field looked up at time t (synth scratch, t != 0.5)
+    fieldOff += L.fw * L.fh;
+    L.lumaWords = lumaOff;
+    L.fieldEntries = fieldOff;
+    return L;
+}
+// Null if a W x H frame fits the device under these settings (the selected motion version's buffers and dispatches), else why not.
+// Below kMinSize the flow resolution degenerates (W or H = 1 -> size-0 buffers). The largest buffers grow with W * H / flowScale^2
+// (V2 Quality's claims and coverage, V1's motion-blur field scratch), the widest dispatch with W / 8 (and V2's static-mask cells).
+static const char* sizeLimitError(uint32_t W, uint32_t H, const Settings& s, const DevLimits& lim) {
+    if (W < Interpolator::kMinSize || H < Interpolator::kMinSize) return "the frame size is below Interpolator::kMinSize (16 pixels) in width or height";
+    if (lim.img2D && (W > lim.img2D || H > lim.img2D)) return "the frame size exceeds the device's maxImageDimension2D";
+    if ((uint64_t)W * H > (1ull << 30)) return "the frame size exceeds 2^30 pixels (32-bit indexing of the library's buffers)";
+    const SizeLayout L = sizeLayout(W, H, s.flowScale);
+    const uint64_t fwh = (uint64_t)L.fw * L.fh, cells = (uint64_t)((L.fw + 7) / 8) * ((L.fh + 7) / 8);
+    uint64_t big = std::max({(uint64_t)L.lumaWords * 4, (uint64_t)L.fieldEntries * 8, (uint64_t)(64 + (W + 3) / 4 * (uint64_t)H) * 4});
+    uint64_t gx = (W + 7) / 8, gy = (H + 7) / 8;
+    if (s.motionVersion == MotionVersion::V2) {
+        big = std::max({big, ((uint64_t)L.lv[0].bw * L.lv[0].bh * 2 + fwh) * 8, (fwh * 5 + 3 * cells) * 4});
+        gx = std::max(gx, (cells + 7) / 8);   // v2_enclose.comp: 8 cells per workgroup, one row of workgroups
+    } else if (s.blurSamples >= 2) {   // recordSynthBlur's scratch (grown by the first blurred record)
+        big = std::max({big, (uint64_t)s.blurSamples * fwh * 8, (uint64_t)s.blurSamples * ((W + 3) / 4) * (uint64_t)H * 4});
+    }
+    if (big > lim.sbRange) return "a buffer of this frame size exceeds the device's maxStorageBufferRange (a larger flowScale needs less)";
+    if (gx > lim.wg[0] || gy > lim.wg[1]) return "a dispatch of this frame size exceeds the device's maxComputeWorkGroupCount (a larger flowScale needs fewer)";
+    return nullptr;
+}
+
 struct Interpolator::Impl {
 #define X(n) PFN_vk##n n = nullptr;
     FG_FUNCS(X)
@@ -283,6 +408,8 @@ struct Interpolator::Impl {
     VkFormat cleanFmt = VK_FORMAT_R8G8B8A8_UNORM, cleanFmtC = VK_FORMAT_UNDEFINED;
     Settings set{};   // active settings (info.settings is only the init value)
     const char* v2Why = nullptr;   // why the device cannot run MotionVersion::V2 (InitInfo::getProps2), null = it can / unchecked
+    DevLimits lim{};                // the device limits a size is checked against (sizeLimitError)
+    const char* sizeWhy = nullptr;  // why the last rebuild() refused its size (null: it did not, or an allocation failed)
     VkPhysicalDeviceMemoryProperties memProps{};
 
     VkSampler sampler = VK_NULL_HANDLE;
@@ -411,7 +538,6 @@ struct Interpolator::Impl {
     bool makeBuffer(int i, VkDeviceSize size);
 };
 
-static int rintHalfEven(double v) { return (int)std::nearbyint(v); }   // == cv2 saturate_cast<int>
 
 bool Interpolator::Impl::makeBuffer(int i, VkDeviceSize size) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -436,33 +562,16 @@ bool Interpolator::Impl::makeBuffer(int i, VkDeviceSize size) {
 }
 
 bool Interpolator::Impl::createSizeDependent() {
-    // interp.flow(): luma at 1/FLOW_SCALE (cv2 rounds the size), pyramid down to MIN_SIDE.
-    fw = rintHalfEven(W * (1.0 / set.flowScale));
-    fh = rintHalfEven(H * (1.0 / set.flowScale));
-    lv.clear();
-    int w = fw, h = fh, lumaOff = 0, fieldOff = 0;
-    for (;;) {
-        Level l{};
-        l.w = w; l.h = h;
-        l.bw = (w + 7) / 8; l.bh = (h + 7) / 8;   // pad_to_block
-        l.offA = lumaOff; l.offC = lumaOff + w * h;
-        lumaOff += 2 * w * h;
-        l.fS = fieldOff; l.fM = fieldOff + l.bw * l.bh;
-        fieldOff += 2 * l.bw * l.bh;
-        lv.push_back(l);
-        if (std::min(w, h) / 2 < 48) break;
-        w = rintHalfEven(w * 0.5);
-        h = rintHalfEven(h * 0.5);
-    }
-    fieldSub = fieldOff;
-    fieldOff += lv[0].bw * lv[0].bh;
-    fieldPF = fieldOff;
-    fieldOff += fw * fh;
-    fieldT = fieldOff;   // per-pixel field looked up at time t (synth scratch, t != 0.5)
-    fieldOff += fw * fh;
+    // interp.flow(): luma at 1/FLOW_SCALE (cv2 rounds the size), pyramid down to MIN_SIDE (sizeLayout).
+    SizeLayout L = sizeLayout(W, H, set.flowScale);
+    fw = L.fw; fh = L.fh;
+    lv = L.lv;
+    fieldSub = L.fieldSub;
+    fieldPF = L.fieldPF;
+    fieldT = L.fieldT;
     int uCount = kEOff + (int)(W + 3) / 4 * (int)H;   // counters/medians, then the packed mismatch
-    if (!makeBuffer(0, (VkDeviceSize)lumaOff * 4)) return false;
-    if (!makeBuffer(1, (VkDeviceSize)fieldOff * 8)) return false;
+    if (!makeBuffer(0, (VkDeviceSize)L.lumaWords * 4)) return false;
+    if (!makeBuffer(1, (VkDeviceSize)L.fieldEntries * 8)) return false;
     if (!makeBuffer(2, (VkDeviceSize)uCount * 4)) return false;
     // static-UI protection: the detection grids, and the resources of the active mode
     cw = ((int)W + kUiCell - 1) / kUiCell; ch = ((int)H + kUiCell - 1) / kUiCell;
@@ -875,7 +984,18 @@ bool Interpolator::init(const InitInfo& ii) {
     if (!colourSpv(fmt, cs)) { err_ = "the shader variants of this format are not built into the library (meson option 'formats')"; return false; }
     if (const char* e = settingsError(ii.settings, fmt)) { err_ = e; return false; }
     const char* v2Why = ii.getProps2 ? v2SubgroupError(ii.getProps2, ii.phys) : nullptr;
+    DevLimits lim{};
+    if (ii.getProps2) {
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        ii.getProps2(ii.phys, &p2);
+        const VkPhysicalDeviceLimits& l = p2.properties.limits;
+        lim.img2D = l.maxImageDimension2D;
+        lim.sbRange = l.maxStorageBufferRange;
+        for (int i = 0; i < 3; i++) lim.wg[i] = l.maxComputeWorkGroupCount[i];
+    }
+    if (const char* e = sizeLimitError(ii.width, ii.height, ii.settings, lim)) { err_ = e; return false; }
     if (ii.settings.motionVersion == MotionVersion::V2 && v2Why) { err_ = v2Why; return false; }
+    if (ii.settings.motionVersion == MotionVersion::V2 && !cs.v2Morph.code) { err_ = kV2NotBuilt; return false; }
     if (fmt == Format::RgbaF16 && ii.transfer == Transfer::Linear && !(ii.linearWhiteNits > 0.0f && ii.linearWhiteNits <= 10000.0f)) {
         err_ = "linearWhiteNits must be in (0, 10000]";
         return false;
@@ -890,6 +1010,7 @@ bool Interpolator::init(const InitInfo& ii) {
     m->set = ii.settings;
     m->fmt = fmt;
     m->v2Why = v2Why;
+    m->lim = lim;
     m->yuv = isYuv(fmt);
     m->cs = cs;
     m->cleanFmt = cleanFormat(fmt);
@@ -1070,7 +1191,12 @@ bool Interpolator::init(const InitInfo& ii) {
         if (m->AllocateDescriptorSets(d, &udsai, m->uiSets) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
     }
 
-    if (!resize(ii.width, ii.height, ii.viewFormat)) { destroy(); err_ = "resize failed: size below kMinSize or an allocation failed"; return false; }
+    if (!resize(ii.width, ii.height, ii.viewFormat)) {
+        const char* why = m->sizeWhy ? m->sizeWhy : "a buffer of this frame size could not be allocated";
+        destroy();
+        err_ = why;
+        return false;
+    }
     return true;
 }
 
@@ -1081,9 +1207,12 @@ bool Interpolator::resize(uint32_t w, uint32_t h, VkFormat fmt) {
 bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force) {
     // Invariant: W != 0 <=> all size-dependent buffers exist. Any failure leaves W = H = 0.
     // The pipelines belong to the Format chosen at init(): a view format of another Format is refused (BGRA <-> RGBA is fine).
-    // Below kMinSize the flow resolution (W/2 x H/2, rounded) degenerates (W or H = 1 -> size-0 buffers).
+    // The size must fit the device under the settings (sizeLimitError: kMinSize, buffer ranges, dispatch sizes); sizeWhy says why not.
     Format nf;
-    bool ok = formatOf(fmt, &nf) && nf == this->fmt && w >= kMinSize && h >= kMinSize;
+    sizeWhy = nullptr;
+    if (!formatOf(fmt, &nf) || nf != this->fmt) sizeWhy = "resize to a view format of another Format (the pipelines belong to the Format of init())";
+    else sizeWhy = sizeLimitError(w, h, set, lim);
+    bool ok = !sizeWhy;
     if (ok && !force && w == W && h == H) { info.viewFormat = fmt; return true; }   // buffers do not depend on the format
     destroySizeDependent();
     W = H = 0;
@@ -1122,14 +1251,20 @@ bool Interpolator::validate(const Settings& s) {
 
 const char* Interpolator::settingsError(const Settings& s, Format f) {
     if (!validate(s)) return "invalid settings: a field is out of range or not finite (see Interpolator::validate)";
-    if (s.motionVersion == MotionVersion::V2 && f != Format::Rgba8)
-        return "MotionVersion::V2 supports only Format::Rgba8 (8-bit RGBA / BGRA views); Rgb10, RgbaF16 (encoded or linear), Nv12 and P010 need MotionVersion::V1";
+    (void)f;   // (no Format rule today: both motion versions run every Format)
     return nullptr;
 }
 
 const char* Interpolator::settingsError(const Settings& s) const {
     if (const char* e = settingsError(s, m ? m->fmt : Format::Rgba8)) return e;
-    return m && s.motionVersion == MotionVersion::V2 ? m->v2Why : nullptr;
+    if (m && s.motionVersion == MotionVersion::V2 && m->v2Why) return m->v2Why;
+    if (m && s.motionVersion == MotionVersion::V2 && !m->cs.v2Morph.code) return kV2NotBuilt;
+    return m && m->W ? sizeLimitError(m->W, m->H, s, m->lim) : nullptr;   // the held size under these settings
+}
+
+const char* Interpolator::sizeError(uint32_t w, uint32_t h) const {
+    if (!m) return "not initialised";
+    return sizeLimitError(w, h, m->set, m->lim);
 }
 
 bool Interpolator::setSettings(const Settings& s) {
@@ -1179,7 +1314,8 @@ bool Interpolator::Impl::motionEnsure() {
     MotionGroup& g = mg();
     if (g.live) return true;
     // V1: the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's,
-    // as are the two colour passes of the blur. V2 (Rgba8 only): both modes' pipelines (see MotionGroup); empty slots are skipped.
+    // as are the two colour passes of the blur. V2: both modes' pipelines (see MotionGroup), the format's luma and synthesis; empty
+    // slots are skipped.
     struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
         {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
         {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
@@ -1190,16 +1326,16 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2_MEDHIST].sp = SPV(v2_medhist);
         spv[P_V2_SEARCH].sp = SPV(v2_search);
         spv[P_V2_CLEAN].sp = SPV(v2_clean);
-        spv[P_V2_MORPH].sp = SPV(v2_morph);
+        spv[P_V2_MORPH] = {cs.v2Morph, spec};   // (the synthesis: the format's own variant)
         spv[P_V2_REPICK].sp = SPV(v2_repick);
         spv[P_V2_QFIELD].sp = SPV(v2_qfield);
         spv[P_V2_QOWN].sp = SPV(v2_qown);
         spv[P_V2_QCOV].sp = SPV(v2_qcov);
-        spv[P_V2_QMORPH].sp = SPV(v2_qmorph);
+        spv[P_V2_QMORPH] = {cs.v2QMorph, spec};
         spv[P_V2_STATIC].sp = SPV(v2_static);
         spv[P_V2_ENCLOSE].sp = SPV(v2_enclose);
-        spv[P_V2_MORPH_S].sp = SPV(v2_morph_s);
-        spv[P_V2_QMORPH_S].sp = SPV(v2_qmorph_s);
+        spv[P_V2_MORPH_S] = {cs.v2MorphS, spec};
+        spv[P_V2_QMORPH_S] = {cs.v2QMorphS, spec};
     }
     struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
@@ -2045,7 +2181,8 @@ bool Interpolator::Impl::v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     for (int k = 0; k < n; k++) v.t[k] = ts[k];
     // the tiles near a static overlay go to the static variant of the pass (V2's static-structure mask), the others to the plain
     // one; both write disjoint tiles and only add to the counts: no barrier between them. (Intended: syncval with its shader-accesses
-    // heuristic reports a WRITE_AFTER_WRITE on binding 5, the output image, between them: each 8x8 tile is stored by one of the two.)
+    // heuristic reports a WRITE_AFTER_WRITE on binding 5, the output image, between them, and in Nv12 / P010 also on binding 10, its
+    // CbCr plane: each 8x8 tile, and the 4x4 chroma texels of its 2x2 blocks, are stored by one of the two.)
     const Pipe morphS = set.v2Mode == V2Mode::Quality ? P_V2_QMORPH_S : P_V2_MORPH_S;
     r.runV2(morph, v, divUp((int)W, 8), divUp((int)H, 8));
     r.runV2(morphS, v, divUp((int)W, 8), divUp((int)H, 8));

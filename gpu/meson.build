@@ -29,6 +29,9 @@ colour_srcs = ['shaders/luma.comp', 'shaders/error.comp', 'shaders/resolve.comp'
                'shaders/ui_v2_update.comp', 'shaders/ui_v2_lumafill.comp',
                'shaders/blur_error.comp', 'shaders/blur_resolve.comp']
 chroma_srcs = ['shaders/ui_inpaint_chroma.comp', 'shaders/ui_patch_chroma.comp']   # YUV only: the half-resolution CbCr plane
+# MotionVersion::V2: only its synthesis reads and writes colour (both modes, with and without the static-overlay tests; YUV: both
+# planes); its other passes read the luma, which luma.comp already gives per format
+v2_colour_srcs = ['shaders/v2_morph.comp', 'shaders/v2_morph_s.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_qmorph_s.comp']
 variant_shaders = []
 foreach f : get_option('formats')
   g = generator(glslang,
@@ -36,7 +39,7 @@ foreach f : get_option('formats')
     depfile : '@BASENAME@_' + f + '_spv.h.d',
     arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                  '-DFG_FORMAT_' + f.to_upper() + '=1', '--vn', '@BASENAME@_' + f + '_spv', '-o', '@OUTPUT@', '@INPUT@'])
-  variant_shaders += [g.process(colour_srcs)]
+  variant_shaders += [g.process(colour_srcs), g.process(v2_colour_srcs)]
   if f == 'nv12' or f == 'p010'
     variant_shaders += [g.process(chroma_srcs)]
   endif
