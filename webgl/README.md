@@ -32,7 +32,9 @@ that contract, updated. Additions (nothing removed):
 | settings `transfer`, `linearWhiteNits` | `rgba16f` only: `'encoded'` (default: display-encoded values, PQ / HLG / sRGB; a level is value × 255) or `'linear'` (scRGB / linear light, measured as PQ codes; 1.0 = `linearWhiteNits`, default 80). Structural |
 | `engine.synthBlur(t0, t1, framebuffer, viewport, opts)` | the library's `recordSynthBlur` for V2: the weighted average of `blurSamples` sub-frames at the midpoints of N equal slices of [t0, t1], each exactly `synth(t_k)`'s output; `0 <= t0 <= t1 <= 1`; blur off or t0 == t1: the instant t1. V1 with blur on throws (see "Gaps") |
 | `__fg.frameSizeError(gl, w, h, settings)`, `__fg.minSize` | why a frame size cannot run (below 16 × 16, the library's minimum, or a texture above `MAX_TEXTURE_SIZE`), else null. `resize` / `pushFrame` throw a `RangeError` with that text and keep the engine at its old size |
-| `__fg.checkSupport(gl, {width, height, flowScale})` | the optional second argument adds the frame-size check to `missing` |
+| `__fg.checkSupport(gl, frame)` (changed) | returns `{ ok, missing, sizeError, quality, qualityError }`. `missing`: GL feature names only, as before. `sizeError`: the optional second argument `{width, height, flowScale}` checked by `frameSizeError`, else null (it used to be pushed into `missing`; `ok` is still false when it is set). `quality` / `qualityError`: whether V2 Quality can run here (the MIN-blend probe below) and, if not, why; does not affect `ok` (V1 and V2 Performance do not need it) |
+| `engine.support` | the `checkSupport(gl)` result the engine was created with |
+| V2 Quality refusal | where `checkSupport(gl).quality` is false, `createEngine` / `setSettings` throw a `RangeError` (`framegen: settings.v2Mode 'quality' is not supported on this context (<qualityError>); use v2Mode 'performance' or motionVersion 1`) for any settings with `motionVersion` 2 and `v2Mode` `'quality'`, and keep the current settings. V1 (whatever `v2Mode` says) and V2 Performance run as before |
 | `__fg.assemblePrograms(sources, settings)` | the exact text of every program the host compiles (for validation) |
 | `engine.setPassHook(fn)` | profiling only: `fn(passName, 0 / 1)` around every draw |
 
@@ -41,7 +43,15 @@ of half floats (rgba16f); a DOM source is uploaded as `HALF_FLOAT` for rgba16f. 
 debug names that changed or are new are listed per stage below. `passCounts().clears` is 0 now (no pass needs a clear).
 
 Required, as before: WebGL2, `EXT_color_buffer_float`, `EXT_float_blend`, `OES_texture_float_linear`, 3 draw buffers, a vertex
-texture unit (V2 Quality's splat reads textures in its vertex shader). Blend equation `MIN` (core WebGL2) on R32F.
+texture unit (V2 Quality's splat reads textures in its vertex shader). Blend equation `MIN` (core WebGL2) on R32F, for V2 Quality
+only: `checkSupport` probes it (once per context, cached; not while the context is lost): a 1 × 1 R32F framebuffer, three
+`uintBitsToFloat` words of the splat's range (>= 2^23) drawn as size-1 points in the order big, small, mid with `blendEquation(MIN)`,
+read back; the texel must hold the small word bit for bit, else `quality: false` with `qualityError` `'MIN blend on R32F: kept 0x..,
+want 0x..'` (or the GL error / incomplete framebuffer / link failure that stopped it). The probe saves and restores every binding and
+state it touches and drains pending GL errors before it runs. Nothing else needs a probe: R32F / RGBA32F rendering and float blending
+are the required extensions; vertex texture fetch (16 units), integer textures and a point size of 1 are WebGL2 core minimums (the
+splat draws size-1 points only; `ALIASED_POINT_SIZE_RANGE` always contains 1); V2 Performance's blur accumulation uses `FUNC_ADD` on
+float targets (`EXT_float_blend`).
 
 ## Motion versions
 
@@ -137,7 +147,7 @@ meson + ninja + the Vulkan headers (the library's build) and a Vulkan GPU with c
 | setup | `vkref.mjs --build-only`, `pairs.py`, `vkref.mjs` | builds fgtest in `gpu/build-webgl`; writes the pairs; runs the library (fgtest) on every pair × mode × flowScale × t |
 | validate | `validate.mjs` | glslangValidator on every assembled program, all three format variants |
 | golden | `ref_gen.py`, `golden.mjs` (+ `compare.mjs`, `page.js`) | V1 vs `proto/interp.py` with per-stage diagnostics (the extension's golden harness) |
-| xbackend | `xbackend.mjs` (+ `server.mjs`, `xpage.js`) | WebGL2 (SwiftShader) vs the library: V1, V2 P, V2 Q; block field, per-pixel field and coverage per stage; switch semantics; API checks |
+| xbackend | `xbackend.mjs` (+ `server.mjs`, `xpage.js`) | WebGL2 (SwiftShader) vs the library: V1, V2 P, V2 Q; block field, per-pixel field and coverage per stage; switch semantics; API checks; the V2 Quality MIN-blend probe (real result, cached, GL state kept; a context with MIN broken by a Proxy: `quality` false, Quality refused, V1 / V2 P run) |
 | hdr | `hdr_pairs.py`, `hdr.mjs`, `vkhdr.cpp` | rgba16f (scRGB linear, PQ-encoded, identity) vs the library in R16G16B16A16_SFLOAT / Rgba8 |
 | blur | `blur.mjs`, `vkhdr.cpp --blur` | `synthBlur` vs `recordSynthBlur` (V2 P, V2 Q) |
 | bench | `bench.mjs` | ms per pair (`--gpu`: hardware GL, timer queries, `--passes`: per pass) |

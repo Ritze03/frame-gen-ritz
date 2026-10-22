@@ -26,7 +26,7 @@
   // Static tables
   // ---------------------------------------------------------------------------------------------
 
-  fg.version = '2';   // 2: V2 Quality, RGBA16F input, synthBlur, frameSizeError (API of 1 unchanged otherwise)
+  fg.version = '2';   // 2: V2 Quality, RGBA16F input, synthBlur, frameSizeError, checkSupport sizeError / quality (API of 1 unchanged otherwise)
   fg.requiredExtensions = ['EXT_color_buffer_float', 'EXT_float_blend', 'OES_texture_float_linear'];
 
   // Program table (LAYOUT 3.2). Sampler order = texture unit order. `vert` defaults to 'vert.glsl'.
@@ -204,21 +204,106 @@
     return null;
   };
 
+  // V2 Quality's coverage splat (v2/qown.vert.glsl) needs MIN blending on an R32F target to keep exactly the smallest of several
+  // positive floats (their bit patterns). Not every driver blends 32-bit floats with MIN exactly, so it is tried: three uint words
+  // (as float bits, the splat's range >= 2^23) are drawn as points of size 1 into one R32F texel in the order big, small, mid; the
+  // texel must read back as the small word bit for bit. -> null (works) or the reason. Cached per context (not while it is lost).
+  // Saves and restores every binding / state it touches; drains pending GL errors first (they would be read as its own).
+  const qProbeCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function probeQuality(gl) {
+    if (qProbeCache && qProbeCache.has(gl)) return qProbeCache.get(gl);
+    if (gl.isContextLost && gl.isContextLost()) return 'context lost';
+    const VS = '#version 300 es\nprecision highp float;\nprecision highp int;\nuniform uint uW[3];\nflat out uint vW;\n' +
+      'void main() { vW = uW[gl_VertexID]; gl_PointSize = 1.0; gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n';
+    const FS = '#version 300 es\nprecision highp float;\nprecision highp int;\nflat in uint vW;\nlayout(location = 0) out vec4 o;\n' +
+      'void main() { o = vec4(uintBitsToFloat(vW), 0.0, 0.0, 0.0); }\n';
+    const WORDS = [0x0FA12345, 0x00923457, 0x05834567], WANT = 0x00923457;
+    while (gl.getError() !== gl.NO_ERROR) { /* drain foreign errors */ }
+    const P = gl.getParameter.bind(gl);
+    const saved = {
+      draw: P(gl.DRAW_FRAMEBUFFER_BINDING), read: P(gl.READ_FRAMEBUFFER_BINDING), prog: P(gl.CURRENT_PROGRAM),
+      vao: P(gl.VERTEX_ARRAY_BINDING), vp: P(gl.VIEWPORT), blend: gl.isEnabled(gl.BLEND), scissor: gl.isEnabled(gl.SCISSOR_TEST),
+      discard: gl.isEnabled(gl.RASTERIZER_DISCARD), eqRgb: P(gl.BLEND_EQUATION_RGB), eqA: P(gl.BLEND_EQUATION_ALPHA),
+      mask: P(gl.COLOR_WRITEMASK), clear: P(gl.COLOR_CLEAR_VALUE), active: P(gl.ACTIVE_TEXTURE), pack: P(gl.PIXEL_PACK_BUFFER_BINDING),
+    };
+    gl.activeTexture(gl.TEXTURE0);
+    const tex0 = P(gl.TEXTURE_BINDING_2D);
+    let tex = null, fbo = null, vs = null, fs = null, prog = null, vao = null, why = null;
+    try {
+      tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R32F, 1, 1);
+      fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (st !== gl.FRAMEBUFFER_COMPLETE) return (why = 'R32F not color-renderable (framebuffer status 0x' + st.toString(16) + ')');
+      const sh = (type, src) => { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); return o; };
+      vs = sh(gl.VERTEX_SHADER, VS); fs = sh(gl.FRAGMENT_SHADER, FS);
+      prog = gl.createProgram();
+      gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return (why = 'MIN blend probe program failed to link: ' + String(gl.getProgramInfoLog(prog) || '').trim());
+      vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.useProgram(prog);
+      gl.uniform1uiv(gl.getUniformLocation(prog, 'uW[0]'), new Uint32Array(WORDS));
+      gl.viewport(0, 0, 1, 1);
+      gl.disable(gl.SCISSOR_TEST); gl.disable(gl.RASTERIZER_DISCARD);
+      gl.colorMask(true, true, true, true);
+      gl.clearColor(3e38, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.enable(gl.BLEND);
+      gl.blendEquation(gl.MIN);
+      gl.drawArrays(gl.POINTS, 0, 3);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      const px = new Float32Array(4);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, px);
+      const e = gl.getError();
+      if (e !== gl.NO_ERROR) return (why = 'MIN blend on R32F: GL error 0x' + e.toString(16));
+      const got = new Uint32Array(px.buffer)[0];
+      if (got !== WANT) return (why = 'MIN blend on R32F: kept 0x' + got.toString(16) + ', want 0x' + WANT.toString(16));
+      return null;
+    } catch (ex) {
+      return (why = 'MIN blend on R32F: ' + String((ex && ex.message) || ex));
+    } finally {
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, saved.draw); gl.bindFramebuffer(gl.READ_FRAMEBUFFER, saved.read);
+      gl.useProgram(saved.prog); gl.bindVertexArray(saved.vao);
+      gl.viewport(saved.vp[0], saved.vp[1], saved.vp[2], saved.vp[3]);
+      (saved.blend ? gl.enable : gl.disable).call(gl, gl.BLEND);
+      (saved.scissor ? gl.enable : gl.disable).call(gl, gl.SCISSOR_TEST);
+      (saved.discard ? gl.enable : gl.disable).call(gl, gl.RASTERIZER_DISCARD);
+      gl.blendEquationSeparate(saved.eqRgb, saved.eqA);
+      gl.colorMask(saved.mask[0], saved.mask[1], saved.mask[2], saved.mask[3]);
+      gl.clearColor(saved.clear[0], saved.clear[1], saved.clear[2], saved.clear[3]);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, saved.pack);
+      gl.bindTexture(gl.TEXTURE_2D, tex0); gl.activeTexture(saved.active);
+      gl.deleteVertexArray(vao); gl.deleteProgram(prog); gl.deleteShader(vs); gl.deleteShader(fs);
+      gl.deleteFramebuffer(fbo); gl.deleteTexture(tex);
+      while (gl.getError() !== gl.NO_ERROR) { /* the probe's own */ }
+      if (qProbeCache && !(gl.isContextLost && gl.isContextLost())) qProbeCache.set(gl, why);
+    }
+  }
+
+  // -> { ok, missing, sizeError, quality, qualityError }. missing: the GL features this context lacks (names only; 'webgl2' alone if
+  // it is no WebGL2 context). sizeError: the optional frame = { width, height, flowScale } checked by fg.frameSizeError, else null.
+  // ok = nothing missing and no sizeError. quality: V2 Quality can run (its MIN-blend splat works, probeQuality); when false,
+  // qualityError says why. V1 and V2 Performance do not need it, so it does not affect ok.
   fg.checkSupport = function (gl, frame) {
     const missing = [];
     let isGl2;
     if (!gl) isGl2 = false;
     else if (typeof root.WebGL2RenderingContext !== 'undefined') isGl2 = gl instanceof root.WebGL2RenderingContext;
     else isGl2 = typeof gl.texStorage2D === 'function' && typeof gl.createVertexArray === 'function';
-    if (!isGl2) return { ok: false, missing: ['webgl2'] };
+    if (!isGl2) return { ok: false, missing: ['webgl2'], sizeError: null, quality: false, qualityError: 'no WebGL2 context' };
     for (const name of fg.requiredExtensions) {
       if (!gl.getExtension(name)) missing.push(name);
     }
     if (!(gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 3)) missing.push('MAX_DRAW_BUFFERS>=3');
     if (!(gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS) >= 1)) missing.push('MAX_VERTEX_TEXTURE_IMAGE_UNITS>=1');
-    // optional frame = { width, height, flowScale }: also the frame size (fg.frameSizeError)
-    if (frame) { const e = fg.frameSizeError(gl, frame.width, frame.height, frame); if (e) missing.push(e); }
-    return { ok: missing.length === 0, missing: missing };
+    const sizeError = frame ? fg.frameSizeError(gl, frame.width, frame.height, frame) : null;
+    // (the probe needs the float render / blend extensions; without them nothing runs anyway)
+    const qualityError = missing.length ? 'needs ' + missing.join(', ') : probeQuality(gl);
+    return { ok: missing.length === 0 && !sizeError, missing: missing, sizeError: sizeError, quality: !qualityError, qualityError: qualityError };
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -263,7 +348,14 @@
     if (!sup.ok) throw new Error('framegen: unsupported context, missing: ' + sup.missing.join(', '));
     if (!sources || typeof sources !== 'object') throw new TypeError('framegen: createEngine: sources object required');
 
-    let settings = mergeSettings(DEFAULTS, settingsIn);
+    // V2 Quality is refused cleanly where its splat cannot work (checkSupport().quality); V1 and V2 Performance still run
+    function qualityGate(s) {
+      if (s.motionVersion === 2 && s.v2Mode === 'quality' && !sup.quality) {
+        throw new RangeError("framegen: settings.v2Mode 'quality' is not supported on this context (" + sup.qualityError + "); use v2Mode 'performance' or motionVersion 1");
+      }
+      return s;
+    }
+    let settings = qualityGate(mergeSettings(DEFAULTS, settingsIn));
     let debug = settings.debug;
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
 
@@ -712,6 +804,7 @@
     const engine = {
       settings: settings,
       info: null,
+      support: sup,   // checkSupport(gl) at creation (quality / qualityError)
     };
 
     engine.resize = function (w, h) {
@@ -724,7 +817,7 @@
 
     engine.setSettings = function (partial) {
       alive();
-      const next = mergeSettings(settings, partial);
+      const next = qualityGate(mergeSettings(settings, partial));
       const fmtChanged = formatDefines(next) !== formatDefines(settings);
       const rebuilt = (next.flowScale !== settings.flowScale || fmtChanged) && info !== null;
       const switched = next.motionVersion !== settings.motionVersion;
