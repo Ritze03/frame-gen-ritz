@@ -110,6 +110,8 @@
 #include "ui_v2_lumafill_nv12_spv.h"
 #include "blur_error_nv12_spv.h"
 #include "blur_resolve_nv12_spv.h"
+#include "ui_inpaint_chroma_nv12_spv.h"
+#include "ui_patch_chroma_nv12_spv.h"
 #endif
 // ... and MotionVersion::V2's synthesis of nv12 (probed on its own: a host build that lists only the colour shaders above gets
 // V2 refused for this format, with a reason)
@@ -119,8 +121,6 @@
 #include "v2_morph_s_nv12_spv.h"
 #include "v2_qmorph_nv12_spv.h"
 #include "v2_qmorph_s_nv12_spv.h"
-#include "ui_inpaint_chroma_nv12_spv.h"
-#include "ui_patch_chroma_nv12_spv.h"
 #endif
 // p010: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_p010_spv.h")
@@ -137,6 +137,8 @@
 #include "ui_v2_lumafill_p010_spv.h"
 #include "blur_error_p010_spv.h"
 #include "blur_resolve_p010_spv.h"
+#include "ui_inpaint_chroma_p010_spv.h"
+#include "ui_patch_chroma_p010_spv.h"
 #endif
 // ... and MotionVersion::V2's synthesis of p010 (probed on its own: a host build that lists only the colour shaders above gets
 // V2 refused for this format, with a reason)
@@ -146,8 +148,6 @@
 #include "v2_morph_s_p010_spv.h"
 #include "v2_qmorph_p010_spv.h"
 #include "v2_qmorph_s_p010_spv.h"
-#include "ui_inpaint_chroma_p010_spv.h"
-#include "ui_patch_chroma_p010_spv.h"
 #endif
 
 namespace framegen {
