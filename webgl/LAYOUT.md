@@ -318,14 +318,15 @@ Classic script. Attaches **`globalThis.__fg`**; defines nothing else globally. N
 ```js
 __fg.version                       // string, '2' (changed; README "API" lists the additions)
 __fg.requiredExtensions            // ['EXT_color_buffer_float','EXT_float_blend','OES_texture_float_linear']
-__fg.checkSupport(gl)              // -> { ok: boolean, missing: string[] }
+__fg.checkSupport(gl, frame?)      // -> { ok: boolean, missing: string[], sizeError: string|null, quality: boolean, qualityError: string|null } (changed)
 __fg.shaderFiles                   // string[] — every key `sources` must contain (§1), e.g. 'common.glsl', 'vert.glsl', 'estimate/luma.frag.glsl', ...
 __fg.defaultSettings()             // -> fresh copy of the defaults of §4
 __fg.levelLayout(W, H, flowScale)  // pure -> { fw, fh, levels: [{ w, h, bw, bh, radius }] }  (§2 sizes)
 __fg.createEngine(gl, sources, settings) // -> engine ; throws Error('framegen: <program>: <info log>') on compile/link failure
 ```
 
-* `checkSupport(gl)`: `missing` contains `'webgl2'` if `gl` is not a `WebGL2RenderingContext` (then nothing else is probed), otherwise each name of `requiredExtensions` for which `gl.getExtension(name)` is null, plus `'MAX_DRAW_BUFFERS>=3'` / `'MAX_VERTEX_TEXTURE_IMAGE_UNITS>=1'` if those limits fail. It calls `getExtension` (so it also *enables* the extensions). `ok = missing.length === 0`. Does not allocate anything.
+* `checkSupport(gl, frame?)` (changed): `missing` contains `'webgl2'` if `gl` is not a `WebGL2RenderingContext` (then nothing else is probed), otherwise each name of `requiredExtensions` for which `gl.getExtension(name)` is null, plus `'MAX_DRAW_BUFFERS>=3'` / `'MAX_VERTEX_TEXTURE_IMAGE_UNITS>=1'` if those limits fail; feature names only. `sizeError` = `frameSizeError(gl, frame.width, frame.height, frame)` for the optional `frame = { width, height, flowScale }`, else null (before, that text was pushed into `missing`). `ok = missing.length === 0 && !sizeError`. `quality` / `qualityError`: V2 Quality's MIN-blend probe (README "API": a 1 × 1 R32F framebuffer, three points, read back; cached per context; restores the GL state it touches); `quality` does not affect `ok`, and with anything in `missing` it is false with `qualityError = 'needs ' + missing`. It calls `getExtension` (so it also *enables* the extensions). The probe allocates (and deletes) one 1 × 1 texture, framebuffer, program and VAO, the first time per context.
+* `createEngine` / `setSettings` (changed): where `checkSupport(gl).quality` is false, settings with `motionVersion: 2, v2Mode: 'quality'` throw a `RangeError` naming `qualityError`; the engine keeps its settings. `engine.support` is the `checkSupport(gl)` result of `createEngine`.
 * `createEngine(gl, sources, settings)`: `gl` is a `WebGL2RenderingContext`; `sources` maps path-relative-to-`shaders/` → string (`{ 'common.glsl': str, 'vert.glsl': str, 'estimate/luma.frag.glsl': str, … }`); `settings` is partial (missing keys take §4 defaults). Calls `checkSupport` and throws if not ok. Compiles and links every program (assembly per §1.1) and creates the empty VAO; textures and FBOs are allocated lazily on the first `resize`/`pushFrame`.
 
 **engine**

@@ -5,7 +5,7 @@
 // Gate per pair x mode x flowScale x t (README "Tolerances"): identical whole-frame decisions (scene cut; flick when no cut), and
 //   no fallback: out MAE <= TOL[mode].mae levels and % pixels with a channel > 4 levels off <= TOL[mode].pct4;
 //   fallback: out bit-identical (both show the nearer real frame).
-// Plus the switch semantics (motionVersion drops the estimate, v2Mode keeps it). Exit 0 PASS, 1 FAIL, 2 setup error.
+// Plus the switch semantics (motionVersion drops the estimate, v2Mode keeps it), the API checks and checkSupport's V2 Quality probe. Exit 0 PASS, 1 FAIL, 2 setup error.
 import fs from 'node:fs';
 import path from 'node:path';
 import { openEngine } from './server.mjs';
@@ -104,9 +104,19 @@ console.log(`\nswitch test on ${sp.name}: ${swOk ? 'PASS' : 'FAIL'} steps ${JSON
 if (!swOk) allOk = false;
 const api = await E.page.evaluate(() => window.__x.apiTest());
 const apiOk = !!api.tooSmall && api.minOk === null && !!api.tooBig && !!api.wide && api.support && !api.support.ok &&
+  api.support.missing.length === 0 && api.support.sizeError === api.tooBig && api.supportFits.ok && api.supportFits.sizeError === null &&
   !!api.badMode && !!api.badFormat && !!api.badBlur && !!api.bigResize && api.infoAfter && api.infoAfter[0] === 64 && !!api.v1Blur && !api.glError;
 console.log(`api test: ${apiOk ? 'PASS' : 'FAIL'} ${JSON.stringify(api)}`);
 if (!apiOk) allOk = false;
+// checkSupport's MIN-blend probe (V2 Quality) and the refusal of v2Mode 'quality' where it fails
+const qt = await E.page.evaluate(() => window.__x.qualityTest());
+const qtOk = !qt.error && qt.real.quality === true && qt.real.qualityError === null && qt.cached && qt.fresh.quality === true && qt.stateKept &&
+  qt.broken.ok === true && qt.broken.quality === false && /MIN blend on R32F/.test(qt.broken.qualityError) && qt.broken.missing.length === 0 &&
+  /^RangeError: .*v2Mode 'quality' is not supported/.test(qt.createQ) && qt.perf.join() === 'true,true' &&
+  /^RangeError: .*v2Mode 'quality'/.test(qt.setQ) && qt.keptMode === 'performance/2' && qt.v1.join() === 'true,true' &&
+  /^RangeError: .*v2Mode 'quality'/.test(qt.toV2) && qt.engineSupport === false && !qt.glError;
+console.log(`quality probe test: ${qtOk ? 'PASS' : 'FAIL'} ${JSON.stringify(qt)}`);
+if (!qtOk) allOk = false;
 if (E.consoleMsgs.size) { console.log('\npage console:'); for (const [k, v] of E.consoleMsgs) console.log(`  [x${v}] ${k}`); }
 await E.browser.close();
 

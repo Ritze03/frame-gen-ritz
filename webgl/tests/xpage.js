@@ -2,7 +2,7 @@
 // globalThis.__fg. Exposes window.__x: init, run (one pair x settings: push, estimate, synth per t, compare with the Vulkan reference
 // in the page, return small metrics), switchTest, bench. Files are fetched from /w/<path relative to $FG_WORK>.
 (() => {
-  let gl = null, engine = null;
+  let gl = null, engine = null, srcs = null;
   const err = (e) => ({ error: String((e && e.message) || e), stack: e && e.stack ? String(e.stack).split('\n').slice(0, 8).join('\n') : '' });
   const get = async (p) => { const r = await fetch('/w/' + p); if (!r.ok) throw new Error('fetch ' + p + ': ' + r.status); return r.arrayBuffer(); };
   const getOpt = async (p) => { const r = await fetch('/w/' + p); return r.ok ? r.arrayBuffer() : null; };
@@ -44,6 +44,7 @@
 
   window.__x = {
     init({ sources, settings }) {
+      srcs = sources;
       const canvas = new OffscreenCanvas(64, 64);
       gl = canvas.getContext('webgl2', { antialias: false, alpha: true, depth: false, stencil: false, premultipliedAlpha: false, powerPreference: 'high-performance' });
       if (!gl) return { fatal: 'getContext("webgl2") returned null' };
@@ -122,6 +123,7 @@
       r.tooBig = __fg.frameSizeError(gl, max + 1, 64, {});
       r.wide = __fg.frameSizeError(gl, max, 64, { flowScale: 1 });
       r.support = __fg.checkSupport(gl, { width: max + 1, height: 64 });
+      r.supportFits = __fg.checkSupport(gl, { width: 64, height: 48 });
       r.badMode = throws(() => engine.setSettings({ v2Mode: 'fast' }));
       r.badFormat = throws(() => engine.setSettings({ inputFormat: 'rgb565' }));
       r.badBlur = throws(() => engine.setSettings({ blurSamples: 17 }));
@@ -133,6 +135,52 @@
       engine.setSettings({ blurSamples: 0 });
       r.version = __fg.version;
       r.glError = gl.getError();
+      return r;
+    },
+
+    // checkSupport's MIN-blend probe (V2 Quality): its result on this context, cached, GL state left as it was; then a context whose
+    // MIN blend is broken (a Proxy that turns blendEquation(MIN) into FUNC_ADD): quality false, v2Mode 'quality' refused with a
+    // RangeError (createEngine and setSettings, settings kept), V1 and V2 Performance still run
+    qualityTest() {
+      const r = {};
+      const throws = (f) => { try { f(); return false; } catch (e) { return (e && e.name) + ': ' + String(e.message || e); } };
+      try {
+        r.real = __fg.checkSupport(gl);
+        r.cached = __fg.checkSupport(gl).qualityError === r.real.qualityError;
+        const g2 = new OffscreenCanvas(16, 16).getContext('webgl2');
+        g2.viewport(1, 2, 3, 4); g2.enable(g2.BLEND); g2.blendEquationSeparate(g2.FUNC_SUBTRACT, g2.FUNC_REVERSE_SUBTRACT);
+        g2.clearColor(0.25, 0.5, 0.75, 1); g2.colorMask(true, false, true, false); g2.enable(g2.SCISSOR_TEST);
+        g2.activeTexture(g2.TEXTURE3);
+        const fb = g2.createFramebuffer(); g2.bindFramebuffer(g2.FRAMEBUFFER, fb);
+        const t0 = performance.now();
+        r.fresh = __fg.checkSupport(g2);
+        r.probeMs = performance.now() - t0;
+        const P = (k) => Array.from([].concat(g2.getParameter(k)));
+        r.stateKept = g2.getParameter(g2.FRAMEBUFFER_BINDING) === fb && P(g2.VIEWPORT).join() === '1,2,3,4' && g2.isEnabled(g2.BLEND) &&
+          g2.getParameter(g2.BLEND_EQUATION_RGB) === g2.FUNC_SUBTRACT && g2.getParameter(g2.BLEND_EQUATION_ALPHA) === g2.FUNC_REVERSE_SUBTRACT &&
+          P(g2.COLOR_CLEAR_VALUE).join() === '0.25,0.5,0.75,1' && P(g2.COLOR_WRITEMASK).join() === 'true,false,true,false' &&
+          g2.isEnabled(g2.SCISSOR_TEST) && g2.getParameter(g2.ACTIVE_TEXTURE) === g2.TEXTURE3 && g2.getError() === g2.NO_ERROR;
+        g2.bindFramebuffer(g2.FRAMEBUFFER, null);
+        const broken = new Proxy(g2, { get(t, k) {
+          if (k === 'blendEquation') return (m) => t.blendEquation(m === t.MIN ? t.FUNC_ADD : m);
+          const v = t[k]; return typeof v === 'function' ? v.bind(t) : v;
+        } });
+        r.broken = __fg.checkSupport(broken);
+        r.createQ = throws(() => __fg.createEngine(broken, srcs, { motionVersion: 2, v2Mode: 'quality' }));
+        const e = __fg.createEngine(broken, srcs, { motionVersion: 2, v2Mode: 'performance' });
+        const fr = (k) => { const d = new Uint8Array(64 * 48 * 4); for (let i = 0; i < d.length; i++) d[i] = ((i >> 2) * 7 + k * 3 + (i & 3) * 50) & 255; return { width: 64, height: 48, data: d }; };
+        e.pushFrame(fr(0)); e.pushFrame(fr(1));
+        r.perf = [e.estimate(), e.synth(0.5, undefined)];
+        r.setQ = throws(() => e.setSettings({ v2Mode: 'quality' }));
+        r.keptMode = e.settings.v2Mode + '/' + e.settings.motionVersion;
+        e.setSettings({ motionVersion: 1, v2Mode: 'quality' });   // V1 never needs it (and 'quality' is the default v2Mode)
+        r.v1 = [e.estimate(), e.synth(0.5, undefined)];
+        r.toV2 = throws(() => e.setSettings({ motionVersion: 2 }));
+        r.engineSupport = e.support && e.support.quality;
+        e.dispose();
+        r.glError = g2.getError();
+        const lose = g2.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext();
+      } catch (e) { r.error = err(e); }
       return r;
     },
 
