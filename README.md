@@ -43,7 +43,7 @@ Per generated frame at time `t` (`recordSynth`, cheap):
 | `Quality` (default) | Performance's field, plus an edge-aware per-pixel field, a static-overlay (HUD / subtitle) mask, coverage (which real frame still sees each spot) so the blend leans to the visible side, and blur along the motion where the two frames still disagree. |
 | `Performance` | The cleaned block field (re-pick among neighbours + vector median + bilateral smoothing), upsampled, and one full-resolution two-tap gather. |
 
-V2 supports SDR `Rgba8` (RGBA/BGRA) only; with any other format `settingsError()` / `initError()` refuse it. All UI-protection modes (including `CrosshairV2`) and motion blur work with both modes. `Settings::v2StaticMask` (default on, V2 only) adds a static-structure mask in both modes: HUD, text and static overlays, including semi-transparent panels and inverted-colour or blended crosshairs that `CrosshairV2` cannot lock on, stay in place; off = no such protection (the tests' unprotected reference). A change takes effect at the next estimate. V2 also tries block-vector candidates where its two taps disagree (fewer pasted / outlier artifacts and ring outlines), and a tap outside the frame takes the other tap. Switching `v2Mode` at runtime keeps the current estimate (no hitch); switching `motionVersion` drops it (the next synth returns false until the next estimate).
+V2 runs every format V1 runs (Rgba8, Rgb10, RgbaF16 encoded or linear / scRGB, Nv12, P010; HDR included), in both modes, with the static mask and motion blur: its synthesis has a shader variant per format and all its thresholds are in the same 8-bit levels of a perceptually encoded picture as V1's (PQ codes for linear light), see "Formats". All UI-protection modes (including `CrosshairV2`) and motion blur work with both modes. `Settings::v2StaticMask` (default on, V2 only) adds a static-structure mask in both modes: HUD, text and static overlays, including semi-transparent panels and inverted-colour or blended crosshairs that `CrosshairV2` cannot lock on, stay in place; off = no such protection (the tests' unprotected reference). A change takes effect at the next estimate. V2 also tries block-vector candidates where its two taps disagree (fewer pasted / outlier artifacts and ring outlines), and a tap outside the frame takes the other tap. Switching `v2Mode` at runtime keeps the current estimate (no hitch); switching `motionVersion` drops it (the next synth returns false until the next estimate).
 
 Cost, RX 7900 XTX, 1080p, back-to-back median ms per real pair (one estimate + N-1 synths):
 
@@ -59,6 +59,8 @@ Cost, RX 7900 XTX, 1080p, back-to-back median ms per real pair (one estimate + N
 Before the fix round (no static mask): 1440p 2x flowScale 2: 0.448 / 0.227 / 0.392 ms; 4K 2x flowScale 2: 0.897 / 0.462 / 0.849 ms.
 
 Quality, preliminary (reference clips, every 20th window, PSNR vs V1): Performance +0.46 dB, Quality +0.51 dB. The final judgement is the user's blind comparison.
+
+Other formats cost what Rgba8 does (1080p 2x fs 2, Performance / Quality: Rgb10 0.193 / 0.290, Nv12 0.189 / 0.283, P010 0.191 / 0.287 ms), RgbaF16 a little more (encoded 0.217 / 0.314, linear scRGB 0.256 / 0.362 ms: twice the bytes, and linear light is compared as PQ codes); table per format and flowScale in INTEGRATION.md "Motion version 2".
 
 ## Repository layout
 
@@ -127,10 +129,12 @@ The library is not limited to 8-bit RGB games. The format is picked once at `ini
 | `Nv12` | `R8_UNORM` (Y plane view; chroma `R8G8_UNORM`) | `Frame{Y view, CbCr view}` |
 | `P010` | `R16_UNORM` (Y plane view; chroma `R16G16_UNORM`; 10 bits in the high bits) | `Frame{Y view, CbCr view}` |
 
+- **Both motion versions run every format.** V1 and V2 (both modes, static mask, motion blur, every UI-protection mode), SDR and HDR (Rgb10 / RgbaF16 with PQ, RgbaF16 scRGB with values far above 1.0, P010 BT.2020 PQ): highlights are interpolated, never clipped (`formattest`'s HDR check: a 1000-4000-nit object moved to its mid position within 0.25 PQ levels).
 - **Rgba8 is untouched.** Each colour shader is built once per format from the same source (`-DFG_FORMAT_*`, `gpu/shaders/format.glsl`); with no define it compiles to the same SPIR-V as before (checked with `cmp` for all 20 shaders when formats landed; since the CrosshairV2 tap rejection the four warp shaders carry two more buffer bindings, and their *output* is checked by hash instead: Off, `Crosshair` and `WholeScreen` equal `origin/main` bit for bit in every format), keeps its header names, and a host that passes plain `VkImageView`s changes nothing. The other variants are only loaded when chosen. The motion estimate runs on luma and is the same code for every format.
 - **Thresholds keep their meaning.** Every level-based setting stays in "8-bit levels": the library converts what it measures to the levels of an 8-bit picture (10-bit codes / 4, PQ codes for linear float, YCbCr differences mapped to R'G'B'), so a number means the same perceived amount in every format. Blending and warping stay in the source's own space.
 - **Host contract.** NV12 / P010: one multi-planar image created with `MUTABLE_FORMAT | EXTENDED_USAGE`, plane views (`PLANE_0` as `R8`/`R16`, `PLANE_1` as `R8G8`/`R16G16`); `out`'s two views are both written (Y full, CbCr half resolution; chroma assumed centre-sited). Every format except Rgba8 and RgbaF16 needs the device feature `shaderStorageImageExtendedFormats`. `InitInfo::getFormatProps` lets `init()` check device support and report a reason (`initError()`).
-- **Memory** of one UI-protection clean copy at 1440p: Rgba8 / Rgb10 14.7 MB, RgbaF16 29.5 MB, Nv12 5.5 MB, P010 11.1 MB. **Embedded SPIR-V:** Rgba8 205 KB as before; Rgb10 +111 KB, RgbaF16 +120 KB, Nv12 and P010 +150 KB each.
+- **Memory** of one UI-protection clean copy at 1440p: Rgba8 / Rgb10 14.7 MB, RgbaF16 29.5 MB, Nv12 5.5 MB, P010 11.1 MB. **Embedded SPIR-V** per non-Rgba8 format: Rgb10 418 KB, RgbaF16 442 KB, Nv12 and P010 490 KB each (of which V2's synthesis 251 / 263 / 276 / 276 KB).
+- **Sizes:** from `Interpolator::kMinSize` (16 x 16) up to the device's limits, checked with a reason (`Interpolator::sizeError()`, `initError()`, `settingsError()`): RX 7900 XTX, both versions, every format, up to 16384 x 16384 at flowScale 2 / 4 and 12288 x 12288 at flowScale 1; verified with validation and GPU-AV from 16 x 16 to 7680 x 4320 (INTEGRATION.md "Formats").
 
 Full contract, the threshold table per format, build and gamescope notes: INTEGRATION.md "Formats".
 
@@ -212,10 +216,11 @@ python3 gpu/compare.py bench 100 --set flowScale=4,subpixel=0   # any mode: --se
 `fgtest` works on tightly packed RGBA8 files of W*H*4 bytes:
 
 ```
-fgtest [--bgra] [--split] [--t T1,T2,..] [--bench N [--mult M]] [--set k=v,..] [--then k=v,..] W H prev.rgba curr.rgba out.rgba [prev curr out ...]
+fgtest [--bgra] [--format F] [--split] [--t T1,T2,..] [--bench N [--mult M]] [--set k=v,..] [--then k=v,..] W H prev.rgba curr.rgba out.rgba [prev curr out ...]
 ```
 
 - `--bgra`: use `B8G8R8A8_UNORM` images (the file data stays RGBA).
+- `--format rgba8|rgb10|f16|f16lin|nv12|p010`: the image format of inputs and outputs; the files stay RGBA8 and are converted on upload and back on readback (rgb10 / f16 / p010 as PQ HDR, an 8-bit value v being 1000 (v/255)^2.4 nits; f16lin the same light as scRGB; nv12 BT.709 SDR; p010 BT.2020 PQ), so every format's output compares with the rgba8 one.
 - `--split`: `recordEstimate` + `recordSynth` instead of `record`.
 - `--t`: generated times (default 0.5). With several values, the k-th output goes to `out.rgba.<k>`.
 - `--bench N --mult M`: benchmark N iterations, one estimate + M-1 synths per pair.
@@ -248,7 +253,7 @@ gpu/build/uitest bench [W H]             # per-pass GPU times: moving / still / 
 `formattest` (needs no footage) checks every image format (Rgb10, RgbaF16 encoded and linear, NV12, P010) on the same kind of synthetic scene, single frames only (640x360 by default, a few milliseconds of GPU per format):
 
 ```sh
-gpu/build/formattest check [--separate-planes] [W H]   # per format: output vs the Rgba8 path, YUV planes written, blur, exact crosshair / HUD
+gpu/build/formattest check [--separate-planes] [--algo v1|v2] [--mode quality|performance] [W H]   # per format: output vs the Rgba8 path, YUV planes written, blur, exact crosshair / HUD, HDR highlights, size limits
                                                        # with UI protection, 10-bit gradient precision, float highlights above 1.0, API refusals
 gpu/build/formattest time [W H]                        # one GPU time per format (estimate + one synth), default 1920x1080
 ```
@@ -326,7 +331,7 @@ for (int k = 1; k < N; ++k)
 | `blurSamples` | 0 | Motion blur: sub-frames averaged by `recordSynthBlur()`. 0 or 1 = off, 2-16 on (see above). Runtime. |
 | `blurWeights` | Gaussian | `Even` (1/N each) or `Gaussian` (ends of the window at 2 sigma, weights taken at the slice centres). Runtime. |
 | `uiMaxStillFraction` | 0.75 | WholeScreen: above this still share (of cells outside the box) the whole-screen passes are skipped for that frame. 1 = never. |
-| `motionVersion` | V1 | `V1` or `V2` (see "Motion version 2"; V2 needs Rgba8). Runtime; a switch drops the current estimate. |
+| `motionVersion` | V1 | `V1` or `V2` (see "Motion version 2"; both run every format). Runtime; a switch drops the current estimate. |
 | `v2Mode` | Quality | V2 only: `Quality` or `Performance`. Runtime; a switch keeps the estimate. |
 | `flowScale` | 2 | Motion estimation at 1/flowScale resolution: 1, 2 or 4. 4 is much cheaper but can miss thin, fine motion. 1 is much slower and was not better on the test clips. (structural) |
 

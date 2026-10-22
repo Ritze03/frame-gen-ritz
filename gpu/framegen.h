@@ -29,9 +29,9 @@ enum class MotionVersion : uint32_t {
     V1 = 0,   // the algorithm of proto/interp.py (the frozen reference), every Format: output byte-identical to a library without the
               // choice. The default.
     V2 = 1,   // the second algorithm, next to V1 (unchanged): a "morphing" interpolator (content is warped along a smooth field and
-              // stretched over gaps; no real frame is shown locally, only the whole-frame scene-cut / flick fallbacks). Rgba8 only:
-              // settingsError() refuses it with any other Format. Settings::v2Mode picks between its two modes. Its motion estimate
-              // computes V1's block field with faster passes (shared by both modes).
+              // stretched over gaps; no real frame is shown locally, only the whole-frame scene-cut / flick fallbacks), every Format
+              // (its synthesis has a variant per Format, its thresholds are in the same 8-bit levels as V1's). Settings::v2Mode picks
+              // between its two modes. Its motion estimate computes V1's block field with faster passes (shared by both modes).
 };
 
 // The two modes of MotionVersion::V2 (Settings::v2Mode). Values are append-only and never renumbered. Runtime: setSettings() at any
@@ -232,8 +232,8 @@ struct Settings {
     uint32_t blurSamples = 0;
     BlurWeights blurWeights = BlurWeights::Gaussian;
 
-    // The motion algorithm (see MotionVersion). V1 = the default: output and memory exactly as before. V2 needs Format::Rgba8
-    // (settingsError()). Runtime: setSettings() at any time. A switch DROPS the current estimate: recordSynth / recordSynthBlur
+    // The motion algorithm (see MotionVersion). V1 = the default: output and memory exactly as before. Both run every Format.
+    // Runtime: setSettings() at any time. A switch DROPS the current estimate: recordSynth / recordSynthBlur
     // return false (out untouched, the host shows the real frame, as with no estimate since init/resize) until the next
     // recordEstimate, which runs the new version; an estimate of one version is never synthesised by the other. The first switch to a
     // version creates its pipelines (and later its buffers) at once, no GPU wait (false from setSettings if that fails, nothing
@@ -275,7 +275,8 @@ struct InitInfo {
     // Optional (instance-level, Vulkan 1.1): lets the library check that the device's subgroups can run MotionVersion::V2 (the
     // compute stage with the basic, vote, arithmetic, shuffle and clustered subgroup operations, subgroups of at least 16 lanes)
     // and refuse V2 with a reason (initError(); setSettings() / reconfigure() refuse it too, settingsError(const Settings&) says
-    // why). Null = no check, the host vouches for it. V1 never needs it.
+    // why). Null = no check, the host vouches for it. V1 never needs it. Also gives the device limits a frame size is checked
+    // against (Interpolator::sizeError(); null: the limits every device has).
     PFN_vkGetPhysicalDeviceProperties2 getProps2 = nullptr;
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;
     // RgbaF16 only. Fixed at init (it is baked into the pipelines): a stream does not change its encoding.
@@ -311,11 +312,20 @@ public:
     static bool validate(const Settings&);
     // validate() plus the rules that depend on the Format: null if the settings are valid for `format`, else why not (a string
     // literal). init(), setSettings() and reconfigure() refuse what it refuses (init() with this as initError()); a host whose
-    // setSettings() returned false can ask it why. Today's only Format rule: MotionVersion::V2 needs Format::Rgba8.
+    // setSettings() returned false can ask it why. (No setting depends on the Format today: both motion versions run every Format.)
     static const char* settingsError(const Settings&, Format format);
     // The same for this object: the active format's rules plus the device's (InitInfo::getProps2: MotionVersion::V2 needs the
-    // subgroup support listed there). What setSettings() and reconfigure() refuse; null if not initialised and the settings are valid.
+    // subgroup support listed there) plus the held frame size's under these settings (sizeError()). What setSettings() and
+    // reconfigure() refuse; null if not initialised and the settings are valid.
     const char* settingsError(const Settings&) const;
+    // Null if this object (its settings, its device's limits from InitInfo::getProps2) can hold a w x h frame, else why not (a
+    // string literal): below kMinSize, beyond the device's maxImageDimension2D, more than 2^30 pixels, a buffer beyond its
+    // maxStorageBufferRange or a dispatch beyond its maxComputeWorkGroupCount (both grow with the size / flowScale^2). init() fails
+    // with this as initError(), resize() refuses what it refuses. Without getProps2 the dispatch limit is the 65535 every device
+    // has and the buffer limit 4 GiB - 1. RX 7900 XTX (maxImageDimension2D 16384, 4 GiB - 1 buffers): both motion versions take
+    // every size up to 16384 x 16384 at flowScale 2 and 4, at flowScale 1 up to 12288 x 12288 (16384 x 16384 needs buffers past
+    // 4 GiB there); 7680 x 4320 (8K) fits everywhere. See INTEGRATION.md "Formats".
+    const char* sizeError(uint32_t width, uint32_t height) const;
     // The box size (pixels) a frame of w x h gets under these settings: the explicit uiBoxWidth/uiBoxHeight, else the
     // square from uiBoxHeightFrac (or the legacy uiCrosshairArea). The same numbers the library protects; for a host
     // preview. Does not check validity.

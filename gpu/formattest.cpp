@@ -1220,6 +1220,44 @@ static void apiChecks(int W, int H) {
     expect(!fg.resize(W, H, VK_FORMAT_R16G16B16A16_SFLOAT), "resize to another Format is refused (pipelines belong to the init format)");
     expect(fg.resize(W, H, VK_FORMAT_R8G8B8A8_UNORM) || true, "(resize within the format class is allowed)");
     fg.destroy();
+    {   // frame sizes: refused below kMinSize and beyond the device's limits, with a reason (init, resize, sizeError, settingsError)
+        Interpolator small;
+        InitInfo t = baseInfo(Enc::Rgba8, 15, 64, Settings{});
+        expect(!small.init(t) && small.initError() && strstr(small.initError(), "kMinSize"), "init refuses 15 x 64 (below kMinSize) with that reason");
+        if (small.initError()) printf("      reason: %s\n", small.initError());
+        t.width = t.height = Interpolator::kMinSize;
+        expect(small.init(t) && !small.sizeError(16, 16) && small.sizeError(16, 15) && !small.resize(16, 15, t.viewFormat),
+               "init at kMinSize x kMinSize succeeds; sizeError / resize refuse 16 x 15");
+        small.destroy();
+        printf("    sizeError at the device's limits (- = fits):\n");
+        const uint32_t sz[][2] = {{7680, 4320}, {8192, 8192}, {12288, 12288}, {16384, 16384}, {16385, 16}};
+        bool fits8k = true, refused = true;
+        for (int v = 0; v < 2; v++)
+            for (uint32_t fs : {1u, 2u, 4u}) {
+                Settings st;
+                st.flowScale = fs;
+#ifndef FORMATTEST_NO_MOTION
+                st.motionVersion = v ? MotionVersion::V2 : MotionVersion::V1;
+#endif
+                Interpolator fg2;
+                InitInfo ii = baseInfo(Enc::Rgba8, 64, 64, st);
+#ifndef FORMATTEST_NO_MOTION
+                ii.settings.motionVersion = st.motionVersion;
+#endif
+                if (!fg2.init(ii)) { expect(false, "init 64 x 64"); continue; }
+                printf("      %s fs%u:", v ? "V2" : "V1", fs);
+                for (auto& z : sz) {
+                    const char* e = fg2.sizeError(z[0], z[1]);
+                    printf("  %ux%u %s", z[0], z[1], e ? (strstr(e, "maxImageDimension2D") ? "image" : strstr(e, "BufferRange") ? "buffer" : strstr(e, "WorkGroupCount") ? "dispatch" : "other") : "-");
+                    if (z[0] == 7680 && e) fits8k = false;
+                    if (z[0] == 16385 && !e) refused = false;
+                }
+                printf("\n");
+                fg2.destroy();
+            }
+        expect(fits8k, "7680 x 4320 (8K) fits every motion version and flowScale");
+        expect(refused, "16385 px (beyond maxImageDimension2D 16384) is refused");
+    }
     InitInfo yuvNoChroma = baseInfo(Enc::Nv12, W, H, Settings{});
 #ifndef FORMATTEST_NO_MOTION
     yuvNoChroma.settings.motionVersion = MotionVersion::V1;   // (Nv12: V1 in every run)
