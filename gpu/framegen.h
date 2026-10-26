@@ -32,6 +32,21 @@ enum class MotionVersion : uint32_t {
               // stretched over gaps; no real frame is shown locally, only the whole-frame scene-cut / flick fallbacks), every Format
               // (its synthesis has a variant per Format, its thresholds are in the same 8-bit levels as V1's). Settings::v2Mode picks
               // between its two modes. Its motion estimate computes V1's block field with faster passes (shared by both modes).
+    Learned = 2,  // opt-in: V1 with its motion search replaced by a small learned estimator (ml-fg: a 5-level coarse-to-fine conv net
+                  // on the flow-res luma, Settings::learnedNet picks the weights, both embedded in the library). It writes what V1's
+                  // search writes (the per-pixel half-vector field, the scene-cut SAD sum); V1's synthesis, trust, fallbacks, motion
+                  // blur and UI protection are unchanged. Two (near-)identical frames (FGR's duplicate test: mean |a - c| <= 0.6
+                  // levels per channel) skip the net and get V1's answer for a still pair, a zero field. Float32 throughout.
+                  // flowScale 2 only (the nets were trained at 2). Every Format. Costs more GPU time and memory than V1 (see
+                  // INTEGRATION.md); V1 stays the default.
+};
+
+// The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. Both nets are the same
+// architecture (ml-fg export/SPEC.md); only the width (channels per hidden layer) differs.
+enum class LearnedNet : uint32_t {
+    E2v3 = 0,   // the default: width 24, 95,530 weights, 13.2 GMAC per 1080p pair. Better than V1 on average over ml-fg's 7 clips
+                // (+0.23 dB, much better on hard footage), 0.1-0.5 dB worse on FGR's own three.
+    E1v3 = 1,   // width 12, 28,330 weights, 3.9 GMAC (3.4x cheaper), 0.24 dB below E2v3 on average (on par with V1).
 };
 
 // The two modes of MotionVersion::V2 (Settings::v2Mode). Values are append-only and never renumbered. Runtime: setSettings() at any
@@ -232,7 +247,8 @@ struct Settings {
     uint32_t blurSamples = 0;
     BlurWeights blurWeights = BlurWeights::Gaussian;
 
-    // The motion algorithm (see MotionVersion). V1 = the default: output and memory exactly as before. Both run every Format.
+    // The motion algorithm (see MotionVersion). V1 = the default: output and memory exactly as before. Every version runs every
+    // Format (Learned needs flowScale 2).
     // Runtime: setSettings() at any time. A switch DROPS the current estimate: recordSynth / recordSynthBlur
     // return false (out untouched, the host shows the real frame, as with no estimate since init/resize) until the next
     // recordEstimate, which runs the new version; an estimate of one version is never synthesised by the other. The first switch to a
@@ -248,6 +264,11 @@ struct Settings {
     // the zero vector and keeps warp taps off them, with or without uiProtection. On = the default; off = V2's synthesis as without
     // it (the tests' unprotected reference). V1 ignores it. Runtime: setSettings() at any time, from the next recordEstimate on.
     bool v2StaticMask = true;
+    // MotionVersion::Learned: the net (see LearnedNet). E2v3 = the default. Other versions ignore it (any valid value, no effect).
+    // Runtime: setSettings() at any time, no GPU wait; the next recordEstimate runs the new net (the current estimate is kept). Both
+    // nets' weights are uploaded with the version's first estimate; a switch to a wider net grows the activation buffer (it only ever
+    // allocates; false from setSettings if that fails, nothing changed).
+    LearnedNet learnedNet = LearnedNet::E2v3;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
     // Motion estimation runs at 1/flowScale of the frame size: 1, 2 or 4. 2 = quality (default);
@@ -577,6 +598,30 @@ public:
     };
     bool debugMapLayout(DebugMapLayout& l) const;
     bool recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
+    // (MotionVersion::Learned has no block field: the block slot of recordDebugMaps is zero, the per-pixel field is the net's.)
+
+    // Debug / test only (gpu/mltest.cpp): MotionVersion::Learned's internals, to verify the net against ml-fg's test vectors. Nothing
+    // changes unless setDebugLearned() was called with a non-default value.
+    //   lumaSrc: every Learned recordEstimate replaces the flow-res lumas P_LUMA wrote (fw x fh float32 of prev, then of curr, 0..255,
+    //            tightly packed; TRANSFER_SRC usage, alive until those records retire) before the net and its SAD read them, so a test
+    //            can feed the reference's lumas (cv2's 15-bit luma instead of the library's 14-bit one).
+    //   stopLevel >= 0: the net stops after step stopStep of that level (0 = its 14-channel input, 1..4 = after hidden layer
+    //            stopStep - 1, 5 = after the field update); the per-pixel field and the SAD sum are then not written.
+    struct LearnedDebug { VkBuffer lumaSrc = VK_NULL_HANDLE; int stopLevel = -1, stopStep = 0; };
+    void setDebugLearned(const LearnedDebug& d);
+    // recordDebugLearned(): copies the latest Learned estimate's buffers into dst (TRANSFER_DST usage) at dstOffset, laid out as
+    // debugLearnedLayout() says (byte offsets relative to dstOffset): the net's state (per level l of the padded pyramid,
+    // n(l) = (pw >> l) * (ph >> l) pixels: la then lc (0..1) at pyrOff[l] (level 0 = the flow-res luma / 255, correctly rounded, so
+    // round(la * 1020) / 4 is the luma the net read); the field h at hOff[l], (x, y) float32 pairs in level-l pixels) and its
+    // activations (region r: channel group g (channels 4g..4g+3, vec4 float32) of level l at actOff[r] + 16 * g * n(l), planar; the
+    // 14-channel input and hidden layers 1 and 3 in region 0, layers 0 and 2 in region 1). Preceded by a COMPUTE write -> TRANSFER
+    // read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised or the selected version is not Learned.
+    struct DebugLearnedLayout {
+        uint32_t fw, fh, pw, ph, width;    // flow size, the net's padded level 0, the selected net's width
+        VkDeviceSize pyrOff[5], hOff[5], actOff[2], size;
+    };
+    bool debugLearnedLayout(DebugLearnedLayout& l) const;
+    bool recordDebugLearned(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
 
     static constexpr uint32_t kSetRing = 32;
     static constexpr uint32_t kUiSets = 64;    // descriptor sets of the UI-protection passes (see above)

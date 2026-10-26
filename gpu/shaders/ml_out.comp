@@ -1,0 +1,47 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::Learned, SPEC.md stages 5 + 6 at flow res: the finest field cropped to fw x fh is V1's per-pixel half-vector field
+// (field[pc.pf + y * fw + x], what pixfield.comp writes and recordSynth reads), and per 16x16 workgroup the partial sum of
+// |ya(q - h) - yc(q + h)| (bilinear, clamp to edge on the UNPADDED flow-res lumas of P_LUMA, 0..255) for ml_reduce.comp (mode 1).
+// A duplicate pair (u[U_MLDUP]): the field is zero, as V1's for two identical frames.
+#include "common.glsl"
+#include "ml_common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared float red[256];
+
+// reference.py bilinear() on luma[] (fw x fh)
+float bilY(int off, float x, float y) {
+    int w = pc.fw, h = pc.fh;
+    precise float xc = clamp(x, 0.0, float(w - 1)), yc = clamp(y, 0.0, float(h - 1));
+    float x0f = floor(xc), y0f = floor(yc);
+    int x0 = int(x0f), y0 = int(y0f);
+    int x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+    precise float fx = xc - x0f, fy = yc - y0f;
+    precise float r = luma[off + y0 * w + x0] * ((1.0 - fy) * (1.0 - fx)) + luma[off + y0 * w + x1] * ((1.0 - fy) * fx)
+                    + luma[off + y1 * w + x0] * (fy * (1.0 - fx)) + luma[off + y1 * w + x1] * (fy * fx);
+    return r;
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    float e = 0.0;
+    if (q.x < pc.fw && q.y < pc.fh) {
+        vec2 h = vec2(0.0);
+        if (!mlDup()) {
+            int ho = mlH(0) + 2 * (q.y * pc.pw + q.x);
+            h = vec2(ml[ho], ml[ho + 1]);
+            precise vec2 pa = vec2(q) - h, pc_ = vec2(q) + h;
+            e = abs(bilY(pc.offYa, pa.x, pa.y) - bilY(pc.offYc, pc_.x, pc_.y));
+        }
+        field[pc.pf + q.y * pc.fw + q.x] = h;
+    }
+    red[lid] = e;
+    barrier();
+    for (int k = 128; k > 0; k >>= 1) {
+        if (lid < k) red[lid] += red[lid + k];
+        barrier();
+    }
+    if (lid == 0) ml[mlPart() + int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x)] = red[0];
+}

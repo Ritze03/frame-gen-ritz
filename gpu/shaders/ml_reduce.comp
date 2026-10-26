@@ -1,0 +1,35 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::Learned: one workgroup sums the nPart partial sums of the pass before it (in a fixed order, so the result does not
+// depend on scheduling) and decides.
+//   mode 0, after ml_dup.comp: the duplicate test. Mean over the pixels of the channel-mean |a - c| <= dupDiff (0.6 levels, FGR's
+//           DUP_DIFF) -> u[U_MLDUP] = 1: the net is skipped and the field is zero.
+//   mode 1, after ml_out.comp: SPEC.md stage 6, sad = the mean over the fw x fh flow pixels of |ya(q - h) - yc(q + h)|, stored as V1
+//           stores its scene-cut sum: fallback.comp / blur_resolve.comp read meanSad = u[U_SADSUM] / 256 / (bw * bh), so
+//           u[U_SADSUM] = 256 * sad * bw * bh (rounded, saturated). A duplicate leaves it 0 (cleared by the estimate).
+#include "common.glsl"
+#include "ml_common.glsl"
+layout(local_size_x = 256) in;
+
+const int U_SADSUM_ = 1;   // == motion_v1.glsl U_SADSUM
+shared float red[256];
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    float s = 0.0;
+    for (int i = lid; i < pc.nPart; i += 256) s += ml[mlPart() + i];
+    red[lid] = s;
+    barrier();
+    for (int k = 128; k > 0; k >>= 1) {
+        if (lid < k) red[lid] += red[lid + k];
+        barrier();
+    }
+    if (lid != 0) return;
+    if (pc.mode == 0) {
+        if (red[0] <= pc.dupDiff * 3.0 * float(pc.W) * float(pc.H)) u[U_MLDUP] = 1u;
+        return;
+    }
+    if (mlDup()) return;
+    float sad = red[0] / (float(pc.fw) * float(pc.fh));
+    u[U_SADSUM_] = uint(min(roundEven(256.0 * sad * float(pc.bw * pc.bh)), 4294967040.0));
+}

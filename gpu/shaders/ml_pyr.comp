@@ -1,0 +1,61 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::Learned, SPEC.md stage 3: the net's own pyramid (not V1's: padded, 5 levels, exact 2x2 means). One workgroup per
+// 16x16 tile of the padded level 0, which is one pixel of level 4. Level 0 = the flow-res luma of P_LUMA (luma[offYa], fw x fh),
+// edge-replicated to pw x ph, / 255 (correctly rounded, as numpy's float32 division); level l + 1 = ((P(2x, 2y) + P(2x+1, 2y)) +
+// (P(2x, 2y+1) + P(2x+1, 2y+1))) * 0.25, in that order (reference.py pyramid()).
+#include "common.glsl"
+#include "ml_common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared float sa[256], sc[256];
+
+// x / 255 correctly rounded (x >= 0), as numpy's float32 division (GLSL's may be the hardware reciprocal, 2.5 ulp): q = x times the
+// rounded reciprocal is within 1 ulp of the correctly rounded quotient, so the answer is q or its neighbour on the remainder's side,
+// whichever leaves the smaller remainder (no ties: x / 255 is never a midpoint). The remainder x - 255 q is computed exactly without
+// fma (which Vulkan does not guarantee fused): (x - 256 q) + q, two exact (Sterbenz) differences, since 256 q is exact and ~x.
+float rem255(float x, float q) {
+    precise float d = x - q * 256.0;
+    precise float e = d + q;
+    return e;
+}
+float div255(float x) {
+    precise float q = x * (1.0 / 255.0);
+    float e = rem255(x, q);
+    if (e == 0.0) return q;
+    float n = uintBitsToFloat(floatBitsToUint(q) + (e > 0.0 ? 1u : 0xFFFFFFFFu));
+    return abs(rem255(x, n)) < abs(e) ? n : q;
+}
+
+void main() {
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);   // the dispatch covers pw x ph exactly (multiples of 16)
+    int lid = l.y * 16 + l.x;
+    ivec2 s = min(q, ivec2(pc.fw - 1, pc.fh - 1));   // edge replication (right and bottom only)
+    float a = div255(luma[pc.offYa + s.y * pc.fw + s.x]);
+    float c = div255(luma[pc.offYc + s.y * pc.fw + s.x]);
+    ml[mlPyr(0) + q.y * pc.pw + q.x] = a;
+    ml[mlPyr(0) + mlN(0) + q.y * pc.pw + q.x] = c;
+    sa[lid] = a;
+    sc[lid] = c;
+    barrier();
+    for (int lv = 1, n = 8; lv < ML_LEVELS; lv++, n >>= 1) {
+        bool on = l.x < n && l.y < n;
+        precise float na = 0.0, nc = 0.0;
+        if (on) {
+            int i = 2 * l.y * 16 + 2 * l.x;
+            na = ((sa[i] + sa[i + 1]) + (sa[i + 16] + sa[i + 17])) * 0.25;
+            nc = ((sc[i] + sc[i + 1]) + (sc[i + 16] + sc[i + 17])) * 0.25;
+        }
+        barrier();
+        if (on) {
+            sa[lid] = na;
+            sc[lid] = nc;
+            int w = pc.pw >> lv;
+            ivec2 o = ivec2(gl_WorkGroupID.xy) * n + l;
+            ml[mlPyr(lv) + o.y * w + o.x] = na;
+            ml[mlPyr(lv) + mlN(lv) + o.y * w + o.x] = nc;
+        }
+        barrier();
+    }
+}

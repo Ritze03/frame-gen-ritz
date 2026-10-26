@@ -1,0 +1,44 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::Learned, pass 1 (a colour pass: one variant per format): FGR's duplicate-frame test, the sum over all full-res
+// pixels of sum_channel |a - c| in 8-bit levels (proto/harness.py `err`: the mean over the three channels of |a - c|, its mean over
+// the frame compared with DUP_DIFF = 0.6; gpu/compare.py `mad` the same), one partial sum per workgroup of 32x32 pixels for
+// ml_reduce.comp (mode 0). Other formats: the levels of their mismatch metric (format.glsl), YCbCr as the R'G'B' difference.
+// Why: the net has no zero-motion prior: on two identical frames it outputs a non-zero field (mean 0.28 px, up to 4.9 px) and the
+// synthesis then changes ~39 % of the pixels, where V1 outputs exactly zero (ml-fg SPEC.md section 9a).
+#include "common.glsl"
+#include "ml_common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared float red[256];
+
+float pixDiff(ivec2 p) {
+#if defined(FG_YUV)
+    vec3 a = vec3(texelFetch(texPrev, p, 0).r, texelFetch(texPrevC, p >> 1, 0).rg) * YU_SCALE;
+    vec3 c = vec3(texelFetch(texCurr, p, 0).r, texelFetch(texCurrC, p >> 1, 0).rg) * YU_SCALE;
+    vec3 d = abs(fgYuvDiff(a - c));
+#elif defined(FG_FORMAT_F16)
+    vec3 d = abs(fgMetric(texelFetch(texPrev, p, 0).rgb) - fgMetric(texelFetch(texCurr, p, 0).rgb));
+#else
+    vec3 d = abs(FG_FETCH(texelFetch(texPrev, p, 0).rgb) - FG_FETCH(texelFetch(texCurr, p, 0).rgb));
+#endif
+    return d.r + d.g + d.b;
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy) * 2;   // 2x2 pixels per thread
+    float s = 0.0;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            ivec2 p = b + ivec2(i, j);
+            if (p.x < pc.W && p.y < pc.H) s += pixDiff(p);
+        }
+    red[lid] = s;
+    barrier();
+    for (int k = 128; k > 0; k >>= 1) {
+        if (lid < k) red[lid] += red[lid + k];
+        barrier();
+    }
+    if (lid == 0) ml[mlPart() + int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x)] = red[0];
+}
