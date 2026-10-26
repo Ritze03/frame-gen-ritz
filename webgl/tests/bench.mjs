@@ -5,7 +5,8 @@
 // --gpu: hardware GL through ANGLE (FG_ANGLE=vulkan default, or gl); otherwise SwiftShader (CPU: only relative numbers mean much).
 // Modes: v1, v2p (V2 Performance), v2q (V2 Quality), ml2 / ml1 (V1 with the learned estimator e2v3 / e1v3, motionPrecision fp16;
 // ml2f / ml1f: fp32; flowScale 2 only), each with the zero-motion test (the default); a suffix n turns the zero test off (ml2n,
-// ml2fn, ...), a suffix g turns the static guard on (ml2g, ml2ng, ...).
+// ml2fn, ...), a suffix g turns the static guard on (ml2g, ml2ng, ...). Any net by its name the same way: e2v4 (fp16), e2v4f (fp32),
+// e2v4n, e2v4fg, ... (ml2 = e2v3, ml1 = e1v3; webgl/nets/<net>.js must exist).
 // --size: the pair resampled (bilinear) to W x H first, e.g. 2560x1440 from the 1080p pair.
 // GPU time (EXT_disjoint_timer_query_webgl2) of pushFrame (the raw RGBA upload from JS + luma pyramid) and of estimate + synths, when the browser exposes it, else wall time per pair with a gl.finish() each
 // (includes the CPU side of the GL calls). Prints the median and the minimum over --iters pairs after 10 warm-up pairs.
@@ -38,7 +39,8 @@ const SET = { v1: { motionVersion: 1, motion: 'search' }, v2p: { motionVersion: 
   ml2: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3', motionPrecision: 'fp16' }, ml1: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3', motionPrecision: 'fp16' },
   ml2f: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3', motionPrecision: 'fp32' }, ml1f: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3', motionPrecision: 'fp32' } };
 const setOf = (mode) => {   // (every learned mode sets both switches: settings persist across modes)
-  const m = /^(ml[12]f?)(n?)(g?)$/.exec(mode);
+  const m = /^(ml[12]f?)(n?)(g?)$/.exec(mode), k = /^(e\d+v\d+)(f?)(n?)(g?)$/.exec(mode);
+  if (k) return { motionVersion: 1, motion: 'learned', motionNet: k[1], motionPrecision: k[2] ? 'fp32' : 'fp16', learnedZeroTest: !k[3], learnedStaticGuard: !!k[4] };
   if (!m) return SET[mode];
   return { ...SET[m[1]], learnedZeroTest: !m[2], learnedStaticGuard: !!m[3] };
 };

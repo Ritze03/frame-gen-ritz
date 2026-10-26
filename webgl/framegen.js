@@ -98,7 +98,7 @@
   // The learned motion estimator (settings.motion 'learned', V1 only; ml-fg export/SPEC.md), compiled the first time it is selected.
   // The convs are one program per shape. motionPrecision 'fp32' (conv.frag.glsl: ML_CIN RGBA32F input textures, ML_COUT output
   // textures, ML_LAST the 2-channel output layer): a net of width w (G = w / 4 textures per activation) uses ml_conv4x3 (layer 0: the
-  // 14-channel input in 4 textures), ml_conv<G>x3 (layers 1-3) and ml_last<G>; G = 6 (e2v3) splits each layer into two passes of 3
+  // 14-channel input in 4 textures), ml_conv<G>x3 (layers 1-3) and ml_last<G>; G = 6 (e2v4 / e2v3) splits each layer into two passes of 3
   // output textures. 'fp16' (conv_h.frag.glsl, 8 half floats per RGBA32UI texel): ml_h<CIN>g<CG>o<COUT>[L], one pass per layer.
   const ML_INC = 'learned/ml_common.inc.glsl';
   const SG_INC = 'learned/sguard.inc.glsl';   // the static guard's constants and weight (learned/sguard.inc.glsl's top block)
@@ -146,7 +146,7 @@
       '#define FG_SGUARD 1\n'],
   ];
   const ML_DUP_DIFF = 0.6;                   // learned/ml_common.inc.glsl's (the duplicate-pair test)
-  const ML_NETS = ['e2v3', 'e1v3'];          // settings.motionNet values (the first is the default); weights: webgl/nets/<name>.js
+  const ML_NETS = ['e2v4', 'e2v3', 'e1v3'];  // settings.motionNet values (DEFAULTS.motionNet is the first); weights: webgl/nets/<name>.js
   const ML_BLOCK_MAX = (3 * 9 * 6 * 16 + 3 * 4) * 4;   // bytes of the largest weight block (conv6x3, conv_h's MlW / MlW2)
 
   fg.shaderFiles = (function () {
@@ -210,7 +210,8 @@
     blurWeights: 'gaussian', // synthBlur: 'gaussian' or 'even' (Settings::blurWeights)
     motion: 'search',       // V1 only: 'search' (V1's block search, proto/interp.py) or 'learned' (the learned estimator: needs flowScale 2
                             // and the net's weights, webgl/nets/<motionNet>.js; ignored by V2)
-    motionNet: 'e2v3',      // motion 'learned': 'e2v3' (width 24, 95,530 weights) or 'e1v3' (width 12, 28,330 weights, ~3.4x cheaper)
+    motionNet: 'e2v4',      // motion 'learned': 'e2v4' (width 24, 95,530 weights: e2v3 fine-tuned, same layout and cost), 'e2v3' (width 24)
+                            // or 'e1v3' (width 12, 28,330 weights, ~3.4x cheaper)
     motionPrecision: 'fp16', // motion 'learned': storage of the net's activations, 'fp16' (8 halves per RGBA32UI texel) or 'fp32' (RGBA32F, exact);
                             // the field, the pyramid, the weights and all arithmetic are float32 either way
     learnedZeroTest: true,  // motion 'learned': the zero-motion test after the net (ml-fg SPEC stage 7, V1's zero candidate: per flow pixel the net's

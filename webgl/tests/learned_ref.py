@@ -2,7 +2,7 @@
 """Python side of learned.mjs (the learned motion estimator vs the ml-fg test vectors). Reads $FG_MLFG_EXPORT (default
 ~/Schinken/Programming/Local/ml-fg/export, read only), writes under $FG_WORK/learned.
 
-    python3 -I learned_ref.py prep           every <net>/testvec/<pair>: a.rgba, c.rgba (the PNGs decoded by cv2 to 8-bit BGR, as
+    python3 -I learned_ref.py prep           every <net>/testvec/<pair> (net: each webgl/nets/<net>.js): a.rgba, c.rgba (the PNGs decoded by cv2 to 8-bit BGR, as
                                              RGBA, row 0 = top), b.bgr (the real middle frame from $FG_FOOTAGE, default <repo>/footage,
                                              when the pair comes from one clip and the footage reproduces a.png) and manifest.json
     python3 -I learned_ref.py synth          end to end through proto/interp.py's synth (export/SPEC.md section 8 step 6): for every
@@ -33,8 +33,15 @@ TS = (0.5, 0.25)
 SCRIPTS = os.environ.get('FG_MLFG_SCRIPTS', os.path.join(os.path.dirname(os.path.abspath(EXPORT)), 'scripts'))   # static_guard.py
 
 
+def nets():
+    """The nets the engine can load (webgl/nets/<net>.js), in name order."""
+    d = os.path.join(here, '..', 'nets')
+    return sorted(f[:-3] for f in os.listdir(d) if f.endswith('.js'))
+
+
 def pairs():
-    for net in ('e2v3', 'e1v3'):
+    """Every (net, pair, dir) of the loadable nets: the pairs are the export's testvec/<pair>/ directories with a vec.json."""
+    for net in nets():
         root = os.path.join(EXPORT, net, 'testvec')
         if not os.path.isdir(root):
             continue
