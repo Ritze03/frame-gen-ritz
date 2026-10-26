@@ -62,6 +62,12 @@ Quality, preliminary (reference clips, every 20th window, PSNR vs V1): Performan
 
 Other formats cost what Rgba8 does (1080p 2x fs 2, Performance / Quality: Rgb10 0.193 / 0.290, Nv12 0.189 / 0.283, P010 0.191 / 0.287 ms), RgbaF16 a little more (encoded 0.217 / 0.314, linear scRGB 0.256 / 0.362 ms: twice the bytes, and linear light is compared as PQ codes); table per format and flowScale in INTEGRATION.md "Motion version 2".
 
+## Learned motion estimate (testing)
+
+`MotionVersion::Learned` is opt-in. It is V1 with its motion search replaced by ml-fg's learned estimator, a 5-level conv net on the flow-res luma. It writes V1's per-pixel field and scene-cut SAD, and V1's synthesis, fallbacks, motion blur and UI protection are unchanged. `Settings::learnedNet` picks `E2v3` (default, width 24) or `E1v3` (width 12, about 2.5x cheaper). `Settings::learnedHalf` stores the activations as fp16. It needs `flowScale` 2 and runs every format. Two (near-)identical frames (mean |a - c| ≤ 0.6 levels) skip the net and get a zero field. The weights are embedded at build time (`gpu/ml/`, `embed_weights.py`). The WebGL backend has the same estimator (`motion: 'learned'`, `webgl/nets/`).
+
+It costs more than V1: 1080p 2x, back-to-back per pair, e2v3 1.30 ms (half 0.98), e1v3 0.51 ms, against V1's 0.29 ms. Parity with ml-fg's test vectors (`gpu/mltest.cpp`, `gpu/ml/synthcheck.py`), memory, the API differences to the WebGL side and the known issues are in `ML-FG-TESTING.md`. One of those issues: static HUD text over moving content is warped, because the net has no zero-motion prior.
+
 ## Repository layout
 
 | Path | Contents |
@@ -80,6 +86,8 @@ Other formats cost what Rgba8 does (1080p 2x fs 2, Performance / Quality: Rgb10 
 | `gpu/formattest.cpp` | Single-frame checks of every image format (Rgb10, RgbaF16, Nv12, P010) against Rgba8 on a synthetic scene |
 | `gpu/blurtest.cpp`, `gpu/blendbench.comp` | Validation and benchmark of the motion blur on a synthetic scene (the shader is the naive blend the benchmark compares against) |
 | `gpu/compare.py` | GPU vs Python reference checks, and the benchmark runs |
+| `gpu/ml/`, `gpu/shaders/ml_*`, `gpu/mltest.cpp` | `MotionVersion::Learned`: the nets' weights (ml-fg export) and `embed_weights.py`, its passes, its test against ml-fg's test vectors (`ml/synthcheck.py`: end to end) |
+| `ML-FG-TESTING.md` | QC record of the learned motion estimator (both backends): status, parity, cost, integration notes |
 | `INTEGRATION.md` | Integration spec for gamescope-ritz, full API contract, settings, costs |
 
 ## Results
@@ -331,7 +339,8 @@ for (int k = 1; k < N; ++k)
 | `blurSamples` | 0 | Motion blur: sub-frames averaged by `recordSynthBlur()`. 0 or 1 = off, 2-16 on (see above). Runtime. |
 | `blurWeights` | Gaussian | `Even` (1/N each) or `Gaussian` (ends of the window at 2 sigma, weights taken at the slice centres). Runtime. |
 | `uiMaxStillFraction` | 0.75 | WholeScreen: above this still share (of cells outside the box) the whole-screen passes are skipped for that frame. 1 = never. |
-| `motionVersion` | V1 | `V1` or `V2` (see "Motion version 2"; both run every format). Runtime; a switch drops the current estimate. |
+| `motionVersion` | V1 | `V1`, `V2` (see "Motion version 2") or `Learned` (see "Learned motion estimate"; flowScale 2 only); all run every format. Runtime; a switch drops the current estimate. |
+| `learnedNet`, `learnedHalf` | E2v3, false | Learned only: the net (`E2v3` / `E1v3`) and fp16 activation storage. Runtime; the next estimate uses them. |
 | `v2Mode` | Quality | V2 only: `Quality` or `Performance`. Runtime; a switch keeps the estimate. |
 | `flowScale` | 2 | Motion estimation at 1/flowScale resolution: 1, 2 or 4. 4 is much cheaper but can miss thin, fine motion. 1 is much slower and was not better on the test clips. (structural) |
 
