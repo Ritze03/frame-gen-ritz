@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // Cost per real pair (push the new frame + estimate + synth(0.5) = 2x) of each motion version in headless Chromium.
 //   node webgl/tests/bench.mjs [--gpu] [--pair battlefield] [--modes v1,v2p,v2q,ml2,ml1,ml2f,ml1f] [--fs 2] [--iters 60] [--mult 2] [--size WxH]
+// --passes: also GPU time per pass (timer query around every draw).
 // --gpu: hardware GL through ANGLE (FG_ANGLE=vulkan default, or gl); otherwise SwiftShader (CPU: only relative numbers mean much).
 // Modes: v1, v2p (V2 Performance), v2q (V2 Quality), ml2 / ml1 (V1 with the learned estimator e2v3 / e1v3, motionPrecision fp16;
-// ml2f / ml1f: fp32; flowScale 2 only).
+// ml2f / ml1f: fp32; flowScale 2 only), each with the zero-motion test (the default); a suffix n turns the zero test off (ml2n,
+// ml2fn, ...), a suffix g turns the static guard on (ml2g, ml2ng, ...).
 // --size: the pair resampled (bilinear) to W x H first, e.g. 2560x1440 from the 1080p pair.
 // GPU time (EXT_disjoint_timer_query_webgl2) of pushFrame (the raw RGBA upload from JS + luma pyramid) and of estimate + synths, when the browser exposes it, else wall time per pair with a gl.finish() each
 // (includes the CPU side of the GL calls). Prints the median and the minimum over --iters pairs after 10 warm-up pairs.
@@ -35,6 +37,11 @@ console.log(`browser : Chromium ${E.version}, renderer ${E.init.info.renderer}`)
 const SET = { v1: { motionVersion: 1, motion: 'search' }, v2p: { motionVersion: 2, v2Mode: 'performance' }, v2q: { motionVersion: 2, v2Mode: 'quality' },
   ml2: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3', motionPrecision: 'fp16' }, ml1: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3', motionPrecision: 'fp16' },
   ml2f: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3', motionPrecision: 'fp32' }, ml1f: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3', motionPrecision: 'fp32' } };
+const setOf = (mode) => {   // (every learned mode sets both switches: settings persist across modes)
+  const m = /^(ml[12]f?)(n?)(g?)$/.exec(mode);
+  if (!m) return SET[mode];
+  return { ...SET[m[1]], learnedZeroTest: !m[2], learnedStaticGuard: !!m[3] };
+};
 await E.page.addScriptTag({ content: `
 window.__bench = async function (job) {
   const gl = window.__x._gl();
@@ -135,11 +142,12 @@ window.__bench = async function (job) {
   const med = (v) => { const s = v.slice().sort((x, y) => x - y); return s.length ? s[s.length >> 1] : null; };
   return { wall: med(wall), wallMin: Math.min(...wall), push: med(gpuPush), gpu: med(gpu), batch: med(batch), bE: med(batchE), bS: med(batchS), perPass, gpuMin: gpu.length ? Math.min(...gpu) : null, timer: !!tq, passCounts: eng.passCounts() };
 };` });
+for (const mode of opt.modes) if (!setOf(mode)) { console.error('bench: unknown mode ' + mode); process.exit(2); }
 for (const mode of opt.modes) for (const S of opt.fs) {
   const W = opt.size ? opt.size[0] : p.width, H = opt.size ? opt.size[1] : p.height;
-  const r = await E.page.evaluate((j) => window.__bench(j), { pair: p.name, W, H, W0: p.width, H0: p.height, size: opt.size, settings: { ...SET[mode], flowScale: S }, passes: opt.passes, iters: opt.iters, mult: opt.mult });
+  const r = await E.page.evaluate((j) => window.__bench(j), { pair: p.name, W, H, W0: p.width, H0: p.height, size: opt.size, settings: { ...setOf(mode), flowScale: S }, passes: opt.passes, iters: opt.iters, mult: opt.mult });
   const f = (v) => (v == null ? '-' : v.toFixed(3));
   if (r.perPass) console.log('  per pass (ms): ' + Object.entries(r.perPass).sort((x, y) => y[1] - x[1]).map(([k, v]) => `${k} ${v.toFixed(3)}`).join(', '));
-  console.log(`${mode.padEnd(4)} fs${S} ${p.name} ${W}x${H} ${opt.mult}x: wall ${f(r.wall)} ms (min ${f(r.wallMin)})  gpu: push ${f(r.push)} ms + estimate/synth ${f(r.gpu)} ms (min ${f(r.gpuMin)}), back-to-back ${f(r.batch)} ms (estimate ${f(r.bE)}, synth ${f(r.bS)})${r.timer ? '' : ' [no timer query]'}  passes ${JSON.stringify(r.passCounts)}`);
+  console.log(`${mode.padEnd(5)} fs${S} ${p.name} ${W}x${H} ${opt.mult}x: wall ${f(r.wall)} ms (min ${f(r.wallMin)})  gpu: push ${f(r.push)} ms + estimate/synth ${f(r.gpu)} ms (min ${f(r.gpuMin)}), back-to-back ${f(r.batch)} ms (estimate ${f(r.bE)}, synth ${f(r.bS)})${r.timer ? '' : ' [no timer query]'}  passes ${JSON.stringify(r.passCounts)}`);
 }
 await E.browser.close();

@@ -14,8 +14,19 @@
 //     act_top0..3, raw_top max |d| <= 5e-5; pf mean |d| <= 2e-4 px and max |d| <= 5e-2 px; sad relative error <= 1e-3.
 //   motionPrecision 'fp16' (half-float activations, SPEC section 7: judged by the synthesised frame): sad relative error <= 1e-2;
 //     pf and the intermediates are reported, not gated.
-// Duplicate skip (per net x precision): a == c gives pixfield 0, sad 0, duplicate true, and an output identical to the input at
-// t = 0.5 and 0.25; a near-duplicate (+-1 level noise, mean |a - c| < 0.6) is skipped too; the test pairs are not.
+//   The rows above run with settings.learnedZeroTest false (the net's own field).
+// Zero-motion test (settings.learnedZeroTest true, SPEC stage 7, the vectors' *_zt files), the same pair estimated again: the net's
+// field (ml.pfNet) bit-identical to the run without the test; the same cut_zt; synth(final pf) vs synth(pf_zt) at t = 0.5 / 0.25
+// >= 70 dB for 'fp32' (SPEC section 8's gate for an exact port), >= 45 dB otherwise; vs the real middle frame within 0.05 dB of
+// synth(pf_zt)'s; engine output vs synth(pf_zt) MAE <= 1 level.
+//   'fp32': zero-mask agreement with zero_zt >= 99.9%; pf vs pf_zt on the pixels where the masks agree mean <= 2e-4 px, max <= 5e-2
+//     px; sad_zt relative error <= 1e-3; C(0) (independent of the field) max |d| <= 2e-3 levels against cost0_zt.
+//   'fp16' / 'hdr': sad_zt relative error <= 1e-2; the mask agreement, pf and costs are reported, not gated.
+// Duplicate skip (per net x precision x zero test on / off): a == c gives pixfield 0, sad 0, duplicate true, and an output identical
+// to the input at t = 0.5 and 0.25; a near-duplicate (+-1 level noise, mean |a - c| < 0.6) is skipped too; the test pairs are not.
+// Static guard (settings.learnedStaticGuard; e2v3 fp32 with the zero test, pairs overlay / motion / cut): the guarded output vs ml-fg's
+// scripts/static_guard.py on the engine's own a, c, unguarded output and field at t: max |d| <= 1 level (RGBA8 and RGBA16F input);
+// the guard switched off again gives the unguarded output bit for bit; a fallback frame (cut) is unchanged.
 // Exit 0 PASS, 1 FAIL, 2 setup error.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -34,7 +45,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--json') opt.json = nx();
   else { console.error('learned: unknown argument ' + a); process.exit(2); }
 }
-const TOL = { top: 5e-5, pfMean: 2e-4, pfMax: 5e-2, sadRel: 1e-3, sadRel16: 1e-2, synthDb: 45, midDb: 0.05, engineMae: 1.0 };
+const TOL = { top: 5e-5, pfMean: 2e-4, pfMax: 5e-2, sadRel: 1e-3, sadRel16: 1e-2, synthDb: 45, midDb: 0.05, engineMae: 1.0,
+  ztAgree: 0.999, ztSynthDb: 70, cost: 2e-3, sgMax: 1.0 };
 const py = (mode) => {
   const r = spawnSync('python3', ['-I', path.join(here, 'learned_ref.py'), mode], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', env: { ...process.env, FG_WORK: work } });
   if (r.status !== 0) { console.error(`learned: learned_ref.py ${mode} failed (${r.status})`); process.exit(2); }
@@ -79,7 +91,7 @@ await E.page.addScriptTag({ content: `
     try {
       let a = await get(job.dir + '/a.rgba'), c = await get(job.dir + '/c.rgba');
       R.setSettings = eng.setSettings({ motionVersion: 1, motion: 'learned', motionNet: job.net, motionPrecision: job.prec, flowScale: 2,
-        inputFormat: job.f16in ? 'rgba16f' : 'rgba8', transfer: 'encoded' });
+        learnedZeroTest: false, learnedStaticGuard: false, inputFormat: job.f16in ? 'rgba16f' : 'rgba8', transfer: 'encoded' });
       if (job.f16in) { a = Float32Array.from(a, (v) => v / 255); c = Float32Array.from(c, (v) => v / 255); }
       eng.pushFrame({ width: job.W, height: job.H, data: a });
       eng.pushFrame({ width: job.W, height: job.H, data: c });
@@ -119,6 +131,26 @@ await E.page.addScriptTag({ content: `
         }
         R['stats' + t] = eng.stats();
       }
+      // the zero-motion test on the same pair (the setting change drops the estimate; the frames stay)
+      eng.setSettings({ learnedZeroTest: true });
+      const Z = R.zt = { t: {} };
+      Z.estimate = eng.estimate();
+      const pfNet = eng.debugRead('ml.pfNet').data;
+      Z.pfNetDiff = 0;
+      for (let i = 0; i < pfNet.length; i++) if (pfNet[i] !== pf.data[i]) Z.pfNetDiff++;
+      const sz = eng.stats();
+      Z.sad = sz.meanSad; Z.cut = sz.cut; Z.duplicate = sz.duplicate;
+      await post(job.tag + '/zt_pf', eng.debugRead('pixfield').data);
+      await post(job.tag + '/zt_zt', eng.debugRead('ml.zt').data);
+      for (const t of [0.5, 0.25]) {
+        Z.t[t] = eng.synth(t, undefined);
+        if (Z.t[t]) {
+          const o = eng.debugRead('out').data;
+          await post(job.tag + '/zt_out_t' + t, job.f16in ? Uint8Array.from(o, (v) => Math.min(255, Math.max(0, Math.round(v * 255)))) : o);
+        }
+      }
+      Z.passCounts = eng.passCounts();
+      eng.setSettings({ learnedZeroTest: false });
       if (job.f16in) eng.setSettings({ inputFormat: 'rgba8' });
       R.glError = window.__x._gl().getError();
     } catch (e) { R.error = err(e); }
@@ -130,7 +162,7 @@ await E.page.addScriptTag({ content: `
     const eng = window.__x._engine();
     try {
       const a = await get(job.dir + '/a.rgba');
-      eng.setSettings({ motionVersion: 1, motion: 'learned', motionNet: job.net, motionPrecision: job.prec, flowScale: 2 });
+      eng.setSettings({ motionVersion: 1, motion: 'learned', motionNet: job.net, motionPrecision: job.prec, flowScale: 2, learnedZeroTest: job.zt });
       const zeroField = () => { const f = eng.debugRead('pixfield').data; let n = 0; for (let i = 0; i < f.length; i++) if (f[i] !== 0) n++; return n; };
       const one = (c) => {
         const r = {};
@@ -154,6 +186,42 @@ await E.page.addScriptTag({ content: `
       let k = 12345;
       for (let i = 0; i < nd.length; i++) { if ((i & 3) === 3) continue; k = (k * 1103515245 + 12345) >>> 0; const r = k >>> 29; if (r === 0 && nd[i] < 255) nd[i]++; else if (r === 1 && nd[i] > 0) nd[i]--; }
       R.near = one(nd);
+      R.glError = window.__x._gl().getError();
+    } catch (e) { R.error = err(e); }
+    return R;
+  };
+  // the static guard on one pair: per t the unguarded output, the field at t and the guarded output (dumped for learned_ref.py
+  // sguard), then the guard off again (must give the unguarded output)
+  window.__sgTest = async function (job) {
+    const R = { t: {} };
+    const eng = window.__x._engine();
+    try {
+      let a = await get(job.dir + '/a.rgba'), c = await get(job.dir + '/c.rgba');
+      eng.setSettings({ motionVersion: 1, motion: 'learned', motionNet: job.net, motionPrecision: job.prec, flowScale: 2, learnedZeroTest: true,
+        learnedStaticGuard: false, inputFormat: job.f16in ? 'rgba16f' : 'rgba8', transfer: 'encoded' });
+      if (job.f16in) { a = Float32Array.from(a, (v) => v / 255); c = Float32Array.from(c, (v) => v / 255); }
+      eng.pushFrame({ width: job.W, height: job.H, data: a });
+      eng.pushFrame({ width: job.W, height: job.H, data: c });
+      R.estimate = eng.estimate();
+      for (const t of job.ts) {
+        const r = R.t[t] = {};
+        const out = () => { r.ok = eng.synth(t, undefined) && (r.ok !== false); return eng.debugRead('out').data.slice(); };
+        eng.setSettings({ learnedStaticGuard: false });
+        const o0 = out();
+        const field = eng.debugRead(t === 0.5 ? 'pixfield' : 'fieldT').data;
+        eng.setSettings({ learnedStaticGuard: true });
+        const og = out();
+        r.passCounts = eng.passCounts();
+        r.fallback = eng.stats().fallback;
+        eng.setSettings({ learnedStaticGuard: false });
+        const o1 = out();
+        r.offDiff = 0;
+        for (let i = 0; i < o0.length; i++) if (o0[i] !== o1[i]) r.offDiff++;
+        r.guardDiff = 0;
+        for (let i = 0; i < o0.length; i++) if (o0[i] !== og[i]) r.guardDiff++;
+        await post(job.tag + '/' + t + '/out0', o0); await post(job.tag + '/' + t + '/outg', og); await post(job.tag + '/' + t + '/field', field);
+      }
+      if (job.f16in) eng.setSettings({ inputFormat: 'rgba8' });
       R.glError = window.__x._gl().getError();
     } catch (e) { R.error = err(e); }
     return R;
@@ -200,6 +268,32 @@ for (const { p, prec, variant } of jobs) {
     row.cut = r.cut; row.cutExp = p.cut; row.duplicate = r.duplicate; row.dupDiff = r.dupDiff;
     row.passCounts = r.passCounts; row.glError = r.glError;
     row.middle = p.middleWhy;
+    if (p.files.pf_zt) {   // the zero-motion test vs the *_zt vectors
+      const Z = r.zt, fwh = p.flow[0] * p.flow[1];
+      const zpf = dump('zt_pf'), zt = dump('zt_zt'), xpf = x('pf_zt'), xmask = fs.readFileSync(p.files.zero_zt.file);
+      const ch = p.files.cost_h_zt ? x('cost_h_zt') : null, c0 = p.files.cost0_zt ? x('cost0_zt') : null;
+      let agree = 0, zeroed = 0, pfMax = 0, pfSum = 0, nAg = 0, chMax = 0, chAgMax = 0, c0Max = 0;
+      for (let i = 0; i < fwh; i++) {
+        const m = zt[4 * i + 3] > 0.5;
+        if (m) zeroed++;
+        const ag = m === (xmask[i] === 1);
+        if (ag) {
+          agree++;
+          for (let k = 0; k < 2; k++) { const d = Math.abs(zpf[2 * i + k] - xpf[2 * i + k]); pfSum += d; nAg++; if (!(d <= pfMax)) pfMax = d; }
+        }
+        if (ch) { const d = Math.abs(zt[4 * i + 1] - ch[i]); if (!(d <= chMax)) chMax = d; if (ag && !(d <= chAgMax)) chAgMax = d; }
+        if (c0) { const d = Math.abs(zt[4 * i + 2] - c0[i]); if (!(d <= c0Max)) c0Max = d; }
+      }
+      row.zt = { agree: agree / fwh, flipped: fwh - agree, zeroed: zeroed / fwh, zeroedExp: p.zeroed_zt, pfMax, pfMean: pfSum / nAg,
+        chMax: ch ? chMax : null, chAgMax: ch ? chAgMax : null, c0Max: c0 ? c0Max : null, sad: Z.sad, sadExp: p.sad_zt,
+        sadRel: Math.abs(Z.sad - p.sad_zt) / Math.max(1, p.sad_zt), cut: Z.cut, cutExp: p.cut_zt, duplicate: Z.duplicate,
+        pfNetDiff: Z.pfNetDiff, passCounts: Z.passCounts };
+      const oz = path.join(o, 'zt');
+      fs.mkdirSync(oz, { recursive: true });
+      fs.writeFileSync(path.join(oz, 'pf.f32'), E.dumps.get(`${tag}/zt_pf`));
+      fs.writeFileSync(path.join(oz, 'est.json'), JSON.stringify({ sad: Z.sad, cut: Z.cut }));
+      for (const t of [0.5, 0.25]) { const b = E.dumps.get(`${tag}/zt_out_t${t}`); if (b) fs.writeFileSync(path.join(oz, `out_t${t}.rgba`), b); }
+    }
     rows.push(row);
   }
 }
@@ -243,29 +337,110 @@ for (const row of rows) {
     `${mid.padEnd(18)} ${mae.toFixed(3).padEnd(8)} ` + (row.ok ? 'PASS' : 'FAIL ' + fails.join('; ')));
 }
 
-// the duplicate skip, per net and precision, on the motion pair's first frame
+// the zero-motion test rows
+console.log('\nzero-motion test (learnedZeroTest true) vs the *_zt vectors:\nnet  pair    prec mask agree   flipped zeroed (exp)    pf mean  pf max   C(h) max C(0) max ' +
+  'sad_zt (expected)   rel      cut   synth dB t.5/.25  vs middle (exp)    out MAE  result');
+for (const row of rows) {
+  if (row.err || !row.zt) continue;
+  const z = row.zt, s = syn[`${row.net}/${row.pair}/${row.prec}/zt`] || {};
+  z.synth = s;
+  const exact = row.prec === 'fp32', fails = [];
+  if (exact) {
+    if (!(z.agree >= TOL.ztAgree)) fails.push('mask agreement ' + (100 * z.agree).toFixed(4) + '%');
+    if (!(z.pfMean <= TOL.pfMean)) fails.push('pf mean ' + e1(z.pfMean));
+    if (!(z.pfMax <= TOL.pfMax)) fails.push('pf max ' + e1(z.pfMax));
+    if (z.c0Max !== null && row.ya && !(z.c0Max <= TOL.cost)) fails.push('C(0) ' + e1(z.c0Max));
+  }
+  if (!(z.sadRel <= (exact ? TOL.sadRel : TOL.sadRel16))) fails.push('sad_zt ' + e1(z.sadRel));
+  if (z.cut !== z.cutExp) fails.push('cut');
+  if (z.duplicate !== false) fails.push('duplicate ' + z.duplicate);
+  if (z.pfNetDiff !== 0) fails.push(`net field differs from the run without the test (${z.pfNetDiff} values)`);
+  for (const t of ['0.5', '0.25']) {
+    const v = s[t];
+    if (!v) { fails.push('no synth t=' + t); continue; }
+    if (!(v.synthDb >= (exact ? TOL.ztSynthDb : TOL.synthDb))) fails.push(`synth t=${t} ${v.synthDb.toFixed(1)} dB`);
+    if (!(v.engineMae <= TOL.engineMae)) fails.push(`engine out t=${t} MAE ${v.engineMae}`);
+    if (v.midDelta !== undefined && !(Math.abs(v.midDelta) <= TOL.midDb)) fails.push(`vs middle frame ${v.midDelta.toFixed(3)} dB`);
+  }
+  z.ok = fails.length === 0;
+  z.fails = fails;
+  if (!z.ok) allOk = false;
+  const db = (t) => (s[t] ? (Number.isFinite(s[t].synthDb) ? s[t].synthDb.toFixed(1) : 'inf') : '-');
+  const mid = s['0.5'] && s['0.5'].midDb !== undefined ? `${s['0.5'].midDb.toFixed(3)} (${s['0.5'].midDbExp.toFixed(3)})` : '-';
+  const mae = Math.max(...['0.5', '0.25'].map((t) => (s[t] ? s[t].engineMae : NaN)));
+  const f = (v) => (v === null ? '-' : e1(v));
+  console.log(`${row.net} ${row.pair.padEnd(7)} ${row.prec} ${(100 * z.agree).toFixed(4).padStart(8)}%  ${String(z.flipped).padEnd(7)} ` +
+    `${(100 * z.zeroed).toFixed(1)}% (${(100 * z.zeroedExp).toFixed(1)}%)`.padEnd(15) + ` ${e1(z.pfMean).padEnd(8)} ${e1(z.pfMax).padEnd(8)} ` +
+    `${f(z.chMax).padEnd(8)} ${f(z.c0Max).padEnd(8)} ` + `${z.sad.toFixed(4)} (${z.sadExp.toFixed(4)})`.padEnd(19) + ` ${e1(z.sadRel).padEnd(8)} ` +
+    `${String(z.cut).padEnd(5)} ${(db('0.5') + ' / ' + db('0.25')).padEnd(16)} ${mid.padEnd(18)} ${mae.toFixed(3).padEnd(8)} ` + (z.ok ? 'PASS' : 'FAIL ' + fails.join('; ')));
+}
+
+// the duplicate skip, per net, precision and zero test on / off, on the motion pair's first frame
 const dups = {};
-for (const prec of opt.prec) {
+for (const prec of opt.prec) for (const zt of [true, false]) {
   for (const net of ['e2v3', 'e1v3']) {
     if (opt.nets && !opt.nets.includes(net)) continue;
     const p = man.pairs.find((q) => q.net === net && q.pair === 'motion');
     if (!p) continue;
-    const r = await E.page.evaluate((j) => window.__dupTest(j), { net, prec, dir: `learned/${net}/${p.pair}`, W: p.W, H: p.H });
-    dups[net + '/' + prec] = r;
-    if (r.error) { console.log(`dup ${net} ${prec}: ENGINE ERROR ${r.error.error}\n${r.error.stack}`); allOk = false; continue; }
+    const r = await E.page.evaluate((j) => window.__dupTest(j), { net, prec, zt, dir: `learned/${net}/${p.pair}`, W: p.W, H: p.H });
+    const dn = `${net} ${prec} zero test ${zt ? 'on' : 'off'}`;
+    dups[net + '/' + prec + '/' + (zt ? 'zt' : 'net')] = r;
+    if (r.error) { console.log(`dup ${dn}: ENGINE ERROR ${r.error.error}\n${r.error.stack}`); allOk = false; continue; }
     const I = r.identical, N = r.near;
     const okI = I.estimate && I.duplicate === true && I.dupDiff === 0 && I.nonZeroField === 0 && I.meanSad === 0 && !I.cut &&
       I['synth0.5'] && I['synth0.25'] && I['diffVsA0.5'] === 0 && I['diffVsA0.25'] === 0;
     const okN = N.duplicate === true && N.dupDiff > 0 && N.dupDiff < 0.6 && N.nonZeroField === 0 && N.meanSad === 0;
     const ok = okI && okN && !r.glError;
     if (!ok) allOk = false;
-    console.log(`dup ${net} ${prec}: identical frames -> duplicate ${I.duplicate} (mean |a-c| ${I.dupDiff}), non-zero field components ${I.nonZeroField}, ` +
+    console.log(`dup ${dn}: identical frames -> duplicate ${I.duplicate} (mean |a-c| ${I.dupDiff}), non-zero field components ${I.nonZeroField}, ` +
       `sad ${I.meanSad}, output vs input: ${I['diffVsA0.5']} / ${I['diffVsA0.25']} channel values differ (t 0.5 / 0.25); near-duplicate (mean |a-c| ` +
       `${N.dupDiff.toFixed(3)}) -> duplicate ${N.duplicate}, non-zero field ${N.nonZeroField}, sad ${N.meanSad}: ${ok ? 'PASS' : 'FAIL'}`);
   }
 }
+// the static guard vs static_guard.py
+const sgRows = [];
+{
+  const sgo = path.join(work, 'learned', 'sguard');
+  fs.rmSync(sgo, { recursive: true, force: true });
+  const cases = [['overlay', false, [0.5, 0.25]], ['motion', false, [0.25]], ['cut', false, [0.5]], ['overlay', true, [0.25]]];
+  for (const [pair, f16in, ts] of cases) {
+    const p = man.pairs.find((q) => q.net === 'e2v3' && q.pair === pair);
+    if (!p || (opt.nets && !opt.nets.includes('e2v3')) || !opt.prec.includes('fp32')) continue;
+    const tag = `sg_${pair}${f16in ? '_hdr' : ''}`;
+    const r = await E.page.evaluate((j) => window.__sgTest(j), { net: 'e2v3', prec: 'fp32', f16in, ts, dir: `learned/e2v3/${pair}`, W: p.W, H: p.H, tag });
+    if (r.error) { console.log(`${tag}: ENGINE ERROR ${r.error.error}\n${r.error.stack}`); allOk = false; continue; }
+    for (const t of ts) {
+      const name = `${pair}${f16in ? '_hdr' : ''}_t${t}`, d = path.join(sgo, name), rt = r.t[t];
+      fs.mkdirSync(d, { recursive: true });
+      for (const k of ['a', 'c']) fs.copyFileSync(path.join(work, 'learned', 'e2v3', pair, k + '.rgba'), path.join(d, k + '.rgba'));
+      for (const k of ['out0', 'outg']) fs.writeFileSync(path.join(d, k + (f16in ? '.f32' : '.rgba')), E.dumps.get(`${tag}/${t}/${k}`));
+      fs.writeFileSync(path.join(d, 'field.f32'), E.dumps.get(`${tag}/${t}/field`));
+      fs.writeFileSync(path.join(d, 'meta.json'), JSON.stringify({ W: p.W, H: p.H, fw: p.flow[0], fh: p.flow[1], t, flowScale: 2, f16: f16in, fallback: rt.fallback }));
+      sgRows.push({ name, ...rt, glError: r.glError });
+    }
+  }
+  if (sgRows.length) {
+    process.stdout.write(py('sguard'));
+    const sgj = JSON.parse(fs.readFileSync(path.join(work, 'learned', 'sguard.json'), 'utf8'));
+    for (const row of sgRows) {
+      const s = sgj[row.name], fails = [];
+      row.py = s;
+      if (!row.ok) fails.push('synth returned false');
+      if (!s) fails.push('no static_guard.py result');
+      else if (!(s.maxDiff <= TOL.sgMax)) fails.push(`max |d| ${s.maxDiff.toFixed(3)} levels`);
+      if (row.offDiff !== 0) fails.push(`guard off again: ${row.offDiff} values differ from the unguarded output`);
+      if (row.fallback && row.guardDiff !== 0) fails.push(`fallback ${row.fallback} changed by the guard (${row.guardDiff} values)`);
+      if (!row.fallback && row.guardDiff === 0) fails.push('the guard changed nothing');
+      if (row.glError) fails.push('glError ' + row.glError);
+      row.ok = fails.length === 0;
+      if (!row.ok) allOk = false;
+      console.log(`static guard ${row.name}: fallback ${row.fallback}, guard changed ${row.guardDiff} channel values, guard off again: ${row.offDiff} differ` +
+        (s ? `, vs static_guard.py max |d| ${s.maxDiff.toFixed(3)} levels (${s.nDiff} px differ)` : '') + `: ${row.ok ? 'PASS' : 'FAIL ' + fails.join('; ')}`);
+    }
+  }
+}
 if (E.consoleMsgs.size) console.log('console: ' + [...E.consoleMsgs.entries()].map(([k, n]) => `${k} (x${n})`).join('\n         '));
-if (opt.json) fs.writeFileSync(opt.json, JSON.stringify({ browser: E.version, renderer: E.init.info.renderer, gpu: opt.gpu, rows, dups }, null, 1));
+if (opt.json) fs.writeFileSync(opt.json, JSON.stringify({ browser: E.version, renderer: E.init.info.renderer, gpu: opt.gpu, rows, dups, sguard: sgRows }, null, 1));
 console.log(`RESULT: ${allOk ? 'PASS' : 'FAIL'}`);
 await E.browser.close();
 process.exit(allOk ? 0 : 1);

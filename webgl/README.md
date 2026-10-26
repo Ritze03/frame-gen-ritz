@@ -42,10 +42,11 @@ that contract, updated. Additions (nothing removed):
 | `__fg.assemblePrograms(sources, settings)` | the exact text of every program the host compiles (for validation) |
 | `engine.setPassHook(fn)` | profiling only: `fn(passName, 0 / 1)` around every draw |
 | settings `motion`, `motionNet`, `motionPrecision` | V1's learned motion estimate (below): `motion` `'search'` (default: V1's block search) or `'learned'`; `motionNet` `'e2v3'` (default) or `'e1v3'`; `motionPrecision` `'fp16'` (default) or `'fp32'`. Runtime (a change drops the estimate, like a `motionVersion` switch); ignored by V2; `'learned'` needs `flowScale` 2 |
+| settings `learnedZeroTest`, `learnedStaticGuard` | learned estimate only (below): the zero-motion test after the net (`true` default; a change drops the estimate) and the static guard after the synthesis (`false` default; runtime, no drop). Same names as the Vulkan library's settings |
 | `__fg.nets` | the learned nets' weights, attached by `webgl/nets/<name>.js` |
 | `checkSupport` `learned`, `learnedError` | whether the learned estimator can run here (WebGL2 core minimums, below); does not affect `ok`. Where false, or where the selected net's script is not loaded, `createEngine` / `setSettings` throw a `RangeError` for learned settings and keep the current ones |
 | `stats()` `duplicate`, `dupDiff` | after a learned estimate: whether the pair was a duplicate (skipped) and its mean absolute difference; null otherwise |
-| `debugRead('ml.*')` | the learned estimator's textures (`LAYOUT.md` §10.3) |
+| `debugRead('ml.*')`, `debugRead('sg')` | the learned estimator's textures, the zero test's (`ml.pfNet`, `ml.ztCost`, `ml.zt`) and the static guard's filters (`LAYOUT.md` §10.3, §10.8, §10.9) |
 
 `pushFrame` takes, besides DOM sources, `{width, height, data}` with `data` a `Uint8Array` (rgba8) or a `Float32Array` / `Uint16Array`
 of half floats (rgba16f); a DOM source is uploaded as `HALF_FLOAT` for rgba16f. `debugRead` / `stats` are unchanged in form; the
@@ -80,7 +81,9 @@ the search's: the per-pixel half-vector field `pixfield` and the scene-cut sum `
 `meanSad` is the net's `sad` and the cut stays `sad > sceneCutSad` = 30). `LAYOUT.md` §10 is the pass contract.
 
 ```js
-engine.setSettings({ motionVersion: 1, motion: 'learned' });                       // e2v3, fp16 (the defaults)
+engine.setSettings({ motionVersion: 1, motion: 'learned' });                       // e2v3, fp16, zero test on (the defaults)
+engine.setSettings({ learnedZeroTest: false });                                    // the net's field without the zero test (A/B)
+engine.setSettings({ learnedStaticGuard: true });                                  // the static guard (opt-in)
 engine.setSettings({ motion: 'learned', motionNet: 'e1v3' });                      // the smaller net
 engine.setSettings({ motion: 'learned', motionPrecision: 'fp32' });                // the exact float32 port
 engine.setSettings({ motion: 'search' });                                          // back to V1's search (the default)
@@ -92,8 +95,37 @@ engine.setSettings({ motion: 'search' });                                       
 | `motionNet` | `'e2v3'`, `'e1v3'` | e2v3: width 24, 95,530 weights, ml-fg's primary (+0.23 dB over V1's `final` on its 7 clips, SPEC 9); e1v3: width 12, 28,330 weights, on par with `final` (−0.01 dB), 3.4x fewer MACs |
 | `motionPrecision` | `'fp16'`, `'fp32'` | storage of the net's input and activations: half floats (8 per RGBA32UI texel) or RGBA32F; the field, pyramid, weights and all arithmetic are float32 either way |
 
-A change of any of the three (with V1) drops the current estimate, like a `motionVersion` switch; the learned programs are
-compiled when it is first selected, its textures and weight buffer allocated by its first estimate.
+| `learnedZeroTest` | `true`, `false` | the zero-motion test after the net (below); `false` gives the net's field as is (A/B) |
+| `learnedStaticGuard` | `false`, `true` | the static guard after the synthesis (below); opt-in |
+
+A change of `motion`, `motionNet`, `motionPrecision` or `learnedZeroTest` (with V1) drops the current estimate, like a
+`motionVersion` switch; `learnedStaticGuard` acts on the next `synth`. The learned programs (22, the zero test's and the
+guard's included) are compiled when it is first selected, its textures and weight buffer allocated by its first estimate.
+
+**Zero-motion test** (`learnedZeroTest`, default on; ml-fg `export/SPEC.md` stage 7, `reference.py` `zero_test()`): the net has
+no zero-motion prior, so static HUD is dragged by the motion around it and still frames flicker. The test is V1's
+`pixel_field` zero candidate applied to the net's field: per flow pixel q, C(h) = the 5 × 5 box mean (replicate border) of
+`|ya(q − h) − yc(q + h)|` (true bilinear, the net's own vectors, clamp to the fw × fh grid) and C(0) = the same of
+`|ya − yc|`; where `C(0) − 1.0 ≤ C(h)` the vector becomes 0. `ya`, `yc` are the net's own flow-res lumas (0..255). The
+net's level 0 writes `ml.pfNet` instead of `pixfield`, `learned/zt_cost` computes d and e per flow pixel, `learned/zt` the box
+means, the mask and the final field into `pixfield`, plus per pixel the SAD term `zero ? e : d`, which `reduce_sad` sums into
+`sadSum`, so `pixfield`, `meanSad` and the cut all belong to the final field (SPEC's SAD identity; `ml_sad` is skipped).
+Window 5 and bonus 1.0 are SPEC's fixed constants (`learned/zt.frag.glsl`). A duplicate pair stays field 0, sad 0. Off: the
+estimate is byte-identical to the backend without the test (`fd5c163`).
+
+**Static guard** (`learnedStaticGuard`, default off; ml-fg `scripts/static_guard.py`, authoritative, and
+`superdoc/features/static-guard.md`): where prev and curr are locally identical and the motion small, the generated pixel is
+mixed towards the plain time mix `(1 − t) prev + t curr`. Per output pixel: s = max over R, G, B of |a − c|; d = 3 × 3 mean of
+s; dMin = 9 × 9 min of s; motion = 2 max(t, 1 − t) · flowScale · |field at t| (the field magnitude bilinearly upsampled, cv2
+`INTER_LINEAR`); gate = 1 − smoothstep(0.5, 1.0, motion); wLocal = (1 − smoothstep(7.65, 22.95, d)) · (1 − smoothstep(5.1,
+7.65, d) · (1 − gate)); wHalo = 1 − smoothstep(5.1, 7.65, dMin); wStatic = max(wLocal, wHalo) · gate; out = out · (1 − wStatic)
++ ((1 − t) a + t c) · wStatic where wStatic > 0.001 (else bit-exact). The constants (static_guard.py `DEFAULTS`, which ml-fg may
+still change) live in one marked block at the top of `shaders/learned/sguard.inc.glsl`. Colour differences are in the levels of
+the backend's mismatch metric `FG_D` (Rgba8: integer levels; RgbaF16: value × 255 for encoded input, PQ code × 255 for
+linear), the mix is in the frame's working values (RGBA8: on the rounded 8-bit output, as static_guard.py; RGBA16F: unrounded).
+Passes: `learned/sg_h` + `learned/sg_v` (separable 3-tap sum and 9-tap min, RG16F, once per pair at the first guarded synth)
+and `final_sg` (`synth/final.frag.glsl` with `FG_SGUARD`) in place of `final`. The scene-cut and flick fallbacks are untouched;
+with the guard off the output is byte-identical.
 
 **Weights**: `webgl/nets/e2v3.js` (540 KB) and `webgl/nets/e1v3.js` (162 KB), classic scripts that attach
 `__fg.nets.e2v3` / `.e1v3` (the float32 weights as base64, byte for byte ml-fg's `export/<net>/weights.bin`, sha256 checked by
@@ -107,7 +139,7 @@ absolute difference over all pixels and R, G, B at most 0.6 levels (`proto/harne
 `sadSum` = 0 and the generated frame is the input. `stats()` reports `duplicate` / `dupDiff`.
 
 **Required features**: nothing beyond the backend's extensions; WebGL2 core minimums only (4 draw buffers and colour
-attachments, uniform blocks of 10,416 bytes, 2 fragment uniform blocks, 8 texture units), reported as `checkSupport(gl).learned`
+attachments, uniform blocks of 10,416 bytes, 2 fragment uniform blocks, 9 texture units: the static guard's `final_sg`), reported as `checkSupport(gl).learned`
 / `learnedError`.
 
 **Memory** (1080p, 2x): e2v3 fp16 ~77 MB, e1v3 fp16 ~61 MB, e2v3 fp32 ~140 MB, e1v3 fp32 ~90 MB of textures (1440p: x1.76),
@@ -115,7 +147,8 @@ plus the weight buffer (400 / 122 KB); V1's own textures stay allocated.
 
 **Results** (`tests/learned.mjs` vs ml-fg's test vectors, `export/SPEC.md` §8; 2026-10-26, Chromium 156; the same on SwiftShader,
 ANGLE / Vulkan / RADV and ANGLE / OpenGL / radeonsi on the RX 7900 XTX, every row PASS): every pair of both nets (e2v3: static,
-motion, far, cut, odd 319 × 181, hd 1920 × 1080; e1v3: motion, cut, odd).
+motion, far, cut, odd 319 × 181, hd 1920 × 1080, overlay; e1v3: motion, cut, odd, overlay). These rows run with
+`learnedZeroTest: false` (the net alone, against `pf.f32` / `sad`); the zero test's rows follow.
 
 | | `fp32` (exact port; gates = reference.py's) | `fp16` (default; judged by the synthesised frame, SPEC §7) |
 |---|---|---|
@@ -135,6 +168,35 @@ mean |a − c| 0.25) is skipped too; none of the test pairs is. V1 and V2 are un
 hardware GL) and `golden` give results identical in every metric to the backend before this change (19f179b), `hdr` and `blur`
 pass.
 
+**Zero-motion test** (`learnedZeroTest: true`, the same pairs estimated again, against the vectors' `pf_zt` / `zero_zt` /
+`cost_h_zt` / `cost0_zt` / `sad_zt` / `cut_zt`; whole chain: the engine's own net field through its own test; 2026-10-26, the same
+three GLs, every row PASS). Gates: SPEC §8 (fp32: mask ≥ 99.9 %, pf on the agreeing pixels mean ≤ 2e-4 / max ≤ 5e-2 px,
+sad_zt ≤ 1e-3, same cut, synth ≥ 70 dB; fp16: sad_zt ≤ 1e-2, synth ≥ 45 dB, mask reported), plus the net field
+(`ml.pfNet`) bit-identical to the run without the test.
+
+| | `fp32` | `fp16` |
+|---|---|---|
+| zero-mask agreement (flipped px) | 99.9983–100 % (0–5; hd: 4–5 of 518,400, overlay: 0–1 of 57,600; reference.py: 0–6) | 99.875–99.998 % (1–428) |
+| zeroed share vs the vectors' `zeroed_zt` | equal to 0.1 % on every pair | equal to 0.1 % |
+| pf vs pf_zt on the agreeing pixels, mean / max (px) | ≤ 4.7e-5 / ≤ 1.8e-2 | ≤ 3.2e-2 / ≤ 4.9 |
+| C(0) / C(h) vs cost0_zt / cost_h_zt, max (levels) | ≤ 1.5e-5 / ≤ 3.7e-2 (C(h) follows the field) | ≤ 1.5e-5 / ≤ 16 |
+| sad_zt relative error | ≤ 7.9e-5 | ≤ 1.0e-3 |
+| cut_zt | identical (cut pairs: cut, sad 33.0 / 34.2) | identical |
+| synth(pf) vs synth(pf_zt), t = 0.5 / 0.25 | 73.7–98.7 dB (e1v3 overlay 73.7: its one flipped pixel, as reference.py's 73.8) | 58.8–80.3 dB |
+| vs the real middle frame, vs synth(pf_zt)'s | within 0.001 dB | within 0.003 dB |
+| engine output vs synth(pf_zt) | MAE ≤ 0.05 levels | MAE ≤ 0.06 |
+
+RGBA16F input (e2v3 fp16, motion / odd): mask 98.86–99.16 % (its luma is unrounded), 49.9–55.6 dB, middle frame within 0.007 dB.
+Duplicates with the test on: field 0, sad 0, output = input, as without it. With `learnedZeroTest: false` the estimate and the
+output are byte-identical to the backend before the test (`fd5c163`: `pf.f32`, both outputs and sad / cut of all 24 rows per GL,
+ANGLE / Vulkan and ANGLE / GL compared file by file).
+
+**Static guard** check (`learned.mjs`: e2v3 fp32 with the zero test on overlay t = 0.5 / 0.25, motion t = 0.25, cut t = 0.5,
+overlay RGBA16F t = 0.25; the engine's own a, c, unguarded output and field at t through `static_guard.py`): RGBA8 max |d| 0
+levels (SwiftShader) / 1 level on 1–4 pixels of 230,400 (hardware GL: rounding ties); RGBA16F 0.29–0.33 levels; the guard
+changes 3,694–6,937 pixels of the overlay pair (static_guard.py: the same ± 1), leaves the cut pair's fallback untouched, and
+switched off again gives the unguarded output bit for bit.
+
 **Cost** (RX 7900 XTX, ANGLE / Vulkan, `bench.mjs --gpu`, battlefield, 1440p resampled from it; ms of GPU time back-to-back, 20
 in one timer query; the estimate alone, then estimate + synth(0.5) per 2x pair):
 
@@ -147,9 +209,17 @@ in one timer query; the estimate alone, then estimate + synth(0.5) per 2x pair):
 
 47 draws per learned estimate (fp32 e2v3: 67, two passes per 24-wide layer). At level 0 a 24-wide hidden layer is ~0.33 ms
 (5,184 MACs per texel over 960 × 544, about half the GPU's fp32 FMA peak): the convs dominate, the coarser levels are mostly
-per-pass overhead (~0.02–0.04 ms each). The first `setSettings({ motion: 'learned' })` compiles 17 programs (94 ms on ANGLE /
+per-pass overhead (~0.02–0.04 ms each). The first `setSettings({ motion: 'learned' })` compiles 22 programs (17 before the zero test and the guard; 94 ms on ANGLE /
 Vulkan, 590 ms on ANGLE / OpenGL); the first learned estimate decodes and uploads the weights and allocates (~40 ms of CPU
 time). SwiftShader runs it too (the tests), far too slowly for use.
+
+Added cost (1080p 2x, battlefield, `bench.mjs --gpu --passes --modes ml2n,ml2,ml2g,...`, GPU time per pair with a sync per
+pair; three runs of e2v3 fp16, one each of e1v3 fp16 and e2v3 fp32): **zero test +0.02–0.08 ms (typically 0.04)** on ANGLE /
+Vulkan for every net and precision (`ml_zt_cost` 0.026 + `ml_zt` 0.03 −
+`ml_sad` 0.04 + one `reduce_sad` step), +0.02–0.03 ms on ANGLE / GL; **static guard +0.06–0.13 ms (typically 0.11)** on
+ANGLE / Vulkan
+(`ml_sg_h` 0.04–0.07 + `ml_sg_v` 0.02–0.03 once per pair, `final_sg` 0.06 in place of `final` 0.045), +0.08 ms on ANGLE / GL.
+Memory: the zero test 16 MB at 1080p (`ml.pfNet`, `ml.ztCost`, `ml.zt`), the guard 16 MB (`sgH`, `sg`, RG16F full res).
 
 ### V2 Performance ("grid morph")
 
@@ -239,7 +309,7 @@ meson + ninja + the Vulkan headers (the library's build) and a Vulkan GPU with c
 | xbackend | `xbackend.mjs` (+ `server.mjs`, `xpage.js`) | WebGL2 (SwiftShader) vs the library: V1, V2 P, V2 Q; block field, per-pixel field and coverage per stage; switch semantics; API checks; the V2 Quality MIN-blend probe (real result, cached, GL state kept; a context with MIN broken by a Proxy: `quality` false, Quality refused, V1 / V2 P run) |
 | hdr | `hdr_pairs.py`, `hdr.mjs`, `vkhdr.cpp` | rgba16f (scRGB linear, PQ-encoded, identity) vs the library in R16G16B16A16_SFLOAT / Rgba8 |
 | blur | `blur.mjs`, `vkhdr.cpp --blur` | `synthBlur` vs `recordSynthBlur` (V2 P, V2 Q) |
-| learned | `learned.mjs`, `learned_ref.py` (+ `make_nets.py`) | the learned estimator vs ml-fg's test vectors, both nets x both precisions + RGBA16F input, the duplicate skip (`learned-gpu`: hardware GL) |
+| learned | `learned.mjs`, `learned_ref.py` (+ `make_nets.py`) | the learned estimator vs ml-fg's test vectors, both nets x both precisions + RGBA16F input, without and with the zero-motion test (`*_zt` vectors), the duplicate skip, the static guard vs ml-fg's `scripts/static_guard.py` (`learned-gpu`: hardware GL) |
 | bench | `bench.mjs` | ms per pair (`--gpu`: hardware GL, timer queries, `--passes`: per pass; modes `v1 v2p v2q ml2 ml1 ml2f ml1f`, `--size WxH`) |
 
 **Pairs** (`pairs.py`): the V1 golden scenes (pan, hud_odd, objects, noisy → flick, cut), the V2 scenes of the extension (panel:
@@ -279,6 +349,7 @@ Diagnostics that do not gate: block-field / per-pixel-field endpoint error and c
 | hdr identity encoding vs Rgba8 | 48 | PASS: MAE 0.2–0.3 (unrounded float taps vs rounded 8-bit taps), ≤ 0.6 % > 4 |
 | blur (V2 P / Q, 4 pairs × 3 windows) | 24 | all PASS: MAE ≤ 0.08, max 1 level |
 | learned (2026-10-26, this branch: e2v3 + e1v3 x fp32 / fp16 + RGBA16F input, duplicates) | 20 + 4 per GL (SwiftShader, ANGLE Vulkan, ANGLE GL) | all PASS ("Learned motion estimate"); xbackend / golden / hdr / blur re-run on this branch: identical to 19f179b |
+| learned + zero test + static guard (2026-10-26, this branch) | 24 net rows + 24 zero-test rows + 8 duplicate cases + 5 static-guard cases per GL (SwiftShader, ANGLE Vulkan, ANGLE GL) | all PASS; xbackend (SwiftShader, 312 rows) and golden identical to fd5c163 in every metric, validate 209/209, hdr 144/144, blur PASS |
 
 To compare against another library version: build it out of tree (e.g. `git archive <rev> gpu | tar -x -C <dir>`, `meson setup
 <dir>/build <dir>/gpu`, `ninja -C <dir>/build fgtest`) and run `FG_VKTAG=<name> FG_GPU=<dir>/gpu FG_GPU_BUILD=<dir>/build node

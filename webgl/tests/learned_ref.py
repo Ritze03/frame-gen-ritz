@@ -9,7 +9,11 @@
                                              pair x precision with the engine's dumps (<prec>/pf.f32 + est.json, out_t<T>.rgba), the PSNR
                                              of synth(engine pf) vs synth(expected pf) at t = 0.5 and 0.25, both vs the real middle frame
                                              (t = 0.5), and the engine's own output (V1 synth on its learned field) vs synth(expected pf).
-                                             -> synth.json
+                                             -> synth.json. With the zero-motion test (<prec>/zt/: the engine's
+                                             final field, est.json, out_t<T>.rgba): the same against synth(pf_zt, sad_zt) -> key .../zt
+    python3 -I learned_ref.py sguard         the static guard (learned.mjs dumps under sguard/<case>/: a, c, the unguarded output,
+                                             the field at t, the guarded output) against ml-fg's scripts/static_guard.py on the same
+                                             inputs ($FG_MLFG_SCRIPTS, default <export>/../scripts) -> sguard.json
 """
 import json
 import os
@@ -26,6 +30,7 @@ WORK = os.environ.get('FG_WORK', os.path.join(here, '..', '..', '.local-work', '
 OUT = os.path.join(WORK, 'learned')
 FOOTAGE = os.environ.get('FG_FOOTAGE', os.path.join(here, '..', '..', 'footage'))
 TS = (0.5, 0.25)
+SCRIPTS = os.environ.get('FG_MLFG_SCRIPTS', os.path.join(os.path.dirname(os.path.abspath(EXPORT)), 'scripts'))   # static_guard.py
 
 
 def pairs():
@@ -93,6 +98,7 @@ def prep():
         with open(mid_why) as f:
             why = f.read()
         man.append(dict(net=net, pair=name, dir=d, W=W, H=H, flow=v['flow_size'], padded=v['padded_flow_size'], sad=v['sad'], cut=v['cut'],
+                        sad_zt=v.get('sad_zt'), cut_zt=v.get('cut_zt'), zeroed_zt=v.get('zeroed_zt'),
                         middle=os.path.exists(mid), middleWhy=why,
                         files={k: dict(file=os.path.join(d, x['file']), shape=x['shape']) for k, x in v['files'].items()}))
         print(f'prep: {net} {name} {W}x{H}, middle frame: {why}')
@@ -140,9 +146,75 @@ def synth():
                 f"t={t} synth {db(v['synthDb'])}" +
                 (f" (vs the real middle frame {v['midDb']:.3f} dB, expected pf {v['midDbExp']:.3f} dB)" if 'midDb' in v else '') +
                 (f", engine out MAE {v['engineMae']:.3f} max {v['engineMax']}" if 'engineMae' in v else '') for t, v in r.items()))
+            oz = os.path.join(o, 'zt')   # the zero-motion test: the engine's final field vs the expected pf_zt (with sad_zt)
+            if os.path.exists(os.path.join(oz, 'est.json')) and 'pf_zt' in p['files']:
+                with open(os.path.join(oz, 'est.json')) as f:
+                    estz = json.load(f)
+                pz_e = np.fromfile(os.path.join(oz, 'pf.f32'), '<f4').reshape(fh, fw, 2)
+                pz_x = np.fromfile(p['files']['pf_zt']['file'], '<f4').reshape(fh, fw, 2)
+                rz = {}
+                for t in TS:
+                    s_e = interp.synth(a, c, {'sad': estz['sad'], 'pf': pz_e}, t)
+                    s_x = interp.synth(a, c, {'sad': p['sad_zt'], 'pf': pz_x}, t)
+                    row = dict(synthDb=psnr(s_e, s_x))
+                    if b is not None and t == 0.5:
+                        row.update(midDb=psnr(s_e, b), midDbExp=psnr(s_x, b))
+                        row['midDelta'] = row['midDb'] - row['midDbExp']
+                    of = os.path.join(oz, f'out_t{t}.rgba')
+                    if os.path.exists(of):
+                        out = np.fromfile(of, np.uint8).reshape(H, W, 4)[..., 2::-1]
+                        d = np.abs(out.astype(np.int16) - s_x)
+                        row.update(engineMae=float(d.mean()), engineMax=int(d.max()), engineDb=psnr(out, s_x))
+                    rz[str(t)] = row
+                res[f"{p['net']}/{p['pair']}/{prec}/zt"] = rz
+                print(f"synth: {p['net']} {p['pair']} {prec} zero test: " + ', '.join(
+                    f"t={t} synth {db(v['synthDb'])}" +
+                    (f" (vs the real middle frame {v['midDb']:.3f} dB, expected pf_zt {v['midDbExp']:.3f} dB)" if 'midDb' in v else '') +
+                    (f", engine out MAE {v['engineMae']:.3f} max {v['engineMax']}" if 'engineMae' in v else '') for t, v in rz.items()))
     with open(os.path.join(OUT, 'synth.json'), 'w') as f:
         json.dump(res, f, indent=1)
 
 
+def sguard():
+    """learned.mjs's static-guard cases (sguard/<case>/meta.json + raw dumps) against static_guard.py: guard() for RGBA8 output; for
+    RGBA16F output (no 8-bit rounding) its weight() and the same mix, compared in levels (value x 255)."""
+    sys.path.insert(0, SCRIPTS)
+    import static_guard as sg
+    root, res = os.path.join(OUT, 'sguard'), {}
+    for case in sorted(os.listdir(root)):
+        d = os.path.join(root, case)
+        with open(os.path.join(d, 'meta.json')) as f:
+            m = json.load(f)
+        W, H, fw, fh, t = m['W'], m['H'], m['fw'], m['fh'], m['t']
+        rgb = lambda k: np.fromfile(os.path.join(d, k + '.rgba'), np.uint8).reshape(H, W, 4)[..., :3].copy()   # (the guard is per channel)
+        a, c = rgb('a'), rgb('c')
+        field = np.fromfile(os.path.join(d, 'field.f32'), '<f4').reshape(fh, fw, 2)
+        params = {'flow_scale': m['flowScale']}
+        w = sg.weight(a, c, field, t, params)
+        eps = 0.25 if m["f16"] else 0.5
+        if m['f16']:
+            fl = lambda k: np.fromfile(os.path.join(d, k + '.f32'), '<f4').reshape(H, W, 4)[..., :3] * np.float32(255)
+            out0, outg = fl('out0'), fl('outg')
+            st = w > 0.001
+            exp = out0.copy()
+            still = (1 - t) * a.astype(np.float32) + t * c.astype(np.float32)
+            exp[st] = out0[st] * (1 - w[st][:, None]) + still[st] * w[st][:, None]
+        else:
+            out0, outg = rgb('out0'), rgb('outg')
+            exp = sg.guard(a, c, out0, field, t, params)
+        if m.get('fallback'):   # a cut / untrusted frame: the guard must leave it untouched (static_guard.wrap)
+            exp = out0
+        dd = np.abs(outg.astype(np.float64) - exp.astype(np.float64))
+        changed = lambda x: int((np.abs(x.astype(np.float64) - out0.astype(np.float64)).max(2) > eps).sum())
+        r = dict(maxDiff=float(dd.max()), meanDiff=float(dd.mean()), nDiff=int((dd > eps).any(2).sum()), changed=changed(outg),
+                 changedExp=changed(exp), wStatic50=float((w > 0.5).mean()), px=W * H)
+        res[case] = r
+        print(f"sguard: {case} ({W}x{H}, t={t}, {'RGBA16F' if m['f16'] else 'RGBA8'}): guarded output vs static_guard.py max |d| {r['maxDiff']:.3f} "
+              f"levels (mean {r['meanDiff']:.2e}, {r['nDiff']} px differ); the guard changed {r['changed']} px (static_guard.py: "
+              f"{r['changedExp']}), wStatic > 0.5 on {100 * r['wStatic50']:.1f}%")
+    with open(os.path.join(OUT, 'sguard.json'), 'w') as f:
+        json.dump(res, f, indent=1)
+
+
 if __name__ == '__main__':
-    {'prep': prep, 'synth': synth}[sys.argv[1]]()
+    {'prep': prep, 'synth': synth, 'sguard': sguard}[sys.argv[1]]()

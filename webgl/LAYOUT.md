@@ -40,6 +40,9 @@ webgl/
       lv0.frag.glsl                  down.frag.glsl           match.frag.glsl (+ ML_PACKED)
       conv.frag.glsl (fp32)          conv_h.frag.glsl (fp16, packed)
       sad.frag.glsl                  sadout.frag.glsl
+      zt_cost.frag.glsl              zt.frag.glsl             the zero-motion test (§10.8)
+      sguard.inc.glsl                include: the static guard's constants (one marked block) and weight (§10.9)
+      sg_h.frag.glsl                 sg_v.frag.glsl           the static guard's filters (+ synth/final.frag.glsl FG_SGUARD)
 ```
 
 One file = one program (`vert.glsl` is shared by every V1 program; V2 Quality's splat `v2/qown` has its own vertex shader). Some V2 programs share a fragment file with different `#define`s (README.md); `__fg.assemblePrograms(sources, settings)` returns the exact text the host compiles.
@@ -274,6 +277,8 @@ Fan-in `uFan` per axis: 16, except the first step of V1's untrusted chain (8: fo
 | `motion` | `'search'` | – | – | V1's motion estimate: `'search'` (this contract's block search) or `'learned'` (§10). Ignored by V2. `'learned'` needs `flowScale` 2 (else `RangeError`), `checkSupport(gl).learned` and the net's weights (`__fg.nets`). A change (with V1) drops the estimate like a `motionVersion` switch. (new) |
 | `motionNet` | `'e2v3'` | – | – | `'e2v3'` (width 24) or `'e1v3'` (width 12, about 1.9x faster here); `motion 'learned'` only (new) |
 | `motionPrecision` | `'fp16'` | – | – | storage of the net's activations: `'fp16'` (half floats, 8 per RGBA32UI texel) or `'fp32'` (RGBA32F, the exact port); the field, pyramid, weights and arithmetic are float32 in both (new) |
+| `learnedZeroTest` | `true` | – | – | `motion 'learned'`: the zero-motion test after the net (§10.8); a change drops the estimate (new) |
+| `learnedStaticGuard` | `false` | – | – | `motion 'learned'`: the static guard after the synthesis (§10.9); runtime, takes effect at the next `synth` (new) |
 
 Compile-time constants (not settings; defined in shaders / host): BLOCK 8, RADIUS 2, TOP_RADIUS 6, MIN_SIDE 48, sub-pixel steps 0.5 then 0.25 (PY:49), PIX_WIN 5 (5×5 → `1/25`), MISMATCH_BOX 7 (`1/49`), LOOKUP_ITERS 2, 7 per-pixel candidates, max 6 seed candidates, trust threshold 0.5 for the untrusted count. Dropped (game-only / not core): `subpixel` (always true), all `ui*`, `blur*`.
 
@@ -423,7 +428,7 @@ See README.md (V2 Performance and Quality, the static mask, frame formats, motio
 ## 10. The learned motion estimator (`motion: 'learned'`) (new)
 
 An opt-in replacement of V1's motion estimate (§3.3 E1–E14) by ml-fg's learned estimator; V1's synthesis (§3.3 Y1–Y7) is
-unchanged and consumes its output. The porting contract is ml-fg's `export/SPEC.md` (stages 1–6, abbreviated **SP**) with its
+unchanged and consumes its output. The porting contract is ml-fg's `export/SPEC.md` (stages 1–7, abbreviated **SP**) with its
 executable reference `export/reference.py` (**REF**); the nets are `e2v3` (width 24, 95,530 weights, the default) and `e1v3`
 (width 12, 28,330 weights). Cites are SP sections.
 
@@ -463,6 +468,10 @@ exact half of its parent.
 | `ml.act.<s>.<k>` | fp32: RGBA32F × G; fp16: RGBA32UI × ⌈G/2⌉ | PW × PH | ping-pong activations, set s = 0, 1 (G = width / 4) |
 | `ml.h.<l>`, l = 1..4 | RG32F | level | the field after level l (REF `dbg['h'][l]`) |
 | `ml.dup`, `ml.sad` | R32F | 1 × 1 | the sums of `|a − c|` and of the SAD terms (chains `dupRed` fan 4/4/…, `sadRed` fan 2/4/…) |
+| `ml.pfNet` | RG32F | fw × fh | zero test on: the net's field (level 0's last conv writes it instead of `pixfield`) |
+| `ml.ztCost` | RG32F | fw × fh | zero test: r = d = `|ya(q − h) − yc(q + h)|`, g = e = `|ya − yc|` |
+| `ml.zt` | RGBA32F | fw × fh | zero test: r = the SAD term `zero ? e : d`, g = C(h), b = C(0), a = zero (1 / 0) |
+| `sg` | RG16F | W × H | static guard: r = d (3 × 3 mean of s), g = dMin (9 × 9 min); `sgH` (RG16F, its horizontal half) is not readable |
 
 `x` and `act` are level-0 sized; a coarser level renders into their top-left corner (viewport = the level) and the convs bound
 their taps by the level size `uSize` (zero padding at the padded level's border, SP 4c pitfall), so data of other levels beyond
@@ -481,11 +490,16 @@ texture's 8. Memory at 1080p (PW × PH = 960 × 544): about 77 MB (e2v3, fp16), 
 | `ml_h<CIN>g<CG>o<COUT>[L]` | `conv_h` (`ML_CIN`, `ML_CG`, `ML_COUT`, `ML_COUTA`, `ML_LAST`) | same, usampler2D | fp16: ⌈COUT/2⌉ RGBA32UI per pass (one pass per layer), or the field |
 | `ml_sad` | `sad` | uLv0, uField | first step of `sadRed` |
 | `ml_sadout` | `sadout` | uSrc, uDup | `sadRed[last]` of V1 = sum · bw₀ · bh₀ / (fw · fh) (`uWeight`) |
+| `ml_zt_cost` | `zt_cost` | uLv0, uField (`ml.pfNet`), uDup | `ml.ztCost` |
+| `ml_zt` | `zt` | uCost, uField (`ml.pfNet`), uDup | MRT `pixfield` + `ml.zt` |
+| `ml_sg_h`, `ml_sg_v` | `sg_h`, `sg_v` (include `sguard.inc`) | uPrev, uCurr / uH | `sgH` / `sg` |
+| `final_sg` | `synth/final` (`FG_SGUARD`, include `sguard.inc`) | final's 7 + uSg (unit 7), uField (8) | `out` |
 
 `estimate()` in learned mode: `ml_lv0`, `reduce_sad` × |dupRed|, `ml_down` × 4, then for l = 4..0: `ml_match.l`, `ml_c0.l` …
 `ml_c4.l` (fp32 e2v3: `ml_c<k>a.l`, `ml_c<k>b.l` for k < 4), the last one writing `ml.h.l` (l > 0) or `pixfield` (l = 0, over
 fw × fh; its taps read the padded level), then `ml_sad`, `reduce_sad` × (|sadRed| − 1), `ml_sadout`. Draws at 1080p: 47 (fp16,
-both nets; fp32 e1v3), 67 (fp32 e2v3). The pass names (with the level) are what `setPassHook` sees.
+both nets; fp32 e1v3), 67 (fp32 e2v3). With the zero test (the default) the last conv of level 0 writes `ml.pfNet`, and
+`ml_sad` is replaced by `ml_zt_cost`, `ml_zt`, `reduce_sad` × |sadRed| (two draws more at 1080p: 49 / 69). Synth with the static guard: `ml_sg_h`, `ml_sg_v` (the first guarded synth of a pair) and `final_sg` for `final`. The pass names (with the level) are what `setPassHook` sees.
 
 Conv (SP 4c, REF `conv3x3`): `out[o](q) = b[o] + Σ_tap Σ_i W[o][i][ky][kx] · in[i](q + (kx − 1, ky − 1))`, hidden layers
 `clamp(·, 0, 1)`, the last layer `h + 2 · out` with h recomputed in float32 by `mlFieldUp` (it is never stored in the
@@ -506,7 +520,7 @@ fp16, outputs 12..23 of a 24-wide layer). The host checks each program's `UNIFOR
 ### 10.6 Required features
 
 WebGL2 core minimums only (`checkSupport().learned` / `learnedError`): `MAX_DRAW_BUFFERS` and `MAX_COLOR_ATTACHMENTS` ≥ 4 (the
-match pass), `MAX_UNIFORM_BLOCK_SIZE` ≥ 10,416 bytes, `MAX_FRAGMENT_UNIFORM_BLOCKS` ≥ 2, `MAX_TEXTURE_IMAGE_UNITS` ≥ 8, plus
+match pass), `MAX_UNIFORM_BLOCK_SIZE` ≥ 10,416 bytes, `MAX_FRAGMENT_UNIFORM_BLOCKS` ≥ 2, `MAX_TEXTURE_IMAGE_UNITS` ≥ 9 (the static guard's `final_sg`), plus
 the backend's `EXT_color_buffer_float` (RGBA32F / RG32F / R32F targets; RGBA32UI is core). Missing → `createEngine` /
 `setSettings` throw a `RangeError` for learned settings and keep the old ones; so does a net whose `webgl/nets/<name>.js` was
 not loaded.
@@ -519,3 +533,47 @@ motion estimate"). `'fp16'` rounds the stored input and activations to half floa
 differs pointwise (low-texture pixels), the synthesised frame stays ≥ 63 dB from the reference's and its PSNR to the real middle
 frame within 0.002 dB of the reference's. Differences from REF: the GPU's division / FMA contraction (noise amplified by the
 net, SP 7), nothing systematic; hardware bilinear is not used (4 `texelFetch`).
+
+### 10.8 The zero-motion test (`learnedZeroTest`, default on)
+
+SP stage 7 / REF `zero_test()`, between the net (SP 5) and the SAD (SP 6). Inputs: the net's field `ml.pfNet` (fw × fh, the
+net's level 0 writes it instead of `pixfield`; the 5 × 5 windows read the neighbours' net vectors, so the field cannot be
+replaced in place) and `ya`, `yc` = `ml.pyr.0` b, a (the unpadded fw × fh planes the net got, 0..255).
+
+* `ml_zt_cost`, per flow pixel q: d = `|mlBil(ya, q − h) − mlBil(yc, q + h)|` (true bilinear, clamp to fw × fh, h = the net's
+  vector at q), e = `|ya(q) − yc(q)|` → `ml.ztCost`.
+* `ml_zt`: C(h), C(0) = the 5 × 5 means of d, e with replicate border (each tap's coordinate clamped to the frame; REF `box`:
+  the 5 taps of a row left to right, the 5 row sums top to bottom, / 25), `zero = (C(0) − 1.0) <= C(h)`; MRT att0 `pixfield` =
+  zero ? 0 : h, att1 `ml.zt` = (zero ? e : d, C(h), C(0), zero).
+* `reduce_sad` sums `ml.zt`.r over the fw × fh grid (the `sadRed` chain, fan 2 then 4), `ml_sadout` scales it as before: by SP 7's
+  identity (a zeroed pixel's SAD term is e, a kept one's d) this is SP 6's `sad` of the final field, so `sadSum`, `meanSad` and the
+  cut belong to the field after the test.
+
+Constants `ML_ZERO_WIN` 5 and `ML_ZERO_BONUS` 1.0 (`zt.frag.glsl`) are SP's fixed values. Everything is float32 (SP 7: fp16 cost
+maps were not tested), in both `motionPrecision`s. Duplicates: both passes write 0 (the net field is 0 then anyway). Off: the last
+conv writes `pixfield` and `ml_sad` runs, exactly as without the test. Exactness (`tests/learned.mjs` against the vectors'
+`*_zt` files, whole chain = the engine's own net field through its own test): fp32 mask agreement 99.998–100 % (0–5 flipped
+pixels per pair; REF itself flips 0–6), pf on the agreeing pixels within SP 8's pf tolerances, `sad_zt` relative ≤ 8e-5,
+identical cut, C(0) within 1.5e-5 levels; fp16 mask agreement 99.88–99.997 %.
+
+### 10.9 The static guard (`learnedStaticGuard`, default off)
+
+ml-fg `scripts/static_guard.py` (authoritative; `superdoc/features/static-guard.md`), a synthesis-stage pass with the learned
+estimate only. Constants: the marked block at the top of `learned/sguard.inc.glsl` (`SG_LO` 7.65, `SG_HI` 22.95, `SG_HALO_LO`
+5.1, `SG_HALO_HI` 7.65, `SG_HALO` 4, `SG_MOTION_LO` 0.5, `SG_MOTION_HI` 1.0, `SG_MIN_W` 0.001 = static_guard.py `DEFAULTS`).
+
+* s(p) = max over R, G, B of `FG_D(prev, curr)` (§1.2 frame formats: the levels of the mismatch metric; Rgba8 integer levels,
+  RgbaF16 value × 255 or, for linear input, the PQ code × 255).
+* `ml_sg_h` (full res, RG16F `sgH`): r = Σ s over x − 1..x + 1, g = min s over x − 4..x + 4 (replicate border); `ml_sg_v` (RG16F
+  `sg`): r = d = Σ of 3 rows / 9 (cv2.blur), g = dMin = min of 9 rows (cv2.erode). They depend on the frames only and run once
+  per pair, at its first guarded synth (re-armed by `pushFrame`).
+* `final_sg` = `synth/final.frag.glsl` with `FG_SGUARD`: after the fallbacks (cut, flick: returned unchanged, as
+  `static_guard.wrap`) and V1's blend `o` (Rgba8: rounded to the stored 8-bit value first), motion = 2 max(uWA, uWC) ·
+  flowScale · |field|, the field magnitude (the field at t: `pixfield` at t = 0.5, else `fieldT`) bilinearly upsampled with
+  cv2 `INTER_LINEAR`'s mapping (half-pixel centres, scale fw / W, clamp); gate = 1 − ss(0.5, 1.0, motion); wLocal = (1 −
+  ss(7.65, 22.95, d)) · (1 − ss(5.1, 7.65, d) · (1 − gate)); wHalo = 1 − ss(5.1, 7.65, dMin); w = max(wLocal, wHalo) · gate,
+  ss = static_guard.py's smoothstep. Where w > 0.001: o = o (1 − w) + (uWA · prev + uWC · curr) w (working values), then
+  `fgStore` (Rgba8: round half up, as static_guard.py's `+ 0.5` and truncation).
+
+Off: `final` as before (byte-identical). Exactness (`tests/learned.mjs` vs static_guard.py on the engine's own a, c, unguarded
+output and field at t): max |d| 0 (SwiftShader) or 1 level on 1–4 px of 230,400 (hardware GL: rounding ties) for RGBA8, ≤ 0.33 levels for RGBA16F.
