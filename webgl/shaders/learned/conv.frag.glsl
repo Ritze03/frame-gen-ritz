@@ -2,8 +2,8 @@
 // textures (4 channels each). Compiled per shape by the host's #defines:
 //   ML_CIN   input textures (RGBA, 4 channels each; the 14-channel input is 4 with 2 zero channels), 1..6
 //   ML_COUT  output textures of this pass, 1..3 (a layer of width 24 is two passes)
-//   ML_LAST  the layer's linear 2-channel output: writes h + 2 * out (h = 4 * uX3.xy, the match pass's hx / 4, hy / 4) instead of
-//            clamp(out, 0, 1)
+//   ML_LAST  the layer's linear 2-channel output: writes h + 2 * out instead of clamp(out, 0, 1), h = this level's input field in
+//            float32 (mlFieldUp of the coarser level's uHc, 0 at the top level uTop), as the match pass computed it
 // out[o](q) = b[o] + sum over taps (kx, ky), inputs i of W[o][i][ky][kx] * in[i](q + (kx - 1, ky - 1)), zero padding outside the
 // level (uSize: the textures are level-0 sized, the region beyond the level holds other levels' data and is never read).
 // Weights (uniform block MlW, bound per pass by the host from the net's buffer): uW[(o * 9 + tap) * ML_CIN + j] is the 4x4 block
@@ -27,7 +27,8 @@ uniform sampler2D uIn4;
 uniform sampler2D uIn5;
 #endif
 #if ML_LAST
-uniform sampler2D uX3;
+uniform sampler2D uHc;
+uniform int uTop;
 #endif
 layout(std140) uniform MlW {
     mat4 uW[ML_COUT * 9 * ML_CIN];
@@ -86,7 +87,7 @@ void main() {
 #endif
     }
 #if ML_LAST
-    vec2 h = 4.0 * texelFetch(uX3, p, 0).xy;
+    vec2 h = uTop != 0 ? vec2(0.0) : mlFieldUp(uHc, p);
     oH = vec4(h + 2.0 * acc[0].xy, 0.0, 0.0);
 #else
     o0 = clamp(acc[0], 0.0, 1.0);

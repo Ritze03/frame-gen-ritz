@@ -2,11 +2,15 @@
 // (uSize = the unpadded fw x fh; the texture is padded to a multiple of 16), the flow-res luma of a and c with edge replication.
 // Luma: cv2 5.0.0 BGR2GRAY, (3735 B + 19235 G + 9798 R + 16384) >> 15 on integer levels (RgbaF16: the same weights on the levels of
 // the perceptual encoding, unrounded); flow res: the mean of the valid pixels of the 2x2 cell (cv2 INTER_AREA, as luma.frag.glsl).
-// Out: r = ya / 255, g = yc / 255 (the net's level 0, 0..1), b = ya, a = yc (0..255, for the SAD).
+// oLv: r = ya / 255, g = yc / 255 (the net's level 0, 0..1), b = ya, a = yc (0..255, for the SAD).
+// oDup: the first step of the duplicate test (ml_common.inc.glsl mlDup): the sum of |a - c| over R, G, B (levels, FG_D) of the
+// full-res pixels of this flow texel's cell, the last row / column of cells also taking the frame's remaining pixels (so the
+// texels of the unpadded grid cover every pixel exactly once); 0 in the padding. reduce_sad sums it to 1x1.
 uniform sampler2D uPrev;
 uniform sampler2D uCurr;
 uniform ivec2 uSize;
 layout(location = 0) out vec4 oLv;
+layout(location = 1) out vec4 oDup;
 
 float mlLuma(sampler2D t, ivec2 p) {
 #ifdef FG_F16
@@ -18,7 +22,8 @@ float mlLuma(sampler2D t, ivec2 p) {
 }
 
 void main() {
-    ivec2 o = min(ivec2(gl_FragCoord.xy), uSize - 1);   // replicate padding (right and bottom)
+    ivec2 q = ivec2(gl_FragCoord.xy);
+    ivec2 o = min(q, uSize - 1);   // replicate padding (right and bottom)
     float sa = 0.0, sc = 0.0;
     int n = 0;
     for (int j = 0; j < 2; j++)
@@ -33,4 +38,15 @@ void main() {
     float s = n == 4 ? 0.25 : (n == 2 ? 0.5 : 1.0);   // (exact: the sums are integers)
     float ya = sa * s, yc = sc * s;
     oLv = vec4(ya / 255.0, yc / 255.0, ya, yc);
+    float dup = 0.0;
+    if (q.x < uSize.x && q.y < uSize.y) {
+        ivec2 e = ivec2(q.x == uSize.x - 1 ? uFrameSize.x : min(2 * q.x + 2, uFrameSize.x),    // end of the cell (exclusive)
+                        q.y == uSize.y - 1 ? uFrameSize.y : min(2 * q.y + 2, uFrameSize.y));
+        for (int y = 2 * q.y; y < e.y; y++)
+            for (int x = 2 * q.x; x < e.x; x++) {
+                vec3 d = FG_D(fgPx(uPrev, ivec2(x, y)), fgPx(uCurr, ivec2(x, y)));
+                dup += (d.r + d.g) + d.b;
+            }
+    }
+    oDup = vec4(dup);
 }

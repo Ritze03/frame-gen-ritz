@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Cost per real pair (push the new frame + estimate + synth(0.5) = 2x) of each motion version in headless Chromium.
-//   node webgl/tests/bench.mjs [--gpu] [--pair battlefield] [--modes v1,v2p,v2q] [--fs 2] [--iters 60] [--mult 2]
+//   node webgl/tests/bench.mjs [--gpu] [--pair battlefield] [--modes v1,v2p,v2q,ml2,ml1] [--fs 2] [--iters 60] [--mult 2] [--size WxH]
 // --gpu: hardware GL through ANGLE (FG_ANGLE=vulkan default, or gl); otherwise SwiftShader (CPU: only relative numbers mean much).
+// Modes: v1, v2p (V2 Performance), v2q (V2 Quality), ml2 / ml1 (V1 with the learned estimator e2v3 / e1v3; flowScale 2 only).
+// --size: the pair resampled (bilinear) to W x H first, e.g. 2560x1440 from the 1080p pair.
 // GPU time (EXT_disjoint_timer_query_webgl2) of pushFrame (the raw RGBA upload from JS + luma pyramid) and of estimate + synths, when the browser exposes it, else wall time per pair with a gl.finish() each
 // (includes the CPU side of the GL calls). Prints the median and the minimum over --iters pairs after 10 warm-up pairs.
 import fs from 'node:fs';
@@ -10,7 +12,7 @@ import { openEngine } from './server.mjs';
 import { work } from './paths.mjs';
 
 const argv = process.argv.slice(2);
-const opt = { passes: false, gpu: false, pair: 'battlefield', modes: ['v1', 'v2p', 'v2q'], fs: [2], iters: 60, mult: 2 };
+const opt = { passes: false, gpu: false, pair: 'battlefield', modes: ['v1', 'v2p', 'v2q'], fs: [2], iters: 60, mult: 2, size: null };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i], nx = () => argv[++i];
   if (a === '--gpu') opt.gpu = true;
@@ -20,6 +22,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--fs') opt.fs = nx().split(',').map(Number);
   else if (a === '--iters') opt.iters = Number(nx());
   else if (a === '--mult') opt.mult = Number(nx());
+  else if (a === '--size') opt.size = nx().split('x').map(Number);
   else { console.error('bench: unknown argument ' + a); process.exit(2); }
 }
 const man = JSON.parse(fs.readFileSync(path.join(work, 'pairs', 'manifest.json'), 'utf8'));
@@ -28,13 +31,32 @@ if (!p) { console.error('bench: no pair ' + opt.pair); process.exit(2); }
 const E = await openEngine({ gpu: opt.gpu, settings: {} });
 if (E.init.fatal) { console.error('bench: ' + E.init.fatal); await E.browser.close(); process.exit(2); }
 console.log(`browser : Chromium ${E.version}, renderer ${E.init.info.renderer}`);
-const SET = { v1: { motionVersion: 1 }, v2p: { motionVersion: 2, v2Mode: 'performance' }, v2q: { motionVersion: 2, v2Mode: 'quality' } };
+const SET = { v1: { motionVersion: 1, motion: 'search' }, v2p: { motionVersion: 2, v2Mode: 'performance' }, v2q: { motionVersion: 2, v2Mode: 'quality' },
+  ml2: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3' }, ml1: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3' } };
 await E.page.addScriptTag({ content: `
 window.__bench = async function (job) {
   const gl = window.__x._gl();
   const eng = window.__x._engine();
   const get = async (q) => new Uint8Array(await (await fetch('/w/' + q)).arrayBuffer());
-  const a = await get('pairs/' + job.pair + '/a.rgba'), c = await get('pairs/' + job.pair + '/c.rgba');
+  let a = await get('pairs/' + job.pair + '/a.rgba'), c = await get('pairs/' + job.pair + '/c.rgba');
+  if (job.size) {   // bilinear resample (half-pixel centres) to job.size
+    const rs = (src) => {
+      const [w2, h2] = job.size, o = new Uint8Array(w2 * h2 * 4), sx = job.W0 / w2, sy = job.H0 / h2;
+      for (let y = 0; y < h2; y++) {
+        const fy = Math.min(Math.max((y + 0.5) * sy - 0.5, 0), job.H0 - 1), y0 = Math.floor(fy), y1 = Math.min(y0 + 1, job.H0 - 1), wy = fy - y0;
+        for (let x = 0; x < w2; x++) {
+          const fx = Math.min(Math.max((x + 0.5) * sx - 0.5, 0), job.W0 - 1), x0 = Math.floor(fx), x1 = Math.min(x0 + 1, job.W0 - 1), wx = fx - x0;
+          for (let k = 0; k < 4; k++) {
+            const v = (src[(y0 * job.W0 + x0) * 4 + k] * (1 - wx) + src[(y0 * job.W0 + x1) * 4 + k] * wx) * (1 - wy) +
+              (src[(y1 * job.W0 + x0) * 4 + k] * (1 - wx) + src[(y1 * job.W0 + x1) * 4 + k] * wx) * wy;
+            o[(y * w2 + x) * 4 + k] = Math.round(v);
+          }
+        }
+      }
+      return o;
+    };
+    a = rs(a); c = rs(c);
+  }
   eng.setSettings(job.settings);
   const tq = gl.getExtension('EXT_disjoint_timer_query_webgl2');
   const fr = [{ width: job.W, height: job.H, data: a }, { width: job.W, height: job.H, data: c }];
@@ -112,9 +134,10 @@ window.__bench = async function (job) {
   return { wall: med(wall), wallMin: Math.min(...wall), push: med(gpuPush), gpu: med(gpu), batch: med(batch), bE: med(batchE), bS: med(batchS), perPass, gpuMin: gpu.length ? Math.min(...gpu) : null, timer: !!tq, passCounts: eng.passCounts() };
 };` });
 for (const mode of opt.modes) for (const S of opt.fs) {
-  const r = await E.page.evaluate((j) => window.__bench(j), { pair: p.name, W: p.width, H: p.height, settings: { ...SET[mode], flowScale: S }, passes: opt.passes, iters: opt.iters, mult: opt.mult });
+  const W = opt.size ? opt.size[0] : p.width, H = opt.size ? opt.size[1] : p.height;
+  const r = await E.page.evaluate((j) => window.__bench(j), { pair: p.name, W, H, W0: p.width, H0: p.height, size: opt.size, settings: { ...SET[mode], flowScale: S }, passes: opt.passes, iters: opt.iters, mult: opt.mult });
   const f = (v) => (v == null ? '-' : v.toFixed(3));
   if (r.perPass) console.log('  per pass (ms): ' + Object.entries(r.perPass).sort((x, y) => y[1] - x[1]).map(([k, v]) => `${k} ${v.toFixed(3)}`).join(', '));
-  console.log(`${mode.padEnd(4)} fs${S} ${p.name} ${p.width}x${p.height} ${opt.mult}x: wall ${f(r.wall)} ms (min ${f(r.wallMin)})  gpu: push ${f(r.push)} ms + estimate/synth ${f(r.gpu)} ms (min ${f(r.gpuMin)}), back-to-back ${f(r.batch)} ms (estimate ${f(r.bE)}, synth ${f(r.bS)})${r.timer ? '' : ' [no timer query]'}  passes ${JSON.stringify(r.passCounts)}`);
+  console.log(`${mode.padEnd(4)} fs${S} ${p.name} ${W}x${H} ${opt.mult}x: wall ${f(r.wall)} ms (min ${f(r.wallMin)})  gpu: push ${f(r.push)} ms + estimate/synth ${f(r.gpu)} ms (min ${f(r.gpuMin)}), back-to-back ${f(r.batch)} ms (estimate ${f(r.bE)}, synth ${f(r.bS)})${r.timer ? '' : ' [no timer query]'}  passes ${JSON.stringify(r.passCounts)}`);
 }
 await E.browser.close();

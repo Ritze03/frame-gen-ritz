@@ -103,13 +103,12 @@
   function mlConv(cin, cout, last) {
     const s = [];
     for (let j = 0; j < cin; j++) s.push('uIn' + j);
-    if (last) s.push('uX3');
+    if (last) s.push('uHc');
     s.push('uDup');
     return [last ? 'ml_last' + cin : 'ml_conv' + cin + 'x' + cout, 'learned/conv.frag.glsl', null, s, ML_INC,
       '#define ML_CIN ' + cin + '\n#define ML_COUT ' + cout + '\n#define ML_LAST ' + (last ? 1 : 0) + '\n'];
   }
   const ML_PROGRAMS = [
-    ['ml_dup', 'learned/dup.frag.glsl', null, ['uPrev', 'uCurr'], ML_INC],
     ['ml_lv0', 'learned/lv0.frag.glsl', null, ['uPrev', 'uCurr'], ML_INC],
     ['ml_down', 'learned/down.frag.glsl', null, ['uSrc']],
     ['ml_match', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup'], ML_INC],
@@ -183,6 +182,8 @@
     motion: 'search',       // V1 only: 'search' (V1's block search, proto/interp.py) or 'learned' (the learned estimator: needs flowScale 2
                             // and the net's weights, webgl/nets/<motionNet>.js; ignored by V2)
     motionNet: 'e2v3',      // motion 'learned': 'e2v3' (width 24, 95,530 weights) or 'e1v3' (width 12, 28,330 weights, ~3.4x cheaper)
+    motionPrecision: 'fp16', // motion 'learned': storage of the net's activations, 'fp16' (RGBA16F) or 'fp32' (RGBA32F, the exact port);
+                            // the field, the pyramid, the weights and all arithmetic are float32 either way
     // ---- structural (re-allocate textures and recompile the programs; drop the frame history) ----
     inputFormat: 'rgba8',   // frame format: 'rgba8' (RGBA8 frames and output) or 'rgba16f' (HDR / float: RGBA16F frames and output)
     transfer: 'encoded',    // rgba16f only: 'encoded' (display-encoded values: PQ, HLG, sRGB, ...) or 'linear' (scRGB / linear light)
@@ -191,7 +192,7 @@
   };
   const MH_ROWS = 4;   // parent rows per band of the median histogram (estimate/medhist.frag.glsl's)
   const STRING_KEYS = { v2Mode: ['quality', 'performance'], blurWeights: ['gaussian', 'even'], inputFormat: ['rgba8', 'rgba16f'], transfer: ['encoded', 'linear'],
-    motion: ['search', 'learned'], motionNet: ML_NETS };
+    motion: ['search', 'learned'], motionNet: ML_NETS, motionPrecision: ['fp16', 'fp32'] };
   const BOOL_KEYS = { debug: 1, v2StaticMask: 1 };
   fg.defaultSettings = function () { return Object.assign({}, DEFAULTS); };
 
@@ -389,7 +390,7 @@
   // the learned estimator is the effective motion estimate (V1 with motion 'learned'; V2 ignores the key)
   function mlOn(s) { return s.motionVersion === 1 && s.motion === 'learned'; }
   // which estimate the settings produce: a change drops the current estimate (like a motionVersion switch)
-  function estKey(s) { return s.motionVersion === 2 ? 'v2' : mlOn(s) ? 'ml:' + s.motionNet : 'v1'; }
+  function estKey(s) { return s.motionVersion === 2 ? 'v2' : mlOn(s) ? 'ml:' + s.motionNet + ':' + s.motionPrecision : 'v1'; }
   // the loaded net `name` (webgl/nets/<name>.js attaches fg.nets[name]) or null
   function mlNetDef(name) {
     const n = fg.nets && fg.nets[name];
@@ -436,6 +437,7 @@
       R16UI: { i: gl.R16UI, f: gl.RED_INTEGER, t: gl.UNSIGNED_SHORT, ch: 1, rf: gl.RGBA_INTEGER, rt: gl.UNSIGNED_INT, A: Uint32Array },
       R32F: { i: gl.R32F, f: gl.RED, t: gl.FLOAT, ch: 1, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
       RG32F: { i: gl.RG32F, f: gl.RG, t: gl.FLOAT, ch: 2, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
+      RG16F: { i: gl.RG16F, f: gl.RG, t: gl.HALF_FLOAT, ch: 2, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
       RGBA32F: { i: gl.RGBA32F, f: gl.RGBA, t: gl.FLOAT, ch: 4, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
       RGBA32I: { i: gl.RGBA32I, f: gl.RGBA_INTEGER, t: gl.INT, ch: 4, rf: gl.RGBA_INTEGER, rt: gl.INT, A: Int32Array },
       RGBA16F: { i: gl.RGBA16F, f: gl.RGBA, t: gl.HALF_FLOAT, ch: 4, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
@@ -670,19 +672,19 @@
       resetCache();
     }
 
-    // sizes of a sum-reduction chain down to 1x1: the first step's fan-in fan0 per axis, then 16 (at least one step)
-    function reduceChain(w, h, fan0) {
+    // sizes of a sum-reduction chain down to 1x1: the first step's fan-in fan0 per axis, then rest (default 16; at least one step)
+    function reduceChain(w, h, fan0, rest) {
       const sizes = [];
       let f = fan0 || 16;
       do {
         w = Math.ceil(w / f); h = Math.ceil(h / f);
         sizes.push([w, h, f]);
-        f = 16;
+        f = rest || 16;
       } while (w > 1 || h > 1);
       return sizes;
     }
-    function mkChain(name, w, h, fan0) {
-      return reduceChain(w, h, fan0).map(function (sz, k) { const t = mk(name + '[' + k + ']', 'R32F', sz[0], sz[1]); t.fan = sz[2]; return t; });
+    function mkChain(name, w, h, fan0, rest) {
+      return reduceChain(w, h, fan0, rest).map(function (sz, k) { const t = mk(name + '[' + k + ']', 'R32F', sz[0], sz[1]); t.fan = sz[2]; return t; });
     }
     // run a reduction chain: step 0 reads src (channel chan; reduce_untrusted: mode0 for the first step), the last output is the sum
     function runChain(prog, chain, src, first, rest) {
@@ -804,51 +806,55 @@
     // The learned estimator's textures (allocated by its first estimate; again when the net changes) and its pass plan. Sizes:
     // padded flow grid PW x PH (fw, fh rounded up to a multiple of 16), level l = (PW >> l) x (PH >> l), every level an exact half.
     //   pyr[0] RGBA32F (la, lc, ya, yc), pyr[l > 0] RG32F (la, lc)   the net's own pyramid (SPEC stage 3)
-    //   x[0..3] RGBA32F, level-0 size                               the 14-channel input of the current level (+ h / 4)
-    //   act[2][G] RGBA32F, level-0 size                             ping-pong activations, G = width / 4 textures each
+    //   x[0..2] RGBA, x[3] RG, level-0 size                         the 14-channel input of the current level
+    //   act[2][G] RGBA, level-0 size                                ping-pong activations, G = width / 4 textures each
     //   h[1..4] RG32F, level size                                   the field after each level (level 0 writes pixfield)
-    //   dupRed, sadRed                                               the duplicate-test and SAD sum chains
-    // The coarser levels render into the level-0-sized x / act textures over their own viewport (uSize = the level: zero padding).
-    function allocMl(name) {
+    //   dupSrc R32F, dupRed, sadRed                                  the duplicate-test and SAD sum chains
+    // x / act are half floats (RGBA16F, RG16F) with settings.motionPrecision 'fp16', float32 with 'fp32'. The coarser levels render
+    // into the level-0-sized x / act textures over their own viewport (uSize = the level: zero padding).
+    function allocMl(name, prec) {
       if (T.ml) {
-        if (T.ml.name === name) return T.ml;
+        if (T.ml.name === name && T.ml.prec === prec) return T.ml;
         freeSome(T.ml.tex, T.ml.fbos);
         T.ml = null;
       }
+      const F4 = prec === 'fp16' ? 'RGBA16F' : 'RGBA32F', F2 = prec === 'fp16' ? 'RG16F' : 'RG32F';
       const nb = mlNetBuffer(name), net = nb.net, G = net.width / 4, NL = net.levels;
       const PW = Math.ceil(FW / net.padMultiple) * net.padMultiple, PH = Math.ceil(FH / net.padMultiple) * net.padMultiple;
       const t0 = ownedTex.length, f0 = ownedFbo.length;
       let m = null;
       try {
-        m = { name: name, net: net, buf: nb.buf, G: G, PW: PW, PH: PH, pyr: [], h: [null], act: [[], []], actMrt: [[], []], plan: [] };
+        m = { name: name, prec: prec, net: net, buf: nb.buf, G: G, PW: PW, PH: PH, pyr: [], h: [null], act: [[], []], actMrt: [[], []], plan: [] };
         m.pyr.push(mk('ml.pyr[0]', 'RGBA32F', PW, PH));
+        m.dupSrc = mk('ml.dupSrc', 'R32F', PW, PH);
+        m.lvMrt = mkMrt('ml_lv0', [m.pyr[0], m.dupSrc]);
         for (let l = 1; l < NL; l++) {
           m.pyr.push(mk('ml.pyr[' + l + ']', 'RG32F', PW >> l, PH >> l));
           m.h.push(mk('ml.h[' + l + ']', 'RG32F', PW >> l, PH >> l));
         }
-        m.x = [0, 1, 2, 3].map(function (k) { return mk('ml.x[' + k + ']', 'RGBA32F', PW, PH); });
+        m.x = [0, 1, 2, 3].map(function (k) { return mk('ml.x[' + k + ']', k < 3 ? F4 : F2, PW, PH); });
         m.xMrt = mkMrt('ml_match', m.x);
         for (let s = 0; s < 2; s++) {
-          for (let g = 0; g < G; g++) m.act[s].push(mk('ml.act[' + s + '][' + g + ']', 'RGBA32F', PW, PH));
+          for (let g = 0; g < G; g++) m.act[s].push(mk('ml.act[' + s + '][' + g + ']', F4, PW, PH));
           for (let part = 0; part < G / 3; part++) m.actMrt[s].push(mkMrt('ml_conv', m.act[s].slice(3 * part, 3 * part + 3)));
         }
-        m.dupRed = mkChain('ml.dupRed', W, H, 8);
-        m.sadRed = mkChain('ml.sadRed', FW, FH, 8);
+        m.dupRed = mkChain('ml.dupRed', PW, PH, 4, 4);   // (small fan-ins: many fragments, short loops)
+        m.sadRed = mkChain('ml.sadRed', FW, FH, 2, 4);
         const dup = m.dupRed[m.dupRed.length - 1];
         // the coarse-to-fine plan: per level the match, then the layers (part a / b for G = 6) into the ping-pong sets, the last
         // layer into h[l] (level 0: pixfield, fw x fh; its taps still read the padded level)
         for (let l = NL - 1; l >= 0; l--) {
-          const lw = PW >> l, lh = PH >> l, size = [lw, lh];
-          m.plan.push({ name: 'ml_match.' + l, p: P.ml_match, out: { fbo: m.xMrt.fbo, w: lw, h: lh }, size: size, top: l === NL - 1 ? 1 : 0,
-            ins: [m.pyr[l], l === NL - 1 ? m.pyr[l] : m.h[l + 1], dup], block: null });
+          const lw = PW >> l, lh = PH >> l, size = [lw, lh], top = l === NL - 1 ? 1 : 0, hc = top ? m.pyr[l] : m.h[l + 1];   // (hc unread at the top)
+          m.plan.push({ name: 'ml_match.' + l, p: P.ml_match, out: { fbo: m.xMrt.fbo, w: lw, h: lh }, size: size, top: top,
+            ins: [m.pyr[l], hc, dup], block: null });
           for (let k = 0; k <= net.depth; k++) {
             const last = k === net.depth, src = k === 0 ? m.x : m.act[(k - 1) & 1], parts = nb.blocks[l][k];
             for (let part = 0; part < parts.length; part++) {
               const b = parts[part], p = P[b.prog];
               if (p.wSize !== b.size) throw new Error('framegen: ' + b.prog + ': uniform block MlW is ' + p.wSize + ' bytes, the host packs ' + b.size);
               const out = !last ? { fbo: m.actMrt[k & 1][part].fbo, w: lw, h: lh } : l === 0 ? T.pixfield : { fbo: m.h[l].fbo, w: lw, h: lh };
-              m.plan.push({ name: 'ml_c' + k + (parts.length > 1 ? 'ab'[part] : '') + '.' + l, p: p, out: out, size: size, top: 0,
-                ins: src.concat(last ? [m.x[3], dup] : [dup]), block: b });
+              m.plan.push({ name: 'ml_c' + k + (parts.length > 1 ? 'ab'[part] : '') + '.' + l, p: p, out: out, size: size, top: top,
+                ins: src.concat(last ? [hc, dup] : [dup]), block: b });
             }
           }
         }
@@ -1248,15 +1254,12 @@
     // per level), then V1's contract: the field in pixfield (fw x fh, flow-res half-vectors) and sadSum = sad * bw * bh in sadRed's
     // last texel. V1's synthesis reads both unchanged (cut: sad > sceneCutSad).
     function estimateLearned() {
-      const m = allocMl(settings.motionNet), A = T.frame[prevS], C = T.frame[currS];
+      const m = allocMl(settings.motionNet, settings.motionPrecision), A = T.frame[prevS], C = T.frame[currS];
       const dr = m.dupRed, dup = dr[dr.length - 1];
-      begin(P.ml_dup, dr[0], A, C);
-      gl.uniform1i(P.ml_dup.u.uFan, dr[0].fan);
-      tri('ml_dup');
-      sumRest(dr);
-      begin(P.ml_lv0, m.pyr[0], A, C);
+      begin(P.ml_lv0, m.lvMrt, A, C);   // level 0 of the pyramid + the duplicate test's per-cell sums
       gl.uniform2i(P.ml_lv0.u.uSize, FW, FH);
       tri('ml_lv0');
+      runChain(P.reduce_sad, dr, m.dupSrc, 0, 0);
       for (let l = 1; l < m.pyr.length; l++) {
         begin(P.ml_down, m.pyr[l], m.pyr[l - 1]);
         tri('ml_down');
