@@ -1,0 +1,109 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::Learned with Settings::learnedZeroTest (the default): ml_out.comp's pass (stages 5 + 6) with ml-fg's zero-motion test
+// (SPEC.md stage 7, reference.py zero_test()) between them, V1's pixel_field zero candidate applied to the net's field. Per flow pixel
+// q (16x16 per workgroup), with h = the net's cropped field (level 0 of the net's state, never written here: the 5x5 windows read the
+// neighbours' NET vectors, so the pass reads that buffer and writes V1's field[pc.pf]):
+//   d(q) = |ya(q - h) - yc(q + h)|   (bilinear, clamp to edge on the UNPADDED flow-res lumas of P_LUMA, 0..255: ml_out.comp's bilY)
+//   e(q) = |ya(q) - yc(q)|           (the zero vector's cost)
+//   C(h) = box5(d), C(0) = box5(e)   (the 5x5 MEAN, replicate border: a tap outside the frame reads d / e at the clamped position)
+//   zero = C(0) - ZT_BONUS <= C(h)   -> field[pc.pf + q] = zero ? 0 : h
+// and per workgroup the partial sum of zero ? e : d for ml_reduce.comp (mode 1): SPEC.md's SAD identity, |ya(q) - yc(q)| = e for a
+// zeroed pixel and |wa - wc| = d for a kept one, so the sum is stage 6's sad of the FINAL field without a second warp. A duplicate
+// pair (u[U_MLDUP]): the field is zero and the sum stays 0, as with ml_out.comp. Float32 throughout (SPEC.md section 7: the costs
+// must not be stored as half).
+// pc.mode = 2 (test only, Interpolator::LearnedDebug::zeroCosts): also act[q.y * fw + q.x] = (C(h), C(0), zero, 0), the vectors'
+// cost_h_zt / cost0_zt / zero_zt (the activations are dead after the net).
+#include "common.glsl"
+#include "ml_common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int ZT_R = 2;              // window 5 (SPEC.md ZERO_WIN = FGR's PIX_WIN): radius 2; do not change (the net was scored with it)
+const float ZT_BONUS = 1.0;      // SPEC.md ZERO_BONUS (FGR's ZERO_BONUS), luma levels subtracted from the zero candidate's cost
+const int TS = 16, TT = TS + 2 * ZT_R;
+
+shared float sd[TT * TT], se[TT * TT];   // d, e of the tile + its 2 px apron (at the clamped positions)
+shared float hd[TT * TS], he[TT * TS];   // horizontal 5-sums: TT rows x TS columns
+shared float red[256];
+
+// == ml_out.comp bilY: reference.py bilinear() on luma[] (fw x fh)
+float bilY(int off, float x, float y) {
+    int w = pc.fw, h = pc.fh;
+    precise float xc = clamp(x, 0.0, float(w - 1)), yc = clamp(y, 0.0, float(h - 1));
+    float x0f = floor(xc), y0f = floor(yc);
+    int x0 = int(x0f), y0 = int(y0f);
+    int x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+    precise float fx = xc - x0f, fy = yc - y0f;
+    precise float r = luma[off + y0 * w + x0] * ((1.0 - fy) * (1.0 - fx)) + luma[off + y0 * w + x1] * ((1.0 - fy) * fx)
+                    + luma[off + y1 * w + x0] * (fy * (1.0 - fx)) + luma[off + y1 * w + x1] * (fy * fx);
+    return r;
+}
+
+vec2 netH(ivec2 q) { int i = mlH(0) + 2 * (q.y * pc.pw + q.x); return vec2(ml[i], ml[i + 1]); }
+
+// s / 25 (s >= 0) correctly rounded, as numpy's float32 division (GLSL's may be the hardware reciprocal, 2.5 ulp), the way
+// ml_pyr.comp divides by 255: q = s times the rounded reciprocal is within 1 ulp of the quotient, so the answer is q or its neighbour
+// on the remainder's side, whichever leaves the smaller remainder (no ties: s / 25 is never a midpoint). The remainder s - 25 q is
+// exact without fma: ((s - 32 q) + 8 q) - q, three Sterbenz differences (32 q, 8 q exact, s ~ 25 q).
+float rem25(float s, float q) {
+    precise float a = s - q * 32.0;
+    precise float b = a + q * 8.0;
+    precise float c = b - q;
+    return c;
+}
+float div25(float s) {
+    precise float q = s * (1.0 / 25.0);
+    float e = rem25(s, q);
+    if (e == 0.0) return q;
+    float n = uintBitsToFloat(floatBitsToUint(q) + (e > 0.0 ? 1u : 0xFFFFFFFFu));
+    return abs(rem25(s, n)) < abs(e) ? n : q;
+}
+
+void main() {
+    int lid = int(gl_LocalInvocationIndex);
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = q.x < pc.fw && q.y < pc.fh;
+    if (mlDup()) {   // uniform: the whole workgroup leaves before any barrier
+        if (inside) field[pc.pf + q.y * pc.fw + q.x] = vec2(0.0);
+        if (pc.mode == 2 && inside) act[q.y * pc.fw + q.x] = vec4(0.0, 0.0, 1.0, 0.0);
+        if (lid == 0) ml[mlPart() + int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x)] = 0.0;
+        return;
+    }
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - ZT_R;
+    for (int i = lid; i < TT * TT; i += TS * TS) {
+        ivec2 p = clamp(t0 + ivec2(i % TT, i / TT), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+        vec2 h = netH(p);
+        precise vec2 pa = vec2(p) - h, pc_ = vec2(p) + h;
+        sd[i] = abs(bilY(pc.offYa, pa.x, pa.y) - bilY(pc.offYc, pc_.x, pc_.y));
+        se[i] = abs(luma[pc.offYa + p.y * pc.fw + p.x] - luma[pc.offYc + p.y * pc.fw + p.x]);
+    }
+    barrier();
+    for (int i = lid; i < TT * TS; i += TS * TS) {   // reference.py box(): the horizontal sum of the 5 taps first, left to right
+        int r = i / TS, c = i % TS;
+        precise float a = 0.0, b = 0.0;
+        for (int k = 0; k < 2 * ZT_R + 1; k++) { a += sd[r * TT + c + k]; b += se[r * TT + c + k]; }
+        hd[i] = a;
+        he[i] = b;
+    }
+    barrier();
+    float term = 0.0;
+    if (inside) {
+        precise float a = 0.0, b = 0.0;   // ... then the vertical sum, top to bottom, then / 25
+        for (int k = 0; k < 2 * ZT_R + 1; k++) { a += hd[(l.y + k) * TS + l.x]; b += he[(l.y + k) * TS + l.x]; }
+        float ch = div25(a), c0 = div25(b);
+        precise float c0b = c0 - ZT_BONUS;
+        bool zero = c0b <= ch;
+        int me = (l.y + ZT_R) * TT + l.x + ZT_R;
+        term = zero ? se[me] : sd[me];
+        field[pc.pf + q.y * pc.fw + q.x] = zero ? vec2(0.0) : netH(q);
+        if (pc.mode == 2) act[q.y * pc.fw + q.x] = vec4(ch, c0, zero ? 1.0 : 0.0, 0.0);
+    }
+    red[lid] = term;
+    barrier();
+    for (int k = 128; k > 0; k >>= 1) {
+        if (lid < k) red[lid] += red[lid + k];
+        barrier();
+    }
+    if (lid == 0) ml[mlPart() + int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x)] = red[0];
+}

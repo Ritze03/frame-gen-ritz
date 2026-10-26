@@ -2,6 +2,8 @@
 //   uitest check [--bgra] [--hash] [W H]     default 1280 720
 //   option --algo v1|v2|learned (every mode): the motion version (Settings::motionVersion) every run starts with (default v1)
 //   option --mode quality|performance (every mode): Settings::v2Mode of every run (default quality; V1 ignores it)
+//   option --zt 0|1, --guard 0|1, --net e2v3|e1v3|e2v4 (every mode): Settings::learnedZeroTest (default 1) / learnedStaticGuard (default 0) / learnedNet (default the library's) of every run
+//                                            (only MotionVersion::Learned reads them)
 //   uitest deep [W H]                        Settings::uiHistory: a synth from a pair 10 frames back still finds its clean copies (default 640x360)
 //   uitest track [W H]                       recordTrack: UI protection kept warm while the host does not generate (default 640x360)
 //   uitest trackbench [W H]                  GPU cost of recordTrack vs recordObserve (default 1920x1080 and 2560x1440)
@@ -259,7 +261,14 @@ struct Result { std::vector<uint8_t> out[2]; };   // t = 0.5, 0.25 of the last p
 #ifndef UITEST_NO_MOTION
 static MotionVersion gAlgo = MotionVersion::V1;
 static V2Mode gMode = V2Mode::Quality;   // --mode
-static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; return s; }
+static bool gZt = true, gGuard = false;   // --zt, --guard: Settings::learnedZeroTest / learnedStaticGuard (MotionVersion::Learned only)
+static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4: Settings::learnedNet (Learned only; default: the library's)
+static bool parseNet(const char* a) {
+    static const char* names[] = {"e2v3", "e1v3", "e2v4"};   // LearnedNet order
+    for (uint32_t i = 0; i < 3; i++) if (!strcmp(a, names[i])) { gNet = (LearnedNet)i; return true; }
+    return false;
+}
+static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
 static bool algoV2() { return gAlgo == MotionVersion::V2; }
 static bool algoV2Quality() { return algoV2() && gMode == V2Mode::Quality; }
 #else
@@ -1657,9 +1666,11 @@ static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "
 // The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes.
 // V2 = both V2Modes: V1's luma / down, its 2 faster estimate passes (medhist, search), the block re-pick and field clean-up (both
 // modes), Performance's morph, Quality's per-pixel field, splat, coverage and morph; no motion-blur passes (its morphs blur): 11.
-// Learned = V1's luma, 4 synth passes and 3 motion-blur passes, its duplicate test, reduction, pyramid and output passes, and its
-// match (2) and conv (20) pipelines per activation storage, net, layer shape and split: 34.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : v == MotionVersion::Learned ? 34 : 14; }
+// Learned = V1's luma, 4 synth passes and 3 motion-blur passes, its duplicate test, reduction, pyramid, output, zero-test and static-guard
+// passes, its match (2) pipelines per activation storage and its conv pipelines, 10 per net (per activation storage, layer shape and
+// split): 16 + 10 per LearnedNet (kLearnedNets: update it when a net is added).
+static const int64_t kLearnedNets = 3;   // E2v3, E1v3, E2v4
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : v == MotionVersion::Learned ? 16 + 10 * kLearnedNets : 14; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1836,6 +1847,9 @@ int main(int argc, char** argv) {
             else if (!strcmp(a, "performance")) gMode = V2Mode::Performance;
             else { fprintf(stderr, "--mode quality|performance\n"); return 2; }
         }
+        else if (!strcmp(argv[i], "--zt") && i + 1 < argc) gZt = atoi(argv[++i]) != 0;
+        else if (!strcmp(argv[i], "--guard") && i + 1 < argc) gGuard = atoi(argv[++i]) != 0;
+        else if (!strcmp(argv[i], "--net") && i + 1 < argc) { if (!parseNet(argv[++i])) { fprintf(stderr, "--net e2v3|e1v3|e2v4\n"); return 2; } }
 #endif
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dumpDir = argv[++i];
         else if (!strcmp(argv[i], "--hash")) hash = true;

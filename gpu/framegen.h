@@ -33,7 +33,9 @@ enum class MotionVersion : uint32_t {
               // (its synthesis has a variant per Format, its thresholds are in the same 8-bit levels as V1's). Settings::v2Mode picks
               // between its two modes. Its motion estimate computes V1's block field with faster passes (shared by both modes).
     Learned = 2,  // opt-in: V1 with its motion search replaced by a small learned estimator (ml-fg: a 5-level coarse-to-fine conv net
-                  // on the flow-res luma, Settings::learnedNet picks the weights, both embedded in the library). It writes what V1's
+                  // on the flow-res luma, Settings::learnedNet picks the weights, all embedded in the library), followed by ml-fg's
+                  // zero-motion test (Settings::learnedZeroTest, on by default) and optionally its static guard on the generated
+                  // frames (Settings::learnedStaticGuard, off by default). It writes what V1's
                   // search writes (the per-pixel half-vector field, the scene-cut SAD sum); V1's synthesis, trust, fallbacks, motion
                   // blur and UI protection are unchanged. Two (near-)identical frames (FGR's duplicate test: mean |a - c| <= 0.6
                   // levels, the mean over the pixels and R, G, B, proto/harness.py DUP_DIFF) skip the net and get V1's answer for a
@@ -41,17 +43,22 @@ enum class MotionVersion : uint32_t {
                   // throughout (Settings::learnedHalf: half activations). flowScale 2 only (the nets were trained at 2). Every
                   // Format. Costs more GPU time and memory than V1; V1 stays the default. RX 7900 XTX, 2x, whole pair (estimate +
                   // synth), back-to-back, ms, float32 / learnedHalf: 1080p E2v3 1.29 / 1.00, E1v3 0.53 / 0.48 (V1 0.31); 1440p E2v3
-                  // 2.70 / 1.66, E1v3 0.88 / 0.78 (V1 0.47). The synth part is V1's (~0.07 ms at 1080p, ~0.12 at 1440p). Memory on
-                  // top of V1 (activations + state): 1080p E2v3 100 + 11 MB, E1v3 58 + 11 MB; 1440p E2v3 177 + 20 MB, E1v3
-                  // 103 + 20 MB (learnedHalf: half the activations).
+                  // 2.70 / 1.66, E1v3 0.88 / 0.78 (V1 0.47); E2v4 costs what E2v3 does. The synth part is V1's (~0.07 ms at 1080p,
+                  // ~0.12 at 1440p). (Measured without the zero test; that test adds ~0.006 ms per pair at 1080p: the net's output
+                  // pass is 0.011-0.016 ms without it, 0.017-0.022 with it; the static guard adds ~0.047 ms (fp32) / 0.050 ms per
+                  // generated frame at 1080p, per-pass GPU profile.) Memory on top of V1 (activations + state): 1080p E2v3 / E2v4
+                  // 100 + 11 MB, E1v3 58 + 11 MB; 1440p E2v3 / E2v4 177 + 20 MB, E1v3 103 + 20 MB (learnedHalf: half the
+                  // activations); the zero test and the static guard need none; the weights of all nets 0.9 MB.
 };
 
-// The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. Both nets are the same
-// architecture (ml-fg export/SPEC.md); only the width (channels per hidden layer) differs.
+// The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. All nets are the same
+// architecture (ml-fg export/SPEC.md); only the width (channels per hidden layer) and the weights differ.
 enum class LearnedNet : uint32_t {
-    E2v3 = 0,   // the default: width 24, 95,530 weights, 13.2 GMAC per 1080p pair. Better than V1 on average over ml-fg's 7 clips
-                // (+0.23 dB, much better on hard footage), 0.1-0.5 dB worse on FGR's own three.
+    E2v3 = 0,   // width 24, 95,530 weights, 13.2 GMAC per 1080p pair. Better than V1 on average over ml-fg's 7 clips (+0.23 dB, much
+                // better on hard footage), 0.1-0.5 dB worse on FGR's own three. (The default before E2v4.)
     E1v3 = 1,   // width 12, 28,330 weights, 3.9 GMAC (3.4x cheaper), 0.24 dB below E2v3 on average (on par with V1).
+    E2v4 = 2,   // the default: E2v3 fine-tuned by ml-fg, the same architecture, size and cost (width 24, 95,530 weights, 13.2 GMAC). With
+                // the zero test (Settings::learnedZeroTest): +0.27 dB over V1 ("final") on ml-fg's 14 clips.
 };
 
 // The two modes of MotionVersion::V2 (Settings::v2Mode). Values are append-only and never renumbered. Runtime: setSettings() at any
@@ -269,15 +276,38 @@ struct Settings {
     // the zero vector and keeps warp taps off them, with or without uiProtection. On = the default; off = V2's synthesis as without
     // it (the tests' unprotected reference). V1 ignores it. Runtime: setSettings() at any time, from the next recordEstimate on.
     bool v2StaticMask = true;
-    // MotionVersion::Learned: the net (see LearnedNet). E2v3 = the default. Other versions ignore it (any valid value, no effect).
-    // Runtime: setSettings() at any time, no GPU wait; the next recordEstimate runs the new net (the current estimate is kept). Both
-    // nets' weights are uploaded with the version's first estimate; a switch to a wider net grows the activation buffer (it only ever
-    // allocates; false from setSettings if that fails, nothing changed).
-    LearnedNet learnedNet = LearnedNet::E2v3;
+    // MotionVersion::Learned: the net (see LearnedNet). E2v4 = the default (E2v3 before it). Other versions ignore it (any valid value,
+    // no effect). Runtime: setSettings() at any time, no GPU wait; the next recordEstimate runs the new net (the current estimate is
+    // kept). Every net's weights are uploaded with the version's first estimate; a switch to a wider net grows the activation buffer (it
+    // only ever allocates; false from setSettings if that fails, nothing changed).
+    LearnedNet learnedNet = LearnedNet::E2v4;
     // MotionVersion::Learned: store the net's activations (its 14-channel input and the four hidden layers' outputs) as IEEE half
     // instead of float32; the arithmetic, the field and the pyramid stay float32 (ml-fg SPEC.md section 7, the tested fp16 storage).
     // Off = the default: the exact float32 port. Other versions ignore it. Runtime: setSettings() at any time, like learnedNet.
     bool learnedHalf = false;
+    // MotionVersion::Learned: ml-fg's zero-motion test (export/SPEC.md stage 7, reference.py zero_test()), V1's per-pixel zero candidate
+    // applied to the net's field: per flow pixel, C(h) = the 5x5 mean (replicate border) of |ya(q - h) - yc(q + h)| with the net's h,
+    // C(0) = the same of |ya - yc|; where C(0) - 1.0 <= C(h) the vector becomes 0 (window and bonus are FGR's PIX_WIN / ZERO_BONUS,
+    // fixed). The scene-cut SAD is then that of the final field. Why: the net has no zero-motion prior, so static HUD, crosshair and
+    // text were dragged by the motion around them and still frames flickered between "still" and invented motion (Known issue (h) of
+    // ML-FG-TESTING.md); ml-fg's harness: +0.10 dB over e2v3 alone on 14 clips (worst clip -0.02), static-pixel error 1.048 -> 1.018
+    // (V1 1.007). Two identical frames give a zero field and SAD exactly. On = the default; off = the net's field as it is (output
+    // byte-identical to the library before the setting). Other versions ignore it. Runtime: setSettings() at any time, no GPU wait and
+    // no allocation; the next recordEstimate uses it. Cost: one flow-res pass in place of the net's output pass (it also does the SAD),
+    // RX 7900 XTX 1080p: see MotionVersion::Learned's cost note; no memory.
+    bool learnedZeroTest = true;
+    // MotionVersion::Learned: ml-fg's static guard (scripts/static_guard.py, opt-in): a pass over every finished generated frame (after
+    // the whole-frame fallback, before the UI patch) that shows the plain time mix (1 - t) A + t C where the two real frames are locally
+    // identical and the motion there is small: wStatic from the 3x3 mean d and the 9x9 min of the per-pixel max-channel |A - C| and the
+    // field's full-res displacement at t (smoothstep ramps, d 7.65..22.95 levels, halo 5.1..7.65 levels, motion 0.5..1 px; the
+    // constants are framegen.cpp kStaticGuard), out = mix(out, time mix, wStatic), bit-exact where wStatic <= 0.001. A frame that took a
+    // whole-frame fallback (scene cut, too much untrusted) is untouched. Every Format (levels: the mismatch metric's convention); with
+    // UI protection A and C are the frames the synthesis read (Crosshair / WholeScreen: the clean copies) and the patch comes after it;
+    // recordSynthBlur applies it once to the average (the time mix at the samples' weighted mean t, the gate with the midpoint field
+    // and the largest per-sample factor; skipped if any sample took a whole-frame fallback). Off = the default (output byte-identical
+    // to the library before the setting). Other versions ignore it. Runtime: setSettings() at any time, no GPU wait, no allocation.
+    // Cost: one full-res pass per generated frame (RX 7900 XTX 1080p: see MotionVersion::Learned's cost note); no memory.
+    bool learnedStaticGuard = false;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
     // Motion estimation runs at 1/flowScale of the frame size: 1, 2 or 4. 2 = quality (default);
@@ -582,7 +612,8 @@ public:
     // MotionVersion::V2: its estimate ends after the levels, then "field clean" (once per estimate: re-pick, refinement, clean-up);
     // Quality adds "pixel field", "splat" and "coverage" (once per estimate); per synth "morph" / "blur morph" and "fallback" (its
     // fix-up). MotionVersion::Learned: after "luma", "duplicate test", "net pyramid", "net level 4" .. "net level 0" and "net output"
-    // (the field and the SAD), then V1's synth passes.
+    // (the field and the SAD; "net output + zero test" with Settings::learnedZeroTest), then V1's synth passes, with
+    // Settings::learnedStaticGuard plus "static guard" after "fallback" / "blur fixup" (before "ui_patch").
     bool readTimings(std::vector<const char*>& names, std::vector<uint64_t>& ticks);
 
     // Debug / test only (bench/score), read-only: changes no output and no state. Records a copy of the latest recordSynth's
@@ -617,7 +648,13 @@ public:
     //            can feed the reference's lumas (cv2's 15-bit luma instead of the library's 14-bit one).
     //   stopLevel >= 0: the net stops after step stopStep of that level (0 = its 14-channel input, 1..4 = after hidden layer
     //            stopStep - 1, 5 = after the field update); the per-pixel field and the SAD sum are then not written.
-    struct LearnedDebug { VkBuffer lumaSrc = VK_NULL_HANDLE; int stopLevel = -1, stopStep = 0; };
+    //   fieldSrc: the net's cropped field (fw x fh (x, y) float32 pairs, TRANSFER_SRC usage, alive until those records retire) is replaced
+    //            by this one before the output pass (and the zero-motion test) read it, so a test can run the stage alone on a given
+    //            field (SPEC.md section 8, step 7a: the vectors' pf.f32).
+    //   zeroCosts: with Settings::learnedZeroTest, the zero test also writes (C(h), C(0), zero ? 1 : 0, 0) per flow pixel as float32 vec4s,
+    //            row-major fw x fh, at the start of the activations (recordDebugLearned's actOff[0]; the activations are dead after the
+    //            net, so the rest of the dump is unchanged).
+    struct LearnedDebug { VkBuffer lumaSrc = VK_NULL_HANDLE; int stopLevel = -1, stopStep = 0; VkBuffer fieldSrc = VK_NULL_HANDLE; bool zeroCosts = false; };
     void setDebugLearned(const LearnedDebug& d);
     // recordDebugLearned(): copies the latest Learned estimate's buffers into dst (TRANSFER_DST usage) at dstOffset, laid out as
     // debugLearnedLayout() says (byte offsets relative to dstOffset): the net's state (per level l of the padded pyramid,

@@ -20,15 +20,21 @@ shaders = shader_gen.process(
   'shaders/v2_medhist.comp', 'shaders/v2_search.comp', 'shaders/v2_clean.comp', 'shaders/v2_morph.comp', 'shaders/v2_repick.comp',
   'shaders/v2_qfield.comp', 'shaders/v2_qown.comp', 'shaders/v2_qcov.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_static.comp', 'shaders/v2_enclose.comp',
   'shaders/v2_morph_s.comp', 'shaders/v2_qmorph_s.comp',
-  'shaders/ml_dup.comp', 'shaders/ml_reduce.comp', 'shaders/ml_pyr.comp', 'shaders/ml_match.comp', 'shaders/ml_conv.comp', 'shaders/ml_out.comp')
+  'shaders/ml_dup.comp', 'shaders/ml_reduce.comp', 'shaders/ml_pyr.comp', 'shaders/ml_match.comp', 'shaders/ml_conv.comp', 'shaders/ml_out.comp',
+  'shaders/ml_zero.comp', 'shaders/ml_guard.comp')
 
 # MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked
-# against the manifest (sha256, shapes, offsets) and re-laid out for shaders/ml_conv.comp. Order = LearnedNet (E2v3, E1v3).
+# against the manifest (sha256, shapes, offsets) and re-laid out for shaders/ml_conv.comp. Order = LearnedNet (E2v3, E1v3, E2v4): a
+# new net is appended here and in framegen.cpp kMlWidths / kMlNet.
+ml_nets = ['e2v3', 'e1v3', 'e2v4']
 python = find_program('python3')
-ml_weights = custom_target('ml_weights',
-  input : ['ml/embed_weights.py', 'ml/e2v3/manifest.json', 'ml/e2v3/weights.bin', 'ml/e1v3/manifest.json', 'ml/e1v3/weights.bin'],
-  output : 'ml_weights.h',
-  command : [python, '-I', '@INPUT0@', '@OUTPUT@', 'e2v3', '@INPUT1@', '@INPUT2@', 'e1v3', '@INPUT3@', '@INPUT4@'])
+ml_inputs = ['ml/embed_weights.py']
+ml_args = [python, '-I', '@INPUT0@', '@OUTPUT@']
+foreach n : ml_nets
+  ml_args += [n, '@INPUT' + ml_inputs.length().to_string() + '@', '@INPUT' + (ml_inputs.length() + 1).to_string() + '@']
+  ml_inputs += ['ml/' + n + '/manifest.json', 'ml/' + n + '/weights.bin']
+endforeach
+ml_weights = custom_target('ml_weights', input : ml_inputs, output : 'ml_weights.h', command : ml_args)
 
 # Per-format variants of the colour shaders (README.md "Formats"): the same sources, compiled once per format with
 # -DFG_FORMAT_<FMT>=1 into <name>_<fmt>_spv.h / <name>_<fmt>_spv. Rgba8 is the plain build above and keeps its names.
@@ -41,8 +47,8 @@ chroma_srcs = ['shaders/ui_inpaint_chroma.comp', 'shaders/ui_patch_chroma.comp']
 # MotionVersion::V2: only its synthesis reads and writes colour (both modes, with and without the static-overlay tests; YUV: both
 # planes); its other passes read the luma, which luma.comp already gives per format
 v2_colour_srcs = ['shaders/v2_morph.comp', 'shaders/v2_morph_s.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_qmorph_s.comp']
-# MotionVersion::Learned: only its duplicate test reads colour; the net reads the luma
-ml_colour_srcs = ['shaders/ml_dup.comp']
+# MotionVersion::Learned: only its duplicate test and its static guard read colour; the net and the zero test read the luma
+ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp']
 variant_shaders = []
 foreach f : get_option('formats')
   g = generator(glslang,

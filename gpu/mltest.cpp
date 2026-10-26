@@ -5,9 +5,10 @@
 //                a.png, c.png, vec.json and the expected float32 arrays (SPEC.md section 8). The vectors are read in place, never
 //                copied into this repo. Cases whose vectors are missing fail with the path.
 //   MLTEST_DUMP  a directory (created): per net and pair the library's pf, `<run>_<pair>_{ref,fgr}.f32` ([fh][fw][2] float32) and
-//                `<run>_<pair>_{ref,fgr}.json` (sad, cut), for gpu/ml/synthcheck.py (the end-to-end dB check through proto/interp.py).
+//                `<run>_<pair>_{ref,fgr}.json` (sad, cut; also refh / fgrh = learnedHalf, and the zero test's kinds below), for gpu/ml/synthcheck.py (the end-to-end dB check through proto/interp.py).
 //
-// Per net (e2v3: static motion far cut odd hd; e1v3: motion cut odd) and pair, SPEC.md section 8 in order:
+// Per net (e2v3: static motion far cut odd hd overlay; e1v3: motion cut odd overlay; e2v4: static motion far cut cut2 odd hd overlay) and pair, SPEC.md section 8 in order (steps 1-6
+// with Settings::learnedZeroTest off: the net's own field):
 //   ref  the library's net fed the reference's flow-res lumas (cv2 5.0.0's 15-bit luma, computed here; Interpolator::
 //        setDebugLearned lumaSrc): the exact-port check. The lumas the net read == ya / yc exactly, its level-0 pyramid == ya / 255
 //        and every coarser level == the 2x2 means (bit-exact, computed here); the coarsest level's in_top, act_top0..3, raw_top
@@ -16,6 +17,8 @@
 //   fgr  the production path: the library's own 14-bit luma (P_LUMA). Its lumas differ from ya / yc by multiples of 0.25 on < 1 %
 //        of the pixels (SPEC.md section 7); pf / sad are printed (SPEC.md: a pointwise pf check does not apply, judge it end to end
 //        with synthcheck.py: >= 45 dB vs the synthesis of the expected pf); the cut decision must still be identical.
+// Then the zero-motion test (Settings::learnedZeroTest, SPEC.md stage 7 / section 8 step 7) against the *_zt vectors: zeroChecks().
+// MLTEST_DUMP also gets its fields, kinds stagezt / refzt / fgrzt / refhzt / fgrhzt (synthcheck.py compares them with pf_zt.f32).
 // Duplicates: two identical frames (and a near-duplicate below FGR's DUP_DIFF) give a zero field, a zero SAD sum and, through the
 // unchanged synthesis, an output identical to the input; a pair above the threshold runs the net.
 #include "framegen.h"
@@ -350,12 +353,35 @@ struct Rig {
         d.stopStep = step;
         fg.setDebugLearned(d);
     }
+    // the zero test's hooks: the reference's lumas (ref) or the library's own, the given field over the net's (or the net's own), and
+    // the cost maps of the zero test (read back by zeroMaps())
+    void zeroDbg(bool ref, const std::vector<float>* pfIn) {
+        Interpolator::LearnedDebug d;
+        if (ref) d.lumaSrc = luma.b;
+        if (pfIn) {
+            field.make(pfIn->size() * 4);
+            memcpy(field.map, pfIn->data(), pfIn->size() * 4);
+            d.fieldSrc = field.b;
+        }
+        d.zeroCosts = true;
+        fg.setDebugLearned(d);
+    }
+    // after a run(.., true) with zeroCosts: C(h), C(0) and the mask per flow pixel
+    void zeroMaps(std::vector<float>& ch, std::vector<float>& c0, std::vector<uint8_t>& zero) {
+        Interpolator::DebugLearnedLayout L{};
+        fg.debugLearnedLayout(L);
+        const size_t n = (size_t)L.fw * L.fh;
+        const float* p = (const float*)(dbg.map + L.actOff[0]);
+        ch.resize(n); c0.resize(n); zero.resize(n);
+        for (size_t i = 0; i < n; i++) { ch[i] = p[4 * i]; c0[i] = p[4 * i + 1]; zero[i] = p[4 * i + 2] != 0; }
+    }
+    HBuf field;
     ~Rig() {
         if (!dev) return;
         vkDeviceWaitIdle(dev);
         fg.destroy();
         for (Img* i : {&a, &c, &out}) if (i->img) destroyImg(*i);
-        for (HBuf* b : {&stg, &dbg, &cnt, &maps, &luma}) b->free();
+        for (HBuf* b : {&stg, &dbg, &cnt, &maps, &luma, &field}) b->free();
     }
 };
 
@@ -370,9 +396,21 @@ static void dumpPf(const std::string& net, const std::string& pair, const char* 
     if (f) { fprintf(f, "{\"sad\": %.9g, \"cut\": %s}\n", sad, cut ? "true" : "false"); fclose(f); }
 }
 
-// The whole SPEC.md section 8 procedure for one net and pair (see the top of the file).
+static void zeroChecks(const char* run, const char* pair, const std::string& dir, const std::string& js, const Settings& s, Rig& rig,
+                       const std::vector<float>& expPf, int fw, int fh);
+
+// The LearnedNet of an export run (its directory name); LearnedNet order. A new net: its name here and its TEST_CASEs below.
+static LearnedNet netOf(const char* run) {
+    static const char* names[] = {"e2v3", "e1v3", "e2v4"};
+    for (uint32_t i = 0; i < 3; i++)
+        if (!strcmp(run, names[i])) return (LearnedNet)i;
+    fprintf(stderr, "unknown net %s\n", run);
+    exit(2);
+}
+
+// The whole SPEC.md section 8 procedure for one net and pair (see the top of the file), then the zero test's (zeroChecks).
 static void checkPair(const char* run, const char* pair) {
-    const LearnedNet net = !strcmp(run, "e1v3") ? LearnedNet::E1v3 : LearnedNet::E2v3;
+    const LearnedNet net = netOf(run);
     const std::string dir = exportDir() + "/" + run + "/testvec/" + pair + "/";
     INFO(run << " " << pair << " (" << dir << ")");
     std::vector<uint8_t> js8, pa, pc;
@@ -402,6 +440,7 @@ static void checkPair(const char* run, const char* pair) {
     Settings s;
     s.motionVersion = MotionVersion::Learned;
     s.learnedNet = net;
+    s.learnedZeroTest = false;   // steps 1-6: the net's own field (the pf / sad vectors)
     Rig rig;
     REQUIRE(rig.init(W, H, s));
     rig.frames(pa, pc, true);
@@ -553,6 +592,88 @@ static void checkPair(const char* run, const char* pair) {
            "fgr pf max %.2e mean %.2e sad %.4f (exp %.4f) cut %s\n", run, pair, haveY ? "exact" : "(none)", topMax, lvMax, lvMean,
            refPf.max, refPf.mean, sadRel, refCut == expCut ? "same" : "DIFFERENT", fgrPf.max, fgrPf.mean, fgrSad, expSad,
            fgrCut == expCut ? "same" : "DIFFERENT");
+    zeroChecks(run, pair, dir, js, s, rig, expPf, fw, fh);
+}
+
+// ---- Settings::learnedZeroTest (SPEC.md stage 7; section 8 step 7 and its tolerances) against the pair's *_zt vectors, five ways:
+//   stagezt  the stage alone: the reference's lumas and the vectors' own pf.f32 as the field (setDebugLearned fieldSrc), so mask, costs,
+//            pf_zt, sad_zt see exactly the torch run's input: mask agreement >= 99.9 %, cost_h_zt / cost0_zt abs <= 2e-3 levels (not
+//            given for hd), pf_zt where the masks agree (max <= 5e-2, mean <= 2e-4 px), sad_zt relative <= 1e-3, the same cut_zt; and
+//            the output field is exactly pf.f32 with the mask applied
+//   refzt    the whole chain on the reference's lumas (the library's net, then its zero test): the same mask / pf / sad / cut gates
+//   fgrzt    the production path (the library's 14-bit luma): the mask agreement, pf and sad are printed (the 14-bit luma moves the
+//            costs; SPEC.md: judge it end to end, synthcheck.py), the cut must be identical
+//   refhzt, fgrhzt   the same with Settings::learnedHalf (printed; the cut must be identical)
+// Each run's field is dumped as <run>_<pair>_<kind> for synthcheck.py (which compares it with synth(pf_zt.f32, sad_zt)).
+static const double kZeroAgree = 0.999, kCostTol = 2e-3;   // reference.py ZERO_AGREE, COST_TOL
+static void zeroChecks(const char* run, const char* pair, const std::string& dir, const std::string& js, const Settings& s, Rig& rig,
+                       const std::vector<float>& expPf, int fw, int fh) {
+    std::vector<float> expZt, eCh, eC0;
+    std::vector<uint8_t> expMask;
+    if (!readF32(dir + "pf_zt.f32", expZt) || !readFile(dir + "zero_zt.u8", expMask)) {
+        printf("  %s %-6s: no *_zt vectors, zero test not checked\n", run, pair);
+        return;
+    }
+    const size_t n = (size_t)fw * fh;
+    REQUIRE(expZt.size() == 2 * n);
+    REQUIRE(expMask.size() == n);
+    const bool haveCost = readF32(dir + "cost_h_zt.f32", eCh) && readF32(dir + "cost0_zt.f32", eC0);
+    const double expSad = jsonNum(js, "sad_zt");
+    const bool expCut = jsonNum(js, "cut_zt") != 0;
+    size_t expZeroed = 0;
+    for (uint8_t v : expMask) expZeroed += v != 0;
+    struct Z { const char* kind; bool ref, half, stage; } runs[] = {
+        {"stagezt", true, false, true}, {"refzt", true, false, false}, {"fgrzt", false, false, false},
+        {"refhzt", true, true, false}, {"fgrhzt", false, true, false}};
+    for (const Z& z : runs) {
+        Settings sz = s;
+        sz.learnedZeroTest = true;
+        sz.learnedHalf = z.half;
+        REQUIRE(rig.fg.setSettings(sz));
+        rig.zeroDbg(z.ref, z.stage ? &expPf : nullptr);
+        REQUIRE(rig.run(false, true));
+        std::vector<float> ch, c0;
+        std::vector<uint8_t> mask;
+        rig.zeroMaps(ch, c0, mask);
+        size_t agree = 0, zeroed = 0, applied = 0;
+        double pfMax = 0, pfSum = 0;
+        for (size_t i = 0; i < n; i++) {
+            const bool zm = mask[i] != 0;
+            zeroed += zm;
+            if (zm == (expMask[i] != 0)) {
+                agree++;
+                for (int k = 0; k < 2; k++) {
+                    const double d = std::fabs((double)rig.pf[2 * i + k] - expZt[2 * i + k]);
+                    if (!(d <= pfMax)) pfMax = d;
+                    pfSum += d;
+                }
+            }
+            if (zm) applied += rig.pf[2 * i] == 0 && rig.pf[2 * i + 1] == 0;
+            else if (z.stage) applied += !memcmp(&rig.pf[2 * i], &expPf[2 * i], 8);   // the given field where the test kept it
+            else applied++;
+        }
+        const double agreeFrac = (double)agree / n, pfMean = agree ? pfSum / (2.0 * agree) : 0;
+        const double sd = rig.sad(), rel = std::fabs(sd - expSad) / std::max(1.0, expSad);
+        const bool cut = sd > s.sceneCutSad;
+        Stat chS, c0S;
+        if (haveCost && z.stage) { chS = diff(ch.data(), eCh.data(), n); c0S = diff(c0.data(), eC0.data(), n); }
+        printf("ZT %s %-7s %-7s: mask agree %.4f %% (%zu px flipped), zeroed %.2f %% (exp %.2f %%), pf on agreeing px max %.2e mean %.2e, "
+               "sad %.4f vs %.4f (rel %.1e), cut %d vs %d", run, pair, z.kind, 100 * agreeFrac, n - agree, 100.0 * zeroed / n,
+               100.0 * expZeroed / n, pfMax, pfMean, sd, expSad, rel, cut, expCut);
+        if (haveCost && z.stage) printf(", cost_h max %.1e, cost0 max %.1e", chS.max, c0S.max);
+        printf("\n");
+        CHECK(applied == n);   // the output field is the mask applied to the field the test read
+        CHECK(cut == expCut);
+        if (z.ref && !z.half) {   // the exact float32 port's gates
+            CHECK(agreeFrac >= kZeroAgree);
+            CHECK(pfMax <= kPfMaxTol);
+            CHECK(pfMean <= kPfMeanTol);
+            CHECK(rel <= kSadTol);
+            if (haveCost && z.stage) { CHECK(chS.max <= kCostTol); CHECK(c0S.max <= kCostTol); }
+        }
+        dumpPf(run, pair, z.kind, rig.pf, sd, cut);
+    }
+    rig.fg.setDebugLearned(Interpolator::LearnedDebug{});
 }
 
 TEST_CASE("e2v3 static", "[vectors][e2v3]") { checkPair("e2v3", "static"); }
@@ -561,9 +682,20 @@ TEST_CASE("e2v3 far", "[vectors][e2v3]") { checkPair("e2v3", "far"); }
 TEST_CASE("e2v3 cut", "[vectors][e2v3]") { checkPair("e2v3", "cut"); }
 TEST_CASE("e2v3 odd", "[vectors][e2v3]") { checkPair("e2v3", "odd"); }
 TEST_CASE("e2v3 hd", "[vectors][e2v3]") { checkPair("e2v3", "hd"); }
+TEST_CASE("e2v3 overlay", "[vectors][e2v3]") { checkPair("e2v3", "overlay"); }
 TEST_CASE("e1v3 motion", "[vectors][e1v3]") { checkPair("e1v3", "motion"); }
 TEST_CASE("e1v3 cut", "[vectors][e1v3]") { checkPair("e1v3", "cut"); }
 TEST_CASE("e1v3 odd", "[vectors][e1v3]") { checkPair("e1v3", "odd"); }
+TEST_CASE("e1v3 overlay", "[vectors][e1v3]") { checkPair("e1v3", "overlay"); }
+// e2v4: its "cut" pair is NOT a cut (sad 28.3) and "cut2" is (sad 42.8): every check reads cut / cut_zt from vec.json
+TEST_CASE("e2v4 static", "[vectors][e2v4]") { checkPair("e2v4", "static"); }
+TEST_CASE("e2v4 motion", "[vectors][e2v4]") { checkPair("e2v4", "motion"); }
+TEST_CASE("e2v4 far", "[vectors][e2v4]") { checkPair("e2v4", "far"); }
+TEST_CASE("e2v4 cut", "[vectors][e2v4]") { checkPair("e2v4", "cut"); }
+TEST_CASE("e2v4 cut2", "[vectors][e2v4]") { checkPair("e2v4", "cut2"); }
+TEST_CASE("e2v4 odd", "[vectors][e2v4]") { checkPair("e2v4", "odd"); }
+TEST_CASE("e2v4 hd", "[vectors][e2v4]") { checkPair("e2v4", "hd"); }
+TEST_CASE("e2v4 overlay", "[vectors][e2v4]") { checkPair("e2v4", "overlay"); }
 
 // ---- duplicates (shaders/ml_dup.comp: FGR's DUP_DIFF test)
 // A frame of the motion pair (or a smooth synthetic one if the vectors are missing)
@@ -586,10 +718,11 @@ static std::vector<uint8_t> someFrame(uint32_t& W, uint32_t& H) {
 static void duplicateCase(LearnedNet net) {
     uint32_t W, H;
     const std::vector<uint8_t> a = someFrame(W, H);
-    for (int algo = 0; algo < 2; algo++) {   // Learned, and V1 as the control (its exact answer for a still pair)
+    for (int algo = 0; algo < 3; algo++) {   // Learned (zero test on, the default; off), and V1 as the control (its exact answer for a still pair)
         Settings s;
-        s.motionVersion = algo ? MotionVersion::V1 : MotionVersion::Learned;
+        s.motionVersion = algo == 2 ? MotionVersion::V1 : MotionVersion::Learned;
         s.learnedNet = net;
+        s.learnedZeroTest = algo == 0;
         Rig rig;
         REQUIRE(rig.init(W, H, s));
         rig.frames(a, a, true);
@@ -600,7 +733,7 @@ static void duplicateCase(LearnedNet net) {
             changed += out[i] != a[i] || out[i + 1] != a[i + 1] || out[i + 2] != a[i + 2];
         float pfMax = 0;
         for (float v : rig.pf) pfMax = std::max(pfMax, std::fabs(v));
-        printf("  %s identical frames %ux%u: output pixels != input %zu, max |pf| %g, SAD sum %u\n", algo ? "V1     " : "Learned",
+        printf("  %s identical frames %ux%u: output pixels != input %zu, max |pf| %g, SAD sum %u\n", algo == 2 ? "V1        " : algo ? "Learned   " : "Learned zt",
                W, H, changed, pfMax, rig.sadSum);
         CHECK(changed == 0);
         CHECK(pfMax == 0);
@@ -608,27 +741,33 @@ static void duplicateCase(LearnedNet net) {
     }
     // near-duplicates around FGR's threshold (mean over pixels of the channel-mean |a - c|, DUP_DIFF = 0.6 levels): every channel of
     // every k-th pixel +-1 level (a mean of 1/k), k = 2 (0.5: a duplicate) and k = 1 (1.0: not)
-    for (int k : {2, 1}) {
-        std::vector<uint8_t> c = a;
-        for (size_t i = 0, px = 0; i < c.size(); i += 4, px++)
-            if (px % k == 0)
-                for (int ch = 0; ch < 3; ch++) c[i + ch] = c[i + ch] < 128 ? c[i + ch] + 1 : c[i + ch] - 1;
-        Settings s;
-        s.motionVersion = MotionVersion::Learned;
-        s.learnedNet = net;
-        Rig rig;
-        REQUIRE(rig.init(W, H, s));
-        rig.frames(a, c, true);
-        REQUIRE(rig.run(true, false));
-        float pfMax = 0;
-        for (float v : rig.pf) pfMax = std::max(pfMax, std::fabs(v));
-        printf("  Learned mean |a - c| %.2f: max |pf| %g, SAD sum %u (%s)\n", 1.0 / k, pfMax, rig.sadSum, k == 2 ? "duplicate: zero" : "the net ran");
-        if (k == 2) { CHECK(pfMax == 0); CHECK(rig.sadSum == 0); }
-        else { CHECK(pfMax > 0); CHECK(rig.sadSum > 0); }
-    }
+    // (zero test on, the default, and off: with it the net's field on this flat +-1 change is zeroed almost everywhere, so only the
+    // SAD sum shows that the net ran; without it the field is the net's own)
+    for (int zt = 0; zt < 2; zt++)
+        for (int k : {2, 1}) {
+            std::vector<uint8_t> c = a;
+            for (size_t i = 0, px = 0; i < c.size(); i += 4, px++)
+                if (px % k == 0)
+                    for (int ch = 0; ch < 3; ch++) c[i + ch] = c[i + ch] < 128 ? c[i + ch] + 1 : c[i + ch] - 1;
+            Settings s;
+            s.motionVersion = MotionVersion::Learned;
+            s.learnedNet = net;
+            s.learnedZeroTest = zt != 0;
+            Rig rig;
+            REQUIRE(rig.init(W, H, s));
+            rig.frames(a, c, true);
+            REQUIRE(rig.run(true, false));
+            float pfMax = 0;
+            for (float v : rig.pf) pfMax = std::max(pfMax, std::fabs(v));
+            printf("  Learned%s mean |a - c| %.2f: max |pf| %g, SAD sum %u (%s)\n", zt ? " zt" : "   ", 1.0 / k, pfMax, rig.sadSum,
+                   k == 2 ? "duplicate: zero" : "the net ran");
+            if (k == 2) { CHECK(pfMax == 0); CHECK(rig.sadSum == 0); }
+            else { CHECK((zt || pfMax > 0)); CHECK(rig.sadSum > 0); }
+        }
 }
 TEST_CASE("e2v3 duplicate frames", "[dup][e2v3]") { duplicateCase(LearnedNet::E2v3); }
 TEST_CASE("e1v3 duplicate frames", "[dup][e1v3]") { duplicateCase(LearnedNet::E1v3); }
+TEST_CASE("e2v4 duplicate frames", "[dup][e2v4]") { duplicateCase(LearnedNet::E2v4); }
 
 // ---- the settings API
 TEST_CASE("Learned settings", "[api]") {
@@ -640,8 +779,11 @@ TEST_CASE("Learned settings", "[api]") {
     f4.flowScale = 4;
     CHECK(Interpolator::validate(f4));   // in range, but not for Learned:
     CHECK(Interpolator::settingsError(f4, Format::Rgba8) != nullptr);
+    CHECK(s.learnedNet == LearnedNet::E2v4);   // the default net
+    CHECK(s.learnedZeroTest);                  // the zero test: on by default
+    CHECK_FALSE(s.learnedStaticGuard);         // the static guard: off by default
     Settings bad = s;
-    bad.learnedNet = (LearnedNet)2;
+    bad.learnedNet = (LearnedNet)3;   // the first value past the last net (E2v4)
     CHECK_FALSE(Interpolator::validate(bad));
     bad = s;
     bad.motionVersion = (MotionVersion)3;
@@ -676,6 +818,14 @@ TEST_CASE("Learned settings", "[api]") {
     REQUIRE(rig.fg.setSettings(s));
     REQUIRE(rig.run(true, false));
     CHECK(rig.pf == pf1);   // deterministic, and the same after the buffer grew
+    s.learnedNet = LearnedNet::E2v3;
+    REQUIRE(rig.fg.setSettings(s));
+    REQUIRE(rig.run(true, false));
+    const std::vector<float> pf3 = rig.pf;
+    s.learnedNet = LearnedNet::E2v4;   // the same width: the third net's weights (after the other two in the weights buffer)
+    REQUIRE(rig.fg.setSettings(s));
+    REQUIRE(rig.run(true, false));
+    CHECK(rig.pf != pf3);
     REQUIRE(rig.fg.setSettings(Settings{}));
     rig.fg.releaseUnusedMotion();
     REQUIRE(rig.run(true, false));
