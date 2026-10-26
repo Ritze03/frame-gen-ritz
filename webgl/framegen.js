@@ -13,7 +13,7 @@
  *     is bound as FRAMEBUFFER, gl.viewport = vp, the blit program is current, engine VAO bound.
  *   - After synth(t, undefined): the engine's `out` FBO is bound with viewport (0,0,W,H).
  *   - estimate() with settings.motion 'learned' also leaves a learned net's weight buffer bound to UNIFORM_BUFFER (the generic
- *     binding and indexed binding point 0).
+ *     binding and indexed binding points 0 and 1).
  *   - pushFrame leaves UNPACK_FLIP_Y_WEBGL=false, UNPACK_PREMULTIPLY_ALPHA_WEBGL=false and, for raw
  *     {data} sources, UNPACK_ALIGNMENT=1.
  *   - debugRead/stats bind FBOs and change PACK state only transiently; they are not hot-path calls.
@@ -96,9 +96,10 @@
   ];
 
   // The learned motion estimator (settings.motion 'learned', V1 only; ml-fg export/SPEC.md), compiled the first time it is selected.
-  // The convs are one program per shape (ML_CIN input textures, ML_COUT output textures, ML_LAST the 2-channel output layer): a net
-  // of width w (a multiple of 4, G = w / 4 textures per activation) uses conv4x3 (layer 0: the 14-channel input in 4 textures),
-  // conv<G>x3 (layers 1-3) and last<G>; G = 6 (e2v3) splits each hidden layer into two passes of 3 output textures.
+  // The convs are one program per shape. motionPrecision 'fp32' (conv.frag.glsl: ML_CIN RGBA32F input textures, ML_COUT output
+  // textures, ML_LAST the 2-channel output layer): a net of width w (G = w / 4 textures per activation) uses ml_conv4x3 (layer 0: the
+  // 14-channel input in 4 textures), ml_conv<G>x3 (layers 1-3) and ml_last<G>; G = 6 (e2v3) splits each layer into two passes of 3
+  // output textures. 'fp16' (conv_h.frag.glsl, 8 half floats per RGBA32UI texel): ml_h<CIN>g<CG>o<COUT>[L], one pass per layer.
   const ML_INC = 'learned/ml_common.inc.glsl';
   function mlConv(cin, cout, last) {
     const s = [];
@@ -108,17 +109,37 @@
     return [last ? 'ml_last' + cin : 'ml_conv' + cin + 'x' + cout, 'learned/conv.frag.glsl', null, s, ML_INC,
       '#define ML_CIN ' + cin + '\n#define ML_COUT ' + cout + '\n#define ML_LAST ' + (last ? 1 : 0) + '\n'];
   }
+  // cin packed input textures, cg 4-channel input groups, cout 4-channel output groups
+  function mlConvH(cin, cg, cout, last) {
+    const s = [];
+    for (let j = 0; j < cin; j++) s.push('uIn' + j);
+    if (last) s.push('uHc');
+    s.push('uDup');
+    return ['ml_h' + cin + 'g' + cg + 'o' + cout + (last ? 'L' : ''), 'learned/conv_h.frag.glsl', null, s, ML_INC,
+      '#define ML_CIN ' + cin + '\n#define ML_CG ' + cg + '\n#define ML_COUT ' + cout + '\n#define ML_COUTA ' + Math.min(cout, 3) +
+      '\n#define ML_LAST ' + (last ? 1 : 0) + '\n'];
+  }
+  // the program of layer k (of depth + 1) of a net with G groups per activation, at precision prec
+  function mlLayerProg(prec, G, k, depth) {
+    const last = k === depth;
+    if (prec === 'fp32') return last ? 'ml_last' + G : 'ml_conv' + (k === 0 ? 4 : G) + 'x3';
+    const cin = k === 0 ? 2 : Math.ceil(G / 2);
+    return 'ml_h' + cin + 'g' + (k === 0 ? 4 : G) + 'o' + (last ? 1 : G) + (last ? 'L' : '');
+  }
   const ML_PROGRAMS = [
     ['ml_lv0', 'learned/lv0.frag.glsl', null, ['uPrev', 'uCurr'], ML_INC],
     ['ml_down', 'learned/down.frag.glsl', null, ['uSrc']],
     ['ml_match', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup'], ML_INC],
+    ['ml_match_h', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup'], ML_INC, '#define ML_PACKED 1\n'],
     ['ml_sad', 'learned/sad.frag.glsl', null, ['uLv0', 'uField'], ML_INC],
     ['ml_sadout', 'learned/sadout.frag.glsl', null, ['uSrc', 'uDup'], ML_INC],
     mlConv(4, 3, false), mlConv(3, 3, false), mlConv(6, 3, false), mlConv(3, 1, true), mlConv(6, 1, true),
+    mlConvH(2, 4, 3, false), mlConvH(2, 4, 6, false), mlConvH(2, 3, 3, false), mlConvH(3, 6, 6, false), mlConvH(2, 3, 1, true),
+    mlConvH(3, 6, 1, true),
   ];
   const ML_DUP_DIFF = 0.6;                   // learned/ml_common.inc.glsl's (the duplicate-pair test)
   const ML_NETS = ['e2v3', 'e1v3'];          // settings.motionNet values (the first is the default); weights: webgl/nets/<name>.js
-  const ML_BLOCK_MAX = (3 * 9 * 6 * 16 + 3 * 4) * 4;   // bytes of the largest MlW block (conv6x3): MAX_UNIFORM_BLOCK_SIZE needed
+  const ML_BLOCK_MAX = (3 * 9 * 6 * 16 + 3 * 4) * 4;   // bytes of the largest weight block (conv6x3, conv_h's MlW / MlW2)
 
   fg.shaderFiles = (function () {
     const files = ['common.glsl', 'vert.glsl'];
@@ -323,7 +344,7 @@
   // fg.frameSizeError, else null. ok = nothing missing and no sizeError. quality: V2 Quality can run (its MIN-blend splat works,
   // probeQuality); when false, qualityError says why. V1 and V2 Performance do not need it, so it does not affect ok. learned: the
   // learned motion estimator (settings.motion 'learned') can run: 4 draw buffers / colour attachments, a fragment uniform block of
-  // ML_BLOCK_MAX bytes, 8 fragment texture units (all WebGL2 core minimums, so false only on a non-conformant context); does not
+  // ML_BLOCK_MAX bytes and 2 fragment uniform blocks, 8 fragment texture units (all WebGL2 core minimums, so false only on a non-conformant context); does not
   // affect ok either. (Whether a net's weights are loaded is fg.nets, not the context: createEngine / setSettings say so.)
   fg.checkSupport = function (gl, frame) {
     const missing = [];
@@ -342,7 +363,7 @@
     const qualityError = missing.length ? 'needs ' + missing.join(', ') : probeQuality(gl);
     const mlMissing = missing.slice();
     for (const [k, min, name] of [[gl.MAX_DRAW_BUFFERS, 4, 'MAX_DRAW_BUFFERS'], [gl.MAX_COLOR_ATTACHMENTS, 4, 'MAX_COLOR_ATTACHMENTS'],
-      [gl.MAX_UNIFORM_BLOCK_SIZE, ML_BLOCK_MAX, 'MAX_UNIFORM_BLOCK_SIZE'], [gl.MAX_FRAGMENT_UNIFORM_BLOCKS, 1, 'MAX_FRAGMENT_UNIFORM_BLOCKS'],
+      [gl.MAX_UNIFORM_BLOCK_SIZE, ML_BLOCK_MAX, 'MAX_UNIFORM_BLOCK_SIZE'], [gl.MAX_FRAGMENT_UNIFORM_BLOCKS, 2, 'MAX_FRAGMENT_UNIFORM_BLOCKS'],
       [gl.MAX_TEXTURE_IMAGE_UNITS, 8, 'MAX_TEXTURE_IMAGE_UNITS']]) {
       if (!(gl.getParameter(k) >= min)) mlMissing.push(name + '>=' + min);
     }
@@ -437,7 +458,7 @@
       R16UI: { i: gl.R16UI, f: gl.RED_INTEGER, t: gl.UNSIGNED_SHORT, ch: 1, rf: gl.RGBA_INTEGER, rt: gl.UNSIGNED_INT, A: Uint32Array },
       R32F: { i: gl.R32F, f: gl.RED, t: gl.FLOAT, ch: 1, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
       RG32F: { i: gl.RG32F, f: gl.RG, t: gl.FLOAT, ch: 2, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
-      RG16F: { i: gl.RG16F, f: gl.RG, t: gl.HALF_FLOAT, ch: 2, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
+      RGBA32UI: { i: gl.RGBA32UI, f: gl.RGBA_INTEGER, t: gl.UNSIGNED_INT, ch: 4, rf: gl.RGBA_INTEGER, rt: gl.UNSIGNED_INT, A: Uint32Array },
       RGBA32F: { i: gl.RGBA32F, f: gl.RGBA, t: gl.FLOAT, ch: 4, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
       RGBA32I: { i: gl.RGBA32I, f: gl.RGBA_INTEGER, t: gl.INT, ch: 4, rf: gl.RGBA_INTEGER, rt: gl.INT, A: Int32Array },
       RGBA16F: { i: gl.RGBA16F, f: gl.RGBA, t: gl.HALF_FLOAT, ch: 4, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
@@ -510,13 +531,14 @@
           const loc = gl.getUniformLocation(b.prog, n);
           if (loc) u[n] = loc;
         }
-        // the learned convs' weights (uniform block MlW): binding point 0, a range of the net's buffer per pass
-        const bi = gl.getUniformBlockIndex(b.prog, 'MlW');
-        let wSize = 0;
-        if (bi !== gl.INVALID_INDEX) {
-          gl.uniformBlockBinding(b.prog, bi, 0);
-          wSize = gl.getActiveUniformBlockParameter(b.prog, bi, gl.UNIFORM_BLOCK_DATA_SIZE);
-        }
+        // the learned convs' weights (uniform blocks MlW, MlW2): binding points 0 and 1, a range of the net's buffer each per pass
+        const wSize = [0, 0];
+        ['MlW', 'MlW2'].forEach(function (bn, k) {
+          const bi = gl.getUniformBlockIndex(b.prog, bn);
+          if (bi === gl.INVALID_INDEX) return;
+          gl.uniformBlockBinding(b.prog, bi, k);
+          wSize[k] = gl.getActiveUniformBlockParameter(b.prog, bi, gl.UNIFORM_BLOCK_DATA_SIZE);
+        });
         gl.useProgram(b.prog);
         b.samplers.forEach(function (sn, unit) {
           const loc = gl.getUniformLocation(b.prog, sn);
@@ -777,7 +799,7 @@
               for (let r = 0; r < 4; r++) { const oc = 12 * part + 4 * o + r; if (oc < ly.cout) f[n * 16 + 4 * o + r] = wt[ly.b + oc]; }
             }
             total = Math.ceil(total / align) * align;
-            parts.push({ off: total, size: f.byteLength, prog: last ? 'ml_last' + G : 'ml_conv' + CIN + 'x3' });
+            parts.push({ off: total, size: f.byteLength });
             datas.push([total, f]);
             total += f.byteLength;
           }
@@ -803,22 +825,24 @@
       resetCache();
     }
 
-    // The learned estimator's textures (allocated by its first estimate; again when the net changes) and its pass plan. Sizes:
-    // padded flow grid PW x PH (fw, fh rounded up to a multiple of 16), level l = (PW >> l) x (PH >> l), every level an exact half.
+    // The learned estimator's textures (allocated by its first estimate; again when the net or the precision changes) and its pass
+    // plan. Sizes: padded flow grid PW x PH (fw, fh rounded up to a multiple of 16), level l = (PW >> l) x (PH >> l), every level an
+    // exact half.
     //   pyr[0] RGBA32F (la, lc, ya, yc), pyr[l > 0] RG32F (la, lc)   the net's own pyramid (SPEC stage 3)
-    //   x[0..2] RGBA, x[3] RG, level-0 size                         the 14-channel input of the current level
-    //   act[2][G] RGBA, level-0 size                                ping-pong activations, G = width / 4 textures each
+    //   x[], level-0 size                                           the 14-channel input of the current level
+    //   act[2][], level-0 size                                      ping-pong activations
     //   h[1..4] RG32F, level size                                   the field after each level (level 0 writes pixfield)
     //   dupSrc R32F, dupRed, sadRed                                  the duplicate-test and SAD sum chains
-    // x / act are half floats (RGBA16F, RG16F) with settings.motionPrecision 'fp16', float32 with 'fp32'. The coarser levels render
-    // into the level-0-sized x / act textures over their own viewport (uSize = the level: zero padding).
+    // motionPrecision 'fp32': x = 3 RGBA32F + 1 RG32F, act = G = width / 4 RGBA32F each; 'fp16': 8 half floats per RGBA32UI texel,
+    // x = 2, act = ceil(G / 2) each. The coarser levels render into the level-0-sized x / act textures over their own viewport
+    // (uSize = the level: zero padding).
     function allocMl(name, prec) {
       if (T.ml) {
         if (T.ml.name === name && T.ml.prec === prec) return T.ml;
         freeSome(T.ml.tex, T.ml.fbos);
         T.ml = null;
       }
-      const F4 = prec === 'fp16' ? 'RGBA16F' : 'RGBA32F', F2 = prec === 'fp16' ? 'RG16F' : 'RG32F';
+      const half = prec === 'fp16';
       const nb = mlNetBuffer(name), net = nb.net, G = net.width / 4, NL = net.levels;
       const PW = Math.ceil(FW / net.padMultiple) * net.padMultiple, PH = Math.ceil(FH / net.padMultiple) * net.padMultiple;
       const t0 = ownedTex.length, f0 = ownedFbo.length;
@@ -832,29 +856,42 @@
           m.pyr.push(mk('ml.pyr[' + l + ']', 'RG32F', PW >> l, PH >> l));
           m.h.push(mk('ml.h[' + l + ']', 'RG32F', PW >> l, PH >> l));
         }
-        m.x = [0, 1, 2, 3].map(function (k) { return mk('ml.x[' + k + ']', k < 3 ? F4 : F2, PW, PH); });
+        const xf = half ? ['RGBA32UI', 'RGBA32UI'] : ['RGBA32F', 'RGBA32F', 'RGBA32F', 'RG32F'];
+        m.x = xf.map(function (f, k) { return mk('ml.x[' + k + ']', f, PW, PH); });
         m.xMrt = mkMrt('ml_match', m.x);
+        const nAct = half ? Math.ceil(G / 2) : G;
         for (let s = 0; s < 2; s++) {
-          for (let g = 0; g < G; g++) m.act[s].push(mk('ml.act[' + s + '][' + g + ']', F4, PW, PH));
-          for (let part = 0; part < G / 3; part++) m.actMrt[s].push(mkMrt('ml_conv', m.act[s].slice(3 * part, 3 * part + 3)));
+          for (let g = 0; g < nAct; g++) m.act[s].push(mk('ml.act[' + s + '][' + g + ']', half ? 'RGBA32UI' : 'RGBA32F', PW, PH));
+          if (half) m.actMrt[s].push(mkMrt('ml_conv', m.act[s]));
+          else for (let part = 0; part < G / 3; part++) m.actMrt[s].push(mkMrt('ml_conv', m.act[s].slice(3 * part, 3 * part + 3)));
         }
         m.dupRed = mkChain('ml.dupRed', PW, PH, 4, 4);   // (small fan-ins: many fragments, short loops)
         m.sadRed = mkChain('ml.sadRed', FW, FH, 2, 4);
         const dup = m.dupRed[m.dupRed.length - 1];
-        // the coarse-to-fine plan: per level the match, then the layers (part a / b for G = 6) into the ping-pong sets, the last
-        // layer into h[l] (level 0: pixfield, fw x fh; its taps still read the padded level)
+        const chkBlock = function (p, k, b) {
+          if (p.wSize[k] !== b.size) throw new Error('framegen: ' + p.name + ': uniform block ' + ['MlW', 'MlW2'][k] + ' is ' + p.wSize[k] + ' bytes, the host packs ' + b.size);
+        };
+        // the coarse-to-fine plan: per level the match, then the layers into the ping-pong sets (fp32, G = 6: parts a / b, each
+        // with its weight block; fp16: one pass, the parts' blocks bound to MlW / MlW2), the last layer into h[l] (level 0:
+        // pixfield, fw x fh; its taps still read the padded level)
         for (let l = NL - 1; l >= 0; l--) {
           const lw = PW >> l, lh = PH >> l, size = [lw, lh], top = l === NL - 1 ? 1 : 0, hc = top ? m.pyr[l] : m.h[l + 1];   // (hc unread at the top)
-          m.plan.push({ name: 'ml_match.' + l, p: P.ml_match, out: { fbo: m.xMrt.fbo, w: lw, h: lh }, size: size, top: top,
-            ins: [m.pyr[l], hc, dup], block: null });
+          m.plan.push({ name: 'ml_match.' + l, p: P[half ? 'ml_match_h' : 'ml_match'], out: { fbo: m.xMrt.fbo, w: lw, h: lh }, size: size, top: top,
+            ins: [m.pyr[l], hc, dup], block: null, block2: null });
           for (let k = 0; k <= net.depth; k++) {
             const last = k === net.depth, src = k === 0 ? m.x : m.act[(k - 1) & 1], parts = nb.blocks[l][k];
+            const p = P[mlLayerProg(prec, G, k, net.depth)], ins = src.concat(last ? [hc, dup] : [dup]);
+            const outOf = function (part) { return !last ? { fbo: m.actMrt[k & 1][part].fbo, w: lw, h: lh } : l === 0 ? T.pixfield : { fbo: m.h[l].fbo, w: lw, h: lh }; };
+            if (half) {
+              chkBlock(p, 0, parts[0]);
+              if (parts[1]) chkBlock(p, 1, parts[1]);
+              m.plan.push({ name: 'ml_c' + k + '.' + l, p: p, out: outOf(0), size: size, top: top, ins: ins, block: parts[0], block2: parts[1] || null });
+              continue;
+            }
             for (let part = 0; part < parts.length; part++) {
-              const b = parts[part], p = P[b.prog];
-              if (p.wSize !== b.size) throw new Error('framegen: ' + b.prog + ': uniform block MlW is ' + p.wSize + ' bytes, the host packs ' + b.size);
-              const out = !last ? { fbo: m.actMrt[k & 1][part].fbo, w: lw, h: lh } : l === 0 ? T.pixfield : { fbo: m.h[l].fbo, w: lw, h: lh };
-              m.plan.push({ name: 'ml_c' + k + (parts.length > 1 ? 'ab'[part] : '') + '.' + l, p: p, out: out, size: size, top: top,
-                ins: src.concat(last ? [hc, dup] : [dup]), block: b });
+              chkBlock(p, 0, parts[part]);
+              m.plan.push({ name: 'ml_c' + k + (parts.length > 1 ? 'ab'[part] : '') + '.' + l, p: p, out: outOf(part), size: size, top: top,
+                ins: ins, block: parts[part], block2: null });
             }
           }
         }
@@ -1270,6 +1307,7 @@
         gl.uniform2i(u.uSize, d.size[0], d.size[1]);
         if (u.uTop) gl.uniform1i(u.uTop, d.top);
         if (d.block) gl.bindBufferRange(gl.UNIFORM_BUFFER, 0, m.buf, d.block.off, d.block.size);
+        if (d.block2) gl.bindBufferRange(gl.UNIFORM_BUFFER, 1, m.buf, d.block2.off, d.block2.size);
         tri(d.name);
       }
       const sr = m.sadRed;
@@ -1614,8 +1652,8 @@
           if (!T.ml) throw new Error('framegen: debugRead("' + name + '"): no learned estimate yet');
           const m = T.ml, key = parts[1];
           if (key === 'pyr') return m.pyr[level(parts, 2, m.pyr.length, name)];
-          if (key === 'x') return m.x[level(parts, 2, 4, name)];
-          if (key === 'act') return m.act[level(parts, 2, 2, name)][level(parts, 3, m.G, name)];
+          if (key === 'x') return m.x[level(parts, 2, m.x.length, name)];
+          if (key === 'act') return m.act[level(parts, 2, 2, name)][level(parts, 3, m.act[0].length, name)];
           if (key === 'h') { const l = level(parts, 2, m.h.length, name); if (l > 0) return m.h[l]; break; }
           if (key === 'dup') return m.dupRed[m.dupRed.length - 1];
           if (key === 'sad') return m.sadRed[m.sadRed.length - 1];

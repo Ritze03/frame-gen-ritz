@@ -53,14 +53,24 @@ await E.page.addScriptTag({ content: `
   const err = (e) => ({ error: String((e && e.message) || e), stack: e && e.stack ? String(e.stack).split('\\n').slice(0, 6).join('\\n') : '' });
   const get = async (q) => new Uint8Array(await (await fetch('/w/' + q)).arrayBuffer());
   const post = (name, arr) => fetch('/dump/' + name, { method: 'POST', body: arr });
-  // channels of RGBA textures, cropped to w x h, channel-first [nch][h][w]
+  const half = (b) => {   // IEEE half bits -> number
+    const s = (b & 0x8000) ? -1 : 1, e = (b >> 10) & 31, f = b & 1023;
+    return e === 0 ? s * f * 2 ** -24 : e === 31 ? (f ? NaN : s * Infinity) : s * (1 + f / 1024) * 2 ** (e - 15);
+  };
+  // the channels of the textures \`names\` (RGBA / RG float: 4 channels per texture; RGBA32UI: 8 packed halves, motionPrecision
+  // 'fp16'), cropped to w x h, channel-first [nch][h][w]
   function chw(eng, names, nch, w, h) {
     const out = new Float32Array(nch * w * h);
-    names.forEach((n, k) => {
-      const t = eng.debugRead(n);
-      for (let c = 0; c < t.channels && 4 * k + c < nch; c++)
-        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) out[((4 * k + c) * h + y) * w + x] = t.data[(y * t.width + x) * t.channels + c];
-    });
+    let base = 0;
+    for (const n of names) {
+      const t = eng.debugRead(n), packed = t.data instanceof Uint32Array, per = packed ? 8 : 4;
+      for (let c = 0; c < per && base + c < nch; c++)
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+          const i = (y * t.width + x) * t.channels;
+          out[((base + c) * h + y) * w + x] = packed ? half((t.data[i + (c >> 1)] >>> (16 * (c & 1))) & 0xffff) : c < t.channels ? t.data[i + c] : 0;
+        }
+      base += per;
+    }
     return out;
   }
   window.__learned = async function (job) {
@@ -75,13 +85,14 @@ await E.page.addScriptTag({ content: `
       eng.pushFrame({ width: job.W, height: job.H, data: c });
       const net = __fg.nets[job.net], G = net.width / 4, top = net.levels - 1;
       const tw = job.padded[0] >> top, th = job.padded[1] >> top;
-      const sfx = G === 6 ? 'b' : '';
+      const fp16 = job.prec === 'fp16', sfx = G === 6 && !fp16 ? 'b' : '';   // (fp32, width 24: a layer is passes a and b)
+      const nx = fp16 ? 2 : 4, nAct = fp16 ? Math.ceil(G / 2) : G;
       const cap = {};
       eng.setPassHook((name, ph) => {
         if (ph !== 1) return;
-        if (name === 'ml_match.' + top) cap.in_top = chw(eng, ['ml.x.0', 'ml.x.1', 'ml.x.2', 'ml.x.3'], 14, tw, th);
+        if (name === 'ml_match.' + top) cap.in_top = chw(eng, Array.from({ length: nx }, (_, k) => 'ml.x.' + k), 14, tw, th);
         for (let k = 0; k < net.depth; k++) {
-          if (name === 'ml_c' + k + sfx + '.' + top) cap['act_top' + k] = chw(eng, Array.from({ length: G }, (_, g) => 'ml.act.' + (k & 1) + '.' + g), net.width, tw, th);
+          if (name === 'ml_c' + k + sfx + '.' + top) cap['act_top' + k] = chw(eng, Array.from({ length: nAct }, (_, g) => 'ml.act.' + (k & 1) + '.' + g), net.width, tw, th);
         }
       });
       R.estimate = eng.estimate();
