@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // The learned motion estimator (settings.motion 'learned', webgl/shaders/learned/) vs the ml-fg hand-off test vectors, by the
 // procedure of export/SPEC.md section 8, for every pair of every net at both activation precisions; then the duplicate-pair skip.
-//   node webgl/tests/learned.mjs [--gpu] [--nets e2v3,e1v3] [--pairs motion,odd] [--prec fp32,fp16] [--json FILE]
+//   node webgl/tests/learned.mjs [--gpu] [--nets e2v4,e2v3,e1v3] [--pairs motion,odd] [--prec fp32,fp16] [--json FILE]
+// Nets: each webgl/nets/<net>.js with an export/<net>/testvec; pairs: its testvec/<pair>/ directories (the cut flags are vec.json's
+// cut / cut_zt, never the pair's name).
 // Vectors: $FG_MLFG_EXPORT (default ~/Schinken/Programming/Local/ml-fg/export; read only, nothing is copied into the repo); the decoded
 // frames, the real middle frames ($FG_FOOTAGE) and the engine's dumps go to $FG_WORK/learned (learned_ref.py prep / synth).
 // --gpu: hardware GL, else SwiftShader.
@@ -24,9 +26,9 @@
 //   'fp16' / 'hdr': sad_zt relative error <= 1e-2; the mask agreement, pf and costs are reported, not gated.
 // Duplicate skip (per net x precision x zero test on / off): a == c gives pixfield 0, sad 0, duplicate true, and an output identical
 // to the input at t = 0.5 and 0.25; a near-duplicate (+-1 level noise, mean |a - c| < 0.6) is skipped too; the test pairs are not.
-// Static guard (settings.learnedStaticGuard; e2v3 fp32 with the zero test, pairs overlay / motion / cut): the guarded output vs ml-fg's
-// scripts/static_guard.py on the engine's own a, c, unguarded output and field at t: max |d| <= 1 level (RGBA8 and RGBA16F input);
-// the guard switched off again gives the unguarded output bit for bit; a fallback frame (cut) is unchanged.
+// Static guard (settings.learnedStaticGuard; e2v3 fp32 with the zero test, pairs overlay / motion and the first with cut_zt true):
+// the guarded output vs ml-fg's scripts/static_guard.py on the engine's own a, c, unguarded output and field at t: max |d| <= 1 level
+// (RGBA8 and RGBA16F input); the guard switched off again gives the unguarded output bit for bit; a fallback frame (cut) is unchanged.
 // Exit 0 PASS, 1 FAIL, 2 setup error.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -47,6 +49,8 @@ for (let i = 0; i < argv.length; i++) {
 }
 const TOL = { top: 5e-5, pfMean: 2e-4, pfMax: 5e-2, sadRel: 1e-3, sadRel16: 1e-2, synthDb: 45, midDb: 0.05, engineMae: 1.0,
   ztAgree: 0.999, ztSynthDb: 70, cost: 2e-3, sgMax: 1.0 };
+const HDR_NETS = ['e2v4', 'e2v3'];   // the RGBA16F-input rows (motion / odd, fp16)
+const SG_NET = 'e2v3';               // the static guard check's net (pinned: the guard does not depend on the net)
 const py = (mode) => {
   const r = spawnSync('python3', ['-I', path.join(here, 'learned_ref.py'), mode], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', env: { ...process.env, FG_WORK: work } });
   if (r.status !== 0) { console.error(`learned: learned_ref.py ${mode} failed (${r.status})`); process.exit(2); }
@@ -237,11 +241,11 @@ const cmp = (e, x) => {
 const e1 = (v) => (v === 0 ? '0' : v.toExponential(1));
 const rows = [];
 let allOk = true;
-// jobs: every pair at each precision, plus (variant 'hdr') e2v3 motion / odd with RGBA16F input (inputFormat 'rgba16f', transfer
+// jobs: every pair at each precision, plus (variant 'hdr') e2v4 / e2v3 motion / odd with RGBA16F input (inputFormat 'rgba16f', transfer
 // 'encoded': the frames as value / 255; the luma is then the unrounded weighted sum, so ya / yc are not compared)
 const jobs = [];
 for (const prec of opt.prec) for (const p of man.pairs) jobs.push({ p, prec, variant: prec });
-if (opt.prec.includes('fp16')) for (const p of man.pairs) if (p.net === 'e2v3' && ['motion', 'odd'].includes(p.pair)) jobs.push({ p, prec: 'fp16', variant: 'hdr' });
+if (opt.prec.includes('fp16')) for (const p of man.pairs) if (HDR_NETS.includes(p.net) && ['motion', 'odd'].includes(p.pair)) jobs.push({ p, prec: 'fp16', variant: 'hdr' });
 for (const { p, prec, variant } of jobs) {
   {
     if (opt.nets && !opt.nets.includes(p.net)) continue;
@@ -378,7 +382,7 @@ for (const row of rows) {
 // the duplicate skip, per net, precision and zero test on / off, on the motion pair's first frame
 const dups = {};
 for (const prec of opt.prec) for (const zt of [true, false]) {
-  for (const net of ['e2v3', 'e1v3']) {
+  for (const net of [...new Set(man.pairs.map((q) => q.net))]) {
     if (opt.nets && !opt.nets.includes(net)) continue;
     const p = man.pairs.find((q) => q.net === net && q.pair === 'motion');
     if (!p) continue;
@@ -402,17 +406,19 @@ const sgRows = [];
 {
   const sgo = path.join(work, 'learned', 'sguard');
   fs.rmSync(sgo, { recursive: true, force: true });
-  const cases = [['overlay', false, [0.5, 0.25]], ['motion', false, [0.25]], ['cut', false, [0.5]], ['overlay', true, [0.25]]];
+  const cutPair = (man.pairs.find((q) => q.net === SG_NET && q.cut_zt) || {}).pair;   // a fallback frame (vec.json's cut_zt)
+  const cases = [['overlay', false, [0.5, 0.25]], ['motion', false, [0.25]], [cutPair, false, [0.5]], ['overlay', true, [0.25]]];
+  if (!cutPair) { console.log(`static guard: no ${SG_NET} pair with cut_zt: FAIL`); allOk = false; }
   for (const [pair, f16in, ts] of cases) {
-    const p = man.pairs.find((q) => q.net === 'e2v3' && q.pair === pair);
-    if (!p || (opt.nets && !opt.nets.includes('e2v3')) || !opt.prec.includes('fp32')) continue;
+    const p = man.pairs.find((q) => q.net === SG_NET && q.pair === pair);
+    if (!p || (opt.nets && !opt.nets.includes(SG_NET)) || !opt.prec.includes('fp32')) continue;
     const tag = `sg_${pair}${f16in ? '_hdr' : ''}`;
-    const r = await E.page.evaluate((j) => window.__sgTest(j), { net: 'e2v3', prec: 'fp32', f16in, ts, dir: `learned/e2v3/${pair}`, W: p.W, H: p.H, tag });
+    const r = await E.page.evaluate((j) => window.__sgTest(j), { net: SG_NET, prec: 'fp32', f16in, ts, dir: `learned/${SG_NET}/${pair}`, W: p.W, H: p.H, tag });
     if (r.error) { console.log(`${tag}: ENGINE ERROR ${r.error.error}\n${r.error.stack}`); allOk = false; continue; }
     for (const t of ts) {
       const name = `${pair}${f16in ? '_hdr' : ''}_t${t}`, d = path.join(sgo, name), rt = r.t[t];
       fs.mkdirSync(d, { recursive: true });
-      for (const k of ['a', 'c']) fs.copyFileSync(path.join(work, 'learned', 'e2v3', pair, k + '.rgba'), path.join(d, k + '.rgba'));
+      for (const k of ['a', 'c']) fs.copyFileSync(path.join(work, 'learned', SG_NET, pair, k + '.rgba'), path.join(d, k + '.rgba'));
       for (const k of ['out0', 'outg']) fs.writeFileSync(path.join(d, k + (f16in ? '.f32' : '.rgba')), E.dumps.get(`${tag}/${t}/${k}`));
       fs.writeFileSync(path.join(d, 'field.f32'), E.dumps.get(`${tag}/${t}/field`));
       fs.writeFileSync(path.join(d, 'meta.json'), JSON.stringify({ W: p.W, H: p.H, fw: p.flow[0], fh: p.flow[1], t, flowScale: 2, f16: f16in, fallback: rt.fallback }));

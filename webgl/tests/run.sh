@@ -47,7 +47,7 @@ for s in "${steps[@]}"; do
     learned-gpu) run learned-gpu 29 node "$here/learned.mjs" --gpu --json "$FG_WORK/learned-gpu.json" ;;
     bench) run bench 4 node "$here/bench.mjs" --fs 2 --iters 10 ;;
     bench-gpu) run bench-gpu 10 node "$here/bench.mjs" --gpu --fs 1,2,4
-               run bench-learned-gpu 5 node "$here/bench.mjs" --gpu --modes v1,ml2,ml1,ml2f,ml1f ;;
+               run bench-learned-gpu 7 node "$here/bench.mjs" --gpu --modes v1,e2v4,ml2,ml1,e2v4f,ml2f,ml1f ;;
     clean) rm -rf "$FG_WORK" ;;
     *) echo "unknown step $s" >&2; exit 2 ;;
   esac

@@ -18,7 +18,8 @@ Core path = RGBA8, `Settings` defaults of `FH:68-212`; RGBA16F input follows `fo
 webgl/
   README.md, LAYOUT.md               design docs
   framegen.js                        host. classic script, attaches globalThis.__fg
-  nets/e2v3.js, nets/e1v3.js         the learned estimator's weights (classic scripts, attach __fg.nets[<name>]; §10)
+  nets/e2v4.js, nets/e2v3.js,        the learned estimator's weights (classic scripts, attach __fg.nets[<name>]; §10);
+  nets/e1v3.js                       vendor all three (e2v4 is the default net)
   shaders/
     common.glsl                      begins with `#version 300 es`
     vert.glsl                        fullscreen-triangle vertex shader, standalone (own #version)
@@ -275,7 +276,7 @@ Fan-in `uFan` per axis: 16, except the first step of V1's untrusted chain (8: fo
 | `globalFallback` | `0.15` | FH:78 | `uGlobalFrac` | (0,1]; 1 = off |
 | `debug` | `false` | – | – | host only: `gl.getError()` after every pass, throw with pass name |
 | `motion` | `'search'` | – | – | V1's motion estimate: `'search'` (this contract's block search) or `'learned'` (§10). Ignored by V2. `'learned'` needs `flowScale` 2 (else `RangeError`), `checkSupport(gl).learned` and the net's weights (`__fg.nets`). A change (with V1) drops the estimate like a `motionVersion` switch. (new) |
-| `motionNet` | `'e2v3'` | – | – | `'e2v3'` (width 24) or `'e1v3'` (width 12, about 1.9x faster here); `motion 'learned'` only (new) |
+| `motionNet` | `'e2v4'` | – | – | `'e2v4'` (width 24, e2v3 fine-tuned: same layout and cost), `'e2v3'` (width 24) or `'e1v3'` (width 12, about 1.9x faster here); `motion 'learned'` only; any value needs `webgl/nets/<motionNet>.js` loaded, else `RangeError` naming the file (new; default `'e2v3'` before e2v4) |
 | `motionPrecision` | `'fp16'` | – | – | storage of the net's activations: `'fp16'` (half floats, 8 per RGBA32UI texel) or `'fp32'` (RGBA32F, the exact port); the field, pyramid, weights and arithmetic are float32 in both (new) |
 | `learnedZeroTest` | `true` | – | – | `motion 'learned'`: the zero-motion test after the net (§10.8); a change drops the estimate (new) |
 | `learnedStaticGuard` | `false` | – | – | `motion 'learned'`: the static guard after the synthesis (§10.9); runtime, takes effect at the next `synth` (new) |
@@ -333,7 +334,7 @@ Classic script. Attaches **`globalThis.__fg`**; defines nothing else globally. N
 __fg.version                       // string, '3' (changed; README "API" lists the additions)
 __fg.requiredExtensions            // ['EXT_color_buffer_float','EXT_float_blend','OES_texture_float_linear']
 __fg.checkSupport(gl, frame?)      // -> { ok, missing: string[], sizeError: string|null, quality: boolean, qualityError: string|null, learned: boolean, learnedError: string|null } (changed)
-__fg.nets                          // { e2v3, e1v3 }: the learned estimator's weights, attached by webgl/nets/<name>.js (§10; new)
+__fg.nets                          // { e2v4, e2v3, e1v3 }: the learned estimator's weights, attached by webgl/nets/<name>.js (§10; new)
 __fg.shaderFiles                   // string[] — every key `sources` must contain (§1), e.g. 'common.glsl', 'vert.glsl', 'estimate/luma.frag.glsl', ...
 __fg.defaultSettings()             // -> fresh copy of the defaults of §4
 __fg.levelLayout(W, H, flowScale)  // pure -> { fw, fh, levels: [{ w, h, bw, bh, radius }] }  (§2 sizes)
@@ -429,8 +430,8 @@ See README.md (V2 Performance and Quality, the static mask, frame formats, motio
 
 An opt-in replacement of V1's motion estimate (§3.3 E1–E14) by ml-fg's learned estimator; V1's synthesis (§3.3 Y1–Y7) is
 unchanged and consumes its output. The porting contract is ml-fg's `export/SPEC.md` (stages 1–7, abbreviated **SP**) with its
-executable reference `export/reference.py` (**REF**); the nets are `e2v3` (width 24, 95,530 weights, the default) and `e1v3`
-(width 12, 28,330 weights). Cites are SP sections.
+executable reference `export/reference.py` (**REF**); the nets are `e2v4` (width 24, 95,530 weights, the default: e2v3 fine-tuned, identical
+architecture and weight layout), `e2v3` (width 24, 95,530 weights) and `e1v3` (width 12, 28,330 weights). Cites are SP sections.
 
 ### 10.1 Contract with V1
 
@@ -476,7 +477,7 @@ exact half of its parent.
 `x` and `act` are level-0 sized; a coarser level renders into their top-left corner (viewport = the level) and the convs bound
 their taps by the level size `uSize` (zero padding at the padded level's border, SP 4c pitfall), so data of other levels beyond
 it is never read. fp16 packs 8 channels per texel: texel component k = `packHalf2x16(channel 2k, channel 2k + 1)` of the
-texture's 8. Memory at 1080p (PW × PH = 960 × 544): about 77 MB (e2v3, fp16), 61 MB (e1v3, fp16), 140 MB (e2v3, fp32), 90 MB
+texture's 8. Memory at 1080p (PW × PH = 960 × 544): about 77 MB (e2v4 / e2v3, fp16), 61 MB (e1v3, fp16), 140 MB (e2v4 / e2v3, fp32), 90 MB
 (e1v3, fp32); 1440p ×1.76.
 
 ### 10.4 Programs and sequence
@@ -486,7 +487,7 @@ texture's 8. Memory at 1080p (PW × PH = 960 × 544): about 77 MB (e2v3, fp16), 
 | `ml_lv0` | `lv0` | uPrev, uCurr | MRT `ml.pyr.0` + `ml.dupSrc`: SP 1–3 luma (`(3735 B + 19235 G + 9798 R + 16384) >> 15`, cv2 5.0.0), 2 × 2 area mean, edge pad, / 255 |
 | `ml_down` | `down` | uSrc | `ml.pyr.<l>` |
 | `ml_match`, `ml_match_h` | `match` (`ML_PACKED` for fp16) | uPyr, uHc, uDup | MRT `ml.x.*`: SP 4a (`mlFieldUp`: y then x, ×2) + 4b (18 true-bilinear taps) |
-| `ml_conv<CIN>x3`, `ml_last<G>` | `conv` (`ML_CIN`, `ML_COUT`, `ML_LAST`) | uIn0..uIn<CIN−1>, (uHc), uDup | fp32: 3 RGBA32F per pass (e2v3: two passes per layer), or the field |
+| `ml_conv<CIN>x3`, `ml_last<G>` | `conv` (`ML_CIN`, `ML_COUT`, `ML_LAST`) | uIn0..uIn<CIN−1>, (uHc), uDup | fp32: 3 RGBA32F per pass (width 24: two passes per layer), or the field |
 | `ml_h<CIN>g<CG>o<COUT>[L]` | `conv_h` (`ML_CIN`, `ML_CG`, `ML_COUT`, `ML_COUTA`, `ML_LAST`) | same, usampler2D | fp16: ⌈COUT/2⌉ RGBA32UI per pass (one pass per layer), or the field |
 | `ml_sad` | `sad` | uLv0, uField | first step of `sadRed` |
 | `ml_sadout` | `sadout` | uSrc, uDup | `sadRed[last]` of V1 = sum · bw₀ · bh₀ / (fw · fh) (`uWeight`) |
@@ -496,9 +497,9 @@ texture's 8. Memory at 1080p (PW × PH = 960 × 544): about 77 MB (e2v3, fp16), 
 | `final_sg` | `synth/final` (`FG_SGUARD`, include `sguard.inc`) | final's 7 + uSg (unit 7), uField (8) | `out` |
 
 `estimate()` in learned mode: `ml_lv0`, `reduce_sad` × |dupRed|, `ml_down` × 4, then for l = 4..0: `ml_match.l`, `ml_c0.l` …
-`ml_c4.l` (fp32 e2v3: `ml_c<k>a.l`, `ml_c<k>b.l` for k < 4), the last one writing `ml.h.l` (l > 0) or `pixfield` (l = 0, over
+`ml_c4.l` (fp32, width 24: `ml_c<k>a.l`, `ml_c<k>b.l` for k < 4), the last one writing `ml.h.l` (l > 0) or `pixfield` (l = 0, over
 fw × fh; its taps read the padded level), then `ml_sad`, `reduce_sad` × (|sadRed| − 1), `ml_sadout`. Draws at 1080p: 47 (fp16,
-both nets; fp32 e1v3), 67 (fp32 e2v3). With the zero test (the default) the last conv of level 0 writes `ml.pfNet`, and
+every net; fp32 width 12), 67 (fp32, width 24). With the zero test (the default) the last conv of level 0 writes `ml.pfNet`, and
 `ml_sad` is replaced by `ml_zt_cost`, `ml_zt`, `reduce_sad` × |sadRed| (two draws more at 1080p: 49 / 69). Synth with the static guard: `ml_sg_h`, `ml_sg_v` (the first guarded synth of a pair) and `final_sg` for `final`. The pass names (with the level) are what `setPassHook` sees.
 
 Conv (SP 4c, REF `conv3x3`): `out[o](q) = b[o] + Σ_tap Σ_i W[o][i][ky][kx] · in[i](q + (kx − 1, ky − 1))`, hidden layers
@@ -511,7 +512,7 @@ activations). Arithmetic float32 throughout.
 checked) attaches `__fg.nets[name] = { name, width, levels, depth, inChannels, padMultiple, flowScale, cutSad, levelToStack,
 stacks: [[{ w, b, cin, cout, act }]], count, sha256, checkpointSha256, checkpointStep, weights }`, `weights` = base64 of the
 float32 little-endian stream (OIHW, SP 3), `w` / `b` element offsets. The engine decodes it once (`atob`) and uploads one
-uniform buffer per net (e2v3 about 400 KB, e1v3 about 122 KB): per level, layer and 12 output channels a std140 block
+uniform buffer per net (e2v4 / e2v3 about 400 KB, e1v3 about 122 KB): per level, layer and 12 output channels a std140 block
 `{ mat4 uW[COUT · 9 · CG]; vec4 uB[COUT]; }` at a multiple of `UNIFORM_BUFFER_OFFSET_ALIGNMENT`, `uW[(o · 9 + tap) · CG + g]`
 = the 4 × 4 weights from input channels 4g..4g+3 (columns) to output channels 4o..4o+3 (rows), zero beyond the layer's channels
 (the 14-channel input is 16 slots). A pass binds its block(s) with `bindBufferRange` to binding points 0 (`MlW`) and 1 (`MlW2`:
