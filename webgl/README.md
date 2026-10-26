@@ -189,7 +189,7 @@ sad_zt ≤ 1e-3, same cut, synth ≥ 70 dB; fp16: sad_zt ≤ 1e-2, synth ≥ 45 
 RGBA16F input (e2v3 fp16, motion / odd): mask 98.86–99.16 % (its luma is unrounded), 49.9–55.6 dB, middle frame within 0.007 dB.
 Duplicates with the test on: field 0, sad 0, output = input, as without it. With `learnedZeroTest: false` the estimate and the
 output are byte-identical to the backend before the test (`fd5c163`: `pf.f32`, both outputs and sad / cut of all 24 rows per GL,
-ANGLE / Vulkan and ANGLE / GL compared file by file).
+SwiftShader, ANGLE / Vulkan and ANGLE / GL compared file by file).
 
 **Static guard** check (`learned.mjs`: e2v3 fp32 with the zero test on overlay t = 0.5 / 0.25, motion t = 0.25, cut t = 0.5,
 overlay RGBA16F t = 0.25; the engine's own a, c, unguarded output and field at t through `static_guard.py`): RGBA8 max |d| 0
