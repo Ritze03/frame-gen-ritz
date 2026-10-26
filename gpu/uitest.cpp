@@ -1,6 +1,6 @@
 // uitest: validation + benchmark of framegen's static-UI protection (Settings::uiProtection).
 //   uitest check [--bgra] [--hash] [W H]     default 1280 720
-//   option --algo v1|v2 (every mode): the motion version (Settings::motionVersion) every run starts with (default v1)
+//   option --algo v1|v2|learned (every mode): the motion version (Settings::motionVersion) every run starts with (default v1)
 //   option --mode quality|performance (every mode): Settings::v2Mode of every run (default quality; V1 ignores it)
 //   uitest deep [W H]                        Settings::uiHistory: a synth from a pair 10 frames back still finds its clean copies (default 640x360)
 //   uitest track [W H]                       recordTrack: UI protection kept warm while the host does not generate (default 640x360)
@@ -1653,11 +1653,13 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const c
     if (!strcmp(name, "vkDestroyPipeline")) return (PFN_vkVoidFunction)countDestroyPipe;
     return vkGetDeviceProcAddr(d, name);
 }
-static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : "V1"; }
+static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : v == MotionVersion::Learned ? "Learned" : "V1"; }
 // The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes.
 // V2 = both V2Modes: V1's luma / down, its 2 faster estimate passes (medhist, search), the block re-pick and field clean-up (both
 // modes), Performance's morph, Quality's per-pixel field, splat, coverage and morph; no motion-blur passes (its morphs blur): 11.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : 14; }
+// Learned = V1's luma, 4 synth passes and 3 motion-blur passes, its duplicate test, reduction, pyramid and output passes, and its
+// match (2) and conv (20) pipelines per activation storage, net, layer shape and split: 34.
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : v == MotionVersion::Learned ? 34 : 14; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1675,7 +1677,7 @@ static void motionCheck(const Scene& sc) {
     printf("\n== motion version: start %s, switch to %s ==\n", algoName(from), algoName(to));
     {   // every Format runs both versions
         Settings v1, v2; v2.motionVersion = MotionVersion::V2;
-        Settings bad; bad.motionVersion = (MotionVersion)2;
+        Settings bad; bad.motionVersion = (MotionVersion)3;   // (2 = MotionVersion::Learned)
         expect(Interpolator::validate(v2) && !Interpolator::validate(bad), "validate accepts V2 and rejects an unknown motion version");
         const Format all[5] = {Format::Rgba8, Format::Rgb10, Format::RgbaF16, Format::Nv12, Format::P010};
         Settings mq = v2, mp = v2, mb = v2, m1 = v1;
@@ -1825,7 +1827,8 @@ int main(int argc, char** argv) {
             const char* a = argv[++i];
             if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
-            else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
+            else if (!strcmp(a, "learned")) gAlgo = MotionVersion::Learned;
+            else { fprintf(stderr, "--algo v1|v2|learned\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char* a = argv[++i];
@@ -1838,7 +1841,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [--algo v1|v2] [--mode quality|performance] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [--algo v1|v2|learned] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

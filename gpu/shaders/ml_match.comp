@@ -57,8 +57,8 @@ void main() {
             if (dx == 0 && dy == 0) { wa = sa; wc = sc; }
         }
     int o = pc.actOut + q.y * lw + q.x;
-    act[o] = vec4(wa, wc, wa - wc, cost[0]);
-    act[o + n] = vec4(cost[1], cost[2], cost[3], cost[4]);
-    act[o + 2 * n] = vec4(cost[5], cost[6], cost[7], cost[8]);
-    act[o + 3 * n] = vec4(h * 0.25, 0.0, 0.0);
+    actStore(o, vec4(wa, wc, wa - wc, cost[0]));
+    actStore(o + n, vec4(cost[1], cost[2], cost[3], cost[4]));
+    actStore(o + 2 * n, vec4(cost[5], cost[6], cost[7], cost[8]));
+    actStore(o + 3 * n, vec4(h * 0.25, 0.0, 0.0));
 }

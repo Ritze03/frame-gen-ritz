@@ -20,7 +20,9 @@ layout(constant_id = 22) const int LINEAR = 0;   // 1 = the last layer: h += 2 *
 layout(constant_id = 23) const int GOT = 6;      // output groups per workgroup (a divisor of GO); dispatch z = GO / GOT
 
 const int TS = 16, TT = TS + 2;   // the 16x16 output tile and its input tile with a 1-pixel halo
-shared vec4 tile[GI * TT * TT];
+shared vec4 tile[ML_HALF != 0 ? 1 : GI * TT * TT];
+shared uvec2 tileh[ML_HALF != 0 ? GI * TT * TT : 1];   // ML_HALF: the tile as stored (half the LDS), unpacked per read
+vec4 tileAt(int i) { return ML_HALF != 0 ? mlUnpack(tileh[i]) : tile[i]; }
 
 void main() {
     if (mlDup()) return;
@@ -29,7 +31,10 @@ void main() {
     for (int i = int(gl_LocalInvocationIndex); i < GI * TT * TT; i += TS * TS) {
         int g = i / (TT * TT), j = i - g * (TT * TT);
         ivec2 s = t0 + ivec2(j % TT, j / TT);
-        tile[i] = s.x >= 0 && s.y >= 0 && s.x < lw && s.y < lh ? act[pc.actIn + g * n + s.y * lw + s.x] : vec4(0.0);
+        const bool in_ = s.x >= 0 && s.y >= 0 && s.x < lw && s.y < lh;
+        const int k = pc.actIn + g * n + s.y * lw + s.x;
+        if (ML_HALF != 0) tileh[i] = in_ ? acth[k] : uvec2(0u);
+        else tile[i] = in_ ? act[k] : vec4(0.0);
     }
     barrier();
     ivec2 q = ivec2(gl_GlobalInvocationID.xy);
@@ -42,7 +47,7 @@ void main() {
         int ky = t / 3, kx = t - 3 * ky;
         int tb = (l.y + ky) * TT + l.x + kx;
         [[unroll]] for (int g = 0; g < GI; g++) {
-            vec4 v = tile[g * (TT * TT) + tb];
+            vec4 v = tileAt(g * (TT * TT) + tb);
             int wb = pc.wOff + (t * GI + g) * 4 * GO + o0;
             [[unroll]] for (int o = 0; o < GOT; o++) {   // explicit fma: RADV does not contract a * b + c on its own
                 acc[o] = fma(vec4(v.x), wt[wb + o], acc[o]);
@@ -53,7 +58,7 @@ void main() {
         }
     }
     if (LINEAR == 0) {
-        [[unroll]] for (int o = 0; o < GOT; o++) act[pc.actOut + (o0 + o) * n + q.y * lw + q.x] = clamp(acc[o], 0.0, 1.0);
+        [[unroll]] for (int o = 0; o < GOT; o++) actStore(pc.actOut + (o0 + o) * n + q.y * lw + q.x, clamp(acc[o], 0.0, 1.0));
     } else {
         int ho = mlH(pc.lvl) + 2 * (q.y * lw + q.x);
         precise float hx = ml[ho] + 2.0 * acc[0].x, hy = ml[ho + 1] + 2.0 * acc[0].y;

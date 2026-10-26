@@ -3,7 +3,7 @@
 //                               (the last pair interpolated at t = 0.5 / 0.25 / blurred), with and without UI protection
 //   formattest time [W H]       one estimate + one synth per format, GPU time per pass group (default 1920 1080)
 //   options: --separate-planes  YUV: two single-plane images instead of one multi-planar image with plane views
-//            --algo v1|v2       the motion version (Settings::motionVersion), default v1. Every check runs every format in it
+//            --algo v1|v2|learned  the motion version (Settings::motionVersion), default v1. Every check runs every format in it
 //            --mode quality|performance  Settings::v2Mode (default quality; V1 ignores it)
 //            --hash             check: print an FNV-1a hash of every output of each format's Off run (t = 0.5, 0.25, blur) and
 //                               WholeScreen run (t = 0.5, 0.25), raw bytes of both planes: diff two library builds
@@ -1284,7 +1284,8 @@ int main(int argc, char** argv) {
             const char* a = argv[++i];
             if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
-            else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
+            else if (!strcmp(a, "learned")) gAlgo = MotionVersion::Learned;
+            else { fprintf(stderr, "--algo v1|v2|learned\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char* a = argv[++i];
@@ -1295,7 +1296,7 @@ int main(int argc, char** argv) {
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [--hash] [--algo v1|v2] [--mode quality|performance] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [--hash] [--algo v1|v2|learned] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

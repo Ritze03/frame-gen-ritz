@@ -534,6 +534,21 @@ static void checkPair(const char* run, const char* pair) {
         topMax = std::max(topMax, st.max);
         CHECK(st.max <= kTopTol);
     }
+    // ---- Settings::learnedHalf (fp16 activations): no pointwise tolerance (SPEC.md section 7), the same cut; synthcheck.py judges it
+    for (int ref = 0; ref < 2; ref++) {
+        Settings sh = s;
+        sh.learnedHalf = true;
+        REQUIRE(rig.fg.setSettings(sh));
+        if (ref) rig.setLumaSrc(ya, yc);
+        else rig.fg.setDebugLearned(Interpolator::LearnedDebug{});
+        REQUIRE(rig.run(false, false));
+        const Stat st = diff(rig.pf.data(), expPf.data(), expPf.size());
+        const double sd = rig.sad();
+        printf("  %s %-6s %s half: pf max %.2e mean %.2e px, sad %.4f vs %.4f (rel %.1e), cut %d vs %d\n", run, pair, ref ? "ref" : "fgr",
+               st.max, st.mean, sd, expSad, std::fabs(sd - expSad) / std::max(1.0, expSad), sd > s.sceneCutSad, expCut);
+        CHECK((sd > s.sceneCutSad) == expCut);
+        dumpPf(run, pair, ref ? "refh" : "fgrh", rig.pf, sd, sd > s.sceneCutSad);
+    }
     printf("RESULT %s %s ya/yc %s | top max %.1e | h_level max %.1e mean %.1e | ref pf max %.2e mean %.2e sad rel %.1e cut %s | "
            "fgr pf max %.2e mean %.2e sad %.4f (exp %.4f) cut %s\n", run, pair, haveY ? "exact" : "(none)", topMax, lvMax, lvMean,
            refPf.max, refPf.mean, sadRel, refCut == expCut ? "same" : "DIFFERENT", fgrPf.max, fgrPf.mean, fgrSad, expSad,

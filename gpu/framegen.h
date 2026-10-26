@@ -269,11 +269,15 @@ struct Settings {
     // nets' weights are uploaded with the version's first estimate; a switch to a wider net grows the activation buffer (it only ever
     // allocates; false from setSettings if that fails, nothing changed).
     LearnedNet learnedNet = LearnedNet::E2v3;
+    // MotionVersion::Learned: store the net's activations (its 14-channel input and the four hidden layers' outputs) as IEEE half
+    // instead of float32; the arithmetic, the field and the pyramid stay float32 (ml-fg SPEC.md section 7, the tested fp16 storage).
+    // Off = the default: the exact float32 port. Other versions ignore it. Runtime: setSettings() at any time, like learnedNet.
+    bool learnedHalf = false;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
     // Motion estimation runs at 1/flowScale of the frame size: 1, 2 or 4. 2 = quality (default);
     // 4 = performance (1440p: ~40 % less total time at 2x, ~30 % at 4x; can miss thin/fine motion detail);
-    // 1 = full res (1080p 2x: ~2.3x the time, not better on the test clips).
+    // 1 = full res (1080p 2x: ~2.3x the time, not better on the test clips). MotionVersion::Learned takes 2 only.
     uint32_t flowScale = 2;
 };
 
@@ -572,7 +576,8 @@ public:
     // (the average of all samples) and "blur fixup" (the whole-frame fallback check, a no-op in the normal case), then "ui_patch".
     // MotionVersion::V2: its estimate ends after the levels, then "field clean" (once per estimate: re-pick, refinement, clean-up);
     // Quality adds "pixel field", "splat" and "coverage" (once per estimate); per synth "morph" / "blur morph" and "fallback" (its
-    // fix-up).
+    // fix-up). MotionVersion::Learned: after "luma", "duplicate test", "net pyramid", "net level 4" .. "net level 0" and "net output"
+    // (the field and the SAD), then V1's synth passes.
     bool readTimings(std::vector<const char*>& names, std::vector<uint64_t>& ticks);
 
     // Debug / test only (bench/score), read-only: changes no output and no state. Records a copy of the latest recordSynth's
@@ -613,11 +618,12 @@ public:
     // debugLearnedLayout() says (byte offsets relative to dstOffset): the net's state (per level l of the padded pyramid,
     // n(l) = (pw >> l) * (ph >> l) pixels: la then lc (0..1) at pyrOff[l] (level 0 = the flow-res luma / 255, correctly rounded, so
     // round(la * 1020) / 4 is the luma the net read); the field h at hOff[l], (x, y) float32 pairs in level-l pixels) and its
-    // activations (region r: channel group g (channels 4g..4g+3, vec4 float32) of level l at actOff[r] + 16 * g * n(l), planar; the
-    // 14-channel input and hidden layers 1 and 3 in region 0, layers 0 and 2 in region 1). Preceded by a COMPUTE write -> TRANSFER
+    // activations (region r: channel group g (channels 4g..4g+3, vec4 float32, or 4 half with learnedHalf) of level l at
+    // actOff[r] + e * g * n(l), planar, e = 16 (8 half) bytes per group and pixel; the 14-channel input and hidden layers 1 and 3 in region 0, layers 0 and 2 in region 1). Preceded by a COMPUTE write -> TRANSFER
     // read barrier; the caller adds its own TRANSFER -> HOST barrier. False if not initialised or the selected version is not Learned.
     struct DebugLearnedLayout {
         uint32_t fw, fh, pw, ph, width;    // flow size, the net's padded level 0, the selected net's width
+        bool half;                         // Settings::learnedHalf: a channel group is 4 IEEE half (8 bytes) instead of a vec4
         VkDeviceSize pyrOff[5], hOff[5], actOff[2], size;
     };
     bool debugLearnedLayout(DebugLearnedLayout& l) const;

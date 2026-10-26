@@ -386,10 +386,15 @@ struct UiEntry {
 // shape (first / hidden / last) and net (LearnedNet), shaders/ml_conv.comp specialised.
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
             P_V2_MEDHIST, P_V2_SEARCH, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
-            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_MATCH, P_ML_OUT, P_ML_CONV, P_COUNT = P_ML_CONV + 10 };
+            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2, P_COUNT = P_ML_CONV + 20 };
 static const int kMlNets = 2;   // LearnedNet::E2v3, E1v3
-// shape 0 = first (14 -> w), 1 = hidden (w -> w), 2 = last (w -> 2); split: one output group per workgroup (the small levels)
-inline Pipe mlConvPipe(int net, int shape, bool split) { return (Pipe)(P_ML_CONV + 5 * net + (shape == 2 ? 4 : 2 * shape + split)); }
+// The match and conv pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF); convs per
+// net and shape (0 = first, 14 -> w; 1 = hidden, w -> w; 2 = last, w -> 2) and, but the last, whole or split (one output group per
+// workgroup: the small levels)
+inline Pipe mlMatchPipe(bool half) { return (Pipe)(P_ML_MATCH + half); }
+inline Pipe mlConvPipe(bool half, int net, int shape, bool split) {
+    return (Pipe)(P_ML_CONV + 10 * half + 5 * net + (shape == 2 ? 4 : 2 * shape + split));
+}
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
@@ -470,9 +475,10 @@ struct MlLayout {
     int pw = 0, ph = 0, n0 = 0, S = 0, nDup = 0, nOut = 0;
     VkDeviceSize stateBytes = 0;
     int g = 0, r0 = 0, groups = 0;   // the net's groups per hidden layer, R0's groups, R0 + R1
-    VkDeviceSize actBytes = 0;
+    VkDeviceSize elem = 0, actBytes = 0;   // bytes per group of 4 channels (16 float32, 8 half), the activations
 };
-static MlLayout mlLayout(uint32_t W, uint32_t H, int fw, int fh, LearnedNet net) {
+static MlLayout mlLayout(uint32_t W, uint32_t H, int fw, int fh, const Settings& s) {
+    const LearnedNet net = s.learnedNet;
     MlLayout L;
     L.pw = (fw + 15) & ~15;
     L.ph = (fh + 15) & ~15;
@@ -484,7 +490,8 @@ static MlLayout mlLayout(uint32_t W, uint32_t H, int fw, int fh, LearnedNet net)
     L.g = mlWidth(net) / 4;
     L.r0 = std::max(4, L.g);
     L.groups = L.r0 + L.g;
-    L.actBytes = (VkDeviceSize)L.groups * L.n0 * 16;
+    L.elem = s.learnedHalf ? 8 : 16;
+    L.actBytes = (VkDeviceSize)L.groups * L.n0 * L.elem;
     return L;
 }
 
@@ -504,7 +511,7 @@ static const char* sizeLimitError(uint32_t W, uint32_t H, const Settings& s, con
         gx = std::max(gx, (cells + 7) / 8);   // v2_enclose.comp: 8 cells per workgroup, one row of workgroups
     } else {
         if (s.motionVersion == MotionVersion::Learned) {   // the net's state and activations (its dispatches are narrower than W / 8)
-            const MlLayout M = mlLayout(W, H, L.fw, L.fh, s.learnedNet);
+            const MlLayout M = mlLayout(W, H, L.fw, L.fh, s);
             big = std::max({big, (uint64_t)M.stateBytes, (uint64_t)M.actBytes});
         }
         if (s.blurSamples >= 2)   // recordSynthBlur's scratch (grown by the first blurred record)
@@ -578,11 +585,11 @@ struct Interpolator::Impl {
     void v2ResetClaims(VkCommandBuffer cb);
     void v2Tail(VkCommandBuffer cb);
     // MotionVersion::Learned: both nets' weights (binding 15; created with the version's pipelines, uploaded by its first estimate:
-    // mlWeightsUp), the activation buffer's capacity in vec4 groups per level-0 pixel (it grows for a wider net, the old one waits in
-    // mlGrave until the size is freed), and the test hooks (setDebugLearned)
+    // mlWeightsUp), the activation buffer's size (it grows for a wider net or float32 storage, the old one waits in mlGrave until the
+    // size is freed), and the test hooks (setDebugLearned)
     UiBuf mlWeights;
     bool mlWeightsUp = false;
-    int mlActGroups = 0;
+    VkDeviceSize mlActBytes = 0;
     std::vector<UiBuf> mlGrave;
     LearnedDebug mlDbg{};
     bool mlearned() const { return set.motionVersion == MotionVersion::Learned; }
@@ -726,7 +733,7 @@ void Interpolator::Impl::destroySizeDependent() {
     }
     for (UiBuf& b : mlGrave) freeBuf(b);
     mlGrave.clear();
-    mlActGroups = 0;
+    mlActBytes = 0;
     freeBuf(blurField);
     freeBuf(blurErr);
     for (UiBuf& b : blurGrave) freeBuf(b);
@@ -1476,26 +1483,31 @@ bool Interpolator::Impl::motionEnsure() {
     }
     // Learned: V1's luma, synthesis and blur, its own passes instead of V1's search; the convs specialised per layer shape and net
     // (shaders/ml_conv.comp: GI, GO, LINEAR), and the weights buffer
-    struct MlSpec { int32_t gi, go, linear, got; } mlSpec[kMlNets * 5]{};
-    VkSpecializationMapEntry mlEnt[4] = {{20, 0, 4}, {21, 4, 4}, {22, 8, 4}, {23, 12, 4}};
-    VkSpecializationInfo mlSi[kMlNets * 5]{};
+    struct MlSpec { int32_t gi, go, linear, got, half; } mlSpec[2 * kMlNets * 5 + 2]{};
+    VkSpecializationMapEntry mlEnt[5] = {{20, 0, 4}, {21, 4, 4}, {22, 8, 4}, {23, 12, 4}, {24, 16, 4}};
+    VkSpecializationInfo mlSi[2 * kMlNets * 5 + 2]{};
     if (mlearned()) {
 #ifdef FG_HAVE_ML
         for (int i = P_DOWN; i <= P_PIXFIELD; i++) spv[i].sp = Spv{};
         spv[P_ML_DUP] = {cs.mlDup, spec};   // (the duplicate test reads colour: the format's own variant)
         spv[P_ML_REDUCE].sp = SPV(ml_reduce);
         spv[P_ML_PYR].sp = SPV(ml_pyr);
-        spv[P_ML_MATCH].sp = SPV(ml_match);
         spv[P_ML_OUT].sp = SPV(ml_out);
-        for (int net = 0; net < kMlNets; net++) {
-            const int gw = mlWidth((LearnedNet)net) / 4;
-            // 14 (padded to 16) -> w, w -> w (each whole and split), w -> 2 (padded to 4)
-            const MlSpec shapes[5] = {{4, gw, 0, gw}, {4, gw, 0, 1}, {gw, gw, 0, gw}, {gw, gw, 0, 1}, {gw, 1, 1, 1}};
-            for (int k = 0; k < 5; k++) {
-                const int j = 5 * net + k;
-                mlSpec[j] = shapes[k];
-                mlSi[j] = {4, mlEnt, sizeof(MlSpec), &mlSpec[j]};
-                spv[P_ML_CONV + j] = {SPV(ml_conv), &mlSi[j]};
+        for (int half = 0; half < 2; half++) {
+            const int jm = 2 * kMlNets * 5 + half;
+            mlSpec[jm].half = half;
+            mlSi[jm] = {5, mlEnt, sizeof(MlSpec), &mlSpec[jm]};
+            spv[mlMatchPipe(half)] = {SPV(ml_match), &mlSi[jm]};
+            for (int net = 0; net < kMlNets; net++) {
+                const int gw = mlWidth((LearnedNet)net) / 4;
+                // 14 (padded to 16) -> w, w -> w (each whole and split), w -> 2 (padded to 4)
+                const MlSpec shapes[5] = {{4, gw, 0, gw, half}, {4, gw, 0, 1, half}, {gw, gw, 0, gw, half}, {gw, gw, 0, 1, half}, {gw, 1, 1, 1, half}};
+                for (int k = 0; k < 5; k++) {
+                    const int j = 10 * half + 5 * net + k;
+                    mlSpec[j] = shapes[k];
+                    mlSi[j] = {5, mlEnt, sizeof(MlSpec), &mlSpec[j]};
+                    spv[P_ML_CONV + j] = {SPV(ml_conv), &mlSi[j]};
+                }
             }
         }
         size_t words = 0;
@@ -1538,21 +1550,21 @@ bool Interpolator::Impl::motionSized(MotionGroup& g) {
 // allocation failed (what this call allocated is freed; an existing smaller activation buffer stays).
 bool Interpolator::Impl::mlSized() {
     MotionGroup& g = mo[(int)MotionVersion::Learned];
-    const MlLayout L = mlLayout(W, H, fw, fh, set.learnedNet);
+    const MlLayout L = mlLayout(W, H, fw, fh, set);
     if (g.bufs.empty()) {
         g.bufs.resize(MLB_COUNT);
-        mlActGroups = 0;
+        mlActBytes = 0;
         if (!allocBuf(g.bufs[MLB_STATE], L.stateBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) { g.bufs.clear(); return false; }
     }
-    if (mlActGroups >= L.groups) return true;
+    if (mlActBytes >= L.actBytes) return true;
     UiBuf nb;
     if (!allocBuf(nb, L.actBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
-        if (!mlActGroups) { for (UiBuf& b : g.bufs) freeBuf(b); g.bufs.clear(); }
+        if (!mlActBytes) { for (UiBuf& b : g.bufs) freeBuf(b); g.bufs.clear(); }
         return false;
     }
     if (g.bufs[MLB_ACT].b) mlGrave.push_back(g.bufs[MLB_ACT]);
     g.bufs[MLB_ACT] = nb;
-    mlActGroups = L.groups;
+    mlActBytes = L.actBytes;
     return true;
 }
 
@@ -1586,7 +1598,7 @@ void Interpolator::Impl::motionFree(MotionGroup& g) {
         mlWeightsUp = false;
         for (UiBuf& b : mlGrave) freeBuf(b);
         mlGrave.clear();
-        mlActGroups = 0;
+        mlActBytes = 0;
     }
     g = MotionGroup{};
 }
@@ -1725,14 +1737,15 @@ void Interpolator::setDebugLearned(const LearnedDebug& d) {
 bool Interpolator::debugLearnedLayout(DebugLearnedLayout& l) const {
     if (!m || !m->W || !m->mlearned() || m->mo[(int)MotionVersion::Learned].bufs.empty()) return false;
     const Impl& I = *m;
-    const MlLayout L = mlLayout(I.W, I.H, I.fw, I.fh, I.set.learnedNet);
+    const MlLayout L = mlLayout(I.W, I.H, I.fw, I.fh, I.set);
+    l.half = I.set.learnedHalf;
     l.fw = (uint32_t)I.fw; l.fh = (uint32_t)I.fh; l.pw = (uint32_t)L.pw; l.ph = (uint32_t)L.ph; l.width = (uint32_t)mlWidth(I.set.learnedNet);
     const VkDeviceSize st = 0;   // the state copy (shaders/ml_common.glsl), then the activations
     VkDeviceSize o = 0;
     for (int k = 0; k < kMlLevels; k++) { l.pyrOff[k] = st + o * 4; o += 2 * (VkDeviceSize)(L.pw >> k) * (L.ph >> k); }
     for (int k = 0; k < kMlLevels; k++) { l.hOff[k] = st + o * 4; o += 2 * (VkDeviceSize)(L.pw >> k) * (L.ph >> k); }
     l.actOff[0] = (st + L.stateBytes + 15) & ~(VkDeviceSize)15;
-    l.actOff[1] = l.actOff[0] + (VkDeviceSize)L.r0 * L.n0 * 16;
+    l.actOff[1] = l.actOff[0] + (VkDeviceSize)L.r0 * L.n0 * L.elem;
     l.size = l.actOff[0] + L.actBytes;
     return true;
 }
@@ -1744,7 +1757,7 @@ bool Interpolator::recordDebugLearned(VkCommandBuffer cb, VkBuffer dst, VkDevice
     const MotionGroup& g = I.mo[(int)MotionVersion::Learned];
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    const MlLayout M = mlLayout(I.W, I.H, I.fw, I.fh, I.set.learnedNet);
+    const MlLayout M = mlLayout(I.W, I.H, I.fw, I.fh, I.set);
     VkBufferCopy sc{0, dstOffset + L.pyrOff[0], M.stateBytes};
     I.CmdCopyBuffer(cb, g.bufs[MLB_STATE].b, dst, 1, &sc);
     VkBufferCopy ac{0, dstOffset + L.actOff[0], M.actBytes};
@@ -2386,8 +2399,9 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
 void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
 #ifdef FG_HAVE_ML
     Rec r(*this, cb);
-    const MlLayout L = mlLayout(W, H, fw, fh, set.learnedNet);
+    const MlLayout L = mlLayout(W, H, fw, fh, set);
     const int net = (int)set.learnedNet;
+    const bool half = set.learnedHalf;
     const uint32_t base = net == 0 ? 0u : (uint32_t)(kMlNet[0].words / 4);   // the net's start in mlWeights (vec4 units)
     const int r1 = L.r0 * L.n0;                                             // activation region R1 (vec4 offset)
     const Level& l0 = lv[0];
@@ -2424,7 +2438,7 @@ void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
         const bool split = gx * gy < kMlSplitTiles;   // a small level: one output group per workgroup (ml_conv.comp)
         m.lvl = lvl;
         m.actOut = 0;   // the 14-channel input -> R0
-        run(P_ML_MATCH, gx, gy);
+        run(mlMatchPipe(half), gx, gy);
         r.cbar();
         if (stop(lvl, 0)) return;
         for (int k = 0; k < kMlLayers; k++) {   // R0 -> R1 -> R0 -> R1 -> R0 -> the field
@@ -2433,7 +2447,7 @@ void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
             m.actIn = k % 2 ? r1 : 0;
             m.actOut = k % 2 ? 0 : r1;
             const int shape = k == 0 ? 0 : k == kMlLayers - 1 ? 2 : 1;
-            run(mlConvPipe(net, shape, split), gx, gy, shape == 2 || !split ? 1 : (uint32_t)L.g);
+            run(mlConvPipe(half, net, shape, split), gx, gy, shape == 2 || !split ? 1 : (uint32_t)L.g);
             r.cbar();
             if (stop(lvl, k + 1)) return;
         }

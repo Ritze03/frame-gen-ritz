@@ -33,7 +33,28 @@ layout(push_constant) uniform MLPC {
 // All three are bound only to the sets of MotionVersion::Learned (framegen.cpp MotionGroup::bufs / mlWeights).
 layout(set = 0, binding = 13, std430) buffer MlState { float ml[]; };
 layout(set = 0, binding = 14, std430) buffer MlAct { vec4 act[]; };
+layout(set = 0, binding = 14, std430) buffer MlActH { uvec2 acth[]; };   // the same buffer, ML_HALF's layout
 layout(set = 0, binding = 15, std430) restrict readonly buffer MlWeights { vec4 wt[]; };
+
+// Settings::learnedHalf (a specialization constant of ml_match / ml_conv): the activations (the 14-channel input and the four hidden
+// layers' outputs) are stored as IEEE half, 4 channels in a uvec2, arithmetic stays float32 (SPEC.md section 7, the tested fp16
+// storage; the field h, the pyramid and the weights stay float32)
+layout(constant_id = 24) const int ML_HALF = 0;
+// Round to nearest even like numpy's astype(float16) (what SPEC.md measured): RADV's packHalf2x16 truncates (v_cvt_pkrtz), so the
+// float32 mantissa is first rounded to half's 10 bits (ties to even) in the integer domain, which the truncation then keeps exactly.
+// (Values below half's normal range, |x| < 6.1e-5, are still truncated to its subnormal grid.)
+vec4 mlRoundHalf(vec4 v) {
+    uvec4 u = floatBitsToUint(v);
+    u = (u + 0xFFFu + ((u >> 13) & 1u)) & ~0x1FFFu;
+    return uintBitsToFloat(u);
+}
+uvec2 mlPack(vec4 v) { v = mlRoundHalf(v); return uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw)); }
+vec4 mlUnpack(uvec2 p) { return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y)); }
+vec4 actLoad(int i) { return ML_HALF != 0 ? mlUnpack(acth[i]) : act[i]; }
+void actStore(int i, vec4 v) {
+    if (ML_HALF != 0) acth[i] = mlPack(v);
+    else act[i] = v;
+}
 
 const int ML_LEVELS = 5;
 const int U_MLDUP = 2;   // u[2] = 1: the pair is a duplicate (ml_reduce.comp, mode 0): every pass of the net exits at once,

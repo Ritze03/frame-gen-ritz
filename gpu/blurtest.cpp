@@ -9,7 +9,7 @@
 //                               (every N 2..8, windows, weights, with scene cut / flick fallbacks), the smear of a moving
 //                               object's edge against the ideal model, the crosshair pixel-exact under UI protection, the
 //                               descriptor rings, validation of the settings.
-//   option --algo v1|v2         the motion version (Settings::motionVersion) every Interpolator is created and set with (default v1)
+//   option --algo v1|v2|learned the motion version (Settings::motionVersion) every Interpolator is created and set with (default v1)
 #include "framegen.h"
 #include "blendbench_spv.h"
 
@@ -667,7 +667,7 @@ static Edge modelEdge(const BScene& bs, const std::vector<float>& t, const std::
 static int check(int W, int H) {
 #ifndef BLURTEST_NO_MOTION
     printf("check %dx%d %s, motion version %s (--algo), v2Mode %s (--mode)\n", W, H, bgra ? "BGRA8" : "RGBA8",
-           gAlgo == MotionVersion::V2 ? "V2" : "V1", gMode == V2Mode::Performance ? "performance" : "quality");
+           gAlgo == MotionVersion::V2 ? "V2" : gAlgo == MotionVersion::Learned ? "Learned" : "V1", gMode == V2Mode::Performance ? "performance" : "quality");
 #else
     printf("check %dx%d %s\n", W, H, bgra ? "BGRA8" : "RGBA8");
 #endif
@@ -1002,7 +1002,8 @@ int main(int argc, char** argv) {
             const char* a = argv[++i];
             if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
-            else { fprintf(stderr, "--algo v1|v2\n"); return 2; }
+            else if (!strcmp(a, "learned")) gAlgo = MotionVersion::Learned;
+            else { fprintf(stderr, "--algo v1|v2|learned\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char* a = argv[++i];
@@ -1013,7 +1014,7 @@ int main(int argc, char** argv) {
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2] [--mode quality|performance] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2|learned] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
