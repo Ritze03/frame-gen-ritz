@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // The learned motion estimator (settings.motion 'learned', webgl/shaders/learned/) vs the ml-fg hand-off test vectors, by the
 // procedure of export/SPEC.md section 8, for every pair of every net at both activation precisions; then the duplicate-pair skip.
-//   node webgl/tests/learned.mjs [--gpu] [--nets e2v4,e2v3,e1v3] [--pairs motion,odd] [--prec fp32,fp16] [--json FILE]
+//   node webgl/tests/learned.mjs [--gpu] [--nets e2v4,e1v4,e2v3,e1v3] [--pairs motion,odd] [--prec fp32,fp16] [--json FILE]
 // Nets: each webgl/nets/<net>.js with an export/<net>/testvec; pairs: its testvec/<pair>/ directories (the cut flags are vec.json's
 // cut / cut_zt, never the pair's name).
 // Vectors: $FG_MLFG_EXPORT (default ~/Schinken/Programming/Local/ml-fg/export; read only, nothing is copied into the repo); the decoded

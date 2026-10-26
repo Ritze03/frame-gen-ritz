@@ -18,8 +18,8 @@ Core path = RGBA8, `Settings` defaults of `FH:68-212`; RGBA16F input follows `fo
 webgl/
   README.md, LAYOUT.md               design docs
   framegen.js                        host. classic script, attaches globalThis.__fg
-  nets/e2v4.js, nets/e2v3.js,        the learned estimator's weights (classic scripts, attach __fg.nets[<name>]; §10);
-  nets/e1v3.js                       vendor all three (e2v4 is the default net)
+  nets/e2v4.js, nets/e1v4.js,        the learned estimator's weights (classic scripts, attach __fg.nets[<name>]; §10);
+  nets/e2v3.js, nets/e1v3.js         vendor all four (e2v4 is the default net, e1v4 the small one: __fg.smallNet)
   shaders/
     common.glsl                      begins with `#version 300 es`
     vert.glsl                        fullscreen-triangle vertex shader, standalone (own #version)
@@ -276,7 +276,7 @@ Fan-in `uFan` per axis: 16, except the first step of V1's untrusted chain (8: fo
 | `globalFallback` | `0.15` | FH:78 | `uGlobalFrac` | (0,1]; 1 = off |
 | `debug` | `false` | – | – | host only: `gl.getError()` after every pass, throw with pass name |
 | `motion` | `'search'` | – | – | V1's motion estimate: `'search'` (this contract's block search) or `'learned'` (§10). Ignored by V2. `'learned'` needs `flowScale` 2 (else `RangeError`), `checkSupport(gl).learned` and the net's weights (`__fg.nets`). A change (with V1) drops the estimate like a `motionVersion` switch. (new) |
-| `motionNet` | `'e2v4'` | – | – | `'e2v4'` (width 24, e2v3 fine-tuned: same layout and cost), `'e2v3'` (width 24) or `'e1v3'` (width 12, about 1.9x faster here); `motion 'learned'` only; any value needs `webgl/nets/<motionNet>.js` loaded, else `RangeError` naming the file (new; default `'e2v3'` before e2v4) |
+| `motionNet` | `'e2v4'` | – | – | `'e2v4'` (width 24, e2v3 fine-tuned: same layout and cost; `__fg.defaultNet`), `'e1v4'` (width 12, e1v3 fine-tuned, about 1.9x faster here; `__fg.smallNet`, the recommended small / fallback net), `'e2v3'` (width 24) or `'e1v3'` (width 12); `motion 'learned'` only; any value needs `webgl/nets/<motionNet>.js` loaded, else `RangeError` naming the file (new; default `'e2v3'` before e2v4) |
 | `motionPrecision` | `'fp16'` | – | – | storage of the net's activations: `'fp16'` (half floats, 8 per RGBA32UI texel) or `'fp32'` (RGBA32F, the exact port); the field, pyramid, weights and arithmetic are float32 in both (new) |
 | `learnedZeroTest` | `true` | – | – | `motion 'learned'`: the zero-motion test after the net (§10.8); a change drops the estimate (new) |
 | `learnedStaticGuard` | `false` | – | – | `motion 'learned'`: the static guard after the synthesis (§10.9); runtime, takes effect at the next `synth` (new) |
@@ -331,10 +331,12 @@ Correctness is **tolerance-based vs `proto/interp.py`** (D11): mean abs error �
 Classic script. Attaches **`globalThis.__fg`**; defines nothing else globally. No `fetch`, no DOM access except what is passed in.
 
 ```js
-__fg.version                       // string, '3' (changed; README "API" lists the additions)
+__fg.version                       // string, '4' (changed; history below, README "API" lists the additions)
 __fg.requiredExtensions            // ['EXT_color_buffer_float','EXT_float_blend','OES_texture_float_linear']
 __fg.checkSupport(gl, frame?)      // -> { ok, missing: string[], sizeError: string|null, quality: boolean, qualityError: string|null, learned: boolean, learnedError: string|null } (changed)
-__fg.nets                          // { e2v4, e2v3, e1v3 }: the learned estimator's weights, attached by webgl/nets/<name>.js (§10; new)
+__fg.nets                          // { e2v4, e1v4, e2v3, e1v3 }: the learned estimator's weights, attached by webgl/nets/<name>.js (§10; new)
+__fg.defaultNet                    // 'e2v4' (read-only; = defaultSettings().motionNet; new)
+__fg.smallNet                      // 'e1v4' (read-only): the recommended small / fallback net; set motionNet: __fg.smallNet to drop to it (new)
 __fg.shaderFiles                   // string[] — every key `sources` must contain (§1), e.g. 'common.glsl', 'vert.glsl', 'estimate/luma.frag.glsl', ...
 __fg.defaultSettings()             // -> fresh copy of the defaults of §4
 __fg.levelLayout(W, H, flowScale)  // pure -> { fw, fh, levels: [{ w, h, bw, bh, radius }] }  (§2 sizes)
@@ -342,6 +344,8 @@ __fg.createEngine(gl, sources, settings) // -> engine ; throws Error('framegen: 
 ```
 
 * `checkSupport(gl, frame?)` (changed): `missing` contains `'webgl2'` if `gl` is not a `WebGL2RenderingContext` (then nothing else is probed), otherwise each name of `requiredExtensions` for which `gl.getExtension(name)` is null, plus `'MAX_DRAW_BUFFERS>=3'` / `'MAX_VERTEX_TEXTURE_IMAGE_UNITS>=1'` if those limits fail; feature names only. `sizeError` = `frameSizeError(gl, frame.width, frame.height, frame)` for the optional `frame = { width, height, flowScale }`, else null (before, that text was pushed into `missing`). `ok = missing.length === 0 && !sizeError`. `quality` / `qualityError`: V2 Quality's MIN-blend probe (README "API": a 1 × 1 R32F framebuffer, three points, read back; cached per context; restores the GL state it touches); `quality` does not affect `ok`, and with anything in `missing` it is false with `qualityError = 'needs ' + missing`. It calls `getExtension` (so it also *enables* the extensions). The probe allocates (and deletes) one 1 × 1 texture, framebuffer, program and VAO, the first time per context.
+* `version` history: `'4'`: nets e2v4 (now the default `motionNet`) and e1v4, `learnedZeroTest` (default `true`: the learned default output changed), `learnedStaticGuard`, `defaultNet` / `smallNet`. `'3'`: the learned estimator (`motion`, `motionNet` default `'e2v3'`, `motionPrecision`, `__fg.nets`, `checkSupport` `learned`, `stats()` `duplicate`). `'2'`: V2 Quality, RGBA16F input, `synthBlur`, `frameSizeError`, `checkSupport` `sizeError` / `quality`. Nothing was removed in any of them.
+* `defaultNet` / `smallNet`: non-writable properties of `__fg` (assigning to them is ignored, or throws in strict mode); a host that switches to a cheaper net reads `smallNet` instead of naming one, so a newer small net needs no host change. Both nets' scripts must be loaded to select them.
 * `createEngine` / `setSettings` (changed): where `checkSupport(gl).quality` is false, settings with `motionVersion: 2, v2Mode: 'quality'` throw a `RangeError` naming `qualityError`; the engine keeps its settings. `engine.support` is the `checkSupport(gl)` result of `createEngine`.
 * `createEngine(gl, sources, settings)`: `gl` is a `WebGL2RenderingContext`; `sources` maps path-relative-to-`shaders/` → string (`{ 'common.glsl': str, 'vert.glsl': str, 'estimate/luma.frag.glsl': str, … }`); `settings` is partial (missing keys take §4 defaults). Calls `checkSupport` and throws if not ok. Compiles and links every program (assembly per §1.1) and creates the empty VAO; textures and FBOs are allocated lazily on the first `resize`/`pushFrame`.
 
@@ -431,7 +435,8 @@ See README.md (V2 Performance and Quality, the static mask, frame formats, motio
 An opt-in replacement of V1's motion estimate (§3.3 E1–E14) by ml-fg's learned estimator; V1's synthesis (§3.3 Y1–Y7) is
 unchanged and consumes its output. The porting contract is ml-fg's `export/SPEC.md` (stages 1–7, abbreviated **SP**) with its
 executable reference `export/reference.py` (**REF**); the nets are `e2v4` (width 24, 95,530 weights, the default: e2v3 fine-tuned, identical
-architecture and weight layout), `e2v3` (width 24, 95,530 weights) and `e1v3` (width 12, 28,330 weights). Cites are SP sections.
+architecture and weight layout), `e1v4` (width 12, 28,330 weights, the small net `__fg.smallNet`: e1v3 fine-tuned, identical
+layout), `e2v3` (width 24, 95,530 weights) and `e1v3` (width 12, 28,330 weights). Cites are SP sections.
 
 ### 10.1 Contract with V1
 
@@ -477,8 +482,8 @@ exact half of its parent.
 `x` and `act` are level-0 sized; a coarser level renders into their top-left corner (viewport = the level) and the convs bound
 their taps by the level size `uSize` (zero padding at the padded level's border, SP 4c pitfall), so data of other levels beyond
 it is never read. fp16 packs 8 channels per texel: texel component k = `packHalf2x16(channel 2k, channel 2k + 1)` of the
-texture's 8. Memory at 1080p (PW × PH = 960 × 544): about 77 MB (e2v4 / e2v3, fp16), 61 MB (e1v3, fp16), 140 MB (e2v4 / e2v3, fp32), 90 MB
-(e1v3, fp32); 1440p ×1.76.
+texture's 8. Memory at 1080p (PW × PH = 960 × 544): about 77 MB (e2v4 / e2v3, fp16), 61 MB (e1v4 / e1v3, fp16), 140 MB (e2v4 / e2v3, fp32), 90 MB
+(e1v4 / e1v3, fp32); 1440p ×1.76.
 
 ### 10.4 Programs and sequence
 
@@ -512,7 +517,7 @@ activations). Arithmetic float32 throughout.
 checked) attaches `__fg.nets[name] = { name, width, levels, depth, inChannels, padMultiple, flowScale, cutSad, levelToStack,
 stacks: [[{ w, b, cin, cout, act }]], count, sha256, checkpointSha256, checkpointStep, weights }`, `weights` = base64 of the
 float32 little-endian stream (OIHW, SP 3), `w` / `b` element offsets. The engine decodes it once (`atob`) and uploads one
-uniform buffer per net (e2v4 / e2v3 about 400 KB, e1v3 about 122 KB): per level, layer and 12 output channels a std140 block
+uniform buffer per net (e2v4 / e2v3 about 400 KB, e1v4 / e1v3 about 122 KB): per level, layer and 12 output channels a std140 block
 `{ mat4 uW[COUT · 9 · CG]; vec4 uB[COUT]; }` at a multiple of `UNIFORM_BUFFER_OFFSET_ALIGNMENT`, `uW[(o · 9 + tap) · CG + g]`
 = the 4 × 4 weights from input channels 4g..4g+3 (columns) to output channels 4o..4o+3 (rows), zero beyond the layer's channels
 (the 14-channel input is 16 slots). A pass binds its block(s) with `bindBufferRange` to binding points 0 (`MlW`) and 1 (`MlW2`:

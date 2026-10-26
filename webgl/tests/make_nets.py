@@ -2,7 +2,7 @@
 """Writes webgl/nets/<run>.js (the learned motion estimator's weights as a classic script) from the ml-fg hand-off package.
 
     python3 -I webgl/tests/make_nets.py [EXPORT_DIR] [RUN ...]     defaults: $FG_MLFG_EXPORT or ~/Schinken/Programming/Local/ml-fg/export,
-                                                                   runs e2v4 e2v3 e1v3
+                                                                   runs e2v4 e1v4 e2v3 e1v3
 
 Each file attaches globalThis.__fg.nets[<run>] = { name, width, levels, depth, inChannels, padMultiple, flowScale, cutSad,
 levelToStack, stacks: [[{ w, b, cin, cout, act }]] (element offsets into the weight stream), count, sha256 (weights.bin),
@@ -20,7 +20,7 @@ out_dir = os.path.join(here, '..', 'nets')
 args = sys.argv[1:]
 export = args.pop(0) if args and os.path.isdir(args[0]) and not os.path.isdir(os.path.join(args[0], 'testvec')) else \
     os.environ.get('FG_MLFG_EXPORT', os.path.expanduser('~/Schinken/Programming/Local/ml-fg/export'))
-runs = args or ['e2v4', 'e2v3', 'e1v3']
+runs = args or ['e2v4', 'e1v4', 'e2v3', 'e1v3']
 os.makedirs(out_dir, exist_ok=True)
 for run in runs:
     d = os.path.join(export, run)
