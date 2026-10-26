@@ -330,6 +330,9 @@ static_assert(sizeof(MLPC) == sizeof(PC), "MLPC is pushed over PC's range");
 // ~0.5"). The net is skipped there and the field is zero (shaders/ml_dup.comp).
 static const float kMlDupDiff = 0.6f;
 static const int kMlLevels = 5, kMlLayers = 5;   // == ML_LEVELS in ml_common.glsl; layers per level (4 hidden + the linear one)
+// A level of fewer 16x16 tiles than this runs its convs split, one output group per workgroup (shaders/ml_conv.comp GOT): on the RX
+// 7900 XTX a whole-pixel workgroup of e2v3 takes ~15 us however small the level, so the coarse levels cost latency, not work.
+static const uint32_t kMlSplitTiles = 256;
 
 // V2 Performance's field clean-up (v2_clean.comp): sigma of the bilateral smoothing's range weight, in flow pixels of half-vector
 // (1 flow px of half-vector = 2 * flowScale px of motion between the real frames).
@@ -383,9 +386,10 @@ struct UiEntry {
 // shape (first / hidden / last) and net (LearnedNet), shaders/ml_conv.comp specialised.
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
             P_V2_MEDHIST, P_V2_SEARCH, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
-            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_MATCH, P_ML_OUT, P_ML_CONV, P_COUNT = P_ML_CONV + 6 };
+            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_MATCH, P_ML_OUT, P_ML_CONV, P_COUNT = P_ML_CONV + 10 };
 static const int kMlNets = 2;   // LearnedNet::E2v3, E1v3
-inline Pipe mlConvPipe(int net, int shape) { return (Pipe)(P_ML_CONV + 3 * net + shape); }   // shape 0 = first, 1 = hidden, 2 = last
+// shape 0 = first (14 -> w), 1 = hidden (w -> w), 2 = last (w -> 2); split: one output group per workgroup (the small levels)
+inline Pipe mlConvPipe(int net, int shape, bool split) { return (Pipe)(P_ML_CONV + 5 * net + (shape == 2 ? 4 : 2 * shape + split)); }
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
@@ -1472,9 +1476,9 @@ bool Interpolator::Impl::motionEnsure() {
     }
     // Learned: V1's luma, synthesis and blur, its own passes instead of V1's search; the convs specialised per layer shape and net
     // (shaders/ml_conv.comp: GI, GO, LINEAR), and the weights buffer
-    struct MlSpec { int32_t gi, go, linear; } mlSpec[kMlNets * 3]{};
-    VkSpecializationMapEntry mlEnt[3] = {{20, 0, 4}, {21, 4, 4}, {22, 8, 4}};
-    VkSpecializationInfo mlSi[kMlNets * 3]{};
+    struct MlSpec { int32_t gi, go, linear, got; } mlSpec[kMlNets * 5]{};
+    VkSpecializationMapEntry mlEnt[4] = {{20, 0, 4}, {21, 4, 4}, {22, 8, 4}, {23, 12, 4}};
+    VkSpecializationInfo mlSi[kMlNets * 5]{};
     if (mlearned()) {
 #ifdef FG_HAVE_ML
         for (int i = P_DOWN; i <= P_PIXFIELD; i++) spv[i].sp = Spv{};
@@ -1485,12 +1489,13 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_ML_OUT].sp = SPV(ml_out);
         for (int net = 0; net < kMlNets; net++) {
             const int gw = mlWidth((LearnedNet)net) / 4;
-            const MlSpec shapes[3] = {{4, gw, 0}, {gw, gw, 0}, {gw, 1, 1}};   // 14 (padded to 16) -> w, w -> w, w -> 2 (padded to 4)
-            for (int k = 0; k < 3; k++) {
-                const int j = 3 * net + k;
+            // 14 (padded to 16) -> w, w -> w (each whole and split), w -> 2 (padded to 4)
+            const MlSpec shapes[5] = {{4, gw, 0, gw}, {4, gw, 0, 1}, {gw, gw, 0, gw}, {gw, gw, 0, 1}, {gw, 1, 1, 1}};
+            for (int k = 0; k < 5; k++) {
+                const int j = 5 * net + k;
                 mlSpec[j] = shapes[k];
-                mlSi[j] = {3, mlEnt, sizeof(MlSpec), &mlSpec[j]};
-                spv[mlConvPipe(net, k)] = {SPV(ml_conv), &mlSi[j]};
+                mlSi[j] = {4, mlEnt, sizeof(MlSpec), &mlSpec[j]};
+                spv[P_ML_CONV + j] = {SPV(ml_conv), &mlSi[j]};
             }
         }
         size_t words = 0;
@@ -2389,10 +2394,10 @@ void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
     MLPC m{};
     m.W = (int)W; m.H = (int)H; m.fw = fw; m.fh = fh; m.pw = L.pw; m.ph = L.ph;
     m.offYa = l0.offA; m.offYc = l0.offC; m.bw = l0.bw; m.bh = l0.bh; m.pf = fieldPF; m.dupDiff = kMlDupDiff;
-    auto run = [&](Pipe p, uint32_t gx, uint32_t gy) {
+    auto run = [&](Pipe p, uint32_t gx, uint32_t gy, uint32_t gz = 1) {
         CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, mg().pipes[p]);
         CmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MLPC), &m);
-        CmdDispatch(cb, gx, gy, 1);
+        CmdDispatch(cb, gx, gy, gz);
     };
     auto stop = [&](int lvl, int step) { return mlDbg.stopLevel == lvl && mlDbg.stopStep == step; };
     if (mlDbg.lumaSrc) {   // test only (setDebugLearned): the reference's flow-res lumas over P_LUMA's
@@ -2416,6 +2421,7 @@ void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
     static const char* lvNames[kMlLevels] = {"net level 0", "net level 1", "net level 2", "net level 3", "net level 4"};
     for (int lvl = kMlLevels - 1; lvl >= 0; lvl--) {
         const uint32_t gx = divUp(L.pw >> lvl, 16), gy = divUp(L.ph >> lvl, 16);
+        const bool split = gx * gy < kMlSplitTiles;   // a small level: one output group per workgroup (ml_conv.comp)
         m.lvl = lvl;
         m.actOut = 0;   // the 14-channel input -> R0
         run(P_ML_MATCH, gx, gy);
@@ -2426,7 +2432,8 @@ void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
             m.bOff = (int)(base + kMlNet[net].table[lvl][k][1]);
             m.actIn = k % 2 ? r1 : 0;
             m.actOut = k % 2 ? 0 : r1;
-            run(mlConvPipe(net, k == 0 ? 0 : k == kMlLayers - 1 ? 2 : 1), gx, gy);
+            const int shape = k == 0 ? 0 : k == kMlLayers - 1 ? 2 : 1;
+            run(mlConvPipe(net, shape, split), gx, gy, shape == 2 || !split ? 1 : (uint32_t)L.g);
             r.cbar();
             if (stop(lvl, k + 1)) return;
         }

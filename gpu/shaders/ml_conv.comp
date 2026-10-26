@@ -2,7 +2,10 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_control_flow_attributes : require
 // MotionVersion::Learned, SPEC.md stage 4c / 4d: one 3x3 conv layer of the level pc.lvl, 4 * GI input channels -> 4 * GO output
-// channels (specialization constants; one pipeline per layer shape and net width). conv3x3 = cross-correlation,
+// channels (specialization constants; one pipeline per layer shape, net width and split). Each workgroup computes GOT of the GO output
+// groups (gl_WorkGroupID.z picks which) for a 16x16 tile: GOT = GO on the big levels, GOT = 1 on the small ones, where one thread
+// computing every output of its pixel would leave most of the GPU idle (the levels' latency, not their work, is the cost there).
+// conv3x3 = cross-correlation,
 // y[o] = b[o] + sum_{i, ky, kx} W[o][i][ky][kx] x[i][y + ky - 1][x + kx - 1], ZERO padding outside the padded level image (the
 // input tile's halo is 0 there). Hidden layers store clamp(y, 0, 1); the last one (LINEAR, 2 channels padded to 4) adds 2 * y to
 // this level's field h (stage 4d, float32, no clamp). Weights: wt[] in gpu/ml/embed_weights.py's layout W'[ky][kx][i][o], read with
@@ -14,6 +17,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(constant_id = 20) const int GI = 4;       // input channel groups (vec4): 4 (14 channels padded to 16), or width / 4
 layout(constant_id = 21) const int GO = 6;       // output channel groups: width / 4, or 1 for the last layer
 layout(constant_id = 22) const int LINEAR = 0;   // 1 = the last layer: h += 2 * y
+layout(constant_id = 23) const int GOT = 6;      // output groups per workgroup (a divisor of GO); dispatch z = GO / GOT
 
 const int TS = 16, TT = TS + 2;   // the 16x16 output tile and its input tile with a 1-pixel halo
 shared vec4 tile[GI * TT * TT];
@@ -31,20 +35,25 @@ void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy);
     if (q.x >= lw || q.y >= lh) return;
     ivec2 l = ivec2(gl_LocalInvocationID.xy);
-    vec4 acc[GO];
-    [[unroll]] for (int o = 0; o < GO; o++) acc[o] = wt[pc.bOff + o];
+    const int o0 = int(gl_WorkGroupID.z) * GOT;   // this workgroup's first output group
+    vec4 acc[GOT];
+    [[unroll]] for (int o = 0; o < GOT; o++) acc[o] = wt[pc.bOff + o0 + o];
     [[dont_unroll]] for (int t = 0; t < 9; t++) {
         int ky = t / 3, kx = t - 3 * ky;
         int tb = (l.y + ky) * TT + l.x + kx;
         [[unroll]] for (int g = 0; g < GI; g++) {
             vec4 v = tile[g * (TT * TT) + tb];
-            int wb = pc.wOff + (t * GI + g) * 4 * GO;
-            [[unroll]] for (int o = 0; o < GO; o++)
-                acc[o] += v.x * wt[wb + o] + v.y * wt[wb + GO + o] + v.z * wt[wb + 2 * GO + o] + v.w * wt[wb + 3 * GO + o];
+            int wb = pc.wOff + (t * GI + g) * 4 * GO + o0;
+            [[unroll]] for (int o = 0; o < GOT; o++) {   // explicit fma: RADV does not contract a * b + c on its own
+                acc[o] = fma(vec4(v.x), wt[wb + o], acc[o]);
+                acc[o] = fma(vec4(v.y), wt[wb + GO + o], acc[o]);
+                acc[o] = fma(vec4(v.z), wt[wb + 2 * GO + o], acc[o]);
+                acc[o] = fma(vec4(v.w), wt[wb + 3 * GO + o], acc[o]);
+            }
         }
     }
     if (LINEAR == 0) {
-        [[unroll]] for (int o = 0; o < GO; o++) act[pc.actOut + o * n + q.y * lw + q.x] = clamp(acc[o], 0.0, 1.0);
+        [[unroll]] for (int o = 0; o < GOT; o++) act[pc.actOut + (o0 + o) * n + q.y * lw + q.x] = clamp(acc[o], 0.0, 1.0);
     } else {
         int ho = mlH(pc.lvl) + 2 * (q.y * lw + q.x);
         precise float hx = ml[ho] + 2.0 * acc[0].x, hy = ml[ho + 1] + 2.0 * acc[0].y;
