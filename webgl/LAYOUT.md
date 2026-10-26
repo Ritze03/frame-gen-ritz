@@ -18,6 +18,7 @@ Core path = RGBA8, `Settings` defaults of `FH:68-212`; RGBA16F input follows `fo
 webgl/
   README.md, LAYOUT.md               design docs
   framegen.js                        host. classic script, attaches globalThis.__fg
+  nets/e2v3.js, nets/e1v3.js         the learned estimator's weights (classic scripts, attach __fg.nets[<name>]; §10)
   shaders/
     common.glsl                      begins with `#version 300 es`
     vert.glsl                        fullscreen-triangle vertex shader, standalone (own #version)
@@ -34,6 +35,11 @@ webgl/
       hbox.frag.glsl                 vbox.frag.glsl
       reduce_untrusted.frag.glsl     final.frag.glsl          blit.frag.glsl
     v2/                              motion version 2 (README.md)
+    learned/                         the learned motion estimator (§10)
+      ml_common.inc.glsl             include: duplicate test mlDup, bilinear mlBil, field upsample mlFieldUp
+      lv0.frag.glsl                  down.frag.glsl           match.frag.glsl (+ ML_PACKED)
+      conv.frag.glsl (fp32)          conv_h.frag.glsl (fp16, packed)
+      sad.frag.glsl                  sadout.frag.glsl
 ```
 
 One file = one program (`vert.glsl` is shared by every V1 program; V2 Quality's splat `v2/qown` has its own vertex shader). Some V2 programs share a fragment file with different `#define`s (README.md); `__fg.assemblePrograms(sources, settings)` returns the exact text the host compiles.
@@ -265,6 +271,9 @@ Fan-in `uFan` per axis: 16, except the first step of V1's untrusted chain (8: fo
 | `trustHigh` | `40.0` | FH:75 | `uTrustScale = fround(1/(trustHigh−trustLow))` | `trustHigh ≥ trustLow+1` |
 | `globalFallback` | `0.15` | FH:78 | `uGlobalFrac` | (0,1]; 1 = off |
 | `debug` | `false` | – | – | host only: `gl.getError()` after every pass, throw with pass name |
+| `motion` | `'search'` | – | – | V1's motion estimate: `'search'` (this contract's block search) or `'learned'` (§10). Ignored by V2. `'learned'` needs `flowScale` 2 (else `RangeError`), `checkSupport(gl).learned` and the net's weights (`__fg.nets`). A change (with V1) drops the estimate like a `motionVersion` switch. (new) |
+| `motionNet` | `'e2v3'` | – | – | `'e2v3'` (width 24) or `'e1v3'` (width 12, about 1.9x faster here); `motion 'learned'` only (new) |
+| `motionPrecision` | `'fp16'` | – | – | storage of the net's activations: `'fp16'` (half floats, 8 per RGBA32UI texel) or `'fp32'` (RGBA32F, the exact port); the field, pyramid, weights and arithmetic are float32 in both (new) |
 
 Compile-time constants (not settings; defined in shaders / host): BLOCK 8, RADIUS 2, TOP_RADIUS 6, MIN_SIDE 48, sub-pixel steps 0.5 then 0.25 (PY:49), PIX_WIN 5 (5×5 → `1/25`), MISMATCH_BOX 7 (`1/49`), LOOKUP_ITERS 2, 7 per-pixel candidates, max 6 seed candidates, trust threshold 0.5 for the untrusted count. Dropped (game-only / not core): `subpixel` (always true), all `ui*`, `blur*`.
 
@@ -316,9 +325,10 @@ Correctness is **tolerance-based vs `proto/interp.py`** (D11): mean abs error �
 Classic script. Attaches **`globalThis.__fg`**; defines nothing else globally. No `fetch`, no DOM access except what is passed in.
 
 ```js
-__fg.version                       // string, '2' (changed; README "API" lists the additions)
+__fg.version                       // string, '3' (changed; README "API" lists the additions)
 __fg.requiredExtensions            // ['EXT_color_buffer_float','EXT_float_blend','OES_texture_float_linear']
-__fg.checkSupport(gl, frame?)      // -> { ok: boolean, missing: string[], sizeError: string|null, quality: boolean, qualityError: string|null } (changed)
+__fg.checkSupport(gl, frame?)      // -> { ok, missing: string[], sizeError: string|null, quality: boolean, qualityError: string|null, learned: boolean, learnedError: string|null } (changed)
+__fg.nets                          // { e2v3, e1v3 }: the learned estimator's weights, attached by webgl/nets/<name>.js (§10; new)
 __fg.shaderFiles                   // string[] — every key `sources` must contain (§1), e.g. 'common.glsl', 'vert.glsl', 'estimate/luma.frag.glsl', ...
 __fg.defaultSettings()             // -> fresh copy of the defaults of §4
 __fg.levelLayout(W, H, flowScale)  // pure -> { fw, fh, levels: [{ w, h, bw, bh, radius }] }  (§2 sizes)
@@ -349,8 +359,8 @@ engine.dispose()                       // deletes every texture/FBO/program/VAO 
 * **`pushFrame(source)`** — `source`: `HTMLVideoElement` (size `videoWidth×videoHeight`), `ImageBitmap`, `HTMLCanvasElement`/`OffscreenCanvas`/`ImageData`-like (size `width×height`), **or** `{ width, height, data: Uint8Array|Uint8ClampedArray }` raw RGBA, `data.length === 4*width*height`, rows top-first. If the size differs from `engine.info` (or no `resize` yet) it calls `resize(width,height)` first (history dropped). Sets `UNPACK_FLIP_Y_WEBGL=false`, `UNPACK_PREMULTIPLY_ALPHA_WEBGL=false`, `UNPACK_ALIGNMENT=1` (raw), leaves `UNPACK_COLORSPACE_CONVERSION_WEBGL` at its default; uploads with `texSubImage2D(TEXTURE_2D,0,0,0,w,h,RGBA,UNSIGNED_BYTE,…)` (raw) or the 7-argument `texSubImage2D(TEXTURE_2D,0,0,0,RGBA,UNSIGNED_BYTE,source)` form (everything else). Throws if the browser rejects the source (e.g. tainted video: `SecurityError` propagates).
 * **`synth(t, framebuffer, viewport)`**: `framebuffer` is a `WebGLFramebuffer` (draw target, texture-backed, treated as top-first), `null` (default framebuffer / canvas, flipped), or `undefined` (render `out` only, no blit; for `debugRead('out')`). `viewport` = `{ x, y, width, height }` in target pixels, default `{0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight}` for `null` and `{0,0,W,H}` otherwise. `t == 0.5` takes the exact 2× path (no `lookup`, `uMid=1`). Valid only until the next `pushFrame`. Leaves `framebuffer` bound, `gl.viewport` = `viewport`.
 * **GL state:** the engine owns the context while a call runs: it disables `DITHER, BLEND` (except inside V2 Quality's splat and the blur accumulation), `DEPTH_TEST, STENCIL_TEST, SCISSOR_TEST, CULL_FACE`, sets `colorMask(true,true,true,true)`, binds its own VAO/program/FBO/textures (clobbering texture units 0..6 and `ACTIVE_TEXTURE`), and restores nothing. The runtime must use a context that nothing else draws with (D17).
-* **`stats()`** → `{ meanSad: number, cut: boolean, untrusted: number|null, untrustedShare: number|null, flick: boolean|null, fallback: null|'cut'|'untrusted', t: number|null }`. `meanSad = sadSum/(bw_0·bh_0)`; `cut = meanSad > sceneCutSad`; `untrusted`/`untrustedShare = untrusted/(W·H)`/`flick = untrusted > globalFallback·W·H` come from the **last `synth` call** (null if none yet); `fallback` mirrors `interp.synth(..., why=True)`: `'cut'` if cut, else `'untrusted'` if flick, else null. Uses `readPixels` on the 1×1 textures — debug/harness only, never on the hot path.
-* **`debugRead(name)`** → `{ name, width, height, channels, data }` where `data` is row-major, **top row first**, channels interleaved (`index = (y*width + x)*channels + c`): `Float32Array` for float formats, `Uint8Array` for RGBA8/R8, `Uint32Array` for R16UI. `channels` = channels of the internal format (R→1, RG→2, RGBA→4). Valid names (from §2): `frame.prev`, `frame.curr`, `luma.prev.<i>`, `luma.curr.<i>`, `hist.<i>` (changed), `fieldRaw.<i>` (new), `median.<i>`, `seedSad.<i>`, `seed.<i>`, `searchSad.<i>`, `field.<i>`, `subSad`, `sub1`, `sub2`, `sadSum`, `pfErr0`, `pfErr1`, `pixfield`, `fieldT`, `warpA`, `warpC`, `mismatch`, `hsum`, `trust`, `untrusted`, `out`. (`prev`/`curr` are resolved through the ping-pong at call time.) Unknown or not-yet-written name → throws. Implementation: temporary FBO on the texture, `readPixels` with `RGBA/FLOAT` (float), `RGBA/UNSIGNED_BYTE` (8-bit), `RGBA_INTEGER/UNSIGNED_INT` (R16UI), then channel-strip; no flip.
+* **`stats()`** → `{ meanSad: number, cut: boolean, untrusted: number|null, untrustedShare: number|null, flick: boolean|null, fallback: null|'cut'|'untrusted', t: number|null, duplicate: boolean|null, dupDiff: number|null }` (`duplicate`, `dupDiff`: §10, null unless the estimate was the learned one). `meanSad = sadSum/(bw_0·bh_0)`; `cut = meanSad > sceneCutSad`; `untrusted`/`untrustedShare = untrusted/(W·H)`/`flick = untrusted > globalFallback·W·H` come from the **last `synth` call** (null if none yet); `fallback` mirrors `interp.synth(..., why=True)`: `'cut'` if cut, else `'untrusted'` if flick, else null. Uses `readPixels` on the 1×1 textures — debug/harness only, never on the hot path.
+* **`debugRead(name)`** → `{ name, width, height, channels, data }` where `data` is row-major, **top row first**, channels interleaved (`index = (y*width + x)*channels + c`): `Float32Array` for float formats, `Uint8Array` for RGBA8/R8, `Uint32Array` for R16UI. `channels` = channels of the internal format (R→1, RG→2, RGBA→4). Valid names (from §2): `frame.prev`, `frame.curr`, `luma.prev.<i>`, `luma.curr.<i>`, `hist.<i>` (changed), `fieldRaw.<i>` (new), `median.<i>`, `seedSad.<i>`, `seed.<i>`, `searchSad.<i>`, `field.<i>`, `subSad`, `sub1`, `sub2`, `sadSum`, `pfErr0`, `pfErr1`, `pixfield`, `fieldT`, `warpA`, `warpC`, `mismatch`, `hsum`, `trust`, `untrusted`, `out`, and the learned estimator's `ml.*` (§10). (`prev`/`curr` are resolved through the ping-pong at call time.) Unknown or not-yet-written name → throws. Implementation: temporary FBO on the texture, `readPixels` with `RGBA/FLOAT` (float), `RGBA/UNSIGNED_BYTE` (8-bit), `RGBA_INTEGER/UNSIGNED_INT` (R16UI), then channel-strip; no flip.
 
 ### 6.1 `debugRead` ↔ `interp.py` map (for the harness)
 
@@ -399,7 +409,7 @@ Texture-fetch order of magnitude per pair at 1080p, S=2 (dominant terms): `searc
 4. **Stats are two separate R32F 1×1 textures** (`sadSum` per pair, `untrusted` per synth) read directly by `final`, not one RG32F stats texture (the two come from different phases/owners). No flag texture: the `t > 0.5` test happens in the first untrusted-reduce step.
 5. **`error` writes `warpA`/`warpC`** (MRT) so `final` does not recompute the warps (the reference's `resolve.comp` calls `mismatch()` a second time).
 6. **`blit` pass + `presentFrame`** are added for presentation: scaling to the canvas, the default-framebuffer y flip, and showing real frames through the same path (D9).
-7. **`MAX_DRAW_BUFFERS` 8 is not needed** (max 3); `OES_texture_float_linear` is required by D12 but unused (§5 rule 3).
+7. **`MAX_DRAW_BUFFERS` 8 is not needed** (max 3; the learned estimator's match pass 4, §10); `OES_texture_float_linear` is required by D12 but unused (§5 rule 3).
 8. **"Integer-valued SAD"** holds exactly only for S=1 level 0 (luma is an integer there); elsewhere luma is dyadic, and the fp32 sums are still exact except at partial cells (§5 rule 1).
 
 ---
@@ -407,3 +417,105 @@ Texture-fetch order of magnitude per pair at 1080p, S=2 (dominant terms): `searc
 ## 9. Motion version 2
 
 See README.md (V2 Performance and Quality, the static mask, frame formats, motion blur, tests).
+
+---
+
+## 10. The learned motion estimator (`motion: 'learned'`) (new)
+
+An opt-in replacement of V1's motion estimate (§3.3 E1–E14) by ml-fg's learned estimator; V1's synthesis (§3.3 Y1–Y7) is
+unchanged and consumes its output. The porting contract is ml-fg's `export/SPEC.md` (stages 1–6, abbreviated **SP**) with its
+executable reference `export/reference.py` (**REF**); the nets are `e2v3` (width 24, 95,530 weights, the default) and `e1v3`
+(width 12, 28,330 weights). Cites are SP sections.
+
+### 10.1 Contract with V1
+
+The estimate writes exactly what V1's search leaves for the synthesis, nothing else:
+
+* `pixfield` (RG32F, fw × fh): the half-vector field `h`, flow-res pixels, texel (x, y) = (hx, hy), row 0 = top (SP 0, 5.3).
+* `sadSum` = the last texel of the `sadRed` chain (1 × 1 R32F) = `sad · bw₀ · bh₀`, so that `meanSad = sadSum / (bw₀ · bh₀)`
+  (`final`, `stats()`) is the net's `sad` (SP 6: the mean over the fw × fh flow pixels of `|ya(q − h) − yc(q + h)|`, true
+  bilinear, clamp to the unpadded grid, 0..255). The cut rule `meanSad > sceneCutSad` (30) is unchanged.
+
+V1's own estimate textures (`field.*`, `sub2`, `pfErr*`, …) are not written in learned mode (they keep stale data). `flowScale`
+must be 2 (SP 5.5). RGBA16F input works through the frame-format helpers (luma = the cv2 weights below on `FG_LV` levels,
+unrounded; the duplicate test on `FG_D`).
+
+### 10.2 Duplicate pairs
+
+The net has no zero-motion prior: on a == c it outputs motion (SP 9 (a)). The estimate therefore applies FGR's duplicate test —
+the mean of `|a − c|` over every pixel and the R, G, B channels at most **0.6** levels (`proto/harness.py:29,50` `DUP_DIFF`,
+`gpu/compare.py:56,63`) — on the GPU: `lv0` writes per flow texel the sum over its pixels (`ml.dupSrc`), `reduce_sad` sums it to
+1 × 1 (`ml.dup`), and every later pass reads that texel (`mlDup()` in `ml_common.inc.glsl`) and, on a duplicate, writes zeros
+without doing its work: `pixfield` = 0, `sadSum` = 0, so the synthesis shows the input unchanged. No readback, no CPU branch.
+`stats()` reports `duplicate` and `dupDiff` (the mean) after a learned estimate.
+
+### 10.3 Textures (allocated by the first learned estimate; again on a size, net or precision change)
+
+Padded flow grid `PW × PH` = fw, fh rounded up to a multiple of 16 (SP 3); level l is `(PW >> l) × (PH >> l)`, l = 0..4, each an
+exact half of its parent.
+
+| Name (`debugRead`) | Format | Size | Content |
+|---|---|---|---|
+| `ml.pyr.0` | RGBA32F | PW × PH | la, lc (= ya / 255, yc / 255, level 0 of the net), ya, yc (0..255); edge replicated beyond fw × fh |
+| `ml.pyr.<l>`, l = 1..4 | RG32F | level | la, lc: `((p00 + p01) + (p10 + p11)) · 0.25` |
+| `ml.dupSrc` | R32F | PW × PH | the duplicate test's per-texel sums (0 in the padding) |
+| `ml.x.<k>` | fp32: RGBA32F × 3 + RG32F; fp16: RGBA32UI × 2 | PW × PH | the 14-channel input of the level being computed (SP 4b order) |
+| `ml.act.<s>.<k>` | fp32: RGBA32F × G; fp16: RGBA32UI × ⌈G/2⌉ | PW × PH | ping-pong activations, set s = 0, 1 (G = width / 4) |
+| `ml.h.<l>`, l = 1..4 | RG32F | level | the field after level l (REF `dbg['h'][l]`) |
+| `ml.dup`, `ml.sad` | R32F | 1 × 1 | the sums of `|a − c|` and of the SAD terms (chains `dupRed` fan 4/4/…, `sadRed` fan 2/4/…) |
+
+`x` and `act` are level-0 sized; a coarser level renders into their top-left corner (viewport = the level) and the convs bound
+their taps by the level size `uSize` (zero padding at the padded level's border, SP 4c pitfall), so data of other levels beyond
+it is never read. fp16 packs 8 channels per texel: texel component k = `packHalf2x16(channel 2k, channel 2k + 1)` of the
+texture's 8. Memory at 1080p (PW × PH = 960 × 544): about 77 MB (e2v3, fp16), 61 MB (e1v3, fp16), 140 MB (e2v3, fp32), 90 MB
+(e1v3, fp32); 1440p ×1.76.
+
+### 10.4 Programs and sequence
+
+| Program | File (defines) | Inputs (units) | Output |
+|---|---|---|---|
+| `ml_lv0` | `lv0` | uPrev, uCurr | MRT `ml.pyr.0` + `ml.dupSrc`: SP 1–3 luma (`(3735 B + 19235 G + 9798 R + 16384) >> 15`, cv2 5.0.0), 2 × 2 area mean, edge pad, / 255 |
+| `ml_down` | `down` | uSrc | `ml.pyr.<l>` |
+| `ml_match`, `ml_match_h` | `match` (`ML_PACKED` for fp16) | uPyr, uHc, uDup | MRT `ml.x.*`: SP 4a (`mlFieldUp`: y then x, ×2) + 4b (18 true-bilinear taps) |
+| `ml_conv<CIN>x3`, `ml_last<G>` | `conv` (`ML_CIN`, `ML_COUT`, `ML_LAST`) | uIn0..uIn<CIN−1>, (uHc), uDup | fp32: 3 RGBA32F per pass (e2v3: two passes per layer), or the field |
+| `ml_h<CIN>g<CG>o<COUT>[L]` | `conv_h` (`ML_CIN`, `ML_CG`, `ML_COUT`, `ML_COUTA`, `ML_LAST`) | same, usampler2D | fp16: ⌈COUT/2⌉ RGBA32UI per pass (one pass per layer), or the field |
+| `ml_sad` | `sad` | uLv0, uField | first step of `sadRed` |
+| `ml_sadout` | `sadout` | uSrc, uDup | `sadRed[last]` of V1 = sum · bw₀ · bh₀ / (fw · fh) (`uWeight`) |
+
+`estimate()` in learned mode: `ml_lv0`, `reduce_sad` × |dupRed|, `ml_down` × 4, then for l = 4..0: `ml_match.l`, `ml_c0.l` …
+`ml_c4.l` (fp32 e2v3: `ml_c<k>a.l`, `ml_c<k>b.l` for k < 4), the last one writing `ml.h.l` (l > 0) or `pixfield` (l = 0, over
+fw × fh; its taps read the padded level), then `ml_sad`, `reduce_sad` × (|sadRed| − 1), `ml_sadout`. Draws at 1080p: 47 (fp16,
+both nets; fp32 e1v3), 67 (fp32 e2v3). The pass names (with the level) are what `setPassHook` sees.
+
+Conv (SP 4c, REF `conv3x3`): `out[o](q) = b[o] + Σ_tap Σ_i W[o][i][ky][kx] · in[i](q + (kx − 1, ky − 1))`, hidden layers
+`clamp(·, 0, 1)`, the last layer `h + 2 · out` with h recomputed in float32 by `mlFieldUp` (it is never stored in the
+activations). Arithmetic float32 throughout.
+
+### 10.5 Weights
+
+`webgl/nets/<name>.js` (generated by `tests/make_nets.py` from ml-fg's `export/<name>/manifest.json` + `weights.bin`, sha256
+checked) attaches `__fg.nets[name] = { name, width, levels, depth, inChannels, padMultiple, flowScale, cutSad, levelToStack,
+stacks: [[{ w, b, cin, cout, act }]], count, sha256, checkpointSha256, checkpointStep, weights }`, `weights` = base64 of the
+float32 little-endian stream (OIHW, SP 3), `w` / `b` element offsets. The engine decodes it once (`atob`) and uploads one
+uniform buffer per net (e2v3 about 400 KB, e1v3 about 122 KB): per level, layer and 12 output channels a std140 block
+`{ mat4 uW[COUT · 9 · CG]; vec4 uB[COUT]; }` at a multiple of `UNIFORM_BUFFER_OFFSET_ALIGNMENT`, `uW[(o · 9 + tap) · CG + g]`
+= the 4 × 4 weights from input channels 4g..4g+3 (columns) to output channels 4o..4o+3 (rows), zero beyond the layer's channels
+(the 14-channel input is 16 slots). A pass binds its block(s) with `bindBufferRange` to binding points 0 (`MlW`) and 1 (`MlW2`:
+fp16, outputs 12..23 of a 24-wide layer). The host checks each program's `UNIFORM_BLOCK_DATA_SIZE` against its packing.
+
+### 10.6 Required features
+
+WebGL2 core minimums only (`checkSupport().learned` / `learnedError`): `MAX_DRAW_BUFFERS` and `MAX_COLOR_ATTACHMENTS` ≥ 4 (the
+match pass), `MAX_UNIFORM_BLOCK_SIZE` ≥ 10,416 bytes, `MAX_FRAGMENT_UNIFORM_BLOCKS` ≥ 2, `MAX_TEXTURE_IMAGE_UNITS` ≥ 8, plus
+the backend's `EXT_color_buffer_float` (RGBA32F / RG32F / R32F targets; RGBA32UI is core). Missing → `createEngine` /
+`setSettings` throw a `RangeError` for learned settings and keep the old ones; so does a net whose `webgl/nets/<name>.js` was
+not loaded.
+
+### 10.7 Exactness
+
+`motionPrecision 'fp32'` is an exact float32 port: ya / yc bit-exact, the coarsest level within 2.5e-5 of the torch vectors,
+pf mean ≤ 5e-5 px / max ≤ 1.8e-2 px, sad relative ≤ 2e-6, identical cut on every test pair of both nets (README "Learned
+motion estimate"). `'fp16'` rounds the stored input and activations to half floats (SP 7, its expected first optimisation): pf
+differs pointwise (low-texture pixels), the synthesised frame stays ≥ 63 dB from the reference's and its PSNR to the real middle
+frame within 0.002 dB of the reference's. Differences from REF: the GPU's division / FMA contraction (noise amplified by the
+net, SP 7), nothing systematic; hardware bilinear is not used (4 `texelFetch`).

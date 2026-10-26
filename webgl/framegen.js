@@ -12,6 +12,8 @@
  *   - After synth(t, fb, vp) / presentFrame(which, fb, vp) with a framebuffer given: `fb` (null = canvas)
  *     is bound as FRAMEBUFFER, gl.viewport = vp, the blit program is current, engine VAO bound.
  *   - After synth(t, undefined): the engine's `out` FBO is bound with viewport (0,0,W,H).
+ *   - estimate() with settings.motion 'learned' also leaves a learned net's weight buffer bound to UNIFORM_BUFFER (the generic
+ *     binding and indexed binding points 0 and 1).
  *   - pushFrame leaves UNPACK_FLIP_Y_WEBGL=false, UNPACK_PREMULTIPLY_ALPHA_WEBGL=false and, for raw
  *     {data} sources, UNPACK_ALIGNMENT=1.
  *   - debugRead/stats bind FBOs and change PACK state only transiently; they are not hot-path calls.
@@ -26,7 +28,8 @@
   // Static tables
   // ---------------------------------------------------------------------------------------------
 
-  fg.version = '2';   // 2: V2 Quality, RGBA16F input, synthBlur, frameSizeError, checkSupport sizeError / quality (API of 1 unchanged otherwise)
+  fg.version = '3';   // 3: the learned motion estimator (settings motion / motionNet, __fg.nets, checkSupport learned); 2: V2 Quality,
+  // RGBA16F input, synthBlur, frameSizeError, checkSupport sizeError / quality (API of the earlier versions unchanged otherwise)
   fg.requiredExtensions = ['EXT_color_buffer_float', 'EXT_float_blend', 'OES_texture_float_linear'];
 
   // Program table (LAYOUT 3.2). Sampler order = texture unit order. `vert` defaults to 'vert.glsl'.
@@ -92,9 +95,55 @@
     ['v2_qmorph', 'v2/morph.frag.glsl', null, MORPH_S.concat(Q_S, ['uEm', 'uGroup']), V2_INC, Q_DEF],
   ];
 
+  // The learned motion estimator (settings.motion 'learned', V1 only; ml-fg export/SPEC.md), compiled the first time it is selected.
+  // The convs are one program per shape. motionPrecision 'fp32' (conv.frag.glsl: ML_CIN RGBA32F input textures, ML_COUT output
+  // textures, ML_LAST the 2-channel output layer): a net of width w (G = w / 4 textures per activation) uses ml_conv4x3 (layer 0: the
+  // 14-channel input in 4 textures), ml_conv<G>x3 (layers 1-3) and ml_last<G>; G = 6 (e2v3) splits each layer into two passes of 3
+  // output textures. 'fp16' (conv_h.frag.glsl, 8 half floats per RGBA32UI texel): ml_h<CIN>g<CG>o<COUT>[L], one pass per layer.
+  const ML_INC = 'learned/ml_common.inc.glsl';
+  function mlConv(cin, cout, last) {
+    const s = [];
+    for (let j = 0; j < cin; j++) s.push('uIn' + j);
+    if (last) s.push('uHc');
+    s.push('uDup');
+    return [last ? 'ml_last' + cin : 'ml_conv' + cin + 'x' + cout, 'learned/conv.frag.glsl', null, s, ML_INC,
+      '#define ML_CIN ' + cin + '\n#define ML_COUT ' + cout + '\n#define ML_LAST ' + (last ? 1 : 0) + '\n'];
+  }
+  // cin packed input textures, cg 4-channel input groups, cout 4-channel output groups
+  function mlConvH(cin, cg, cout, last) {
+    const s = [];
+    for (let j = 0; j < cin; j++) s.push('uIn' + j);
+    if (last) s.push('uHc');
+    s.push('uDup');
+    return ['ml_h' + cin + 'g' + cg + 'o' + cout + (last ? 'L' : ''), 'learned/conv_h.frag.glsl', null, s, ML_INC,
+      '#define ML_CIN ' + cin + '\n#define ML_CG ' + cg + '\n#define ML_COUT ' + cout + '\n#define ML_COUTA ' + Math.min(cout, 3) +
+      '\n#define ML_LAST ' + (last ? 1 : 0) + '\n'];
+  }
+  // the program of layer k (of depth + 1) of a net with G groups per activation, at precision prec
+  function mlLayerProg(prec, G, k, depth) {
+    const last = k === depth;
+    if (prec === 'fp32') return last ? 'ml_last' + G : 'ml_conv' + (k === 0 ? 4 : G) + 'x3';
+    const cin = k === 0 ? 2 : Math.ceil(G / 2);
+    return 'ml_h' + cin + 'g' + (k === 0 ? 4 : G) + 'o' + (last ? 1 : G) + (last ? 'L' : '');
+  }
+  const ML_PROGRAMS = [
+    ['ml_lv0', 'learned/lv0.frag.glsl', null, ['uPrev', 'uCurr'], ML_INC],
+    ['ml_down', 'learned/down.frag.glsl', null, ['uSrc']],
+    ['ml_match', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup'], ML_INC],
+    ['ml_match_h', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup'], ML_INC, '#define ML_PACKED 1\n'],
+    ['ml_sad', 'learned/sad.frag.glsl', null, ['uLv0', 'uField'], ML_INC],
+    ['ml_sadout', 'learned/sadout.frag.glsl', null, ['uSrc', 'uDup'], ML_INC],
+    mlConv(4, 3, false), mlConv(3, 3, false), mlConv(6, 3, false), mlConv(3, 1, true), mlConv(6, 1, true),
+    mlConvH(2, 4, 3, false), mlConvH(2, 4, 6, false), mlConvH(2, 3, 3, false), mlConvH(3, 6, 6, false), mlConvH(2, 3, 1, true),
+    mlConvH(3, 6, 1, true),
+  ];
+  const ML_DUP_DIFF = 0.6;                   // learned/ml_common.inc.glsl's (the duplicate-pair test)
+  const ML_NETS = ['e2v3', 'e1v3'];          // settings.motionNet values (the first is the default); weights: webgl/nets/<name>.js
+  const ML_BLOCK_MAX = (3 * 9 * 6 * 16 + 3 * 4) * 4;   // bytes of the largest weight block (conv6x3, conv_h's MlW / MlW2)
+
   fg.shaderFiles = (function () {
     const files = ['common.glsl', 'vert.glsl'];
-    for (const [, frag, vert, , inc] of PROGRAMS.concat(V2_PROGRAMS)) {
+    for (const [, frag, vert, , inc] of PROGRAMS.concat(V2_PROGRAMS, ML_PROGRAMS)) {
       for (const f of [vert, inc, frag]) if (f && files.indexOf(f) < 0) files.push(f);
     }
     return files;
@@ -123,7 +172,7 @@
   }
   // settings: optional (partial) settings whose format keys select the variant (default rgba8)
   fg.assemblePrograms = function (sources, settings) {
-    return assemble(PROGRAMS.concat(V2_PROGRAMS), function (k) {
+    return assemble(PROGRAMS.concat(V2_PROGRAMS, ML_PROGRAMS), function (k) {
       if (typeof sources[k] !== 'string') throw new Error('framegen: missing shader source "' + k + '"');
       return sources[k];
     }, formatDefines(mergeSettings(DEFAULTS, settings)));
@@ -134,7 +183,7 @@
     'uCutSad', 'uTrust0', 'uTrustScale', 'uGlobalFrac', 'uTrustMid'];
   const U_TIME = ['uT', 'uS', 'uWA', 'uWC', 'uNearC', 'uMid'];
   const U_PASS = ['uBlocks', 'uCount', 'uRadius', 'uStep', 'uSrcSize', 'uChan', 'uMode',
-    'uVpOrigin', 'uVpSize', 'uFlipY', 'uExact', 'uStaticOff', 'uSide', 'uFan', 'uWeight', 'uWsum'];
+    'uVpOrigin', 'uVpSize', 'uFlipY', 'uExact', 'uStaticOff', 'uSide', 'uFan', 'uWeight', 'uWsum', 'uSize', 'uTop'];
   const U_ALL = U_STATIC.concat(U_TIME, U_PASS);
 
   const DEFAULTS = {
@@ -151,6 +200,11 @@
     v2StaticMask: true,     // V2 only: keep static HUD / text / subtitles in place (Settings::v2StaticMask)
     blurSamples: 0,         // synthBlur (V2): sub-frames per output, 0 / 1 = off, 2..16 (Settings::blurSamples)
     blurWeights: 'gaussian', // synthBlur: 'gaussian' or 'even' (Settings::blurWeights)
+    motion: 'search',       // V1 only: 'search' (V1's block search, proto/interp.py) or 'learned' (the learned estimator: needs flowScale 2
+                            // and the net's weights, webgl/nets/<motionNet>.js; ignored by V2)
+    motionNet: 'e2v3',      // motion 'learned': 'e2v3' (width 24, 95,530 weights) or 'e1v3' (width 12, 28,330 weights, ~3.4x cheaper)
+    motionPrecision: 'fp16', // motion 'learned': storage of the net's activations, 'fp16' (8 halves per RGBA32UI texel) or 'fp32' (RGBA32F, exact);
+                            // the field, the pyramid, the weights and all arithmetic are float32 either way
     // ---- structural (re-allocate textures and recompile the programs; drop the frame history) ----
     inputFormat: 'rgba8',   // frame format: 'rgba8' (RGBA8 frames and output) or 'rgba16f' (HDR / float: RGBA16F frames and output)
     transfer: 'encoded',    // rgba16f only: 'encoded' (display-encoded values: PQ, HLG, sRGB, ...) or 'linear' (scRGB / linear light)
@@ -158,7 +212,8 @@
     debug: false,
   };
   const MH_ROWS = 4;   // parent rows per band of the median histogram (estimate/medhist.frag.glsl's)
-  const STRING_KEYS = { v2Mode: ['quality', 'performance'], blurWeights: ['gaussian', 'even'], inputFormat: ['rgba8', 'rgba16f'], transfer: ['encoded', 'linear'] };
+  const STRING_KEYS = { v2Mode: ['quality', 'performance'], blurWeights: ['gaussian', 'even'], inputFormat: ['rgba8', 'rgba16f'], transfer: ['encoded', 'linear'],
+    motion: ['search', 'learned'], motionNet: ML_NETS, motionPrecision: ['fp16', 'fp32'] };
   const BOOL_KEYS = { debug: 1, v2StaticMask: 1 };
   fg.defaultSettings = function () { return Object.assign({}, DEFAULTS); };
 
@@ -284,17 +339,21 @@
     }
   }
 
-  // -> { ok, missing, sizeError, quality, qualityError }. missing: the GL features this context lacks (names only; 'webgl2' alone if
-  // it is no WebGL2 context). sizeError: the optional frame = { width, height, flowScale } checked by fg.frameSizeError, else null.
-  // ok = nothing missing and no sizeError. quality: V2 Quality can run (its MIN-blend splat works, probeQuality); when false,
-  // qualityError says why. V1 and V2 Performance do not need it, so it does not affect ok.
+  // -> { ok, missing, sizeError, quality, qualityError, learned, learnedError }. missing: the GL features this context lacks (names
+  // only; 'webgl2' alone if it is no WebGL2 context). sizeError: the optional frame = { width, height, flowScale } checked by
+  // fg.frameSizeError, else null. ok = nothing missing and no sizeError. quality: V2 Quality can run (its MIN-blend splat works,
+  // probeQuality); when false, qualityError says why. V1 and V2 Performance do not need it, so it does not affect ok. learned: the
+  // learned motion estimator (settings.motion 'learned') can run: 4 draw buffers / colour attachments, uniform blocks of ML_BLOCK_MAX
+  // bytes, 2 fragment uniform blocks, 8 fragment texture units (all WebGL2 core minimums, so false only on a non-conformant
+  // context); does not affect ok either. (Whether a net's weights are loaded is fg.nets, not the context: createEngine / setSettings
+  // say so.)
   fg.checkSupport = function (gl, frame) {
     const missing = [];
     let isGl2;
     if (!gl) isGl2 = false;
     else if (typeof root.WebGL2RenderingContext !== 'undefined') isGl2 = gl instanceof root.WebGL2RenderingContext;
     else isGl2 = typeof gl.texStorage2D === 'function' && typeof gl.createVertexArray === 'function';
-    if (!isGl2) return { ok: false, missing: ['webgl2'], sizeError: null, quality: false, qualityError: 'no WebGL2 context' };
+    if (!isGl2) return { ok: false, missing: ['webgl2'], sizeError: null, quality: false, qualityError: 'no WebGL2 context', learned: false, learnedError: 'no WebGL2 context' };
     for (const name of fg.requiredExtensions) {
       if (!gl.getExtension(name)) missing.push(name);
     }
@@ -303,7 +362,15 @@
     const sizeError = frame ? fg.frameSizeError(gl, frame.width, frame.height, frame) : null;
     // (the probe needs the float render / blend extensions; without them nothing runs anyway)
     const qualityError = missing.length ? 'needs ' + missing.join(', ') : probeQuality(gl);
-    return { ok: missing.length === 0 && !sizeError, missing: missing, sizeError: sizeError, quality: !qualityError, qualityError: qualityError };
+    const mlMissing = missing.slice();
+    for (const [k, min, name] of [[gl.MAX_DRAW_BUFFERS, 4, 'MAX_DRAW_BUFFERS'], [gl.MAX_COLOR_ATTACHMENTS, 4, 'MAX_COLOR_ATTACHMENTS'],
+      [gl.MAX_UNIFORM_BLOCK_SIZE, ML_BLOCK_MAX, 'MAX_UNIFORM_BLOCK_SIZE'], [gl.MAX_FRAGMENT_UNIFORM_BLOCKS, 2, 'MAX_FRAGMENT_UNIFORM_BLOCKS'],
+      [gl.MAX_TEXTURE_IMAGE_UNITS, 8, 'MAX_TEXTURE_IMAGE_UNITS']]) {
+      if (!(gl.getParameter(k) >= min)) mlMissing.push(name + '>=' + min);
+    }
+    const learnedError = mlMissing.length ? 'needs ' + mlMissing.join(', ') : null;
+    return { ok: missing.length === 0 && !sizeError, missing: missing, sizeError: sizeError, quality: !qualityError, qualityError: qualityError,
+      learned: !learnedError, learnedError: learnedError };
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -336,7 +403,22 @@
     if (!(s.trustHigh >= s.trustLow + 1)) throw new RangeError('framegen: settings.trustHigh must be >= trustLow + 1');
     if (!(Number.isInteger(s.blurSamples) && s.blurSamples >= 0 && s.blurSamples <= 16)) throw new RangeError('framegen: settings.blurSamples must be an integer 0..16');
     if (!(s.linearWhiteNits > 0 && s.linearWhiteNits <= 10000)) throw new RangeError('framegen: settings.linearWhiteNits must be in (0, 10000]');
+    if (s.motionVersion === 1 && s.motion === 'learned' && s.flowScale !== 2) {
+      throw new RangeError("framegen: settings.motion 'learned' needs flowScale 2 (the net was trained at 2; got " + s.flowScale + ')');
+    }
     return Object.freeze(s);
+  }
+
+  // the learned estimator is the effective motion estimate (V1 with motion 'learned'; V2 ignores the key)
+  function mlOn(s) { return s.motionVersion === 1 && s.motion === 'learned'; }
+  // which estimate the settings produce: a change drops the current estimate (like a motionVersion switch)
+  function estKey(s) { return s.motionVersion === 2 ? 'v2' : mlOn(s) ? 'ml:' + s.motionNet + ':' + s.motionPrecision : 'v1'; }
+  // the loaded net `name` (webgl/nets/<name>.js attaches fg.nets[name]) or null
+  function mlNetDef(name) {
+    const n = fg.nets && fg.nets[name];
+    if (!n || typeof n.weights !== 'string' || n.levels !== 5 || n.inChannels !== 14 || n.padMultiple !== 16 || !(n.width === 12 || n.width === 24) ||
+      !Array.isArray(n.stacks) || !Array.isArray(n.levelToStack)) return null;
+    return n;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -355,7 +437,17 @@
       }
       return s;
     }
-    let settings = qualityGate(mergeSettings(DEFAULTS, settingsIn));
+    // the learned estimator: refused cleanly where the context lacks what it needs or its net's weights are not loaded
+    function learnedGate(s) {
+      if (!mlOn(s)) return s;
+      if (!sup.learned) throw new RangeError("framegen: settings.motion 'learned' is not supported on this context (" + sup.learnedError + ')');
+      if (!mlNetDef(s.motionNet)) {
+        throw new RangeError("framegen: settings.motion 'learned': the weights of net '" + s.motionNet + "' are not loaded (load webgl/nets/" +
+          s.motionNet + '.js next to framegen.js)');
+      }
+      return s;
+    }
+    let settings = learnedGate(qualityGate(mergeSettings(DEFAULTS, settingsIn)));
     let debug = settings.debug;
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
 
@@ -367,6 +459,7 @@
       R16UI: { i: gl.R16UI, f: gl.RED_INTEGER, t: gl.UNSIGNED_SHORT, ch: 1, rf: gl.RGBA_INTEGER, rt: gl.UNSIGNED_INT, A: Uint32Array },
       R32F: { i: gl.R32F, f: gl.RED, t: gl.FLOAT, ch: 1, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
       RG32F: { i: gl.RG32F, f: gl.RG, t: gl.FLOAT, ch: 2, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
+      RGBA32UI: { i: gl.RGBA32UI, f: gl.RGBA_INTEGER, t: gl.UNSIGNED_INT, ch: 4, rf: gl.RGBA_INTEGER, rt: gl.UNSIGNED_INT, A: Uint32Array },
       RGBA32F: { i: gl.RGBA32F, f: gl.RGBA, t: gl.FLOAT, ch: 4, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
       RGBA32I: { i: gl.RGBA32I, f: gl.RGBA_INTEGER, t: gl.INT, ch: 4, rf: gl.RGBA_INTEGER, rt: gl.INT, A: Int32Array },
       RGBA16F: { i: gl.RGBA16F, f: gl.RGBA, t: gl.HALF_FLOAT, ch: 4, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
@@ -388,6 +481,7 @@
     const progList = [];
     let vao = null;
     let v2Built = false;
+    let mlBuilt = false;
     function buildPrograms(list) {
       const shaders = [];    // { sh, file }
       const vertCache = {};
@@ -438,13 +532,21 @@
           const loc = gl.getUniformLocation(b.prog, n);
           if (loc) u[n] = loc;
         }
+        // the learned convs' weights (uniform blocks MlW, MlW2): binding points 0 and 1, a range of the net's buffer each per pass
+        const wSize = [0, 0];
+        ['MlW', 'MlW2'].forEach(function (bn, k) {
+          const bi = gl.getUniformBlockIndex(b.prog, bn);
+          if (bi === gl.INVALID_INDEX) return;
+          gl.uniformBlockBinding(b.prog, bi, k);
+          wSize[k] = gl.getActiveUniformBlockParameter(b.prog, bi, gl.UNIFORM_BLOCK_DATA_SIZE);
+        });
         gl.useProgram(b.prog);
         b.samplers.forEach(function (sn, unit) {
           const loc = gl.getUniformLocation(b.prog, sn);
           if (loc) gl.uniform1i(loc, unit);   // (a sampler of a shared include that this program does not read is inactive: fine)
         });
         const p = {
-          name: b.name, prog: b.prog, u: u,
+          name: b.name, prog: b.prog, u: u, wSize: wSize,
           hasTime: U_TIME.some(function (n) { return !!u[n]; }),
         };
         P[b.name] = p;
@@ -461,6 +563,7 @@
       for (const k of Object.keys(P)) delete P[k];
       buildPrograms(PROGRAMS);
       if (v2Built) buildPrograms(V2_PROGRAMS);
+      if (mlBuilt) buildPrograms(ML_PROGRAMS);
       staticDirty = true;
     }
     // V2 programs are compiled the first time V2 is selected, so a V1-only session never pays for them.
@@ -468,6 +571,13 @@
       if (v2Built) return;
       buildPrograms(V2_PROGRAMS);
       v2Built = true;
+      staticDirty = true;
+    }
+    // the learned estimator's programs likewise, the first time settings select it
+    function ensureMlPrograms() {
+      if (mlBuilt) return;
+      buildPrograms(ML_PROGRAMS);
+      mlBuilt = true;
       staticDirty = true;
     }
 
@@ -485,7 +595,10 @@
     let synthDone = false, synthMid = false, lastT = null;
     let staticDirty = true;
     let qDone = false;             // V2 Quality's estimate tail has run for the current estimate
+    let mlEst = false;             // the current estimate is the learned estimator's (stats: duplicate)
+    const mlBufs = {};             // net name -> its weights in a uniform buffer (mlNetBuffer)
     if (settings.motionVersion === 2) ensureV2Programs();
+    if (mlOn(settings)) ensureMlPrograms();
 
     // time-dependent uniform values of the current synth call
     let tT = 0, tS = 0, tWA = 0, tWC = 0, tNear = 0, tMid = 0;
@@ -578,23 +691,23 @@
       ownedTex = []; ownedFbo = [];
       T = null; info = null; levels = null;
       count = 0; currS = 0; prevS = 1;
-      estimatedPair = false; haveEstimate = false; synthDone = false; synthMid = false; lastT = null; qDone = false;
+      estimatedPair = false; haveEstimate = false; synthDone = false; synthMid = false; lastT = null; qDone = false; mlEst = false;
       resetCache();
     }
 
-    // sizes of a sum-reduction chain down to 1x1: the first step's fan-in fan0 per axis, then 16 (at least one step)
-    function reduceChain(w, h, fan0) {
+    // sizes of a sum-reduction chain down to 1x1: the first step's fan-in fan0 per axis, then rest (default 16; at least one step)
+    function reduceChain(w, h, fan0, rest) {
       const sizes = [];
       let f = fan0 || 16;
       do {
         w = Math.ceil(w / f); h = Math.ceil(h / f);
         sizes.push([w, h, f]);
-        f = 16;
+        f = rest || 16;
       } while (w > 1 || h > 1);
       return sizes;
     }
-    function mkChain(name, w, h, fan0) {
-      return reduceChain(w, h, fan0).map(function (sz, k) { const t = mk(name + '[' + k + ']', 'R32F', sz[0], sz[1]); t.fan = sz[2]; return t; });
+    function mkChain(name, w, h, fan0, rest) {
+      return reduceChain(w, h, fan0, rest).map(function (sz, k) { const t = mk(name + '[' + k + ']', 'R32F', sz[0], sz[1]); t.fan = sz[2]; return t; });
     }
     // run a reduction chain: step 0 reads src (channel chan; reduce_untrusted: mode0 for the first step), the last output is the sum
     function runChain(prog, chain, src, first, rest) {
@@ -644,6 +757,155 @@
       q.vis = mk('v2.qvis', 'RG32F', FW, FH);          // does prev / curr still show the location's content
       q.cov = mk('v2.qcov', 'RGBA32F', FW, FH);        // coverage cP, cC, z (quantised)
       return q;
+    }
+
+    // ---- the learned motion estimator (settings.motion 'learned'; ml-fg export/SPEC.md, export/reference.py) ---------------------
+    // The net's weights as one uniform buffer: per level (finest first), layer and 12 output channels (a part) a std140 block of the
+    // conv shape (learned/conv.frag.glsl's MlW; conv_h.frag.glsl binds part 0 / 1 as MlW / MlW2): COUT * 9 * CIN mat4 (column c =
+    // input channel 4j + c, row r = output channel 12 * part + 4o + r) and
+    // COUT bias vec4, each block at a multiple of UNIFORM_BUFFER_OFFSET_ALIGNMENT. Decoded and uploaded once per net and engine.
+    function mlNetBuffer(name) {
+      if (mlBufs[name]) return mlBufs[name];
+      const net = mlNetDef(name);
+      const bin = root.atob(net.weights);
+      if (bin.length !== 4 * net.count) throw new Error('framegen: net ' + name + ': ' + bin.length + ' weight bytes, want ' + 4 * net.count);
+      const dv = new DataView(new ArrayBuffer(bin.length)), u8 = new Uint8Array(dv.buffer);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const wt = new Float32Array(net.count);
+      for (let i = 0; i < net.count; i++) wt[i] = dv.getFloat32(4 * i, true);
+      const G = net.width / 4, align = gl.getParameter(gl.UNIFORM_BUFFER_OFFSET_ALIGNMENT);
+      const blocks = [], datas = [];
+      let total = 0;
+      for (let l = 0; l < net.levels; l++) {
+        const st = net.stacks[net.levelToStack[l]], lv = [];
+        for (let k = 0; k <= net.depth; k++) {
+          const ly = st[k], last = k === net.depth;
+          if (ly.cin !== (k === 0 ? net.inChannels : net.width) || ly.cout !== (last ? 2 : net.width) || ly.act !== (last ? 'none' : 'clamp01')) {
+            throw new Error('framegen: net ' + name + ': unexpected layer ' + k + ' of level ' + l);
+          }
+          const CIN = k === 0 ? 4 : G, COUT = last ? 1 : 3, parts = [];
+          for (let part = 0; part < (last ? 1 : G / 3); part++) {
+            const n = COUT * 9 * CIN, f = new Float32Array(n * 16 + COUT * 4);
+            for (let o = 0; o < COUT; o++) {
+              for (let t = 0; t < 9; t++) {
+                for (let j = 0; j < CIN; j++) {
+                  const m = ((o * 9 + t) * CIN + j) * 16;
+                  for (let c = 0; c < 4; c++) {
+                    for (let r = 0; r < 4; r++) {
+                      const oc = 12 * part + 4 * o + r, ic = 4 * j + c;   // W[oc][ic][ky][kx] (OIHW), t = ky * 3 + kx
+                      if (oc < ly.cout && ic < ly.cin) f[m + 4 * c + r] = wt[ly.w + (oc * ly.cin + ic) * 9 + t];
+                    }
+                  }
+                }
+              }
+              for (let r = 0; r < 4; r++) { const oc = 12 * part + 4 * o + r; if (oc < ly.cout) f[n * 16 + 4 * o + r] = wt[ly.b + oc]; }
+            }
+            total = Math.ceil(total / align) * align;
+            parts.push({ off: total, size: f.byteLength });
+            datas.push([total, f]);
+            total += f.byteLength;
+          }
+          lv.push(parts);
+        }
+        blocks.push(lv);
+      }
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.UNIFORM_BUFFER, buf);
+      gl.bufferData(gl.UNIFORM_BUFFER, total, gl.STATIC_DRAW);
+      for (const [off, f] of datas) gl.bufferSubData(gl.UNIFORM_BUFFER, off, f);
+      gl.bindBuffer(gl.UNIFORM_BUFFER, null);
+      if (debug) chk('mlNetBuffer');
+      return (mlBufs[name] = { name: name, net: net, buf: buf, blocks: blocks, bytes: total });
+    }
+
+    // drop some of the owned textures / FBOs (the learned set on a net switch)
+    function freeSome(tex, fbos) {
+      for (const t of tex) { gl.deleteFramebuffer(t.fbo); gl.deleteTexture(t.tex); }
+      for (const f of fbos) gl.deleteFramebuffer(f);
+      ownedTex = ownedTex.filter(function (t) { return tex.indexOf(t) < 0; });
+      ownedFbo = ownedFbo.filter(function (f) { return fbos.indexOf(f) < 0; });
+      resetCache();
+    }
+
+    // The learned estimator's textures (allocated by its first estimate; again when the net or the precision changes) and its pass
+    // plan. Sizes: padded flow grid PW x PH (fw, fh rounded up to a multiple of 16), level l = (PW >> l) x (PH >> l), every level an
+    // exact half.
+    //   pyr[0] RGBA32F (la, lc, ya, yc), pyr[l > 0] RG32F (la, lc)   the net's own pyramid (SPEC stage 3)
+    //   x[], level-0 size                                           the 14-channel input of the current level
+    //   act[2][], level-0 size                                      ping-pong activations
+    //   h[1..4] RG32F, level size                                   the field after each level (level 0 writes pixfield)
+    //   dupSrc R32F, dupRed, sadRed                                  the duplicate-test and SAD sum chains
+    // motionPrecision 'fp32': x = 3 RGBA32F + 1 RG32F, act = G = width / 4 RGBA32F each; 'fp16': 8 half floats per RGBA32UI texel,
+    // x = 2, act = ceil(G / 2) each. The coarser levels render into the level-0-sized x / act textures over their own viewport
+    // (uSize = the level: zero padding).
+    function allocMl(name, prec) {
+      if (T.ml) {
+        if (T.ml.name === name && T.ml.prec === prec) return T.ml;
+        freeSome(T.ml.tex, T.ml.fbos);
+        T.ml = null;
+      }
+      const half = prec === 'fp16';
+      const nb = mlNetBuffer(name), net = nb.net, G = net.width / 4, NL = net.levels;
+      const PW = Math.ceil(FW / net.padMultiple) * net.padMultiple, PH = Math.ceil(FH / net.padMultiple) * net.padMultiple;
+      const t0 = ownedTex.length, f0 = ownedFbo.length;
+      let m = null;
+      try {
+        m = { name: name, prec: prec, net: net, buf: nb.buf, G: G, PW: PW, PH: PH, pyr: [], h: [null], act: [[], []], actMrt: [[], []], plan: [] };
+        m.pyr.push(mk('ml.pyr[0]', 'RGBA32F', PW, PH));
+        m.dupSrc = mk('ml.dupSrc', 'R32F', PW, PH);
+        m.lvMrt = mkMrt('ml_lv0', [m.pyr[0], m.dupSrc]);
+        for (let l = 1; l < NL; l++) {
+          m.pyr.push(mk('ml.pyr[' + l + ']', 'RG32F', PW >> l, PH >> l));
+          m.h.push(mk('ml.h[' + l + ']', 'RG32F', PW >> l, PH >> l));
+        }
+        const xf = half ? ['RGBA32UI', 'RGBA32UI'] : ['RGBA32F', 'RGBA32F', 'RGBA32F', 'RG32F'];
+        m.x = xf.map(function (f, k) { return mk('ml.x[' + k + ']', f, PW, PH); });
+        m.xMrt = mkMrt('ml_match', m.x);
+        const nAct = half ? Math.ceil(G / 2) : G;
+        for (let s = 0; s < 2; s++) {
+          for (let g = 0; g < nAct; g++) m.act[s].push(mk('ml.act[' + s + '][' + g + ']', half ? 'RGBA32UI' : 'RGBA32F', PW, PH));
+          if (half) m.actMrt[s].push(mkMrt('ml_conv', m.act[s]));
+          else for (let part = 0; part < G / 3; part++) m.actMrt[s].push(mkMrt('ml_conv', m.act[s].slice(3 * part, 3 * part + 3)));
+        }
+        m.dupRed = mkChain('ml.dupRed', PW, PH, 4, 4);   // (small fan-ins: many fragments, short loops)
+        m.sadRed = mkChain('ml.sadRed', FW, FH, 2, 4);
+        const dup = m.dupRed[m.dupRed.length - 1];
+        const chkBlock = function (p, k, b) {
+          if (p.wSize[k] !== b.size) throw new Error('framegen: ' + p.name + ': uniform block ' + ['MlW', 'MlW2'][k] + ' is ' + p.wSize[k] + ' bytes, the host packs ' + b.size);
+        };
+        // the coarse-to-fine plan: per level the match, then the layers into the ping-pong sets (fp32, G = 6: parts a / b, each
+        // with its weight block; fp16: one pass, the parts' blocks bound to MlW / MlW2), the last layer into h[l] (level 0:
+        // pixfield, fw x fh; its taps still read the padded level)
+        for (let l = NL - 1; l >= 0; l--) {
+          const lw = PW >> l, lh = PH >> l, size = [lw, lh], top = l === NL - 1 ? 1 : 0, hc = top ? m.pyr[l] : m.h[l + 1];   // (hc unread at the top)
+          m.plan.push({ name: 'ml_match.' + l, p: P[half ? 'ml_match_h' : 'ml_match'], out: { fbo: m.xMrt.fbo, w: lw, h: lh }, size: size, top: top,
+            ins: [m.pyr[l], hc, dup], block: null, block2: null });
+          for (let k = 0; k <= net.depth; k++) {
+            const last = k === net.depth, src = k === 0 ? m.x : m.act[(k - 1) & 1], parts = nb.blocks[l][k];
+            const p = P[mlLayerProg(prec, G, k, net.depth)], ins = src.concat(last ? [hc, dup] : [dup]);
+            const outOf = function (part) { return !last ? { fbo: m.actMrt[k & 1][part].fbo, w: lw, h: lh } : l === 0 ? T.pixfield : { fbo: m.h[l].fbo, w: lw, h: lh }; };
+            if (half) {
+              chkBlock(p, 0, parts[0]);
+              if (parts[1]) chkBlock(p, 1, parts[1]);
+              m.plan.push({ name: 'ml_c' + k + '.' + l, p: p, out: outOf(0), size: size, top: top, ins: ins, block: parts[0], block2: parts[1] || null });
+              continue;
+            }
+            for (let part = 0; part < parts.length; part++) {
+              chkBlock(p, 0, parts[part]);
+              m.plan.push({ name: 'ml_c' + k + (parts.length > 1 ? 'ab'[part] : '') + '.' + l, p: p, out: outOf(part), size: size, top: top,
+                ins: ins, block: parts[part], block2: null });
+            }
+          }
+        }
+        if (debug) chk('allocMl');
+      } catch (e) {
+        freeSome(ownedTex.slice(t0), ownedFbo.slice(f0));
+        throw e;
+      }
+      m.tex = ownedTex.slice(t0);
+      m.fbos = ownedFbo.slice(f0);
+      T.ml = m;
+      return m;
     }
 
     function alloc(w, h) {
@@ -774,6 +1036,15 @@
       for (let k = 2; k < arguments.length; k++) if (arguments[k]) bindIn(k - 2, arguments[k]);
     }
 
+    // begin() with the inputs as an array (the learned plan)
+    function beginArr(p, out, ins) {
+      use(p);
+      if (p.hasTime) setTime(p);
+      bindFbo(out.fbo);
+      setVp(0, 0, out.w, out.h);
+      for (let k = 0; k < ins.length; k++) bindIn(k, ins[k]);
+    }
+
     let passHook = null;   // engine.setPassHook (profiling only): called before / after every draw
     function draw(name, mode, n) {
       if (passHook) passHook(name, 0);
@@ -817,16 +1088,18 @@
 
     engine.setSettings = function (partial) {
       alive();
-      const next = qualityGate(mergeSettings(settings, partial));
+      const next = learnedGate(qualityGate(mergeSettings(settings, partial)));
       const fmtChanged = formatDefines(next) !== formatDefines(settings);
       const rebuilt = (next.flowScale !== settings.flowScale || fmtChanged) && info !== null;
       const switched = next.motionVersion !== settings.motionVersion;
-      if (fmtChanged || (switched && next.motionVersion === 2)) {
+      const estSwitched = estKey(next) !== estKey(settings);   // (motion / motionNet with V1 too)
+      if (fmtChanged || (switched && next.motionVersion === 2) || (mlOn(next) && !mlBuilt)) {
         const keep = settings;
         settings = next;   // (srcOf / compile errors surface here, not on the hot path)
         try {
           if (fmtChanged) rebuildPrograms();
           if (next.motionVersion === 2) ensureV2Programs();
+          if (mlOn(next)) ensureMlPrograms();
         } catch (e) { settings = keep; if (fmtChanged) rebuildPrograms(); throw e; }
       }
       settings = next;
@@ -834,9 +1107,10 @@
       engine.settings = settings;
       staticDirty = true;
       if (rebuilt) alloc(W, H);   // re-allocates all flow-res (or, for a format change, all) textures, drops frame history
-      else if (switched) {
-        // like the library: a motion-version switch drops the current estimate (synth returns false until the next estimate())
-        estimatedPair = false; haveEstimate = false; synthDone = false; synthMid = false; lastT = null;
+      else if (switched || estSwitched) {
+        // like the library: a motion-version switch drops the current estimate (synth returns false until the next estimate()); so
+        // does a switch of V1's estimator (motion / motionNet)
+        estimatedPair = false; haveEstimate = false; synthDone = false; synthMid = false; lastT = null; mlEst = false;
         if (info && settings.motionVersion === 2 && !T.v2) T.v2 = allocV2();
       }
       return { rebuilt: rebuilt };
@@ -1003,11 +1277,67 @@
       tri('v2_final');
     }
 
+    // a reduction chain whose first step `first` (already bound by the caller's begin) has drawn: the rest with reduce_sad
+    function sumRest(chain) {
+      const p = P.reduce_sad;
+      for (let k = 1; k < chain.length; k++) {
+        begin(p, chain[k], chain[k - 1]);
+        gl.uniform2i(p.u.uSrcSize, chain[k - 1].w, chain[k - 1].h);
+        gl.uniform1i(p.u.uFan, chain[k].fan);
+        gl.uniform1i(p.u.uChan, 0);
+        tri('reduce_sad');
+      }
+    }
+
+    // The learned estimate (ml-fg export/SPEC.md stages 1-6): the duplicate test, the net's pyramid, coarse to fine (match, 5 convs
+    // per level), then V1's contract: the field in pixfield (fw x fh, flow-res half-vectors) and sadSum = sad * bw * bh in sadRed's
+    // last texel. V1's synthesis reads both unchanged (cut: sad > sceneCutSad).
+    function estimateLearned() {
+      const m = allocMl(settings.motionNet, settings.motionPrecision), A = T.frame[prevS], C = T.frame[currS];
+      const dr = m.dupRed, dup = dr[dr.length - 1];
+      begin(P.ml_lv0, m.lvMrt, A, C);   // level 0 of the pyramid + the duplicate test's per-cell sums
+      gl.uniform2i(P.ml_lv0.u.uSize, FW, FH);
+      tri('ml_lv0');
+      runChain(P.reduce_sad, dr, m.dupSrc, 0, 0);
+      for (let l = 1; l < m.pyr.length; l++) {
+        begin(P.ml_down, m.pyr[l], m.pyr[l - 1]);
+        tri('ml_down');
+      }
+      for (let i = 0; i < m.plan.length; i++) {
+        const d = m.plan[i], u = d.p.u;
+        beginArr(d.p, d.out, d.ins);
+        gl.uniform2i(u.uSize, d.size[0], d.size[1]);
+        if (u.uTop) gl.uniform1i(u.uTop, d.top);
+        if (d.block) gl.bindBufferRange(gl.UNIFORM_BUFFER, 0, m.buf, d.block.off, d.block.size);
+        if (d.block2) gl.bindBufferRange(gl.UNIFORM_BUFFER, 1, m.buf, d.block2.off, d.block2.size);
+        tri(d.name);
+      }
+      const sr = m.sadRed;
+      begin(P.ml_sad, sr[0], m.pyr[0], T.pixfield);
+      gl.uniform1i(P.ml_sad.u.uFan, sr[0].fan);
+      tri('ml_sad');
+      sumRest(sr);
+      const lv0 = levels[0];
+      begin(P.ml_sadout, T.sadRed[T.sadRed.length - 1], sr[sr.length - 1], dup);
+      gl.uniform1f(P.ml_sadout.u.uWeight, Math.fround(lv0.bw * lv0.bh / (FW * FH)));
+      tri('ml_sadout');
+    }
+
     engine.estimate = function () {
       alive();
       if (!info || count < 2) return false;
       beginCall();
       nDraw = 0; nClear = 0;
+      mlEst = mlOn(settings);
+      if (mlEst) {
+        estimateLearned();
+        estimatedPair = true;
+        haveEstimate = true;
+        synthDone = false;
+        counts.estimate = nDraw;
+        counts.clears = nClear;
+        return true;
+      }
       const A = T.luma[prevS], C = T.luma[currS];
       const v2 = settings.motionVersion === 2;
       if (v2) {
@@ -1318,6 +1648,19 @@
           }
           break;
         }
+        case 'ml': {
+          // the learned estimator (its last estimate): ml.pyr.<l>, ml.x.<k>, ml.act.<set>.<k>, ml.h.<l> (l >= 1), ml.dup (1x1 sum of
+          // |a - c|), ml.sad (1x1 sum of the SAD terms). x / act are level-0 sized: after an estimate they hold level 0
+          if (!T.ml) throw new Error('framegen: debugRead("' + name + '"): no learned estimate yet');
+          const m = T.ml, key = parts[1];
+          if (key === 'pyr') return m.pyr[level(parts, 2, m.pyr.length, name)];
+          if (key === 'x') return m.x[level(parts, 2, m.x.length, name)];
+          if (key === 'act') return m.act[level(parts, 2, 2, name)][level(parts, 3, m.act[0].length, name)];
+          if (key === 'h') { const l = level(parts, 2, m.h.length, name); if (l > 0) return m.h[l]; break; }
+          if (key === 'dup') return m.dupRed[m.dupRed.length - 1];
+          if (key === 'sad') return m.sadRed[m.sadRed.length - 1];
+          break;
+        }
         case 'out': needSynth(name); return T.out;
         default: break;
       }
@@ -1338,7 +1681,12 @@
       const sadSum = readTex(T.sadRed[T.sadRed.length - 1])[0];
       const meanSad = sadSum / (lv0.bw * lv0.bh);
       const cut = meanSad > settings.sceneCutSad;
-      let untrusted = null, share = null, flick = null, fallback = null;
+      let untrusted = null, share = null, flick = null, fallback = null, duplicate = null, dupDiff = null;
+      if (mlEst && T.ml) {   // the learned estimate: the duplicate test (mean |a - c| over pixels and R, G, B, in levels)
+        const dr = T.ml.dupRed;
+        dupDiff = readTex(dr[dr.length - 1])[0] / (3 * W * H);
+        duplicate = dupDiff <= ML_DUP_DIFF;
+      }
       if (synthDone) {
         const ur = settings.motionVersion === 2 ? T.v2.untrRed : T.untrRed;
         untrusted = readTex(ur[ur.length - 1])[0];
@@ -1348,7 +1696,7 @@
       }
       return {
         meanSad: meanSad, cut: cut, untrusted: untrusted, untrustedShare: share, flick: flick,
-        fallback: fallback, t: synthDone ? lastT : null,
+        fallback: fallback, t: synthDone ? lastT : null, duplicate: duplicate, dupDiff: dupDiff,
       };
     };
 
@@ -1356,6 +1704,7 @@
       if (disposed) return;
       freeTextures();
       for (const p of progList) gl.deleteProgram(p.prog);
+      for (const k of Object.keys(mlBufs)) gl.deleteBuffer(mlBufs[k].buf);
       gl.deleteVertexArray(vao);
       progList.length = 0;
       disposed = true;

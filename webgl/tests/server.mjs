@@ -1,6 +1,6 @@
 // Headless Chromium with the engine loaded on a local HTTP server (127.0.0.1, random port; large frames do not fit through the
 // DevTools protocol): /w/<path> serves files of $FG_WORK, POST /dump/<name> stores a body (engine output) for the caller.
-// Shared by xbackend.mjs, hdr.mjs, blur.mjs and bench.mjs.
+// Shared by xbackend.mjs, hdr.mjs, blur.mjs, bench.mjs and learned.mjs.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -45,6 +45,9 @@ export async function openEngine({ gpu = false, settings = {}, engine = engineFi
   page.on('pageerror', (e) => consoleMsgs.set('pageerror: ' + String(e.stack || e).slice(0, 300), 1));
   await page.goto(`http://127.0.0.1:${srv.address().port}/`);
   await page.addScriptTag({ content: fs.readFileSync(engine, 'utf8') });
+  // the learned estimator's weights (webgl/nets/<net>.js, classic scripts next to framegen.js)
+  const nets = path.join(path.dirname(engine), 'nets');
+  if (fs.existsSync(nets)) for (const f of fs.readdirSync(nets).filter((x) => x.endsWith('.js')).sort()) await page.addScriptTag({ content: fs.readFileSync(path.join(nets, f), 'utf8') });
   const files = await page.evaluate(() => Array.from(globalThis.__fg.shaderFiles));
   const sources = {};
   for (const f of files) sources[f] = fs.readFileSync(path.join(shaders, f), 'utf8');
