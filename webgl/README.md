@@ -148,8 +148,8 @@ in one timer query; the estimate alone, then estimate + synth(0.5) per 2x pair):
 47 draws per learned estimate (fp32 e2v3: 67, two passes per 24-wide layer). At level 0 a 24-wide hidden layer is ~0.33 ms
 (5,184 MACs per texel over 960 × 544, about half the GPU's fp32 FMA peak): the convs dominate, the coarser levels are mostly
 per-pass overhead (~0.02–0.04 ms each). The first `setSettings({ motion: 'learned' })` compiles 17 programs (94 ms on ANGLE /
-Vulkan, 590 ms on ANGLE / OpenGL); the first learned estimate decodes and uploads the weights and allocates (~40 ms).
-SwiftShader (CPU): about 2.3 s per 1080p e2v3 pair, only for tests.
+Vulkan, 590 ms on ANGLE / OpenGL); the first learned estimate decodes and uploads the weights and allocates (~40 ms of CPU
+time). SwiftShader runs it too (the tests), far too slowly for use.
 
 ### V2 Performance ("grid morph")
 
