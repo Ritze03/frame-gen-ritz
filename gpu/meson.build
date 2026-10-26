@@ -19,7 +19,16 @@ shaders = shader_gen.process(
   'shaders/blur_lookup.comp', 'shaders/blur_error.comp', 'shaders/blur_resolve.comp',
   'shaders/v2_medhist.comp', 'shaders/v2_search.comp', 'shaders/v2_clean.comp', 'shaders/v2_morph.comp', 'shaders/v2_repick.comp',
   'shaders/v2_qfield.comp', 'shaders/v2_qown.comp', 'shaders/v2_qcov.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_static.comp', 'shaders/v2_enclose.comp',
-  'shaders/v2_morph_s.comp', 'shaders/v2_qmorph_s.comp')
+  'shaders/v2_morph_s.comp', 'shaders/v2_qmorph_s.comp',
+  'shaders/ml_dup.comp', 'shaders/ml_reduce.comp', 'shaders/ml_pyr.comp', 'shaders/ml_match.comp', 'shaders/ml_conv.comp', 'shaders/ml_out.comp')
+
+# MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked
+# against the manifest (sha256, shapes, offsets) and re-laid out for shaders/ml_conv.comp. Order = LearnedNet (E2v3, E1v3).
+python = find_program('python3')
+ml_weights = custom_target('ml_weights',
+  input : ['ml/embed_weights.py', 'ml/e2v3/manifest.json', 'ml/e2v3/weights.bin', 'ml/e1v3/manifest.json', 'ml/e1v3/weights.bin'],
+  output : 'ml_weights.h',
+  command : [python, '-I', '@INPUT0@', '@OUTPUT@', 'e2v3', '@INPUT1@', '@INPUT2@', 'e1v3', '@INPUT3@', '@INPUT4@'])
 
 # Per-format variants of the colour shaders (README.md "Formats"): the same sources, compiled once per format with
 # -DFG_FORMAT_<FMT>=1 into <name>_<fmt>_spv.h / <name>_<fmt>_spv. Rgba8 is the plain build above and keeps its names.
@@ -32,6 +41,8 @@ chroma_srcs = ['shaders/ui_inpaint_chroma.comp', 'shaders/ui_patch_chroma.comp']
 # MotionVersion::V2: only its synthesis reads and writes colour (both modes, with and without the static-overlay tests; YUV: both
 # planes); its other passes read the luma, which luma.comp already gives per format
 v2_colour_srcs = ['shaders/v2_morph.comp', 'shaders/v2_morph_s.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_qmorph_s.comp']
+# MotionVersion::Learned: only its duplicate test reads colour; the net reads the luma
+ml_colour_srcs = ['shaders/ml_dup.comp']
 variant_shaders = []
 foreach f : get_option('formats')
   g = generator(glslang,
@@ -39,14 +50,14 @@ foreach f : get_option('formats')
     depfile : '@BASENAME@_' + f + '_spv.h.d',
     arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                  '-DFG_FORMAT_' + f.to_upper() + '=1', '--vn', '@BASENAME@_' + f + '_spv', '-o', '@OUTPUT@', '@INPUT@'])
-  variant_shaders += [g.process(colour_srcs), g.process(v2_colour_srcs)]
+  variant_shaders += [g.process(colour_srcs), g.process(v2_colour_srcs), g.process(ml_colour_srcs)]
   if f == 'nv12' or f == 'p010'
     variant_shaders += [g.process(chroma_srcs)]
   endif
 endforeach
 
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
-framegen_lib = static_library('framegen', 'framegen.cpp', shaders, variant_shaders,
+framegen_lib = static_library('framegen', 'framegen.cpp', shaders, variant_shaders, ml_weights,
   dependencies : vulkan.partial_dependency(compile_args : true, includes : true))
 framegen_dep = declare_dependency(link_with : framegen_lib, include_directories : include_directories('.'))
 
@@ -58,6 +69,13 @@ executable('formattest', 'formattest.cpp', dependencies : [framegen_dep, vulkan]
 
 blend_bench = shader_gen.process('blendbench.comp')   # test only: the naive blend the benchmark compares against
 executable('blurtest', 'blurtest.cpp', blend_bench, dependencies : [framegen_dep, vulkan])
+
+# MotionVersion::Learned against ml-fg's test vectors (export/<run>/testvec, read from $MLFG_EXPORT, default the ml-fg checkout's
+# export/; not copied into this repo) and its duplicate-frame skip. Needs libpng for the vectors' PNGs.
+png = dependency('libpng', required : false)
+if png.found()
+  executable('mltest', 'mltest.cpp', dependencies : [framegen_dep, vulkan, png])
+endif
 
 # CPU-only: frame-generation pacing (pacing.h) and the motion-blur window. No GPU, no Vulkan.
 pacingtest = executable('pacingtest', 'pacingtest.cpp')

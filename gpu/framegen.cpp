@@ -43,6 +43,18 @@
 #include "v2_enclose_spv.h"
 #include "v2_morph_s_spv.h"
 #include "v2_qmorph_s_spv.h"
+// MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
+// generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) has format variants (probed per format below).
+#if __has_include("ml_conv_spv.h") && __has_include("ml_weights.h")
+#define FG_HAVE_ML 1
+#include "ml_dup_spv.h"
+#include "ml_reduce_spv.h"
+#include "ml_pyr_spv.h"
+#include "ml_match_spv.h"
+#include "ml_conv_spv.h"
+#include "ml_out_spv.h"
+#include "ml_weights.h"
+#endif
 
 // The colour shaders of the formats other than Rgba8 (shaders/format.glsl), when built.
 // rgb10: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
@@ -70,6 +82,11 @@
 #include "v2_qmorph_rgb10_spv.h"
 #include "v2_qmorph_s_rgb10_spv.h"
 #endif
+// ... and MotionVersion::Learned's duplicate test of rgb10 (probed on its own, like V2's synthesis)
+#if __has_include("ml_dup_rgb10_spv.h") && defined(FG_HAVE_RGB10) && defined(FG_HAVE_ML)
+#define FG_HAVE_ML_RGB10 1
+#include "ml_dup_rgb10_spv.h"
+#endif
 // f16: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_f16_spv.h")
 #define FG_HAVE_F16 1
@@ -94,6 +111,10 @@
 #include "v2_morph_s_f16_spv.h"
 #include "v2_qmorph_f16_spv.h"
 #include "v2_qmorph_s_f16_spv.h"
+#endif
+#if __has_include("ml_dup_f16_spv.h") && defined(FG_HAVE_F16) && defined(FG_HAVE_ML)
+#define FG_HAVE_ML_F16 1
+#include "ml_dup_f16_spv.h"
 #endif
 // nv12: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_nv12_spv.h")
@@ -122,6 +143,10 @@
 #include "v2_qmorph_nv12_spv.h"
 #include "v2_qmorph_s_nv12_spv.h"
 #endif
+#if __has_include("ml_dup_nv12_spv.h") && defined(FG_HAVE_NV12) && defined(FG_HAVE_ML)
+#define FG_HAVE_ML_NV12 1
+#include "ml_dup_nv12_spv.h"
+#endif
 // p010: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_p010_spv.h")
 #define FG_HAVE_P010 1
@@ -149,6 +174,10 @@
 #include "v2_qmorph_p010_spv.h"
 #include "v2_qmorph_s_p010_spv.h"
 #endif
+#if __has_include("ml_dup_p010_spv.h") && defined(FG_HAVE_P010) && defined(FG_HAVE_ML)
+#define FG_HAVE_ML_P010 1
+#include "ml_dup_p010_spv.h"
+#endif
 
 namespace framegen {
 
@@ -171,20 +200,29 @@ struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
 struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill,
-    v2Morph, v2MorphS, v2QMorph, v2QMorphS; };
+    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup; };
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
     SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
     SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f), Spv{}, Spv{}, Spv{}, Spv{}}
 #define V2_SET(c, f) (c.v2Morph = SPV(v2_morph##f), c.v2MorphS = SPV(v2_morph_s##f), c.v2QMorph = SPV(v2_qmorph##f), c.v2QMorphS = SPV(v2_qmorph_s##f))
+#define ML_SET(c, f) (c.mlDup = SPV(ml_dup##f))
 // false = this format's variants were not built into the library (meson option `formats`)
 bool colourSpv(Format f, ColourSpv& c) {
     switch (f) {
-    case Format::Rgba8: c = COLOUR_SET(); V2_SET(c, ); return true;
+    case Format::Rgba8:
+        c = COLOUR_SET(); V2_SET(c, );
+#ifdef FG_HAVE_ML
+        ML_SET(c, );
+#endif
+        return true;
 #ifdef FG_HAVE_RGB10
     case Format::Rgb10:
         c = COLOUR_SET(_rgb10);
 #ifdef FG_HAVE_V2_RGB10
         V2_SET(c, _rgb10);
+#endif
+#ifdef FG_HAVE_ML_RGB10
+        ML_SET(c, _rgb10);
 #endif
         return true;
 #endif
@@ -194,6 +232,9 @@ bool colourSpv(Format f, ColourSpv& c) {
 #ifdef FG_HAVE_V2_F16
         V2_SET(c, _f16);
 #endif
+#ifdef FG_HAVE_ML_F16
+        ML_SET(c, _f16);
+#endif
         return true;
 #endif
 #ifdef FG_HAVE_NV12
@@ -201,6 +242,9 @@ bool colourSpv(Format f, ColourSpv& c) {
         c = COLOUR_SET(_nv12); c.uiInpaintC = SPV(ui_inpaint_chroma_nv12); c.uiPatchC = SPV(ui_patch_chroma_nv12);
 #ifdef FG_HAVE_V2_NV12
         V2_SET(c, _nv12);
+#endif
+#ifdef FG_HAVE_ML_NV12
+        ML_SET(c, _nv12);
 #endif
         return true;
 #endif
@@ -210,6 +254,9 @@ bool colourSpv(Format f, ColourSpv& c) {
 #ifdef FG_HAVE_V2_P010
         V2_SET(c, _p010);
 #endif
+#ifdef FG_HAVE_ML_P010
+        ML_SET(c, _p010);
+#endif
         return true;
 #endif
     default: return false;
@@ -217,6 +264,17 @@ bool colourSpv(Format f, ColourSpv& c) {
 }
 inline bool isYuv(Format f) { return f == Format::Nv12 || f == Format::P010; }
 const char* const kV2NotBuilt = "the MotionVersion::V2 shader variants of this format (v2_morph, v2_morph_s, v2_qmorph, v2_qmorph_s) are not built into the library";
+const char* const kMlNotBuilt = "the MotionVersion::Learned shaders of this format (ml_dup, ml_reduce, ml_pyr, ml_match, ml_conv, ml_out) or its weights (ml_weights.h, gpu/ml/embed_weights.py) are not built into the library";
+const char* const kMlFlowScale = "MotionVersion::Learned needs flowScale 2 (its nets were trained at 2)";
+#ifdef FG_HAVE_ML
+// The embedded nets, in LearnedNet order (gpu/ml/embed_weights.py): weights in shaders/ml_conv.comp's layout, the table of each
+// (level, layer)'s weight / bias offsets (vec4 units, relative to the net's start in the weights buffer)
+struct MlNet { const uint32_t* w; size_t words; uint32_t width; const uint32_t (*table)[5][2]; };
+const MlNet kMlNet[2] = {{kMlWeights_e2v3, sizeof(kMlWeights_e2v3) / 4, kMlWidth_e2v3, kMlTable_e2v3},
+                         {kMlWeights_e1v3, sizeof(kMlWeights_e1v3) / 4, kMlWidth_e1v3, kMlTable_e1v3}};
+static_assert(kMlWidth_e2v3 == 24 && kMlWidth_e1v3 == 12, "mlWidth()");
+static_assert(sizeof(kMlWeights_e2v3) % 16 == 0, "the second net starts on a vec4");
+#endif
 // the view / clean-copy formats of a Format: the library's own clean copies are in the source's own format, in logical channel order
 VkFormat cleanFormat(Format f) {
     switch (f) {
@@ -239,7 +297,7 @@ VkFormat cleanFormatC(Format f) { return f == Format::P010 ? VK_FORMAT_R16G16_UN
     X(DestroyQueryPool) X(GetQueryPoolResults) X(CmdBindPipeline) X(CmdBindDescriptorSets) \
     X(CmdPushConstants) X(CmdDispatch) X(CmdPipelineBarrier) X(CmdFillBuffer) X(CmdResetQueryPool) \
     X(CmdWriteTimestamp) X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(BindImageMemory) \
-    X(CreateImageView) X(DestroyImageView) X(CmdCopyBuffer)
+    X(CreateImageView) X(DestroyImageView) X(CmdCopyBuffer) X(CmdUpdateBuffer)
 
 // Must match the push-constant block in shaders/motion_v1.glsl.
 struct PC {
@@ -259,6 +317,23 @@ struct V2PC {
     float t[16];
 };
 static_assert(sizeof(V2PC) == sizeof(PC), "V2PC is pushed over PC's range");
+// Must match the push-constant block in shaders/ml_common.glsl (MotionVersion::Learned's passes). Pushed over the same range of the
+// same pipeline layout as PC.
+struct MLPC {
+    int32_t W, H, fw, fh, pw, ph, lvl, actIn, actOut, wOff, bOff, nPart, offYa, offYc, bw, bh, pf, mode;
+    float dupDiff;
+    int32_t pad_[13];
+};
+static_assert(sizeof(MLPC) == sizeof(PC), "MLPC is pushed over PC's range");
+// MotionVersion::Learned's duplicate test: FGR's own, proto/harness.py DUP_DIFF (and gpu/compare.py): a pair whose mean over the
+// pixels of the channel-mean |a - c| is at most this many 8-bit levels is a duplicate ("re-encoded duplicate frames differ by up to
+// ~0.5"). The net is skipped there and the field is zero (shaders/ml_dup.comp).
+static const float kMlDupDiff = 0.6f;
+static const int kMlLevels = 5, kMlLayers = 5;   // == ML_LEVELS in ml_common.glsl; layers per level (4 hidden + the linear one)
+// A level of fewer 16x16 tiles than this runs its convs split, one output group per workgroup (shaders/ml_conv.comp GOT): on the RX
+// 7900 XTX a whole-pixel workgroup of e2v3 takes ~15 us however small the level, so the coarse levels cost latency, not work.
+static const uint32_t kMlSplitTiles = 256;
+
 // V2 Performance's field clean-up (v2_clean.comp): sigma of the bilateral smoothing's range weight, in flow pixels of half-vector
 // (1 flow px of half-vector = 2 * flowScale px of motion between the real frames).
 static const float kV2CleanSigma = 1.0f;
@@ -307,8 +382,19 @@ struct UiEntry {
 };
 
 // P_V2_*: MotionVersion::V2's own passes (empty in V1's group; V2's group leaves V1's P_MEDHIST / P_SEARCH / P_SUBPIX empty instead).
+// P_ML_*: MotionVersion::Learned's (its group has V1's luma and synthesis, none of V1's search); the convs are one pipeline per layer
+// shape (first / hidden / last) and net (LearnedNet), shaders/ml_conv.comp specialised.
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
-            P_V2_MEDHIST, P_V2_SEARCH, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S, P_COUNT };
+            P_V2_MEDHIST, P_V2_SEARCH, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
+            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2, P_COUNT = P_ML_CONV + 20 };
+static const int kMlNets = 2;   // LearnedNet::E2v3, E1v3
+// The match and conv pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF); convs per
+// net and shape (0 = first, 14 -> w; 1 = hidden, w -> w; 2 = last, w -> 2) and, but the last, whole or split (one output group per
+// workgroup: the small levels)
+inline Pipe mlMatchPipe(bool half) { return (Pipe)(P_ML_MATCH + half); }
+inline Pipe mlConvPipe(bool half, int net, int shape, bool split) {
+    return (Pipe)(P_ML_CONV + 10 * half + 5 * net + (shape == 2 ? 4 : 2 * shape + split));
+}
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 
@@ -320,10 +406,16 @@ struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 // (P_V2_REPICK / CLEAN); Performance morphs with it in one pass (P_V2_MORPH), Quality derives its per-pixel field and coverage
 // (P_V2_QFIELD / QOWN / QCOV, shaders/v2_quality.glsl) and morphs with those (P_V2_QMORPH). Its buffers (`bufs`, created by
 // motionSized()) are its own. No motion-blur pipelines: both morphs average the blur's sub-frames themselves.
-static const int kMotionVersions = 2;   // MotionVersion::V1, V2
+// Learned: V1's luma, synthesis and motion-blur pipelines plus its own (P_ML_*); its buffers (MLB_*) are the net's state and
+// activations (sized for the selected net, grown when a wider one is selected); the weights of both nets (Impl::mlWeights) are
+// size-independent and created with the pipelines.
+static const int kMotionVersions = 3;   // MotionVersion::V1, V2, Learned
 // MotionGroup::bufs of V2: binding 13 (vec2): the cleaned block field, the fitted finest field (bw x bh each), Quality's per-pixel
 // field (fw x fh); binding 14 (uint): Quality's claims, own claims and coverage (4 x fw x fh, shaders/v2_quality.glsl)
 enum { V2B_FIELD, V2B_QUAL, V2B_COUNT };
+// MotionGroup::bufs of Learned: binding 13 (float): the pyramid, the field of every level, the partial sums; binding 14 (vec4): the
+// activations, two regions (shaders/ml_common.glsl)
+enum { MLB_STATE, MLB_ACT, MLB_COUNT };
 struct MotionGroup {
     VkPipeline pipes[P_COUNT]{};
     VkPipeline blurPipes[B_COUNT_]{};
@@ -375,6 +467,34 @@ static SizeLayout sizeLayout(uint32_t W, uint32_t H, uint32_t flowScale) {
     L.fieldEntries = fieldOff;
     return L;
 }
+// MotionVersion::Learned's layout of a size (shaders/ml_common.glsl): the net's padded level 0 (fw, fh rounded up to a multiple of
+// 16), the sum S of its 5 level sizes, the partial sums of its two reductions, and per net the activation regions: R0 holds the
+// 14-channel input (4 groups) and two hidden layers (width / 4 groups each), R1 the other two.
+inline int mlWidth(LearnedNet n) { return n == LearnedNet::E1v3 ? 12 : 24; }
+struct MlLayout {
+    int pw = 0, ph = 0, n0 = 0, S = 0, nDup = 0, nOut = 0;
+    VkDeviceSize stateBytes = 0;
+    int g = 0, r0 = 0, groups = 0;   // the net's groups per hidden layer, R0's groups, R0 + R1
+    VkDeviceSize elem = 0, actBytes = 0;   // bytes per group of 4 channels (16 float32, 8 half), the activations
+};
+static MlLayout mlLayout(uint32_t W, uint32_t H, int fw, int fh, const Settings& s) {
+    const LearnedNet net = s.learnedNet;
+    MlLayout L;
+    L.pw = (fw + 15) & ~15;
+    L.ph = (fh + 15) & ~15;
+    L.n0 = L.pw * L.ph;
+    for (int l = 0; l < kMlLevels; l++) L.S += (L.pw >> l) * (L.ph >> l);
+    L.nDup = (int)(((W + 31) / 32) * ((H + 31) / 32));   // ml_dup.comp: 32x32 pixels per workgroup
+    L.nOut = ((fw + 15) / 16) * ((fh + 15) / 16);       // ml_out.comp: 16x16 flow pixels per workgroup
+    L.stateBytes = ((VkDeviceSize)4 * L.S + std::max(L.nDup, L.nOut)) * 4;
+    L.g = mlWidth(net) / 4;
+    L.r0 = std::max(4, L.g);
+    L.groups = L.r0 + L.g;
+    L.elem = s.learnedHalf ? 8 : 16;
+    L.actBytes = (VkDeviceSize)L.groups * L.n0 * L.elem;
+    return L;
+}
+
 // Null if a W x H frame fits the device under these settings (the selected motion version's buffers and dispatches), else why not.
 // Below kMinSize the flow resolution degenerates (W or H = 1 -> size-0 buffers). The largest buffers grow with W * H / flowScale^2
 // (V2 Quality's claims and coverage, V1's motion-blur field scratch), the widest dispatch with W / 8 (and V2's static-mask cells).
@@ -389,8 +509,13 @@ static const char* sizeLimitError(uint32_t W, uint32_t H, const Settings& s, con
     if (s.motionVersion == MotionVersion::V2) {
         big = std::max({big, ((uint64_t)L.lv[0].bw * L.lv[0].bh * 2 + fwh) * 8, (fwh * 5 + 3 * cells) * 4});
         gx = std::max(gx, (cells + 7) / 8);   // v2_enclose.comp: 8 cells per workgroup, one row of workgroups
-    } else if (s.blurSamples >= 2) {   // recordSynthBlur's scratch (grown by the first blurred record)
-        big = std::max({big, (uint64_t)s.blurSamples * fwh * 8, (uint64_t)s.blurSamples * ((W + 3) / 4) * (uint64_t)H * 4});
+    } else {
+        if (s.motionVersion == MotionVersion::Learned) {   // the net's state and activations (its dispatches are narrower than W / 8)
+            const MlLayout M = mlLayout(W, H, L.fw, L.fh, s);
+            big = std::max({big, (uint64_t)M.stateBytes, (uint64_t)M.actBytes});
+        }
+        if (s.blurSamples >= 2)   // recordSynthBlur's scratch (grown by the first blurred record)
+            big = std::max({big, (uint64_t)s.blurSamples * fwh * 8, (uint64_t)s.blurSamples * ((W + 3) / 4) * (uint64_t)H * 4});
     }
     if (big > lim.sbRange) return "a buffer of this frame size exceeds the device's maxStorageBufferRange (a larger flowScale needs less)";
     if (gx > lim.wg[0] || gy > lim.wg[1]) return "a dispatch of this frame size exceeds the device's maxComputeWorkGroupCount (a larger flowScale needs fewer)";
@@ -459,6 +584,18 @@ struct Interpolator::Impl {
     bool v2NeedCov() const { return mv2() && set.v2Mode == V2Mode::Quality && !v2Cov; }   // the tail still has to splat (reset the claims first)
     void v2ResetClaims(VkCommandBuffer cb);
     void v2Tail(VkCommandBuffer cb);
+    // MotionVersion::Learned: both nets' weights (binding 15; created with the version's pipelines, uploaded by its first estimate:
+    // mlWeightsUp), the activation buffer's size (it grows for a wider net or float32 storage, the old one waits in mlGrave until the
+    // size is freed), and the test hooks (setDebugLearned)
+    UiBuf mlWeights;
+    bool mlWeightsUp = false;
+    VkDeviceSize mlActBytes = 0;
+    std::vector<UiBuf> mlGrave;
+    LearnedDebug mlDbg{};
+    bool mlearned() const { return set.motionVersion == MotionVersion::Learned; }
+    bool mlSized();
+    void mlUpload(VkCommandBuffer cb);
+    void mlEstimate(VkCommandBuffer cb);
     bool v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Frame curr, Frame out, const float* ts, int n, bool gauss);
 
     // size dependent
@@ -594,6 +731,9 @@ void Interpolator::Impl::destroySizeDependent() {
         for (UiBuf& b : g.bufs) freeBuf(b);
         g.bufs.clear();
     }
+    for (UiBuf& b : mlGrave) freeBuf(b);
+    mlGrave.clear();
+    mlActBytes = 0;
     freeBuf(blurField);
     freeBuf(blurErr);
     for (UiBuf& b : blurGrave) freeBuf(b);
@@ -996,6 +1136,7 @@ bool Interpolator::init(const InitInfo& ii) {
     if (const char* e = sizeLimitError(ii.width, ii.height, ii.settings, lim)) { err_ = e; return false; }
     if (ii.settings.motionVersion == MotionVersion::V2 && v2Why) { err_ = v2Why; return false; }
     if (ii.settings.motionVersion == MotionVersion::V2 && !cs.v2Morph.code) { err_ = kV2NotBuilt; return false; }
+    if (ii.settings.motionVersion == MotionVersion::Learned && !cs.mlDup.code) { err_ = kMlNotBuilt; return false; }
     if (fmt == Format::RgbaF16 && ii.transfer == Transfer::Linear && !(ii.linearWhiteNits > 0.0f && ii.linearWhiteNits <= 10000.0f)) {
         err_ = "linearWhiteNits must be in (0, 10000]";
         return false;
@@ -1032,9 +1173,10 @@ bool Interpolator::init(const InitInfo& ii) {
     // bindings 0-2 buffers, 3-4 prev/curr, 5 out; 6-7: motion-blur scratch (only the blur passes use them);
     // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out; 11-12 (synth sets): the V2 masks of prev / curr (ui_reject.glsl);
     // 13: MotionVersion::V2's cleaned block field, 14: V2 Quality's claims and coverage (written only to V2's sets,
-    // shaders/v2_motion.glsl, v2_quality.glsl)
+    // shaders/v2_motion.glsl, v2_quality.glsl); MotionVersion::Learned's sets: 13 the net's state, 14 its activations, 15 its weights
+    // (shaders/ml_common.glsl)
     uint32_t nb = m->yuv ? 11 : 8;
-    VkDescriptorSetLayoutBinding b[15]{};
+    VkDescriptorSetLayoutBinding b[16]{};
     VkDescriptorType types[11] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -1048,7 +1190,7 @@ bool Interpolator::init(const InitInfo& ii) {
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         if (i == 3 || i == 4 || i == 8 || i == 9) b[i].pImmutableSamplers = &m->sampler;
     }
-    for (uint32_t k = 11; k <= 14; k++, nb++) {
+    for (uint32_t k = 11; k <= 15; k++, nb++) {
         b[nb].binding = k;
         b[nb].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         b[nb].descriptorCount = 1;
@@ -1235,8 +1377,8 @@ bool Interpolator::validate(const Settings& s) {
            in(s.sceneCutSad, 0.0f, 255.0f) && s.sceneCutSad > 0.0f &&
            in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) &&
-           (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V2 &&
-           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance &&
+           (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::Learned &&
+           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.learnedNet <= (uint32_t)LearnedNet::E1v3 &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
            in(s.uiBoxHeightFrac, 0.0f, 1.0f) &&
@@ -1251,7 +1393,8 @@ bool Interpolator::validate(const Settings& s) {
 
 const char* Interpolator::settingsError(const Settings& s, Format f) {
     if (!validate(s)) return "invalid settings: a field is out of range or not finite (see Interpolator::validate)";
-    (void)f;   // (no Format rule today: both motion versions run every Format)
+    if (s.motionVersion == MotionVersion::Learned && s.flowScale != 2) return kMlFlowScale;
+    (void)f;   // (no Format rule today: every motion version runs every Format)
     return nullptr;
 }
 
@@ -1259,6 +1402,7 @@ const char* Interpolator::settingsError(const Settings& s) const {
     if (const char* e = settingsError(s, m ? m->fmt : Format::Rgba8)) return e;
     if (m && s.motionVersion == MotionVersion::V2 && m->v2Why) return m->v2Why;
     if (m && s.motionVersion == MotionVersion::V2 && !m->cs.v2Morph.code) return kV2NotBuilt;
+    if (m && s.motionVersion == MotionVersion::Learned && !m->cs.mlDup.code) return kMlNotBuilt;
     return m && m->W ? sizeLimitError(m->W, m->H, s, m->lim) : nullptr;   // the held size under these settings
 }
 
@@ -1312,7 +1456,7 @@ void Interpolator::releaseUnusedMotion() {
 // False = a creation failed: what this call created is freed again and the caller refuses the settings.
 bool Interpolator::Impl::motionEnsure() {
     MotionGroup& g = mg();
-    if (g.live) return true;
+    if (g.live) return !W || !mlearned() || mlSized();   // (Learned: a wider net than before grows the activations)
     // V1: the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's,
     // as are the two colour passes of the blur. V2: both modes' pipelines (see MotionGroup), the format's luma and synthesis; empty
     // slots are skipped.
@@ -1337,6 +1481,43 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2_MORPH_S] = {cs.v2MorphS, spec};
         spv[P_V2_QMORPH_S] = {cs.v2QMorphS, spec};
     }
+    // Learned: V1's luma, synthesis and blur, its own passes instead of V1's search; the convs specialised per layer shape and net
+    // (shaders/ml_conv.comp: GI, GO, LINEAR), and the weights buffer
+    struct MlSpec { int32_t gi, go, linear, got, half; } mlSpec[2 * kMlNets * 5 + 2]{};
+    VkSpecializationMapEntry mlEnt[5] = {{20, 0, 4}, {21, 4, 4}, {22, 8, 4}, {23, 12, 4}, {24, 16, 4}};
+    VkSpecializationInfo mlSi[2 * kMlNets * 5 + 2]{};
+    if (mlearned()) {
+#ifdef FG_HAVE_ML
+        for (int i = P_DOWN; i <= P_PIXFIELD; i++) spv[i].sp = Spv{};
+        spv[P_ML_DUP] = {cs.mlDup, spec};   // (the duplicate test reads colour: the format's own variant)
+        spv[P_ML_REDUCE].sp = SPV(ml_reduce);
+        spv[P_ML_PYR].sp = SPV(ml_pyr);
+        spv[P_ML_OUT].sp = SPV(ml_out);
+        for (int half = 0; half < 2; half++) {
+            const int jm = 2 * kMlNets * 5 + half;
+            mlSpec[jm].half = half;
+            mlSi[jm] = {5, mlEnt, sizeof(MlSpec), &mlSpec[jm]};
+            spv[mlMatchPipe(half)] = {SPV(ml_match), &mlSi[jm]};
+            for (int net = 0; net < kMlNets; net++) {
+                const int gw = mlWidth((LearnedNet)net) / 4;
+                // 14 (padded to 16) -> w, w -> w (each whole and split), w -> 2 (padded to 4)
+                const MlSpec shapes[5] = {{4, gw, 0, gw, half}, {4, gw, 0, 1, half}, {gw, gw, 0, gw, half}, {gw, gw, 0, 1, half}, {gw, 1, 1, 1, half}};
+                for (int k = 0; k < 5; k++) {
+                    const int j = 10 * half + 5 * net + k;
+                    mlSpec[j] = shapes[k];
+                    mlSi[j] = {5, mlEnt, sizeof(MlSpec), &mlSpec[j]};
+                    spv[P_ML_CONV + j] = {SPV(ml_conv), &mlSi[j]};
+                }
+            }
+        }
+        size_t words = 0;
+        for (const MlNet& n : kMlNet) words += n.words;
+        if (!allocBuf(mlWeights, (VkDeviceSize)words * 4)) return false;
+        mlWeightsUp = false;
+#else
+        return false;   // (refused before: settingsError, kMlNotBuilt)
+#endif
+    }
     struct { Spv sp; const VkSpecializationInfo* sc; } bspv[B_COUNT_] = {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
     bool ok = true;
@@ -1352,6 +1533,7 @@ bool Interpolator::Impl::motionEnsure() {
 // The size-dependent buffers of one motion version, beside the shared buf[] (called while a size is held: by motionEnsure and
 // createSizeDependent; destroySizeDependent frees them). V1 has none of its own; V2: V2B_*.
 bool Interpolator::Impl::motionSized(MotionGroup& g) {
+    if (&g == &mo[(int)MotionVersion::Learned]) return mlSized();
     if (&g != &mo[(int)MotionVersion::V2] || !g.bufs.empty()) return true;
     g.bufs.resize(V2B_COUNT);
     // the cleaned field, then the search's fitted finest field (v2_est.glsl); recordDebugMaps copies the cleaned one
@@ -1363,11 +1545,61 @@ bool Interpolator::Impl::motionSized(MotionGroup& g) {
     return false;
 }
 
+// Learned's size-dependent buffers (MLB_*) for the selected net: the state once per size, the activations grown whenever the net needs
+// more groups than they hold (the outgrown buffer may still be in a pending record: mlGrave, freed with the size). False = an
+// allocation failed (what this call allocated is freed; an existing smaller activation buffer stays).
+bool Interpolator::Impl::mlSized() {
+    MotionGroup& g = mo[(int)MotionVersion::Learned];
+    const MlLayout L = mlLayout(W, H, fw, fh, set);
+    if (g.bufs.empty()) {
+        g.bufs.resize(MLB_COUNT);
+        mlActBytes = 0;
+        if (!allocBuf(g.bufs[MLB_STATE], L.stateBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) { g.bufs.clear(); return false; }
+    }
+    if (mlActBytes >= L.actBytes) return true;
+    UiBuf nb;
+    if (!allocBuf(nb, L.actBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+        if (!mlActBytes) { for (UiBuf& b : g.bufs) freeBuf(b); g.bufs.clear(); }
+        return false;
+    }
+    if (g.bufs[MLB_ACT].b) mlGrave.push_back(g.bufs[MLB_ACT]);
+    g.bufs[MLB_ACT] = nb;
+    mlActBytes = L.actBytes;
+    return true;
+}
+
+// Learned: the weights of both nets into mlWeights, once after it was created (CmdUpdateBuffer, at most 64 KiB per command).
+// Recorded between the barriers of a counter clear (Rec::clearCounters: a transfer write ordered after every earlier record and before
+// this one's passes). No-op unless pending.
+void Interpolator::Impl::mlUpload(VkCommandBuffer cb) {
+#ifdef FG_HAVE_ML
+    if (!mlWeights.b || mlWeightsUp) return;
+    VkDeviceSize off = 0;
+    for (const MlNet& n : kMlNet)
+        for (size_t w = 0; w < n.words; ) {
+            const size_t k = std::min<size_t>(n.words - w, 65536 / 4);
+            CmdUpdateBuffer(cb, mlWeights.b, off, k * 4, n.w + w);
+            w += k;
+            off += k * 4;
+        }
+    mlWeightsUp = true;
+#else
+    (void)cb;
+#endif
+}
+
 // Frees one motion version's resources (retire rule of resize()/destroy()).
 void Interpolator::Impl::motionFree(MotionGroup& g) {
     for (VkPipeline p : g.pipes) if (p) DestroyPipeline(info.device, p, nullptr);
     for (VkPipeline p : g.blurPipes) if (p) DestroyPipeline(info.device, p, nullptr);
     for (UiBuf& b : g.bufs) freeBuf(b);
+    if (&g == &mo[(int)MotionVersion::Learned]) {
+        freeBuf(mlWeights);
+        mlWeightsUp = false;
+        for (UiBuf& b : mlGrave) freeBuf(b);
+        mlGrave.clear();
+        mlActBytes = 0;
+    }
     g = MotionGroup{};
 }
 
@@ -1491,9 +1723,45 @@ bool Interpolator::recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSiz
     int blockIn = I.set.subpixel ? I.fieldSub : I.lv[0].fM;   // == pc.fIn of the pixel-field pass
     VkBufferCopy f[2] = {{(VkDeviceSize)blockIn * 8, dstOffset + L.blockOff, L.pixOff - L.blockOff},
                          {(VkDeviceSize)I.fieldPF * 8, dstOffset + L.pixOff, L.eOff - L.pixOff}};
-    I.CmdCopyBuffer(cb, I.buf[1], dst, 2, f);
+    if (I.mlearned()) I.CmdFillBuffer(cb, dst, dstOffset + L.blockOff, L.pixOff - L.blockOff, 0);   // Learned: no block field
+    I.CmdCopyBuffer(cb, I.buf[1], dst, I.mlearned() ? 1 : 2, I.mlearned() ? &f[1] : f);
     VkBufferCopy e{(VkDeviceSize)kEOff * 4, dstOffset + L.eOff, L.size - L.eOff};
     I.CmdCopyBuffer(cb, I.buf[2], dst, 1, &e);
+    return true;
+}
+
+void Interpolator::setDebugLearned(const LearnedDebug& d) {
+    if (m) m->mlDbg = d;
+}
+
+bool Interpolator::debugLearnedLayout(DebugLearnedLayout& l) const {
+    if (!m || !m->W || !m->mlearned() || m->mo[(int)MotionVersion::Learned].bufs.empty()) return false;
+    const Impl& I = *m;
+    const MlLayout L = mlLayout(I.W, I.H, I.fw, I.fh, I.set);
+    l.half = I.set.learnedHalf;
+    l.fw = (uint32_t)I.fw; l.fh = (uint32_t)I.fh; l.pw = (uint32_t)L.pw; l.ph = (uint32_t)L.ph; l.width = (uint32_t)mlWidth(I.set.learnedNet);
+    const VkDeviceSize st = 0;   // the state copy (shaders/ml_common.glsl), then the activations
+    VkDeviceSize o = 0;
+    for (int k = 0; k < kMlLevels; k++) { l.pyrOff[k] = st + o * 4; o += 2 * (VkDeviceSize)(L.pw >> k) * (L.ph >> k); }
+    for (int k = 0; k < kMlLevels; k++) { l.hOff[k] = st + o * 4; o += 2 * (VkDeviceSize)(L.pw >> k) * (L.ph >> k); }
+    l.actOff[0] = (st + L.stateBytes + 15) & ~(VkDeviceSize)15;
+    l.actOff[1] = l.actOff[0] + (VkDeviceSize)L.r0 * L.n0 * L.elem;
+    l.size = l.actOff[0] + L.actBytes;
+    return true;
+}
+
+bool Interpolator::recordDebugLearned(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset) {
+    DebugLearnedLayout L;
+    if (!debugLearnedLayout(L)) return false;
+    Impl& I = *m;
+    const MotionGroup& g = I.mo[(int)MotionVersion::Learned];
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    const MlLayout M = mlLayout(I.W, I.H, I.fw, I.fh, I.set);
+    VkBufferCopy sc{0, dstOffset + L.pyrOff[0], M.stateBytes};
+    I.CmdCopyBuffer(cb, g.bufs[MLB_STATE].b, dst, 1, &sc);
+    VkBufferCopy ac{0, dstOffset + L.actOff[0], M.actBytes};
+    I.CmdCopyBuffer(cb, g.bufs[MLB_ACT].b, dst, 1, &ac);
     return true;
 }
 
@@ -1512,7 +1780,11 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
     const MotionGroup& v2g = mo[(int)MotionVersion::V2];
     VkDescriptorBufferInfo vb = {v2g.bufs.empty() ? VK_NULL_HANDLE : v2g.bufs[V2B_FIELD].b, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo qb = {v2g.bufs.empty() ? VK_NULL_HANDLE : v2g.bufs[V2B_QUAL].b, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet wr[15]{};
+    const MotionGroup& mlg = mo[(int)MotionVersion::Learned];
+    VkDescriptorBufferInfo mb[3] = {{mlg.bufs.empty() ? VK_NULL_HANDLE : mlg.bufs[MLB_STATE].b, 0, VK_WHOLE_SIZE},
+                                    {mlg.bufs.empty() ? VK_NULL_HANDLE : mlg.bufs[MLB_ACT].b, 0, VK_WHOLE_SIZE},
+                                    {mlWeights.b, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wr[16]{};
     uint32_t n = 0;
     auto add = [&](uint32_t binding, VkDescriptorType t) -> VkWriteDescriptorSet& {
         VkWriteDescriptorSet& w = wr[n++];
@@ -1550,6 +1822,8 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
         add(13, BUF).pBufferInfo = &vb;
         add(14, BUF).pBufferInfo = &qb;
     }
+    if (mlearned() && mb[0].buffer && mb[1].buffer && mb[2].buffer)   // Learned's sets only
+        for (uint32_t i = 0; i < 3; i++) add(13 + i, BUF).pBufferInfo = &mb[i];
     UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
     return set;
 }
@@ -1591,6 +1865,7 @@ struct Rec {
         barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         I.CmdFillBuffer(cb, I.buf[2], 0, words * 4, 0);
         if (claims) I.v2ResetClaims(cb);
+        I.mlUpload(cb);   // (Learned: its weights, once)
         barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
         I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);
     }
@@ -2030,6 +2305,10 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);   // the fills bound the UI set
         r.stamp("ui_fill");
     }
+    if (I.mlearned()) {   // the learned estimator instead of V1's pyramid and search (V1's luma above, V1's synthesis after it)
+        I.mlEstimate(cb);
+        return true;
+    }
     // 2. pyramid
     for (size_t i = 1; i < I.lv.size(); i++) {
         const Level &s = I.lv[i - 1], &t = I.lv[i];
@@ -2111,6 +2390,80 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     r.cbar();
     r.stamp("pixel field");
     return true;
+}
+
+// MotionVersion::Learned's estimate after P_LUMA (and CrosshairV2's luma fill), with the estimate's set bound (shaders/ml_*.comp,
+// ml-fg export/SPEC.md stages 3-6): FGR's duplicate test (a duplicate skips the net: every pass exits at once, the field is zero),
+// the net's own pyramid, per level coarse -> fine the upsampled field + 14-channel input and the five convs (the last adds to the
+// field), then the cropped field into V1's per-pixel field (I.fieldPF) and the SAD into V1's scene-cut sum (u[U_SADSUM]).
+void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
+#ifdef FG_HAVE_ML
+    Rec r(*this, cb);
+    const MlLayout L = mlLayout(W, H, fw, fh, set);
+    const int net = (int)set.learnedNet;
+    const bool half = set.learnedHalf;
+    const uint32_t base = net == 0 ? 0u : (uint32_t)(kMlNet[0].words / 4);   // the net's start in mlWeights (vec4 units)
+    const int r1 = L.r0 * L.n0;                                             // activation region R1 (vec4 offset)
+    const Level& l0 = lv[0];
+    MLPC m{};
+    m.W = (int)W; m.H = (int)H; m.fw = fw; m.fh = fh; m.pw = L.pw; m.ph = L.ph;
+    m.offYa = l0.offA; m.offYc = l0.offC; m.bw = l0.bw; m.bh = l0.bh; m.pf = fieldPF; m.dupDiff = kMlDupDiff;
+    auto run = [&](Pipe p, uint32_t gx, uint32_t gy, uint32_t gz = 1) {
+        CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, mg().pipes[p]);
+        CmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MLPC), &m);
+        CmdDispatch(cb, gx, gy, gz);
+    };
+    auto stop = [&](int lvl, int step) { return mlDbg.stopLevel == lvl && mlDbg.stopStep == step; };
+    if (mlDbg.lumaSrc) {   // test only (setDebugLearned): the reference's flow-res lumas over P_LUMA's
+        r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkDeviceSize n = (VkDeviceSize)fw * fh * 4;
+        VkBufferCopy c[2] = {{0, (VkDeviceSize)l0.offA * 4, n}, {n, (VkDeviceSize)l0.offC * 4, n}};
+        CmdCopyBuffer(cb, mlDbg.lumaSrc, buf[0], 2, c);
+        r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
+    }
+    // the duplicate test (full res) and its decision, then the pyramid
+    m.nPart = L.nDup;
+    run(P_ML_DUP, divUp((int)W, 32), divUp((int)H, 32));
+    r.cbar();
+    m.mode = 0;
+    run(P_ML_REDUCE, 1, 1);
+    r.cbar();
+    r.stamp("duplicate test");
+    run(P_ML_PYR, (uint32_t)L.pw / 16, (uint32_t)L.ph / 16);
+    r.cbar();
+    r.stamp("net pyramid");
+    static const char* lvNames[kMlLevels] = {"net level 0", "net level 1", "net level 2", "net level 3", "net level 4"};
+    for (int lvl = kMlLevels - 1; lvl >= 0; lvl--) {
+        const uint32_t gx = divUp(L.pw >> lvl, 16), gy = divUp(L.ph >> lvl, 16);
+        const bool split = gx * gy < kMlSplitTiles;   // a small level: one output group per workgroup (ml_conv.comp)
+        m.lvl = lvl;
+        m.actOut = 0;   // the 14-channel input -> R0
+        run(mlMatchPipe(half), gx, gy);
+        r.cbar();
+        if (stop(lvl, 0)) return;
+        for (int k = 0; k < kMlLayers; k++) {   // R0 -> R1 -> R0 -> R1 -> R0 -> the field
+            m.wOff = (int)(base + kMlNet[net].table[lvl][k][0]);
+            m.bOff = (int)(base + kMlNet[net].table[lvl][k][1]);
+            m.actIn = k % 2 ? r1 : 0;
+            m.actOut = k % 2 ? 0 : r1;
+            const int shape = k == 0 ? 0 : k == kMlLayers - 1 ? 2 : 1;
+            run(mlConvPipe(half, net, shape, split), gx, gy, shape == 2 || !split ? 1 : (uint32_t)L.g);
+            r.cbar();
+            if (stop(lvl, k + 1)) return;
+        }
+        r.stamp(lvNames[lvl]);
+    }
+    // the field V1's synthesis reads, and the scene-cut sum
+    m.nPart = L.nOut;
+    run(P_ML_OUT, divUp(fw, 16), divUp(fh, 16));
+    r.cbar();
+    m.mode = 1;
+    run(P_ML_REDUCE, 1, 1);
+    r.cbar();
+    r.stamp("net output");
+#else
+    (void)cb;
+#endif
 }
 
 // V2 Quality's claims (shaders/v2_quality.glsl: prev's and curr's, 2 x fw x fh words) -> 0xFFFFFFFF, "unclaimed", before its splat.
