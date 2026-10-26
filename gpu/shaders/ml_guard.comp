@@ -1,0 +1,143 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::Learned with Settings::learnedStaticGuard (opt-in, off by default): ml-fg's static guard (scripts/static_guard.py,
+// authoritative; superdoc/features/static-guard.md), a pass over the FINISHED generated frame (after resolve.comp / blur_resolve.comp
+// and the whole-frame fallback, before the UI paste-back): where the two real frames are locally identical and the motion there is
+// small, the output pixel becomes the plain time mix (1 - t) A + t C instead of the warped blend. Per output pixel p (16x16 per
+// workgroup; A, C = the frames the synthesis read, i.e. the clean copies under Crosshair / WholeScreen protection):
+//   s(p)       = max over the channels of |A(p) - C(p)|               (levels; other formats: the mismatch metric's, below)
+//   d          = 3x3 mean of s, dMin = min of s over (2 halo + 1)^2     (both replicate border: taps at the clamped position)
+//   motion(p)  = motionK * |g| bilinearly resized to full res (cv2.resize INTER_LINEAR of the flow-res magnitudes), g = the field
+//                on the grid of t (interp.field_at), motionK = 2 max(t, 1 - t) * flowScale: full-res px of the larger warp side
+//   gate       = 1 - smoothstep(motionLo, motionHi, motion)
+//   wLocal     = (1 - smoothstep(lo, hi, d)) * (1 - smoothstep(haloLo, haloHi, d) * (1 - gate))
+//   wHalo      = 1 - smoothstep(haloLo, haloHi, dMin)
+//   w          = max(wLocal, wHalo) * gate
+//   out        = out where w <= wMin (bit-exact), else round(out (1 - w) + ((1 - t) A + t C) w)
+// smoothstep(lo, hi, x) = x' x' (3 - 2 x'), x' = clamp((x - lo) / max(hi - lo, 1e-6), 0, 1) (static_guard.py's). The constants come
+// from the push constants (framegen.cpp kStaticGuard, the one place they are defined). A pair whose synthesis took a whole-frame
+// fallback (scene cut, more than globalFallback untrusted: fallback.comp's tests on the same counters) is left untouched.
+// Formats: the frames are mixed in their own space as resolve.comp blends them (Rgba8 / Rgb10 in 8-bit levels, RgbaF16 in its
+// values, Nv12 / P010 per plane in levels, the CbCr texel of each 2x2 block with the weight of its even-even pixel); s is the max
+// channel of the mismatch metric's difference (format.glsl FG_DIFF: 10-bit codes / 4, PQ codes for linear floats, YCbCr differences
+// as R'G'B' levels: ml_dup.comp's convention), so the thresholds are 8-bit levels in every format.
+// It reads the generated frame back, so it declares the bindings itself (common.glsl's output image is writeonly).
+#include "format.glsl"
+
+layout(set = 0, binding = 1, std430) restrict readonly buffer FieldBuf { vec2 field[]; };
+layout(set = 0, binding = 2, std430) restrict readonly buffer UBuf { uint u[]; };
+layout(set = 0, binding = 3) uniform sampler2D texPrev;
+layout(set = 0, binding = 4) uniform sampler2D texCurr;
+layout(set = 0, binding = 5, FG_FMT) uniform restrict image2D outImg;
+#ifdef FG_YUV
+layout(set = 0, binding = 8) uniform sampler2D texPrevC;
+layout(set = 0, binding = 9) uniform sampler2D texCurrC;
+layout(set = 0, binding = 10, FG_FMTC) uniform restrict image2D outImgC;
+#endif
+
+// framegen.cpp GuardPC mirrors this block (pushed over PC's range of the same pipeline layout)
+layout(push_constant) uniform GPC {
+    int W, H, fw, fh;
+    int pf;            // field[] offset of the field on the grid of t (recordSynth: fieldPF at t = 0.5, else fieldT; blur: fieldPF)
+    int bw, bh;        // the finest block grid (the scene-cut mean, as fallback.comp)
+    int cnt0, nCnt;    // the untrusted counts u[cnt0 .. cnt0 + nCnt) (recordSynth: u[0]; blur: its interior samples)
+    int halo;          // dMin's radius, 1..GUARD_HALO_MAX
+    float wA, wC;      // the time mix (1 - t, t), float32 as resolve.comp's
+    float motionK;     // 2 max(t, 1 - t) * flowScale (blur: the largest over its samples)
+    float cutSad, globalFrac;
+    float lo, hi, haloLo, haloHi, motionLo, motionHi, wMin;
+} pc;
+
+const int TS = 16, GUARD_HALO_MAX = 8, TT = TS + 2 * GUARD_HALO_MAX;   // == framegen.cpp kGuardHaloMax
+shared float ss[TT * TT];   // s of the tile + its apron (R = max(halo, 1) px), at the clamped positions
+shared float hm[TT * TS];   // horizontal (2 halo + 1)-mins
+shared float hb[TT * TS];   // horizontal 3-sums
+layout(local_size_x = 16, local_size_y = 16) in;
+
+float sAt(ivec2 p) {
+#if defined(FG_YUV)
+    vec3 a = vec3(texelFetch(texPrev, p, 0).r, texelFetch(texPrevC, p >> 1, 0).rg) * YU_SCALE;
+    vec3 c = vec3(texelFetch(texCurr, p, 0).r, texelFetch(texCurrC, p >> 1, 0).rg) * YU_SCALE;
+    vec3 d = FG_DIFF(a, c);
+#else
+    vec3 d = FG_DIFF(FG_FETCH(texelFetch(texPrev, p, 0).rgb), FG_FETCH(texelFetch(texCurr, p, 0).rgb));
+#endif
+    return max(d.r, max(d.g, d.b));
+}
+
+float ramp(float lo, float hi, float x) {   // static_guard.py smoothstep()
+    float y = clamp((x - lo) / max(hi - lo, 1e-6), 0.0, 1.0);
+    return y * y * (3.0 - 2.0 * y);
+}
+
+float magAt(int x, int y) { vec2 g = field[pc.pf + y * pc.fw + x]; return length(g); }
+
+// cv2.resize(INTER_LINEAR) of the flow-res magnitudes to W x H at p: source x = (p + 0.5) fw / W - 0.5, clamped to the edge
+float motionAt(ivec2 p) {
+    vec2 s = (vec2(p) + 0.5) * (vec2(pc.fw, pc.fh) / vec2(pc.W, pc.H)) - 0.5;
+    vec2 fl = floor(s);
+    ivec2 i0 = ivec2(fl);
+    vec2 f = s - fl;
+    if (i0.x < 0) { i0.x = 0; f.x = 0.0; }
+    if (i0.y < 0) { i0.y = 0; f.y = 0.0; }
+    if (i0.x >= pc.fw - 1) { i0.x = pc.fw - 1; f.x = 0.0; }
+    if (i0.y >= pc.fh - 1) { i0.y = pc.fh - 1; f.y = 0.0; }
+    ivec2 i1 = min(i0 + 1, ivec2(pc.fw - 1, pc.fh - 1));
+    float m0 = magAt(i0.x, i0.y) * (1.0 - f.x) + magAt(i1.x, i0.y) * f.x;
+    float m1 = magAt(i0.x, i1.y) * (1.0 - f.x) + magAt(i1.x, i1.y) * f.x;
+    return pc.motionK * (m0 * (1.0 - f.y) + m1 * f.y);
+}
+
+void main() {
+    // the whole-frame fallbacks (uniform): fallback.comp's / blur_resolve.comp's tests on the same counters
+    float meanSad = float(u[1]) * (1.0 / 256.0) / float(pc.bw * pc.bh);   // U_SADSUM
+    if (meanSad > pc.cutSad) return;
+    float untrustedLimit = pc.globalFrac * float(pc.W) * float(pc.H);
+    for (int k = 0; k < pc.nCnt; k++)
+        if (float(u[pc.cnt0 + k]) > untrustedLimit) return;
+
+    int lid = int(gl_LocalInvocationIndex);
+    int R = max(pc.halo, 1), n = TS + 2 * R;
+    ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS - R;
+    ivec2 hiP = ivec2(pc.W - 1, pc.H - 1);
+    for (int i = lid; i < n * n; i += TS * TS) ss[i] = sAt(clamp(t0 + ivec2(i % n, i / n), ivec2(0), hiP));
+    barrier();
+    for (int i = lid; i < n * TS; i += TS * TS) {   // per apron row: the (2 halo + 1)-min and the 3-sum around each column
+        int r = i / TS, c = i % TS + R;
+        float m = ss[r * n + c];
+        for (int k = 1; k <= pc.halo; k++) m = min(m, min(ss[r * n + c - k], ss[r * n + c + k]));
+        hm[i] = m;
+        hb[i] = (ss[r * n + c - 1] + ss[r * n + c]) + ss[r * n + c + 1];
+    }
+    barrier();
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.W || p.y >= pc.H) return;
+    int r = l.y + R;
+    float dMin = hm[r * TS + l.x];
+    for (int k = 1; k <= pc.halo; k++) dMin = min(dMin, min(hm[(r - k) * TS + l.x], hm[(r + k) * TS + l.x]));
+    float d = ((hb[(r - 1) * TS + l.x] + hb[r * TS + l.x]) + hb[(r + 1) * TS + l.x]) * (1.0 / 9.0);
+    float gate = 1.0 - ramp(pc.motionLo, pc.motionHi, motionAt(p));
+    float wLocal = (1.0 - ramp(pc.lo, pc.hi, d)) * (1.0 - ramp(pc.haloLo, pc.haloHi, d) * (1.0 - gate));
+    float wHalo = 1.0 - ramp(pc.haloLo, pc.haloHi, dMin);
+    float w = max(wLocal, wHalo) * gate;
+    if (w <= pc.wMin) return;   // below this the pixel is left bit-exact
+#ifdef FG_YUV
+    float ay = texelFetch(texPrev, p, 0).r * YU_SCALE, cy = texelFetch(texCurr, p, 0).r * YU_SCALE;
+    precise float sy = pc.wA * ay + pc.wC * cy;
+    float oy = imageLoad(outImg, p).r * YU_SCALE;
+    imageStore(outImg, p, vec4(fgOut(oy * (1.0 - w) + sy * w), 0.0, 0.0, 1.0));
+    if (((p.x | p.y) & 1) == 0) {   // the CbCr texel of the 2x2 block, with its even-even pixel's weight (as resolve.comp's trust)
+        vec2 ac = texelFetch(texPrevC, p >> 1, 0).rg * YU_SCALE, cc = texelFetch(texCurrC, p >> 1, 0).rg * YU_SCALE;
+        precise vec2 sc = pc.wA * ac + pc.wC * cc;
+        vec2 oc = imageLoad(outImgC, p >> 1).rg * YU_SCALE;
+        imageStore(outImgC, p >> 1, vec4(fgOut2(oc * (1.0 - w) + sc * w), 0.0, 1.0));
+    }
+#else
+    vec3 a = FG_FETCH(texelFetch(texPrev, p, 0).rgb), c = FG_FETCH(texelFetch(texCurr, p, 0).rgb);
+    precise vec3 st = pc.wA * a + pc.wC * c;
+    vec4 o = imageLoad(outImg, p);
+    vec3 ol = FG_FETCH(o.rgb);
+    imageStore(outImg, p, FG_STORE(ol * (1.0 - w) + st * w, o.a));
+#endif
+}

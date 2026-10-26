@@ -4,10 +4,13 @@
     python3 -I gpu/ml/synthcheck.py DIR [--export ML-FG/export] [--footage FGR/footage]
 
 For every dumped pf (`<run>_<pair>_<kind>.f32` + `.json`: kind `ref` = fed the reference's luma, `fgr` = the library's own 14-bit
-luma) it runs FGR's synthesis (proto/interp.py synth, t = 0.5) with that pf and sad and with the test vector's expected pf.f32 and
-sad, and prints the PSNR between the two frames (SPEC.md: >= 80 dB for an exact float32 port, >= 45 dB with shortcuts) and, where the
-pair's source has a real middle frame (frames 2 apart in one clip), both frames' PSNR against it (within 0.05 dB). Exit status 1 if a
-criterion fails. Needs numpy and OpenCV (the PNGs, the footage).
+luma, `refh` / `fgrh` the same with learnedHalf) it runs FGR's synthesis (proto/interp.py synth, t = 0.5) with that pf and sad and
+with the test vector's expected pf.f32 and sad, and prints the PSNR between the two frames (SPEC.md: >= 80 dB for an exact float32
+port, >= 45 dB with shortcuts; the gate here is 45) and, where the pair's source has a real middle frame (frames 2 apart in one clip),
+both frames' PSNR against it (within 0.05 dB). The zero-motion test's kinds (Settings::learnedZeroTest, mltest zeroChecks: `stagezt`
+= the stage alone on pf.f32, `refzt`, `fgrzt`, `refhzt`, `fgrhzt`) are compared with the synthesis of the expected pf_zt.f32 and
+sad_zt instead, and their cut with cut_zt (SPEC.md section 8 step 7c: >= 70 dB for an exact float32 port, the gate of `stagezt` /
+`refzt`; 45 dB for the others). Exit status 1 if a criterion fails. Needs numpy and OpenCV (the PNGs, the footage).
 """
 import argparse
 import glob
@@ -61,14 +64,17 @@ def main():
             mine = json.load(f)
         a, c = cv2.imread(os.path.join(d, 'a.png')), cv2.imread(os.path.join(d, 'c.png'))
         fh, fw = v['flow_size'][1], v['flow_size'][0]
-        exp = np.fromfile(os.path.join(d, 'pf.f32'), '<f4').reshape(fh, fw, 2)
+        zt = kind.endswith('zt')   # the zero test's kinds: against pf_zt / sad_zt / cut_zt
+        exp = np.fromfile(os.path.join(d, 'pf_zt.f32' if zt else 'pf.f32'), '<f4').reshape(fh, fw, 2)
+        sad, cut = (v['sad_zt'], v['cut_zt']) if zt else (v['sad'], v['cut'])
         got = np.fromfile(path, '<f4').reshape(fh, fw, 2)
-        s_exp = interp.synth(a, c, {'sad': v['sad'], 'pf': exp}, 0.5)
+        s_exp = interp.synth(a, c, {'sad': sad, 'pf': exp}, 0.5)
         s_got = interp.synth(a, c, {'sad': mine['sad'], 'pf': got}, 0.5)
         db = psnr(s_got, s_exp)
-        need = 45.0
-        ok = db >= need and mine['cut'] == v['cut']
-        line = f'{run} {pair:6} {kind}: synth vs synth(expected pf) {db:6.2f} dB (>= {need:.0f}), cut {mine["cut"]} vs {v["cut"]}'
+        need = 70.0 if kind in ('stagezt', 'refzt') else 45.0
+        ok = db >= need and mine['cut'] == cut
+        line = (f'{run} {pair:7} {kind:7}: synth vs synth(expected {"pf_zt" if zt else "pf"}) {db:6.2f} dB (>= {need:.0f}), '
+                f'cut {mine["cut"]} vs {cut}')
         fr = middle(args.footage, v['source'], (a.shape[1], a.shape[0]))
         if fr is not None and np.array_equal(fr[0], a) and np.array_equal(fr[2], c):
             pe, pg = psnr(s_exp, fr[1]), psnr(s_got, fr[1])

@@ -44,8 +44,9 @@
 #include "v2_morph_s_spv.h"
 #include "v2_qmorph_s_spv.h"
 // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
-// generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) has format variants (probed per format below).
-#if __has_include("ml_conv_spv.h") && __has_include("ml_weights.h")
+// generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
+// have format variants (probed per format below).
+#if __has_include("ml_conv_spv.h") && __has_include("ml_zero_spv.h") && __has_include("ml_guard_spv.h") && __has_include("ml_weights.h")
 #define FG_HAVE_ML 1
 #include "ml_dup_spv.h"
 #include "ml_reduce_spv.h"
@@ -53,6 +54,8 @@
 #include "ml_match_spv.h"
 #include "ml_conv_spv.h"
 #include "ml_out_spv.h"
+#include "ml_zero_spv.h"
+#include "ml_guard_spv.h"
 #include "ml_weights.h"
 #endif
 
@@ -82,10 +85,11 @@
 #include "v2_qmorph_rgb10_spv.h"
 #include "v2_qmorph_s_rgb10_spv.h"
 #endif
-// ... and MotionVersion::Learned's duplicate test of rgb10 (probed on its own, like V2's synthesis)
-#if __has_include("ml_dup_rgb10_spv.h") && defined(FG_HAVE_RGB10) && defined(FG_HAVE_ML)
+// ... and MotionVersion::Learned's colour passes of rgb10, its duplicate test and static guard (probed on their own, like V2's synthesis)
+#if __has_include("ml_dup_rgb10_spv.h") && __has_include("ml_guard_rgb10_spv.h") && defined(FG_HAVE_RGB10) && defined(FG_HAVE_ML)
 #define FG_HAVE_ML_RGB10 1
 #include "ml_dup_rgb10_spv.h"
+#include "ml_guard_rgb10_spv.h"
 #endif
 // f16: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_f16_spv.h")
@@ -112,9 +116,10 @@
 #include "v2_qmorph_f16_spv.h"
 #include "v2_qmorph_s_f16_spv.h"
 #endif
-#if __has_include("ml_dup_f16_spv.h") && defined(FG_HAVE_F16) && defined(FG_HAVE_ML)
+#if __has_include("ml_dup_f16_spv.h") && __has_include("ml_guard_f16_spv.h") && defined(FG_HAVE_F16) && defined(FG_HAVE_ML)
 #define FG_HAVE_ML_F16 1
 #include "ml_dup_f16_spv.h"
+#include "ml_guard_f16_spv.h"
 #endif
 // nv12: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_nv12_spv.h")
@@ -143,9 +148,10 @@
 #include "v2_qmorph_nv12_spv.h"
 #include "v2_qmorph_s_nv12_spv.h"
 #endif
-#if __has_include("ml_dup_nv12_spv.h") && defined(FG_HAVE_NV12) && defined(FG_HAVE_ML)
+#if __has_include("ml_dup_nv12_spv.h") && __has_include("ml_guard_nv12_spv.h") && defined(FG_HAVE_NV12) && defined(FG_HAVE_ML)
 #define FG_HAVE_ML_NV12 1
 #include "ml_dup_nv12_spv.h"
+#include "ml_guard_nv12_spv.h"
 #endif
 // p010: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_p010_spv.h")
@@ -174,9 +180,10 @@
 #include "v2_qmorph_p010_spv.h"
 #include "v2_qmorph_s_p010_spv.h"
 #endif
-#if __has_include("ml_dup_p010_spv.h") && defined(FG_HAVE_P010) && defined(FG_HAVE_ML)
+#if __has_include("ml_dup_p010_spv.h") && __has_include("ml_guard_p010_spv.h") && defined(FG_HAVE_P010) && defined(FG_HAVE_ML)
 #define FG_HAVE_ML_P010 1
 #include "ml_dup_p010_spv.h"
+#include "ml_guard_p010_spv.h"
 #endif
 
 namespace framegen {
@@ -200,12 +207,12 @@ struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
 struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill,
-    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup; };
+    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard; };
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
     SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
     SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f), Spv{}, Spv{}, Spv{}, Spv{}}
 #define V2_SET(c, f) (c.v2Morph = SPV(v2_morph##f), c.v2MorphS = SPV(v2_morph_s##f), c.v2QMorph = SPV(v2_qmorph##f), c.v2QMorphS = SPV(v2_qmorph_s##f))
-#define ML_SET(c, f) (c.mlDup = SPV(ml_dup##f))
+#define ML_SET(c, f) (c.mlDup = SPV(ml_dup##f), c.mlGuard = SPV(ml_guard##f))
 // false = this format's variants were not built into the library (meson option `formats`)
 bool colourSpv(Format f, ColourSpv& c) {
     switch (f) {
@@ -264,16 +271,30 @@ bool colourSpv(Format f, ColourSpv& c) {
 }
 inline bool isYuv(Format f) { return f == Format::Nv12 || f == Format::P010; }
 const char* const kV2NotBuilt = "the MotionVersion::V2 shader variants of this format (v2_morph, v2_morph_s, v2_qmorph, v2_qmorph_s) are not built into the library";
-const char* const kMlNotBuilt = "the MotionVersion::Learned shaders of this format (ml_dup, ml_reduce, ml_pyr, ml_match, ml_conv, ml_out) or its weights (ml_weights.h, gpu/ml/embed_weights.py) are not built into the library";
+const char* const kMlNotBuilt = "the MotionVersion::Learned shaders of this format (ml_dup, ml_reduce, ml_pyr, ml_match, ml_conv, ml_out, ml_zero, ml_guard) or its weights (ml_weights.h, gpu/ml/embed_weights.py) are not built into the library";
 const char* const kMlFlowScale = "MotionVersion::Learned needs flowScale 2 (its nets were trained at 2)";
+// The nets of MotionVersion::Learned, in LearnedNet order: their name (ml-fg's export run, learnedNetName()) and width (channels per
+// hidden layer; the layout and the pipelines depend on it). ADDING A NET: append its LearnedNet value and bump kLearnedNets
+// (framegen.h), append its name + width here and its ML_NET entry to kMlNet below, copy ml-fg's export/<run>/manifest.json +
+// weights.bin into gpu/ml/<run>/ and append <run> to gpu/meson.build's ml_nets (the same order). Tests: mltest's TEST_CASEs.
+struct MlNetInfo { const char* name; int width; };
+constexpr MlNetInfo kMlNetInfo[] = {{"e2v3", 24}, {"e1v3", 12}, {"e2v4", 24}, {"e1v4", 12}};
+constexpr int kMlNets = (int)(sizeof(kMlNetInfo) / sizeof(kMlNetInfo[0]));
+static_assert(kMlNets == (int)kLearnedNets, "a name and width per LearnedNet");
 #ifdef FG_HAVE_ML
 // The embedded nets, in LearnedNet order (gpu/ml/embed_weights.py): weights in shaders/ml_conv.comp's layout, the table of each
 // (level, layer)'s weight / bias offsets (vec4 units, relative to the net's start in the weights buffer)
 struct MlNet { const uint32_t* w; size_t words; uint32_t width; const uint32_t (*table)[5][2]; };
-const MlNet kMlNet[2] = {{kMlWeights_e2v3, sizeof(kMlWeights_e2v3) / 4, kMlWidth_e2v3, kMlTable_e2v3},
-                         {kMlWeights_e1v3, sizeof(kMlWeights_e1v3) / 4, kMlWidth_e1v3, kMlTable_e1v3}};
-static_assert(kMlWidth_e2v3 == 24 && kMlWidth_e1v3 == 12, "mlWidth()");
-static_assert(sizeof(kMlWeights_e2v3) % 16 == 0, "the second net starts on a vec4");
+#define ML_NET(n) MlNet{kMlWeights_##n, sizeof(kMlWeights_##n) / 4, kMlWidth_##n, kMlTable_##n}
+constexpr MlNet kMlNet[] = {ML_NET(e2v3), ML_NET(e1v3), ML_NET(e2v4), ML_NET(e1v4)};
+static_assert(sizeof(kMlNet) / sizeof(kMlNet[0]) == kMlNets, "an embedded net per LearnedNet");
+constexpr bool mlWidthsMatch() {
+    for (int i = 0; i < kMlNets; i++)
+        if ((int)kMlNet[i].width != kMlNetInfo[i].width) return false;
+    return true;
+}
+static_assert(mlWidthsMatch(), "kMlNetInfo's widths are those of ml_weights.h");
+// (every net's weights are a whole number of vec4: embed_weights.py pads each layer to 4 channels, so each net starts on a vec4)
 #endif
 // the view / clean-copy formats of a Format: the library's own clean copies are in the source's own format, in logical channel order
 VkFormat cleanFormat(Format f) {
@@ -334,6 +355,29 @@ static const int kMlLevels = 5, kMlLayers = 5;   // == ML_LEVELS in ml_common.gl
 // 7900 XTX a whole-pixel workgroup of e2v3 takes ~15 us however small the level, so the coarse levels cost latency, not work.
 static const uint32_t kMlSplitTiles = 256;
 
+// ==== Settings::learnedStaticGuard: THE constants of the static guard (shaders/ml_guard.comp), the one place they are defined ====
+// ml-fg scripts/static_guard.py DEFAULTS (authoritative; superdoc/features/static-guard.md): MONZikWasTaken/Framegen's 0..1
+// thresholds x 255. Levels are 8-bit levels in every Format (the mismatch metric's convention), distances full-resolution pixels.
+// ml-fg may send other final defaults after its scoring (I31): change them here only.
+struct StaticGuardParams {
+    float lo, hi;              // colorStatic = 1 - smoothstep(lo, hi, d), d = 3x3 mean of the max-channel |A - C|
+    float haloLo, haloHi;      // uncertain = smoothstep(haloLo, haloHi, d); wHalo = 1 - smoothstep(haloLo, haloHi, dMin)
+    int halo;                  // dMin = the min of the per-pixel |A - C| over (2 halo + 1)^2 (9x9), 1..kGuardHaloMax
+    float motionLo, motionHi;  // gate = 1 - smoothstep(motionLo, motionHi, motion), motion in full-res px of the larger warp side
+    float wMin;                // wStatic <= wMin leaves the pixel bit-exact
+};
+static constexpr StaticGuardParams kStaticGuard = {7.65f, 22.95f, 5.1f, 7.65f, 4, 0.5f, 1.0f, 0.001f};
+static constexpr int kGuardHaloMax = 8;   // == GUARD_HALO_MAX in shaders/ml_guard.comp (its shared-memory apron)
+static_assert(kStaticGuard.halo >= 1 && kStaticGuard.halo <= kGuardHaloMax, "ml_guard.comp's apron");
+// Must match the push-constant block in shaders/ml_guard.comp. Pushed over the same range of the same pipeline layout as PC.
+struct GuardPC {
+    int32_t W, H, fw, fh, pf, bw, bh, cnt0, nCnt, halo;
+    float wA, wC, motionK, cutSad, globalFrac;
+    float lo, hi, haloLo, haloHi, motionLo, motionHi, wMin;
+    int32_t pad_[10];
+};
+static_assert(sizeof(GuardPC) == sizeof(PC), "GuardPC is pushed over PC's range");
+
 // V2 Performance's field clean-up (v2_clean.comp): sigma of the bilateral smoothing's range weight, in flow pixels of half-vector
 // (1 flow px of half-vector = 2 * flowScale px of motion between the real frames).
 static const float kV2CleanSigma = 1.0f;
@@ -386,14 +430,13 @@ struct UiEntry {
 // shape (first / hidden / last) and net (LearnedNet), shaders/ml_conv.comp specialised.
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
             P_V2_MEDHIST, P_V2_SEARCH, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
-            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2, P_COUNT = P_ML_CONV + 20 };
-static const int kMlNets = 2;   // LearnedNet::E2v3, E1v3
+            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2, P_ML_ZERO = P_ML_CONV + 10 * kMlNets, P_ML_GUARD, P_COUNT };
 // The match and conv pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF); convs per
 // net and shape (0 = first, 14 -> w; 1 = hidden, w -> w; 2 = last, w -> 2) and, but the last, whole or split (one output group per
 // workgroup: the small levels)
 inline Pipe mlMatchPipe(bool half) { return (Pipe)(P_ML_MATCH + half); }
 inline Pipe mlConvPipe(bool half, int net, int shape, bool split) {
-    return (Pipe)(P_ML_CONV + 10 * half + 5 * net + (shape == 2 ? 4 : 2 * shape + split));
+    return (Pipe)(P_ML_CONV + 5 * (kMlNets * half + net) + (shape == 2 ? 4 : 2 * shape + split));
 }
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
@@ -470,7 +513,7 @@ static SizeLayout sizeLayout(uint32_t W, uint32_t H, uint32_t flowScale) {
 // MotionVersion::Learned's layout of a size (shaders/ml_common.glsl): the net's padded level 0 (fw, fh rounded up to a multiple of
 // 16), the sum S of its 5 level sizes, the partial sums of its two reductions, and per net the activation regions: R0 holds the
 // 14-channel input (4 groups) and two hidden layers (width / 4 groups each), R1 the other two.
-inline int mlWidth(LearnedNet n) { return n == LearnedNet::E1v3 ? 12 : 24; }
+inline int mlWidth(LearnedNet n) { return kMlNetInfo[(int)n].width; }
 struct MlLayout {
     int pw = 0, ph = 0, n0 = 0, S = 0, nDup = 0, nOut = 0;
     VkDeviceSize stateBytes = 0;
@@ -595,6 +638,9 @@ struct Interpolator::Impl {
     bool mlearned() const { return set.motionVersion == MotionVersion::Learned; }
     bool mlSized();
     void mlUpload(VkCommandBuffer cb);
+    // Settings::learnedStaticGuard: the pass over a finished generated frame (shaders/ml_guard.comp), recorded with a synth set bound
+    bool mlGuardOn() const { return mlearned() && set.learnedStaticGuard; }
+    void mlGuard(VkCommandBuffer cb, float t, float motionK, int pf, int cnt0, int nCnt);
     void mlEstimate(VkCommandBuffer cb);
     bool v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Frame curr, Frame out, const float* ts, int n, bool gauss);
 
@@ -1370,6 +1416,16 @@ bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool forc
     return true;
 }
 
+const char* learnedNetName(LearnedNet n) { return (uint32_t)n < kLearnedNets ? kMlNetInfo[(int)n].name : nullptr; }
+bool learnedNetFromName(const char* name, LearnedNet* out) {
+    for (int i = 0; name && i < kMlNets; i++)
+        if (!strcmp(name, kMlNetInfo[i].name)) {
+            if (out) *out = (LearnedNet)i;
+            return true;
+        }
+    return false;
+}
+
 bool Interpolator::validate(const Settings& s) {
     auto in = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
     return in(s.trustLow, 0.0f, 255.0f) && in(s.trustHigh, 0.0f, 255.0f) && s.trustHigh - s.trustLow >= 1.0f &&
@@ -1378,7 +1434,7 @@ bool Interpolator::validate(const Settings& s) {
            in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::Learned &&
-           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.learnedNet <= (uint32_t)LearnedNet::E1v3 &&
+           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
            in(s.uiBoxHeightFrac, 0.0f, 1.0f) &&
@@ -1493,6 +1549,8 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_ML_REDUCE].sp = SPV(ml_reduce);
         spv[P_ML_PYR].sp = SPV(ml_pyr);
         spv[P_ML_OUT].sp = SPV(ml_out);
+        spv[P_ML_ZERO].sp = SPV(ml_zero);         // Settings::learnedZeroTest (ml_out's pass with the zero-motion test)
+        spv[P_ML_GUARD] = {cs.mlGuard, spec};     // Settings::learnedStaticGuard (reads and writes colour: the format's variant)
         for (int half = 0; half < 2; half++) {
             const int jm = 2 * kMlNets * 5 + half;
             mlSpec[jm].half = half;
@@ -1503,7 +1561,7 @@ bool Interpolator::Impl::motionEnsure() {
                 // 14 (padded to 16) -> w, w -> w (each whole and split), w -> 2 (padded to 4)
                 const MlSpec shapes[5] = {{4, gw, 0, gw, half}, {4, gw, 0, 1, half}, {gw, gw, 0, gw, half}, {gw, gw, 0, 1, half}, {gw, 1, 1, 1, half}};
                 for (int k = 0; k < 5; k++) {
-                    const int j = 10 * half + 5 * net + k;
+                    const int j = 5 * (kMlNets * half + net) + k;
                     mlSpec[j] = shapes[k];
                     mlSi[j] = {5, mlEnt, sizeof(MlSpec), &mlSpec[j]};
                     spv[P_ML_CONV + j] = {SPV(ml_conv), &mlSi[j]};
@@ -2402,7 +2460,8 @@ void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
     const MlLayout L = mlLayout(W, H, fw, fh, set);
     const int net = (int)set.learnedNet;
     const bool half = set.learnedHalf;
-    const uint32_t base = net == 0 ? 0u : (uint32_t)(kMlNet[0].words / 4);   // the net's start in mlWeights (vec4 units)
+    uint32_t base = 0;   // the net's start in mlWeights (vec4 units): the nets are uploaded back to back in LearnedNet order
+    for (int k = 0; k < net; k++) base += (uint32_t)(kMlNet[k].words / 4);
     const int r1 = L.r0 * L.n0;                                             // activation region R1 (vec4 offset)
     const Level& l0 = lv[0];
     MLPC m{};
@@ -2453,18 +2512,51 @@ void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
         }
         r.stamp(lvNames[lvl]);
     }
-    // the field V1's synthesis reads, and the scene-cut sum
+    if (mlDbg.fieldSrc) {   // test only (setDebugLearned): a given field (fw x fh) over the net's, the input of the passes below
+        r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        std::vector<VkBufferCopy> c((size_t)fh);
+        for (int y = 0; y < fh; y++)
+            c[y] = {(VkDeviceSize)y * fw * 8, ((VkDeviceSize)2 * L.S + (VkDeviceSize)2 * y * L.pw) * 4, (VkDeviceSize)fw * 8};
+        CmdCopyBuffer(cb, mlDbg.fieldSrc, mo[(int)MotionVersion::Learned].bufs[MLB_STATE].b, (uint32_t)fh, c.data());
+        r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
+    }
+    // the field V1's synthesis reads, and the scene-cut sum: the net's cropped field (ml_out), or with Settings::learnedZeroTest the
+    // field after ml-fg's zero-motion test and the SAD of that final field (ml_zero: it reads the net's field in MLB_STATE, which it
+    // never writes)
     m.nPart = L.nOut;
-    run(P_ML_OUT, divUp(fw, 16), divUp(fh, 16));
+    m.mode = mlDbg.zeroCosts ? 2 : 0;
+    run(set.learnedZeroTest ? P_ML_ZERO : P_ML_OUT, divUp(fw, 16), divUp(fh, 16));
     r.cbar();
     m.mode = 1;
     run(P_ML_REDUCE, 1, 1);
     r.cbar();
-    r.stamp("net output");
+    r.stamp(set.learnedZeroTest ? "net output + zero test" : "net output");
 #else
     (void)cb;
 #endif
 }
+
+// Settings::learnedStaticGuard (shaders/ml_guard.comp, ml-fg scripts/static_guard.py) over the finished generated frame in `out`, after
+// the whole-frame fallback pass and before the UI patch, with a synth set bound with `layout` and the synth's writes ordered before it.
+// t = the time of the mix (1 - t) A + t C, motionK = 2 max(t, 1 - t) * flowScale (the larger warp side's full-res displacement per
+// flow px of the field), pf = the field on the grid of t; it leaves the frame untouched where a whole-frame fallback was taken
+// (the scene cut, or one of the untrusted counts u[cnt0 .. cnt0 + nCnt) above globalFallback). The constants: kStaticGuard.
+void Interpolator::Impl::mlGuard(VkCommandBuffer cb, float t, float motionK, int pf, int cnt0, int nCnt) {
+    GuardPC g{};
+    g.W = (int)W; g.H = (int)H; g.fw = fw; g.fh = fh; g.pf = pf; g.bw = lv[0].bw; g.bh = lv[0].bh; g.cnt0 = cnt0; g.nCnt = nCnt;
+    g.halo = kStaticGuard.halo;
+    g.wA = (float)(1.0 - (double)t);   // float32(1 - t), float32(t): resolve.comp's (and numpy's) time mix
+    g.wC = t;
+    g.motionK = motionK;
+    g.cutSad = set.sceneCutSad; g.globalFrac = set.globalFallback;
+    g.lo = kStaticGuard.lo; g.hi = kStaticGuard.hi; g.haloLo = kStaticGuard.haloLo; g.haloHi = kStaticGuard.haloHi;
+    g.motionLo = kStaticGuard.motionLo; g.motionHi = kStaticGuard.motionHi; g.wMin = kStaticGuard.wMin;
+    CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, mg().pipes[P_ML_GUARD]);
+    CmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GuardPC), &g);
+    CmdDispatch(cb, divUp((int)W, 16), divUp((int)H, 16), 1);
+}
+// motionK of mlGuard for one instant t: static_guard.py's 2 max(t, 1 - t) * FLOW_SCALE
+static float guardMotionK(double t, uint32_t flowScale) { return (float)(2.0 * std::max(t, 1.0 - t) * flowScale); }
 
 // V2 Quality's claims (shaders/v2_quality.glsl: prev's and curr's, 2 x fw x fh words) -> 0xFFFFFFFF, "unclaimed", before its splat.
 // Recorded between the barriers of a counter clear (a transfer write ordered after every earlier record and before this one's passes).
@@ -2604,16 +2696,23 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
     r.stamp("resolve");
     // global fallbacks (scene cut / too much untrusted) -> the nearer real frame
     r.run(P_FALLBACK, divUp((int)I.W, 64), divUp((int)I.H, 64));
+    const char* last = "fallback";
+    if (I.mlGuardOn()) {   // Learned, Settings::learnedStaticGuard: over the finished frame, before the UI patch
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
+        r.stamp(last);
+        I.mlGuard(cb, t, guardMotionK(t, I.set.flowScale), pc.pf, 0, 1);   // the field at t; u[0] = U_UNTRUSTED
+        last = "static guard";
+    }
     if (I.estUi) {
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
-        r.stamp("fallback");
+        r.stamp(last);
         I.uiRecordPatch(cb, curr, out, I.uiE[I.estEnt[1]]);   // the real UI pixels back over the generated frame
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
         r.stamp("ui_patch");
         return true;
     }
     r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
-    r.stamp("fallback");
+    r.stamp(last);
     return true;
 }
 
@@ -2686,16 +2785,35 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     r.stamp("blur resolve");
     bp.fix = 1;   // exits at once unless a sample turned out to have too many untrusted pixels
     run(B_RESOLVE, divUp((int)I.W, 64), divUp((int)I.H, 64), 1);
+    const char* last = "blur fixup";
+    if (I.mlGuardOn() && nInt > 0) {
+        // Learned, Settings::learnedStaticGuard, once over the AVERAGE (before the UI patch): the time mix at the samples' weighted mean
+        // time (the time mix is linear in t, so this is the average of the samples' own time mixes, real-frame samples included), the
+        // motion gate with the midpoint field and the largest motionK of the interior samples (the gate closes if any sample moves); no
+        // guard when a sample took a whole-frame fallback (the scene cut, or an interior sample's untrusted count past globalFallback)
+        double ws = 0, wt = 0, mk = 0;
+        for (int k = 0; k < n; k++) {
+            const double x = (2.0 * k + 1.0 - n) / n, w = bp.gauss ? std::exp(-2.0 * x * x) : 1.0;   // == blur_resolve.comp's weights
+            ws += w;
+            wt += w * bp.t[k];
+            if (k >= lo && k <= hi) mk = std::max(mk, (double)guardMotionK(bp.t[k], st.flowScale));
+        }
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
+        r.stamp(last);
+        I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);   // the guard pushes PC's range
+        I.mlGuard(cb, (float)(wt / ws), (float)mk, I.fieldPF, kBlurCnt0 + lo, nInt);
+        last = "static guard";
+    }
     if (I.estUi) {
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
-        r.stamp("blur fixup");
+        r.stamp(last);
         I.uiRecordPatch(cb, curr, out, I.uiE[I.estEnt[1]]);   // the real UI pixels back over the blurred frame
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);
         r.stamp("ui_patch");
         return true;
     }
     r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);
-    r.stamp("blur fixup");
+    r.stamp(last);
     return true;
 }
 
