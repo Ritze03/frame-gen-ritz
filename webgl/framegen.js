@@ -203,7 +203,7 @@
     motion: 'search',       // V1 only: 'search' (V1's block search, proto/interp.py) or 'learned' (the learned estimator: needs flowScale 2
                             // and the net's weights, webgl/nets/<motionNet>.js; ignored by V2)
     motionNet: 'e2v3',      // motion 'learned': 'e2v3' (width 24, 95,530 weights) or 'e1v3' (width 12, 28,330 weights, ~3.4x cheaper)
-    motionPrecision: 'fp16', // motion 'learned': storage of the net's activations, 'fp16' (RGBA16F) or 'fp32' (RGBA32F, the exact port);
+    motionPrecision: 'fp16', // motion 'learned': storage of the net's activations, 'fp16' (8 halves per RGBA32UI texel) or 'fp32' (RGBA32F, exact);
                             // the field, the pyramid, the weights and all arithmetic are float32 either way
     // ---- structural (re-allocate textures and recompile the programs; drop the frame history) ----
     inputFormat: 'rgba8',   // frame format: 'rgba8' (RGBA8 frames and output) or 'rgba16f' (HDR / float: RGBA16F frames and output)
@@ -760,8 +760,9 @@
     }
 
     // ---- the learned motion estimator (settings.motion 'learned'; ml-fg export/SPEC.md, export/reference.py) ---------------------
-    // The net's weights as one uniform buffer: per level (finest first), layer and pass a std140 block MlW of that pass's conv shape
-    // (learned/conv.frag.glsl): COUT * 9 * CIN mat4 (column c = input channel 4j + c, row r = output channel 12 * part + 4o + r) and
+    // The net's weights as one uniform buffer: per level (finest first), layer and 12 output channels (a part) a std140 block of the
+    // conv shape (learned/conv.frag.glsl's MlW; conv_h.frag.glsl binds part 0 / 1 as MlW / MlW2): COUT * 9 * CIN mat4 (column c =
+    // input channel 4j + c, row r = output channel 12 * part + 4o + r) and
     // COUT bias vec4, each block at a multiple of UNIFORM_BUFFER_OFFSET_ALIGNMENT. Decoded and uploaded once per net and engine.
     function mlNetBuffer(name) {
       if (mlBufs[name]) return mlBufs[name];
