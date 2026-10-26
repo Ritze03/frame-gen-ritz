@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Cost per real pair (push the new frame + estimate + synth(0.5) = 2x) of each motion version in headless Chromium.
-//   node webgl/tests/bench.mjs [--gpu] [--pair battlefield] [--modes v1,v2p,v2q,ml2,ml1] [--fs 2] [--iters 60] [--mult 2] [--size WxH]
+//   node webgl/tests/bench.mjs [--gpu] [--pair battlefield] [--modes v1,v2p,v2q,ml2,ml1,ml2f,ml1f] [--fs 2] [--iters 60] [--mult 2] [--size WxH]
 // --gpu: hardware GL through ANGLE (FG_ANGLE=vulkan default, or gl); otherwise SwiftShader (CPU: only relative numbers mean much).
-// Modes: v1, v2p (V2 Performance), v2q (V2 Quality), ml2 / ml1 (V1 with the learned estimator e2v3 / e1v3; flowScale 2 only).
+// Modes: v1, v2p (V2 Performance), v2q (V2 Quality), ml2 / ml1 (V1 with the learned estimator e2v3 / e1v3, motionPrecision fp16;
+// ml2f / ml1f: fp32; flowScale 2 only).
 // --size: the pair resampled (bilinear) to W x H first, e.g. 2560x1440 from the 1080p pair.
 // GPU time (EXT_disjoint_timer_query_webgl2) of pushFrame (the raw RGBA upload from JS + luma pyramid) and of estimate + synths, when the browser exposes it, else wall time per pair with a gl.finish() each
 // (includes the CPU side of the GL calls). Prints the median and the minimum over --iters pairs after 10 warm-up pairs.
@@ -32,7 +33,8 @@ const E = await openEngine({ gpu: opt.gpu, settings: {} });
 if (E.init.fatal) { console.error('bench: ' + E.init.fatal); await E.browser.close(); process.exit(2); }
 console.log(`browser : Chromium ${E.version}, renderer ${E.init.info.renderer}`);
 const SET = { v1: { motionVersion: 1, motion: 'search' }, v2p: { motionVersion: 2, v2Mode: 'performance' }, v2q: { motionVersion: 2, v2Mode: 'quality' },
-  ml2: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3' }, ml1: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3' } };
+  ml2: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3', motionPrecision: 'fp16' }, ml1: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3', motionPrecision: 'fp16' },
+  ml2f: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3', motionPrecision: 'fp32' }, ml1f: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3', motionPrecision: 'fp32' } };
 await E.page.addScriptTag({ content: `
 window.__bench = async function (job) {
   const gl = window.__x._gl();

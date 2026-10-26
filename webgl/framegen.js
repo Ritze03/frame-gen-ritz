@@ -343,9 +343,10 @@
   // only; 'webgl2' alone if it is no WebGL2 context). sizeError: the optional frame = { width, height, flowScale } checked by
   // fg.frameSizeError, else null. ok = nothing missing and no sizeError. quality: V2 Quality can run (its MIN-blend splat works,
   // probeQuality); when false, qualityError says why. V1 and V2 Performance do not need it, so it does not affect ok. learned: the
-  // learned motion estimator (settings.motion 'learned') can run: 4 draw buffers / colour attachments, a fragment uniform block of
-  // ML_BLOCK_MAX bytes and 2 fragment uniform blocks, 8 fragment texture units (all WebGL2 core minimums, so false only on a non-conformant context); does not
-  // affect ok either. (Whether a net's weights are loaded is fg.nets, not the context: createEngine / setSettings say so.)
+  // learned motion estimator (settings.motion 'learned') can run: 4 draw buffers / colour attachments, uniform blocks of ML_BLOCK_MAX
+  // bytes, 2 fragment uniform blocks, 8 fragment texture units (all WebGL2 core minimums, so false only on a non-conformant
+  // context); does not affect ok either. (Whether a net's weights are loaded is fg.nets, not the context: createEngine / setSettings
+  // say so.)
   fg.checkSupport = function (gl, frame) {
     const missing = [];
     let isGl2;
