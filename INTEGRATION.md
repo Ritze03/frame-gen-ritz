@@ -116,7 +116,8 @@ A plain struct whose in-class defaults are the tuned values of `proto/interp.py`
 | `uiHistory` | 3 | 3-`kUiFramesMax` (65) | runtime | Observed real frames that keep their clean copy + mask (LRU). 3 = the newest pair and the one before it. A host that synthesises from an older pair (the lag-spike buffer plays pairs several frames back) sets it to `Pacer::HistoryDepth()`. Memory: 4 B/px per kept frame (4.9 MB at 1280x960, 14.7 MB at 1440p; WholeScreen +1 B/px). See "Static UI protection". |
 | `blurSamples` | 0 | 0, 1 (off), 2-16 | runtime | Interpolation-based motion blur: sub-frames averaged by `recordSynthBlur()` (see "Motion blur"). Off = byte-identical. |
 | `blurWeights` | Gaussian | Even, Gaussian | runtime | Weights of the sub-frames: 1/N each, or a Gaussian with the window ends at 2 sigma (weights at the slice centres). |
-| `learnedNet`, `learnedHalf` | E2v3, false | E2v3 / E1v3; bool | runtime | `MotionVersion::Learned` only: the net and fp16 activation storage (see "Learned motion estimate"). The next estimate uses them. |
+| `learnedNet`, `learnedHalf` | E2v4, false | E2v4 / E1v4 (the small net) / E2v3 / E1v3; bool | runtime | `MotionVersion::Learned` only: the net and fp16 activation storage (see "Learned motion estimate"). The next estimate uses them. `learnedNetFromName()` maps the names `e2v4`, `e1v4`, `e2v3`, `e1v3`. |
+| `learnedZeroTest`, `learnedStaticGuard` | true, false | bool; bool | runtime | `MotionVersion::Learned` only: ml-fg's zero-motion test on the net's field (from the next estimate; off = the net's raw field, byte-identical to round 1), and the opt-in static guard on every generated frame (from the next synth; off = byte-identical). Expose both for A/B testing. |
 | `motionVersion` | V1 | V1, V2, Learned (`flowScale` 2 only) | runtime | The motion algorithm (see "Motion version 2", "Learned motion estimate"). V1 = byte-identical to before. Both run every `Format`. A switch **drops** the current estimate: `recordSynth` / `recordSynthBlur` return false (show the real frame) until the next `recordEstimate`. The first switch to a version creates its pipelines at once (no GPU wait); `releaseUnusedMotion()` frees the unused version's resources (retire rule of `resize()`). |
 | `v2Mode` | Quality | Quality, Performance | runtime | V2's mode; V1 ignores it. A switch keeps the current estimate (no hitch). |
 | `v2StaticMask` | true | bool | runtime | V2 (both modes): static-structure mask; where both real frames show the same structure (HUD, text, semi-transparent panels, inverted-colour / blended crosshairs) the pixels keep the zero vector and warp taps stay off them, with or without `uiProtection`. Off = V2 without it (the tests' unprotected reference). V1 ignores it. A change applies from the next `recordEstimate` on. |
@@ -190,12 +191,40 @@ RgbaF16 reads twice the bytes; linear light also converts every compared value t
 **Tests:** `fgtest --set algo=v2,v2Mode=quality|performance,flowScale=N` (`v2StaticMask=0` for the unprotected reference); `uitest`, `blurtest`, `formattest` take `--algo v1|v2` and `--mode quality|performance`.
 
 ## Learned motion estimate (`MotionVersion::Learned`, testing branch `ml-fg-testing`)
-Opt-in: V1 with its motion search replaced by ml-fg's learned estimator (`e2v3` default / `e1v3`, `Settings::learnedNet`; `learnedHalf` = fp16 activations). It writes V1's per-pixel field (`fieldPF`) and scene-cut sum (`u[1]`). V1's synthesis, the cut rule and UI protection are unchanged. A duplicate pair (mean |a - c| ≤ 0.6 levels) skips the net and gets a zero field. It needs `flowScale` 2 and runs every `Format`. The full QC record (parity with ml-fg's test vectors, cost, memory, known issues) is `ML-FG-TESTING.md`. What the host has to do:
-- **Shader build:** add `ml_dup`, `ml_reduce`, `ml_pyr`, `ml_match`, `ml_conv`, `ml_out` (`ml_common.glsl` is included) to the shader list, plus `ml_dup` per non-RGBA8 format (`-DFG_FORMAT_<FMT>=1`). Generate `ml_weights.h` with `gpu/ml/embed_weights.py` from `gpu/ml/<net>/` (see `gpu/meson.build` `ml_weights`). Without them `__has_include` leaves Learned out: `init()` / `setSettings()` refuse it with a reason, and V1/V2 are unaffected.
-- **Descriptors:** Learned's sets add storage buffers at bindings 13 (state), 14 (activations) and 15 (weights), all in the library's own layout.
-- **Weights upload:** `vkCmdUpdateBuffer` in the first Learned estimate's command buffer (again after `releaseUnusedMotion()` freed them). That command buffer must be submitted; the existing rule "every record is submitted" already says so.
-- **Cost** (RX 7900 XTX, 2x, back-to-back per pair): 1080p e2v3 1.30 ms (half 0.98), e1v3 0.51 (half 0.46), against V1's 0.29. 1440p e2v3 2.6 / 1.6, e1v3 0.8 / 0.7. This is well above the 0.33 / 0.47 ms budget of the V1 pipeline. Memory on top of V1: 1080p e2v3 100 + 11 MB (half 50 + 11), e1v3 58 + 11 MB; 1440p about 1.76x that.
-- **Known limits:** static HUD over moving content is warped (the net has no zero-motion prior). CrosshairV2 leaves more pixels around the crosshair than with V1 (`uitest --algo learned` fails V1/V2-tuned thresholds). The duplicate test is whole-frame, so a cursor moving on a still desktop is held.
+Opt-in: V1 with its motion search replaced by ml-fg's learned estimator, then ml-fg's zero-motion test. The settings:
+- `Settings::learnedNet`: `E2v4` (the default), `E1v4` (the small net, the fallback when E2v4 costs too much), `E2v3`, `E1v3`.
+- `learnedZeroTest`: default on.
+- `learnedStaticGuard`: default off.
+- `learnedHalf`: fp16 activations.
+
+It writes V1's per-pixel field (`fieldPF`) and scene-cut sum (`u[1]`, from the final field). V1's synthesis, the cut rule and UI
+protection are unchanged. A duplicate pair (mean |a - c| ≤ 0.6 levels) skips the net and gets a zero field. It needs `flowScale`
+2 and runs every `Format`. The full QC record is `ML-FG-TESTING.md`: parity with ml-fg's test vectors, cost, memory, the HUD
+finding, known issues, and what changed since round 1. What the host has to do:
+- **Shader build:** add `ml_dup`, `ml_reduce`, `ml_pyr`, `ml_match`, `ml_conv`, `ml_out`, `ml_zero` and `ml_guard`
+  (`ml_common.glsl` is included) to the shader list. Also add `ml_dup` and `ml_guard` per non-RGBA8 format
+  (`-DFG_FORMAT_<FMT>=1`).
+- **Weights:** generate `ml_weights.h` with `gpu/ml/embed_weights.py` from `gpu/ml/<net>/` for all four nets in `LearnedNet`
+  order (`gpu/meson.build` `ml_nets = ['e2v3', 'e1v3', 'e2v4', 'e1v4']`).
+- **Missing pieces:** without any of these, `__has_include` leaves Learned out as a whole. `init()` / `setSettings()` refuse it
+  with a reason, and V1/V2 are unaffected. A host that only re-vendors round 1's shader list loses Learned.
+- **Descriptors:** Learned's sets add storage buffers at bindings 13 (state), 14 (activations) and 15 (weights, all four nets,
+  1.0 MB), all in the library's own layout.
+- **Weights upload:** `vkCmdUpdateBuffer` in the first Learned estimate's command buffer (again after `releaseUnusedMotion()`
+  freed them). That command buffer must be submitted; the existing rule "every record is submitted" already says so. The first
+  switch creates 56 pipelines.
+- **Cost** (RX 7900 XTX, 1080p 2x, back-to-back per pair, QC 2026-10-26):
+  - e2v4 1.44–1.48 ms (half 1.09–1.13) and e1v4 0.62 ms (half 0.49), against V1's 0.30 ms;
+  - the zero test adds ~0.005 ms, and the static guard ~0.05 ms per generated frame;
+  - 1440p is about 2x the 1080p figures (e2v3 / e1v3 in round 1: 2.6 / 0.8 ms).
+
+  This is well above the 0.33 / 0.47 ms budget of the V1 pipeline. Memory on top of V1: 1080p e2v4 100 + 11 MB (half 50 + 11),
+  e1v4 58 + 11 MB; 1440p about 1.76x that.
+- **Known limits:**
+  - Static HUD over moving content is no longer smeared with the zero test, but its glyph edges are not as clean as with V1.
+  - CrosshairV2 leaves more pixels around the crosshair than with V1 (`uitest --algo learned` fails V1/V2-tuned thresholds).
+  - The static guard is applied once to a `recordSynthBlur` average, not per sub-frame.
+  - The duplicate test is whole-frame, so a cursor moving on a still desktop is held.
 
 ## Formats (`InitInfo::viewFormat`, `framegen::Format`, `framegen::Frame`)
 
