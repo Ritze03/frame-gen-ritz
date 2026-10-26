@@ -43,12 +43,12 @@ enum class MotionVersion : uint32_t {
                   // throughout (Settings::learnedHalf: half activations). flowScale 2 only (the nets were trained at 2). Every
                   // Format. Costs more GPU time and memory than V1; V1 stays the default. RX 7900 XTX, 2x, whole pair (estimate +
                   // synth), back-to-back, ms, float32 / learnedHalf: 1080p E2v3 1.29 / 1.00, E1v3 0.53 / 0.48 (V1 0.31); 1440p E2v3
-                  // 2.70 / 1.66, E1v3 0.88 / 0.78 (V1 0.47); E2v4 costs what E2v3 does. The synth part is V1's (~0.07 ms at 1080p,
-                  // ~0.12 at 1440p). (Measured without the zero test; that test adds ~0.006 ms per pair at 1080p: the net's output
-                  // pass is 0.011-0.016 ms without it, 0.017-0.022 with it; the static guard adds ~0.047 ms (fp32) / 0.050 ms per
-                  // generated frame at 1080p, per-pass GPU profile.) Memory on top of V1 (activations + state): 1080p E2v3 / E2v4
-                  // 100 + 11 MB, E1v3 58 + 11 MB; 1440p E2v3 / E2v4 177 + 20 MB, E1v3 103 + 20 MB (learnedHalf: half the
-                  // activations); the zero test and the static guard need none; the weights of all nets 0.9 MB.
+                  // 2.70 / 1.66, E1v3 0.88 / 0.78 (V1 0.47); E2v4 costs what E2v3 does, E1v4 what E1v3 does. The synth part is
+                  // V1's (~0.07 ms at 1080p, ~0.12 at 1440p). (Measured without the zero test; that test adds ~0.006 ms per pair at
+                  // 1080p: the net's output pass is 0.011-0.016 ms without it, 0.017-0.022 with it; the static guard adds 0.047-0.050
+                  // ms per generated frame at 1080p, per-pass GPU profile.) Memory on top of V1 (activations + state): 1080p E2v3 / E2v4
+                  // 100 + 11 MB, E1v3 / E1v4 58 + 11 MB; 1440p E2v3 / E2v4 177 + 20 MB, E1v3 / E1v4 103 + 20 MB (learnedHalf: half the
+                  // activations); the zero test and the static guard need none; the weights of all four nets 1.0 MB.
 };
 
 // The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. All nets are the same
@@ -59,7 +59,16 @@ enum class LearnedNet : uint32_t {
     E1v3 = 1,   // width 12, 28,330 weights, 3.9 GMAC (3.4x cheaper), 0.24 dB below E2v3 on average (on par with V1).
     E2v4 = 2,   // the default: E2v3 fine-tuned by ml-fg, the same architecture, size and cost (width 24, 95,530 weights, 13.2 GMAC). With
                 // the zero test (Settings::learnedZeroTest): +0.27 dB over V1 ("final") on ml-fg's 14 clips.
+    E1v4 = 3,   // THE SMALL NET, the recommended fallback when E2v4 costs too much (a host that drops to a cheaper net at high resolution or
+                // refresh rate picks this one): E1v3 fine-tuned by ml-fg, the same architecture, size and cost as E1v3 (width 12, 28,330
+                // weights, 3.9 GMAC, ~0.5 ms per 1080p pair). With the zero test: +0.05 dB over E1v3, better on 13 of ml-fg's 14 clips.
 };
+// The number of LearnedNet values (every net is built into the library), and their names as ml-fg's export calls them ("e2v3", "e1v3",
+// "e2v4", "e1v4"), for a host's or a test's settings parser: learnedNetName() is null for a value out of range, learnedNetFromName() false
+// (out untouched) for an unknown name.
+constexpr uint32_t kLearnedNets = 4;
+const char* learnedNetName(LearnedNet n);
+bool learnedNetFromName(const char* name, LearnedNet* out);
 
 // The two modes of MotionVersion::V2 (Settings::v2Mode). Values are append-only and never renumbered. Runtime: setSettings() at any
 // time, no rebuild, no pipeline creation; a switch keeps the current estimate (the part of the estimate the other mode needs is
@@ -276,7 +285,8 @@ struct Settings {
     // the zero vector and keeps warp taps off them, with or without uiProtection. On = the default; off = V2's synthesis as without
     // it (the tests' unprotected reference). V1 ignores it. Runtime: setSettings() at any time, from the next recordEstimate on.
     bool v2StaticMask = true;
-    // MotionVersion::Learned: the net (see LearnedNet). E2v4 = the default (E2v3 before it). Other versions ignore it (any valid value,
+    // MotionVersion::Learned: the net (see LearnedNet). E2v4 = the default (E2v3 before it); E1v4 = the small net, the recommended fallback
+    // when E2v4 is too expensive (~2.4x cheaper at 1080p). Other versions ignore it (any valid value,
     // no effect). Runtime: setSettings() at any time, no GPU wait; the next recordEstimate runs the new net (the current estimate is
     // kept). Every net's weights are uploaded with the version's first estimate; a switch to a wider net grows the activation buffer (it
     // only ever allocates; false from setSettings if that fails, nothing changed).

@@ -273,19 +273,27 @@ inline bool isYuv(Format f) { return f == Format::Nv12 || f == Format::P010; }
 const char* const kV2NotBuilt = "the MotionVersion::V2 shader variants of this format (v2_morph, v2_morph_s, v2_qmorph, v2_qmorph_s) are not built into the library";
 const char* const kMlNotBuilt = "the MotionVersion::Learned shaders of this format (ml_dup, ml_reduce, ml_pyr, ml_match, ml_conv, ml_out, ml_zero, ml_guard) or its weights (ml_weights.h, gpu/ml/embed_weights.py) are not built into the library";
 const char* const kMlFlowScale = "MotionVersion::Learned needs flowScale 2 (its nets were trained at 2)";
-// The nets of MotionVersion::Learned, in LearnedNet order: their width (channels per hidden layer; the layout and the pipelines depend
-// on it). ADDING A NET: append its LearnedNet value (framegen.h), its width here, its kMlNet entry below, its gpu/ml/<run>/ (ml-fg's
-// manifest.json + weights.bin) and its triple in gpu/meson.build's ml_weights target (the same order).
-constexpr int kMlWidths[] = {24, 12, 24};   // E2v3, E1v3, E2v4
-constexpr int kMlNets = (int)(sizeof(kMlWidths) / sizeof(kMlWidths[0]));
+// The nets of MotionVersion::Learned, in LearnedNet order: their name (ml-fg's export run, learnedNetName()) and width (channels per
+// hidden layer; the layout and the pipelines depend on it). ADDING A NET: append its LearnedNet value and bump kLearnedNets
+// (framegen.h), append its name + width here and its ML_NET entry to kMlNet below, copy ml-fg's export/<run>/manifest.json +
+// weights.bin into gpu/ml/<run>/ and append <run> to gpu/meson.build's ml_nets (the same order). Tests: mltest's TEST_CASEs.
+struct MlNetInfo { const char* name; int width; };
+constexpr MlNetInfo kMlNetInfo[] = {{"e2v3", 24}, {"e1v3", 12}, {"e2v4", 24}, {"e1v4", 12}};
+constexpr int kMlNets = (int)(sizeof(kMlNetInfo) / sizeof(kMlNetInfo[0]));
+static_assert(kMlNets == (int)kLearnedNets, "a name and width per LearnedNet");
 #ifdef FG_HAVE_ML
 // The embedded nets, in LearnedNet order (gpu/ml/embed_weights.py): weights in shaders/ml_conv.comp's layout, the table of each
 // (level, layer)'s weight / bias offsets (vec4 units, relative to the net's start in the weights buffer)
 struct MlNet { const uint32_t* w; size_t words; uint32_t width; const uint32_t (*table)[5][2]; };
 #define ML_NET(n) MlNet{kMlWeights_##n, sizeof(kMlWeights_##n) / 4, kMlWidth_##n, kMlTable_##n}
-const MlNet kMlNet[] = {ML_NET(e2v3), ML_NET(e1v3), ML_NET(e2v4)};
-static_assert(sizeof(kMlNet) / sizeof(kMlNet[0]) == kMlNets, "a width per net");
-static_assert(kMlWidth_e2v3 == kMlWidths[0] && kMlWidth_e1v3 == kMlWidths[1] && kMlWidth_e2v4 == kMlWidths[2], "kMlWidths");
+constexpr MlNet kMlNet[] = {ML_NET(e2v3), ML_NET(e1v3), ML_NET(e2v4), ML_NET(e1v4)};
+static_assert(sizeof(kMlNet) / sizeof(kMlNet[0]) == kMlNets, "an embedded net per LearnedNet");
+constexpr bool mlWidthsMatch() {
+    for (int i = 0; i < kMlNets; i++)
+        if ((int)kMlNet[i].width != kMlNetInfo[i].width) return false;
+    return true;
+}
+static_assert(mlWidthsMatch(), "kMlNetInfo's widths are those of ml_weights.h");
 // (every net's weights are a whole number of vec4: embed_weights.py pads each layer to 4 channels, so each net starts on a vec4)
 #endif
 // the view / clean-copy formats of a Format: the library's own clean copies are in the source's own format, in logical channel order
@@ -505,7 +513,7 @@ static SizeLayout sizeLayout(uint32_t W, uint32_t H, uint32_t flowScale) {
 // MotionVersion::Learned's layout of a size (shaders/ml_common.glsl): the net's padded level 0 (fw, fh rounded up to a multiple of
 // 16), the sum S of its 5 level sizes, the partial sums of its two reductions, and per net the activation regions: R0 holds the
 // 14-channel input (4 groups) and two hidden layers (width / 4 groups each), R1 the other two.
-inline int mlWidth(LearnedNet n) { return kMlWidths[(int)n]; }
+inline int mlWidth(LearnedNet n) { return kMlNetInfo[(int)n].width; }
 struct MlLayout {
     int pw = 0, ph = 0, n0 = 0, S = 0, nDup = 0, nOut = 0;
     VkDeviceSize stateBytes = 0;
@@ -1406,6 +1414,16 @@ bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool forc
         return false;
     }
     return true;
+}
+
+const char* learnedNetName(LearnedNet n) { return (uint32_t)n < kLearnedNets ? kMlNetInfo[(int)n].name : nullptr; }
+bool learnedNetFromName(const char* name, LearnedNet* out) {
+    for (int i = 0; name && i < kMlNets; i++)
+        if (!strcmp(name, kMlNetInfo[i].name)) {
+            if (out) *out = (LearnedNet)i;
+            return true;
+        }
+    return false;
 }
 
 bool Interpolator::validate(const Settings& s) {

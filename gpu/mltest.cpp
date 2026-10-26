@@ -7,7 +7,8 @@
 //   MLTEST_DUMP  a directory (created): per net and pair the library's pf, `<run>_<pair>_{ref,fgr}.f32` ([fh][fw][2] float32) and
 //                `<run>_<pair>_{ref,fgr}.json` (sad, cut; also refh / fgrh = learnedHalf, and the zero test's kinds below), for gpu/ml/synthcheck.py (the end-to-end dB check through proto/interp.py).
 //
-// Per net (e2v3: static motion far cut odd hd overlay; e1v3: motion cut odd overlay; e2v4: static motion far cut cut2 odd hd overlay) and pair, SPEC.md section 8 in order (steps 1-6
+// Per net (e2v3: static motion far cut odd hd overlay; e1v3: motion cut odd overlay; e2v4: static motion far cut cut2 odd hd overlay;
+// e1v4: motion cut cut2 odd overlay) and pair, SPEC.md section 8 in order (steps 1-6
 // with Settings::learnedZeroTest off: the net's own field):
 //   ref  the library's net fed the reference's flow-res lumas (cv2 5.0.0's 15-bit luma, computed here; Interpolator::
 //        setDebugLearned lumaSrc): the exact-port check. The lumas the net read == ya / yc exactly, its level-0 pyramid == ya / 255
@@ -399,11 +400,10 @@ static void dumpPf(const std::string& net, const std::string& pair, const char* 
 static void zeroChecks(const char* run, const char* pair, const std::string& dir, const std::string& js, const Settings& s, Rig& rig,
                        const std::vector<float>& expPf, int fw, int fh);
 
-// The LearnedNet of an export run (its directory name); LearnedNet order. A new net: its name here and its TEST_CASEs below.
+// The LearnedNet of an export run (its directory name = framegen::learnedNetName). A new net: its TEST_CASEs below.
 static LearnedNet netOf(const char* run) {
-    static const char* names[] = {"e2v3", "e1v3", "e2v4"};
-    for (uint32_t i = 0; i < 3; i++)
-        if (!strcmp(run, names[i])) return (LearnedNet)i;
+    LearnedNet n{};
+    if (learnedNetFromName(run, &n)) return n;
     fprintf(stderr, "unknown net %s\n", run);
     exit(2);
 }
@@ -696,6 +696,12 @@ TEST_CASE("e2v4 cut2", "[vectors][e2v4]") { checkPair("e2v4", "cut2"); }
 TEST_CASE("e2v4 odd", "[vectors][e2v4]") { checkPair("e2v4", "odd"); }
 TEST_CASE("e2v4 hd", "[vectors][e2v4]") { checkPair("e2v4", "hd"); }
 TEST_CASE("e2v4 overlay", "[vectors][e2v4]") { checkPair("e2v4", "overlay"); }
+// e1v4: both "cut" (sad 43.2) and "cut2" (sad 56.1) are cuts (vec.json)
+TEST_CASE("e1v4 motion", "[vectors][e1v4]") { checkPair("e1v4", "motion"); }
+TEST_CASE("e1v4 cut", "[vectors][e1v4]") { checkPair("e1v4", "cut"); }
+TEST_CASE("e1v4 cut2", "[vectors][e1v4]") { checkPair("e1v4", "cut2"); }
+TEST_CASE("e1v4 odd", "[vectors][e1v4]") { checkPair("e1v4", "odd"); }
+TEST_CASE("e1v4 overlay", "[vectors][e1v4]") { checkPair("e1v4", "overlay"); }
 
 // ---- duplicates (shaders/ml_dup.comp: FGR's DUP_DIFF test)
 // A frame of the motion pair (or a smooth synthetic one if the vectors are missing)
@@ -768,6 +774,7 @@ static void duplicateCase(LearnedNet net) {
 TEST_CASE("e2v3 duplicate frames", "[dup][e2v3]") { duplicateCase(LearnedNet::E2v3); }
 TEST_CASE("e1v3 duplicate frames", "[dup][e1v3]") { duplicateCase(LearnedNet::E1v3); }
 TEST_CASE("e2v4 duplicate frames", "[dup][e2v4]") { duplicateCase(LearnedNet::E2v4); }
+TEST_CASE("e1v4 duplicate frames", "[dup][e1v4]") { duplicateCase(LearnedNet::E1v4); }
 
 // ---- the settings API
 TEST_CASE("Learned settings", "[api]") {
@@ -783,7 +790,15 @@ TEST_CASE("Learned settings", "[api]") {
     CHECK(s.learnedZeroTest);                  // the zero test: on by default
     CHECK_FALSE(s.learnedStaticGuard);         // the static guard: off by default
     Settings bad = s;
-    bad.learnedNet = (LearnedNet)3;   // the first value past the last net (E2v4)
+    bad.learnedNet = (LearnedNet)kLearnedNets;   // the first value past the last net
+    CHECK_FALSE(Interpolator::validate(bad));
+    CHECK(learnedNetName((LearnedNet)kLearnedNets) == nullptr);
+    CHECK(!strcmp(learnedNetName(LearnedNet::E2v4), "e2v4"));
+    LearnedNet byName = LearnedNet::E2v3;
+    CHECK(learnedNetFromName("e1v3", &byName));
+    CHECK(byName == LearnedNet::E1v3);
+    CHECK_FALSE(learnedNetFromName("e9v9", &byName));
+    CHECK(byName == LearnedNet::E1v3);
     CHECK_FALSE(Interpolator::validate(bad));
     bad = s;
     bad.motionVersion = (MotionVersion)3;

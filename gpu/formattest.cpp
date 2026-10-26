@@ -5,7 +5,7 @@
 //   options: --separate-planes  YUV: two single-plane images instead of one multi-planar image with plane views
 //            --algo v1|v2|learned  the motion version (Settings::motionVersion), default v1. Every check runs every format in it
 //            --mode quality|performance  Settings::v2Mode (default quality; V1 ignores it)
-//            --zt 0|1, --guard 0|1, --net e2v3|e1v3|e2v4  Settings::learnedZeroTest (default 1) / learnedStaticGuard (default 0) / learnedNet (default the library's); only Learned reads them
+//            --zt 0|1, --guard 0|1, --net e2v3|e1v3|e2v4|e1v4  Settings::learnedZeroTest (default 1) / learnedStaticGuard (default 0) / learnedNet (default the library's); only Learned reads them
 //            --hash             check: print an FNV-1a hash of every output of each format's Off run (t = 0.5, 0.25, blur) and
 //                               WholeScreen run (t = 0.5, 0.25), raw bytes of both planes: diff two library builds
 //
@@ -42,12 +42,8 @@ static bool hashOut = false;   // --hash
 static MotionVersion gAlgo = MotionVersion::V1;   // --algo
 static V2Mode gMode = V2Mode::Quality;             // --mode
 static bool gZt = true, gGuard = false;            // --zt, --guard: Settings::learnedZeroTest / learnedStaticGuard (Learned only)
-static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4: Settings::learnedNet (Learned only; default: the library's)
-static bool parseNet(const char* a) {
-    static const char* names[] = {"e2v3", "e1v3", "e2v4"};   // LearnedNet order
-    for (uint32_t i = 0; i < 3; i++) if (!strcmp(a, names[i])) { gNet = (LearnedNet)i; return true; }
-    return false;
-}
+static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4|e1v4: Settings::learnedNet (Learned only; default: the library's)
+static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
 static bool algoV2() { return gAlgo == MotionVersion::V2; }
 #else
 static bool algoV2() { return false; }
@@ -1306,7 +1302,7 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--zt") && i + 1 < argc) gZt = atoi(argv[++i]) != 0;
         else if (!strcmp(argv[i], "--guard") && i + 1 < argc) gGuard = atoi(argv[++i]) != 0;
-        else if (!strcmp(argv[i], "--net") && i + 1 < argc) { if (!parseNet(argv[++i])) { fprintf(stderr, "--net e2v3|e1v3|e2v4\n"); return 2; } }
+        else if (!strcmp(argv[i], "--net") && i + 1 < argc) { if (!parseNet(argv[++i])) { fprintf(stderr, "--net e2v3|e1v3|e2v4|e1v4\n"); return 2; } }
 #endif
         else pos.push_back(argv[i]);
     }
