@@ -101,6 +101,7 @@
   // 14-channel input in 4 textures), ml_conv<G>x3 (layers 1-3) and ml_last<G>; G = 6 (e2v3) splits each layer into two passes of 3
   // output textures. 'fp16' (conv_h.frag.glsl, 8 half floats per RGBA32UI texel): ml_h<CIN>g<CG>o<COUT>[L], one pass per layer.
   const ML_INC = 'learned/ml_common.inc.glsl';
+  const SG_INC = 'learned/sguard.inc.glsl';   // the static guard's constants and weight (learned/sguard.inc.glsl's top block)
   function mlConv(cin, cout, last) {
     const s = [];
     for (let j = 0; j < cin; j++) s.push('uIn' + j);
@@ -136,6 +137,13 @@
     mlConv(4, 3, false), mlConv(3, 3, false), mlConv(6, 3, false), mlConv(3, 1, true), mlConv(6, 1, true),
     mlConvH(2, 4, 3, false), mlConvH(2, 4, 6, false), mlConvH(2, 3, 3, false), mlConvH(3, 6, 6, false), mlConvH(2, 3, 1, true),
     mlConvH(3, 6, 1, true),
+    // the zero-motion test (settings.learnedZeroTest, SPEC stage 7) and the static guard (settings.learnedStaticGuard)
+    ['ml_zt_cost', 'learned/zt_cost.frag.glsl', null, ['uLv0', 'uField', 'uDup'], ML_INC],
+    ['ml_zt', 'learned/zt.frag.glsl', null, ['uCost', 'uField', 'uDup'], ML_INC],
+    ['ml_sg_h', 'learned/sg_h.frag.glsl', null, ['uPrev', 'uCurr'], SG_INC],
+    ['ml_sg_v', 'learned/sg_v.frag.glsl', null, ['uH'], SG_INC],
+    ['final_sg', 'synth/final.frag.glsl', null, ['uPrev', 'uCurr', 'uWarpA', 'uWarpC', 'uTrust', 'uSadSum', 'uUntrusted', 'uSg', 'uField'], SG_INC,
+      '#define FG_SGUARD 1\n'],
   ];
   const ML_DUP_DIFF = 0.6;                   // learned/ml_common.inc.glsl's (the duplicate-pair test)
   const ML_NETS = ['e2v3', 'e1v3'];          // settings.motionNet values (the first is the default); weights: webgl/nets/<name>.js
@@ -205,6 +213,11 @@
     motionNet: 'e2v3',      // motion 'learned': 'e2v3' (width 24, 95,530 weights) or 'e1v3' (width 12, 28,330 weights, ~3.4x cheaper)
     motionPrecision: 'fp16', // motion 'learned': storage of the net's activations, 'fp16' (8 halves per RGBA32UI texel) or 'fp32' (RGBA32F, exact);
                             // the field, the pyramid, the weights and all arithmetic are float32 either way
+    learnedZeroTest: true,  // motion 'learned': the zero-motion test after the net (ml-fg SPEC stage 7, V1's zero candidate: per flow pixel the net's
+                            // vector or 0, whichever matches better on a 5x5 window, 1 level bonus for 0); the field and the scene-cut SAD are then
+                            // the test's. false: the net's field as is (A/B)
+    learnedStaticGuard: false, // motion 'learned': the static guard after the synthesis (ml-fg scripts/static_guard.py): where prev and curr are
+                            // locally identical and the motion small, the output becomes the time mix (1 - t) prev + t curr. Opt-in
     // ---- structural (re-allocate textures and recompile the programs; drop the frame history) ----
     inputFormat: 'rgba8',   // frame format: 'rgba8' (RGBA8 frames and output) or 'rgba16f' (HDR / float: RGBA16F frames and output)
     transfer: 'encoded',    // rgba16f only: 'encoded' (display-encoded values: PQ, HLG, sRGB, ...) or 'linear' (scRGB / linear light)
@@ -214,7 +227,7 @@
   const MH_ROWS = 4;   // parent rows per band of the median histogram (estimate/medhist.frag.glsl's)
   const STRING_KEYS = { v2Mode: ['quality', 'performance'], blurWeights: ['gaussian', 'even'], inputFormat: ['rgba8', 'rgba16f'], transfer: ['encoded', 'linear'],
     motion: ['search', 'learned'], motionNet: ML_NETS, motionPrecision: ['fp16', 'fp32'] };
-  const BOOL_KEYS = { debug: 1, v2StaticMask: 1 };
+  const BOOL_KEYS = { debug: 1, v2StaticMask: 1, learnedZeroTest: 1, learnedStaticGuard: 1 };
   fg.defaultSettings = function () { return Object.assign({}, DEFAULTS); };
 
   // round-half-to-even (= cv2.saturate_cast<int> = FG:346 rintHalfEven)
@@ -344,8 +357,9 @@
   // fg.frameSizeError, else null. ok = nothing missing and no sizeError. quality: V2 Quality can run (its MIN-blend splat works,
   // probeQuality); when false, qualityError says why. V1 and V2 Performance do not need it, so it does not affect ok. learned: the
   // learned motion estimator (settings.motion 'learned') can run: 4 draw buffers / colour attachments, uniform blocks of ML_BLOCK_MAX
-  // bytes, 2 fragment uniform blocks, 8 fragment texture units (all WebGL2 core minimums, so false only on a non-conformant
-  // context); does not affect ok either. (Whether a net's weights are loaded is fg.nets, not the context: createEngine / setSettings
+  // bytes, 2 fragment uniform blocks, 9 fragment texture units (the static guard's final_sg; all within the WebGL2 core minimums,
+  // so false only on a non-conformant context); does not affect ok either. (Whether a net's weights are loaded is fg.nets, not the
+  // context: createEngine / setSettings
   // say so.)
   fg.checkSupport = function (gl, frame) {
     const missing = [];
@@ -365,7 +379,7 @@
     const mlMissing = missing.slice();
     for (const [k, min, name] of [[gl.MAX_DRAW_BUFFERS, 4, 'MAX_DRAW_BUFFERS'], [gl.MAX_COLOR_ATTACHMENTS, 4, 'MAX_COLOR_ATTACHMENTS'],
       [gl.MAX_UNIFORM_BLOCK_SIZE, ML_BLOCK_MAX, 'MAX_UNIFORM_BLOCK_SIZE'], [gl.MAX_FRAGMENT_UNIFORM_BLOCKS, 2, 'MAX_FRAGMENT_UNIFORM_BLOCKS'],
-      [gl.MAX_TEXTURE_IMAGE_UNITS, 8, 'MAX_TEXTURE_IMAGE_UNITS']]) {
+      [gl.MAX_TEXTURE_IMAGE_UNITS, 9, 'MAX_TEXTURE_IMAGE_UNITS']]) {
       if (!(gl.getParameter(k) >= min)) mlMissing.push(name + '>=' + min);
     }
     const learnedError = mlMissing.length ? 'needs ' + mlMissing.join(', ') : null;
@@ -412,7 +426,7 @@
   // the learned estimator is the effective motion estimate (V1 with motion 'learned'; V2 ignores the key)
   function mlOn(s) { return s.motionVersion === 1 && s.motion === 'learned'; }
   // which estimate the settings produce: a change drops the current estimate (like a motionVersion switch)
-  function estKey(s) { return s.motionVersion === 2 ? 'v2' : mlOn(s) ? 'ml:' + s.motionNet + ':' + s.motionPrecision : 'v1'; }
+  function estKey(s) { return s.motionVersion === 2 ? 'v2' : mlOn(s) ? 'ml:' + s.motionNet + ':' + s.motionPrecision + (s.learnedZeroTest ? ':zt' : '') : 'v1'; }
   // the loaded net `name` (webgl/nets/<name>.js attaches fg.nets[name]) or null
   function mlNetDef(name) {
     const n = fg.nets && fg.nets[name];
@@ -464,6 +478,7 @@
       RGBA32I: { i: gl.RGBA32I, f: gl.RGBA_INTEGER, t: gl.INT, ch: 4, rf: gl.RGBA_INTEGER, rt: gl.INT, A: Int32Array },
       RGBA16F: { i: gl.RGBA16F, f: gl.RGBA, t: gl.HALF_FLOAT, ch: 4, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
       R16F: { i: gl.R16F, f: gl.RED, t: gl.HALF_FLOAT, ch: 1, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
+      RG16F: { i: gl.RG16F, f: gl.RG, t: gl.HALF_FLOAT, ch: 2, rf: gl.RGBA, rt: gl.FLOAT, A: Float32Array },
     };
     // the frame / output / warp texture format of settings.inputFormat
     function colorFmt() { return settings.inputFormat === 'rgba16f' ? 'RGBA16F' : 'RGBA8'; }
@@ -596,6 +611,8 @@
     let staticDirty = true;
     let qDone = false;             // V2 Quality's estimate tail has run for the current estimate
     let mlEst = false;             // the current estimate is the learned estimator's (stats: duplicate)
+    let mlZt = false;              // ... and ran the zero-motion test (debugRead ml.zt / ml.ztCost)
+    let sgPair = false;            // the static guard's filters (T.sgD) hold the current pair
     const mlBufs = {};             // net name -> its weights in a uniform buffer (mlNetBuffer)
     if (settings.motionVersion === 2) ensureV2Programs();
     if (mlOn(settings)) ensureMlPrograms();
@@ -692,6 +709,7 @@
       T = null; info = null; levels = null;
       count = 0; currS = 0; prevS = 1;
       estimatedPair = false; haveEstimate = false; synthDone = false; synthMid = false; lastT = null; qDone = false; mlEst = false;
+      mlZt = false; sgPair = false;
       resetCache();
     }
 
@@ -833,7 +851,10 @@
     //   pyr[0] RGBA32F (la, lc, ya, yc), pyr[l > 0] RG32F (la, lc)   the net's own pyramid (SPEC stage 3)
     //   x[], level-0 size                                           the 14-channel input of the current level
     //   act[2][], level-0 size                                      ping-pong activations
-    //   h[1..4] RG32F, level size                                   the field after each level (level 0 writes pixfield)
+    //   h[1..4] RG32F, level size                                   the field after each level (level 0 writes pixfield; with the
+    //                                                               zero test pfNet)
+    //   pfNet RG32F, ztCost RG32F, zt RGBA32F, fw x fh              the zero test's input field, its costs d / e and its MRT output
+    //                                                               (allocated by the first estimate with the test on)
     //   dupSrc R32F, dupRed, sadRed                                  the duplicate-test and SAD sum chains
     // motionPrecision 'fp32': x = 3 RGBA32F + 1 RG32F, act = G = width / 4 RGBA32F each; 'fp16': 8 half floats per RGBA32UI texel,
     // x = 2, act = ceil(G / 2) each. The coarser levels render into the level-0-sized x / act textures over their own viewport
@@ -887,13 +908,14 @@
             if (half) {
               chkBlock(p, 0, parts[0]);
               if (parts[1]) chkBlock(p, 1, parts[1]);
-              m.plan.push({ name: 'ml_c' + k + '.' + l, p: p, out: outOf(0), size: size, top: top, ins: ins, block: parts[0], block2: parts[1] || null });
+              m.plan.push({ name: 'ml_c' + k + '.' + l, p: p, out: outOf(0), size: size, top: top, ins: ins, block: parts[0], block2: parts[1] || null,
+                pf: last && l === 0 });
               continue;
             }
             for (let part = 0; part < parts.length; part++) {
               chkBlock(p, 0, parts[part]);
               m.plan.push({ name: 'ml_c' + k + (parts.length > 1 ? 'ab'[part] : '') + '.' + l, p: p, out: outOf(part), size: size, top: top,
-                ins: ins, block: parts[part], block2: null });
+                ins: ins, block: parts[part], block2: null, pf: last && l === 0 });
             }
           }
         }
@@ -1109,8 +1131,8 @@
       if (rebuilt) alloc(W, H);   // re-allocates all flow-res (or, for a format change, all) textures, drops frame history
       else if (switched || estSwitched) {
         // like the library: a motion-version switch drops the current estimate (synth returns false until the next estimate()); so
-        // does a switch of V1's estimator (motion / motionNet)
-        estimatedPair = false; haveEstimate = false; synthDone = false; synthMid = false; lastT = null; mlEst = false;
+        // does a switch of V1's estimator (motion / motionNet / motionPrecision / learnedZeroTest)
+        estimatedPair = false; haveEstimate = false; synthDone = false; synthMid = false; lastT = null; mlEst = false; mlZt = false;
         if (info && settings.motionVersion === 2 && !T.v2) T.v2 = allocV2();
       }
       return { rebuilt: rebuilt };
@@ -1168,6 +1190,7 @@
 
       prevS = currS; currS = n;
       count++;
+      sgPair = false;
       estimatedPair = false;
       synthDone = false;
       counts.pushFrame = nDraw;
@@ -1289,11 +1312,25 @@
       }
     }
 
-    // The learned estimate (ml-fg export/SPEC.md stages 1-6): the duplicate test, the net's pyramid, coarse to fine (match, 5 convs
-    // per level), then V1's contract: the field in pixfield (fw x fh, flow-res half-vectors) and sadSum = sad * bw * bh in sadRed's
-    // last texel. V1's synthesis reads both unchanged (cut: sad > sceneCutSad).
+    // the zero-motion test's textures (the first estimate with settings.learnedZeroTest; freed with the learned set)
+    function allocZt(m) {
+      const t0 = ownedTex.length, f0 = ownedFbo.length;
+      m.pfNet = mk('ml.pfNet', 'RG32F', FW, FH);
+      m.ztCost = mk('ml.ztCost', 'RG32F', FW, FH);
+      m.zt = mk('ml.zt', 'RGBA32F', FW, FH);
+      m.ztMrt = mkMrt('ml_zt', [T.pixfield, m.zt]);
+      m.tex = m.tex.concat(ownedTex.slice(t0));
+      m.fbos = m.fbos.concat(ownedFbo.slice(f0));
+    }
+
+    // The learned estimate (ml-fg export/SPEC.md stages 1-7): the duplicate test, the net's pyramid, coarse to fine (match, 5 convs
+    // per level), the zero-motion test (settings.learnedZeroTest: the net's level 0 writes pfNet, ml_zt_cost + ml_zt write the final
+    // field into pixfield and the per-pixel SAD terms), then V1's contract: the field in pixfield (fw x fh, flow-res half-vectors)
+    // and sadSum = sad * bw * bh in sadRed's last texel. V1's synthesis reads both unchanged (cut: sad > sceneCutSad).
     function estimateLearned() {
       const m = allocMl(settings.motionNet, settings.motionPrecision), A = T.frame[prevS], C = T.frame[currS];
+      const zt = settings.learnedZeroTest;
+      if (zt && !m.zt) allocZt(m);
       const dr = m.dupRed, dup = dr[dr.length - 1];
       begin(P.ml_lv0, m.lvMrt, A, C);   // level 0 of the pyramid + the duplicate test's per-cell sums
       gl.uniform2i(P.ml_lv0.u.uSize, FW, FH);
@@ -1305,7 +1342,7 @@
       }
       for (let i = 0; i < m.plan.length; i++) {
         const d = m.plan[i], u = d.p.u;
-        beginArr(d.p, d.out, d.ins);
+        beginArr(d.p, d.pf && zt ? m.pfNet : d.out, d.ins);
         gl.uniform2i(u.uSize, d.size[0], d.size[1]);
         if (u.uTop) gl.uniform1i(u.uTop, d.top);
         if (d.block) gl.bindBufferRange(gl.UNIFORM_BUFFER, 0, m.buf, d.block.off, d.block.size);
@@ -1313,10 +1350,19 @@
         tri(d.name);
       }
       const sr = m.sadRed;
-      begin(P.ml_sad, sr[0], m.pyr[0], T.pixfield);
-      gl.uniform1i(P.ml_sad.u.uFan, sr[0].fan);
-      tri('ml_sad');
-      sumRest(sr);
+      if (zt) {   // SPEC stage 7, then stage 6 from its per-pixel terms (zero ? e : d: the SAD of the final field)
+        begin(P.ml_zt_cost, m.ztCost, m.pyr[0], m.pfNet, dup);
+        tri('ml_zt_cost');
+        begin(P.ml_zt, m.ztMrt, m.ztCost, m.pfNet, dup);
+        tri('ml_zt');
+        runChain(P.reduce_sad, sr, m.zt, 0, 0);
+      } else {
+        begin(P.ml_sad, sr[0], m.pyr[0], T.pixfield);
+        gl.uniform1i(P.ml_sad.u.uFan, sr[0].fan);
+        tri('ml_sad');
+        sumRest(sr);
+      }
+      mlZt = zt;
       const lv0 = levels[0];
       begin(P.ml_sadout, T.sadRed[T.sadRed.length - 1], sr[sr.length - 1], dup);
       gl.uniform1f(P.ml_sadout.u.uWeight, Math.fround(lv0.bw * lv0.bh / (FW * FH)));
@@ -1329,6 +1375,7 @@
       beginCall();
       nDraw = 0; nClear = 0;
       mlEst = mlOn(settings);
+      mlZt = false;
       if (mlEst) {
         estimateLearned();
         estimatedPair = true;
@@ -1455,10 +1502,24 @@
         // Y5 untrusted count reduction
         const ur = T.untrRed;
         runChain(P.reduce_untrusted, ur, T.trust, 1, 0);
-        // Y6 final
-        begin(P.final, T.out, T.frame[prevS], T.frame[currS], T.warpA, T.warpC, T.trust,
-          T.sadRed[T.sadRed.length - 1], ur[ur.length - 1]);
-        tri('final');
+        // Y6 final (the static guard: its filters of |prev - curr| once per pair, then final with the guard)
+        if (mlEst && settings.learnedStaticGuard) {
+          if (!sgPair) {
+            if (!T.sgH) { T.sgH = mk('sgH', 'RG16F', W, H); T.sgD = mk('sgD', 'RG16F', W, H); }
+            begin(P.ml_sg_h, T.sgH, T.frame[prevS], T.frame[currS]);
+            tri('ml_sg_h');
+            begin(P.ml_sg_v, T.sgD, T.sgH);
+            tri('ml_sg_v');
+            sgPair = true;
+          }
+          begin(P.final_sg, T.out, T.frame[prevS], T.frame[currS], T.warpA, T.warpC, T.trust,
+            T.sadRed[T.sadRed.length - 1], ur[ur.length - 1], T.sgD, field);
+          tri('final_sg');
+        } else {
+          begin(P.final, T.out, T.frame[prevS], T.frame[currS], T.warpA, T.warpC, T.trust,
+            T.sadRed[T.sadRed.length - 1], ur[ur.length - 1]);
+          tri('final');
+        }
       }
       synthDone = true;
       synthMid = mid;
@@ -1659,8 +1720,17 @@
           if (key === 'h') { const l = level(parts, 2, m.h.length, name); if (l > 0) return m.h[l]; break; }
           if (key === 'dup') return m.dupRed[m.dupRed.length - 1];
           if (key === 'sad') return m.sadRed[m.sadRed.length - 1];
+          // the zero-motion test (its last estimate with settings.learnedZeroTest): ml.pfNet (the net's field before the test),
+          // ml.ztCost (r = d, g = e), ml.zt (r = the SAD term, g = C(h), b = C(0), a = zero)
+          if (key === 'pfNet' || key === 'ztCost' || key === 'zt') {
+            if (!mlZt) throw new Error('framegen: debugRead("' + name + '"): the last estimate did not run the zero-motion test');
+            return m[key];
+          }
           break;
         }
+        case 'sg':   // the static guard's filters of the current pair (r = d, g = dMin; its last guarded synth)
+          if (!T.sgD || !sgPair) throw new Error('framegen: debugRead("sg"): no static-guard synth for this pair yet');
+          return T.sgD;
         case 'out': needSynth(name); return T.out;
         default: break;
       }
