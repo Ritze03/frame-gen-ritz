@@ -36,9 +36,14 @@ enum class MotionVersion : uint32_t {
                   // on the flow-res luma, Settings::learnedNet picks the weights, both embedded in the library). It writes what V1's
                   // search writes (the per-pixel half-vector field, the scene-cut SAD sum); V1's synthesis, trust, fallbacks, motion
                   // blur and UI protection are unchanged. Two (near-)identical frames (FGR's duplicate test: mean |a - c| <= 0.6
-                  // levels per channel) skip the net and get V1's answer for a still pair, a zero field. Float32 throughout.
-                  // flowScale 2 only (the nets were trained at 2). Every Format. Costs more GPU time and memory than V1 (see
-                  // INTEGRATION.md); V1 stays the default.
+                  // levels, the mean over the pixels and R, G, B, proto/harness.py DUP_DIFF) skip the net and get V1's answer for a
+                  // still pair, a zero field (a small cursor moving on a still desktop counts as a duplicate too). Float32
+                  // throughout (Settings::learnedHalf: half activations). flowScale 2 only (the nets were trained at 2). Every
+                  // Format. Costs more GPU time and memory than V1; V1 stays the default. RX 7900 XTX, 2x, whole pair (estimate +
+                  // synth), back-to-back, ms, float32 / learnedHalf: 1080p E2v3 1.29 / 1.00, E1v3 0.53 / 0.48 (V1 0.31); 1440p E2v3
+                  // 2.70 / 1.66, E1v3 0.88 / 0.78 (V1 0.47). The synth part is V1's (~0.07 ms at 1080p, ~0.12 at 1440p). Memory on
+                  // top of V1 (activations + state): 1080p E2v3 100 + 11 MB, E1v3 58 + 11 MB; 1440p E2v3 177 + 20 MB, E1v3
+                  // 103 + 20 MB (learnedHalf: half the activations).
 };
 
 // The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. Both nets are the same
