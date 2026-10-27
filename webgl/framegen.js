@@ -28,8 +28,8 @@
   // Static tables
   // ---------------------------------------------------------------------------------------------
 
-  fg.version = '4';   // 4: nets e2v4 (the default motionNet) and e1v4, learnedZeroTest (default on), learnedStaticGuard, smallNet /
-  // defaultNet; 3: the learned motion estimator (settings motion / motionNet, __fg.nets, checkSupport learned); 2: V2 Quality,
+  fg.version = '5';   // 5: nets e2v5 (the default motionNet) and e1v5 (smallNet), the default learned output changed; 4: nets e2v4
+  // and e1v4, learnedZeroTest (default on), learnedStaticGuard, smallNet / defaultNet; 3: the learned motion estimator (settings motion / motionNet, __fg.nets, checkSupport learned); 2: V2 Quality,
   // RGBA16F input, synthBlur, frameSizeError, checkSupport sizeError / quality (API of the earlier versions unchanged otherwise)
   fg.requiredExtensions = ['EXT_color_buffer_float', 'EXT_float_blend', 'OES_texture_float_linear'];
 
@@ -99,7 +99,7 @@
   // The learned motion estimator (settings.motion 'learned', V1 only; ml-fg export/SPEC.md), compiled the first time it is selected.
   // The convs are one program per shape. motionPrecision 'fp32' (conv.frag.glsl: ML_CIN RGBA32F input textures, ML_COUT output
   // textures, ML_LAST the 2-channel output layer): a net of width w (G = w / 4 textures per activation) uses ml_conv4x3 (layer 0: the
-  // 14-channel input in 4 textures), ml_conv<G>x3 (layers 1-3) and ml_last<G>; G = 6 (e2v4 / e2v3) splits each layer into two passes of 3
+  // 14-channel input in 4 textures), ml_conv<G>x3 (layers 1-3) and ml_last<G>; G = 6 (e2v5 / e2v4 / e2v3) splits each layer into two passes of 3
   // output textures. 'fp16' (conv_h.frag.glsl, 8 half floats per RGBA32UI texel): ml_h<CIN>g<CG>o<COUT>[L], one pass per layer.
   const ML_INC = 'learned/ml_common.inc.glsl';
   const SG_INC = 'learned/sguard.inc.glsl';   // the static guard's constants and weight (learned/sguard.inc.glsl's top block)
@@ -147,8 +147,8 @@
       '#define FG_SGUARD 1\n'],
   ];
   const ML_DUP_DIFF = 0.6;                   // learned/ml_common.inc.glsl's (the duplicate-pair test)
-  const ML_NETS = ['e2v4', 'e1v4', 'e2v3', 'e1v3'];  // settings.motionNet values (DEFAULTS.motionNet is the first); weights: webgl/nets/<name>.js
-  const ML_SMALL_NET = 'e1v4';               // the recommended small / fallback net (width 12, ~3.4x cheaper than the default)
+  const ML_NETS = ['e2v5', 'e1v5', 'e2v4', 'e1v4', 'e2v3', 'e1v3'];  // settings.motionNet values (DEFAULTS.motionNet is the first); weights: webgl/nets/<name>.js
+  const ML_SMALL_NET = 'e1v5';               // the recommended small / fallback net (width 12, ~3.4x cheaper than the default)
   // Read-only: __fg.defaultNet (= DEFAULTS.motionNet) and __fg.smallNet, so a caller picks the small net without naming it
   for (const [k, v] of [['defaultNet', ML_NETS[0]], ['smallNet', ML_SMALL_NET]]) {
     Object.defineProperty(fg, k, { value: v, enumerable: true, writable: false, configurable: true });
@@ -216,8 +216,8 @@
     blurWeights: 'gaussian', // synthBlur: 'gaussian' or 'even' (Settings::blurWeights)
     motion: 'search',       // V1 only: 'search' (V1's block search, proto/interp.py) or 'learned' (the learned estimator: needs flowScale 2
                             // and the net's weights, webgl/nets/<motionNet>.js; ignored by V2)
-    motionNet: 'e2v4',      // motion 'learned': 'e2v4' (width 24, 95,530 weights: e2v3 fine-tuned, same layout and cost), 'e1v4'
-                            // (width 12, 28,330 weights, ~3.4x cheaper: __fg.smallNet, e1v3 fine-tuned), 'e2v3' or 'e1v3'
+    motionNet: 'e2v5',      // motion 'learned': 'e2v5' (width 24, 95,530 weights: e2v4 fine-tuned on more footage, same layout and cost),
+                            // 'e1v5' (width 12, 28,330 weights, ~3.4x cheaper: __fg.smallNet, e1v4 fine-tuned), 'e2v4', 'e1v4', 'e2v3' or 'e1v3'
     motionPrecision: 'fp16', // motion 'learned': storage of the net's activations, 'fp16' (8 halves per RGBA32UI texel) or 'fp32' (RGBA32F, exact);
                             // the field, the pyramid, the weights and all arithmetic are float32 either way
     learnedZeroTest: true,  // motion 'learned': the zero-motion test after the net (ml-fg SPEC stage 7, V1's zero candidate: per flow pixel the net's

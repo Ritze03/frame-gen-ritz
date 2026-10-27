@@ -5,8 +5,8 @@
 // --gpu: hardware GL through ANGLE (FG_ANGLE=vulkan default, or gl); otherwise SwiftShader (CPU: only relative numbers mean much).
 // Modes: v1, v2p (V2 Performance), v2q (V2 Quality), ml2 / ml1 (V1 with the learned estimator e2v3 / e1v3, motionPrecision fp16;
 // ml2f / ml1f: fp32; flowScale 2 only), each with the zero-motion test (the default); a suffix n turns the zero test off (ml2n,
-// ml2fn, ...), a suffix g turns the static guard on (ml2g, ml2ng, ...). Any net by its name the same way: e2v4 (fp16), e2v4f (fp32),
-// e2v4n, e2v4fg, e1v4, ... (ml2 = e2v3, ml1 = e1v3; webgl/nets/<net>.js must exist).
+// ml2fn, ...), a suffix g turns the static guard on (ml2g, ml2ng, ...). Any net by its name the same way: e2v5 (fp16), e2v5f (fp32),
+// e2v5n, e2v5fg, e1v5, e2v4, ... (ml2 = e2v3, ml1 = e1v3; webgl/nets/<net>.js must exist).
 // --size: the pair resampled (bilinear) to W x H first, e.g. 2560x1440 from the 1080p pair.
 // GPU time (EXT_disjoint_timer_query_webgl2) of pushFrame (the raw RGBA upload from JS + luma pyramid) and of estimate + synths, when the browser exposes it, else wall time per pair with a gl.finish() each
 // (includes the CPU side of the GL calls). Prints the median and the minimum over --iters pairs after 10 warm-up pairs.
