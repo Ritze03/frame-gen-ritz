@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // The learned motion estimator (settings.motion 'learned', webgl/shaders/learned/) vs the ml-fg hand-off test vectors, by the
 // procedure of export/SPEC.md section 8, for every pair of every net at both activation precisions; then the duplicate-pair skip.
-//   node webgl/tests/learned.mjs [--gpu] [--nets e2v4,e1v4,e2v3,e1v3] [--pairs motion,odd] [--prec fp32,fp16] [--json FILE]
+//   node webgl/tests/learned.mjs [--gpu] [--nets e2v5,e1v5,e2v4,e1v4,e2v3,e1v3] [--pairs motion,odd] [--prec fp32,fp16] [--json FILE]
 // Nets: each webgl/nets/<net>.js with an export/<net>/testvec; pairs: its testvec/<pair>/ directories (the cut flags are vec.json's
 // cut / cut_zt, never the pair's name).
 // Vectors: $FG_MLFG_EXPORT (default ~/Schinken/Programming/Local/ml-fg/export; read only, nothing is copied into the repo); the decoded
@@ -49,7 +49,7 @@ for (let i = 0; i < argv.length; i++) {
 }
 const TOL = { top: 5e-5, pfMean: 2e-4, pfMax: 5e-2, sadRel: 1e-3, sadRel16: 1e-2, synthDb: 45, midDb: 0.05, engineMae: 1.0,
   ztAgree: 0.999, ztSynthDb: 70, cost: 2e-3, sgMax: 1.0 };
-const HDR_NETS = ['e2v4', 'e2v3'];   // the RGBA16F-input rows (motion / odd, fp16)
+const HDR_NETS = ['e2v5', 'e2v4', 'e2v3'];   // the RGBA16F-input rows (motion / odd, fp16)
 const SG_NET = 'e2v3';               // the static guard check's net (pinned: the guard does not depend on the net)
 const py = (mode) => {
   const r = spawnSync('python3', ['-I', path.join(here, 'learned_ref.py'), mode], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', env: { ...process.env, FG_WORK: work } });
@@ -241,7 +241,7 @@ const cmp = (e, x) => {
 const e1 = (v) => (v === 0 ? '0' : v.toExponential(1));
 const rows = [];
 let allOk = true;
-// jobs: every pair at each precision, plus (variant 'hdr') e2v4 / e2v3 motion / odd with RGBA16F input (inputFormat 'rgba16f', transfer
+// jobs: every pair at each precision, plus (variant 'hdr') e2v5 / e2v4 / e2v3 motion / odd with RGBA16F input (inputFormat 'rgba16f', transfer
 // 'encoded': the frames as value / 255; the luma is then the unrounded weighted sum, so ya / yc are not compared)
 const jobs = [];
 for (const prec of opt.prec) for (const p of man.pairs) jobs.push({ p, prec, variant: prec });
