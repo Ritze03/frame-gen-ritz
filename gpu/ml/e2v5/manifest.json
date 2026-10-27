@@ -1,0 +1,793 @@
+{
+ "run": "e2v5",
+ "checkpoint_sha256": "5f8f3702700ec5ad01ce6afda8a721e4d70bd867db57ffeb464e41a68acaaed1",
+ "checkpoint_step": 19000,
+ "checkpoint_val_score": 31.913,
+ "config": {
+  "levels": 5,
+  "width": 24,
+  "depth": 4,
+  "shared": false,
+  "cost": 1
+ },
+ "in_channels": 14,
+ "input_channels": [
+  "wa",
+  "wc",
+  "wa-wc",
+  "cost(dy=-1,dx=-1)",
+  "cost(dy=-1,dx=0)",
+  "cost(dy=-1,dx=1)",
+  "cost(dy=0,dx=-1)",
+  "cost(dy=0,dx=0)",
+  "cost(dy=0,dx=1)",
+  "cost(dy=1,dx=-1)",
+  "cost(dy=1,dx=0)",
+  "cost(dy=1,dx=1)",
+  "hx/4",
+  "hy/4"
+ ],
+ "flow_scale": 2,
+ "cut_sad": 30.0,
+ "sad": "mean over all fh*fw flow-res pixels of |ya(q-h) - yc(q+h)| (bilinear, clamp-to-edge on the UNPADDED flow-res luma, luma in 0..255 units, h = final pf); cut when sad > cut_sad",
+ "pad_multiple": 16,
+ "weights_file": "weights.bin",
+ "weights_dtype": "float32 little-endian, packed, no padding between tensors",
+ "weights_sha256": "7ee3da3ad206dbfec8a82915062fea3d59a1841b343e7d8a2f8f48afed8be66f",
+ "weights_f16_file": "weights.f16.bin",
+ "weights_f16_note": "same tensors rounded to IEEE half; offsets = offset_bytes / 2; max abs rounding error below",
+ "weights_f16_max_abs_err": 0.0018792152404785156,
+ "total_elements": 95530,
+ "forward_order": "tensors are listed coarsest pyramid level first (level index L-1), then ..., finest (level 0)",
+ "level_to_stack": [
+  4,
+  3,
+  2,
+  1,
+  0
+ ],
+ "stacks": [
+  {
+   "name": "nets.4",
+   "levels": [
+    4
+   ],
+   "layers": [
+    {
+     "weight": "nets.4.0.weight",
+     "bias": "nets.4.0.bias",
+     "c_in": 14,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.4.2.weight",
+     "bias": "nets.4.2.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.4.4.weight",
+     "bias": "nets.4.4.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.4.6.weight",
+     "bias": "nets.4.6.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.4.8.weight",
+     "bias": "nets.4.8.bias",
+     "c_in": 24,
+     "c_out": 2,
+     "act": "none"
+    }
+   ]
+  },
+  {
+   "name": "nets.3",
+   "levels": [
+    3
+   ],
+   "layers": [
+    {
+     "weight": "nets.3.0.weight",
+     "bias": "nets.3.0.bias",
+     "c_in": 14,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.3.2.weight",
+     "bias": "nets.3.2.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.3.4.weight",
+     "bias": "nets.3.4.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.3.6.weight",
+     "bias": "nets.3.6.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.3.8.weight",
+     "bias": "nets.3.8.bias",
+     "c_in": 24,
+     "c_out": 2,
+     "act": "none"
+    }
+   ]
+  },
+  {
+   "name": "nets.2",
+   "levels": [
+    2
+   ],
+   "layers": [
+    {
+     "weight": "nets.2.0.weight",
+     "bias": "nets.2.0.bias",
+     "c_in": 14,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.2.2.weight",
+     "bias": "nets.2.2.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.2.4.weight",
+     "bias": "nets.2.4.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.2.6.weight",
+     "bias": "nets.2.6.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.2.8.weight",
+     "bias": "nets.2.8.bias",
+     "c_in": 24,
+     "c_out": 2,
+     "act": "none"
+    }
+   ]
+  },
+  {
+   "name": "nets.1",
+   "levels": [
+    1
+   ],
+   "layers": [
+    {
+     "weight": "nets.1.0.weight",
+     "bias": "nets.1.0.bias",
+     "c_in": 14,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.1.2.weight",
+     "bias": "nets.1.2.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.1.4.weight",
+     "bias": "nets.1.4.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.1.6.weight",
+     "bias": "nets.1.6.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.1.8.weight",
+     "bias": "nets.1.8.bias",
+     "c_in": 24,
+     "c_out": 2,
+     "act": "none"
+    }
+   ]
+  },
+  {
+   "name": "nets.0",
+   "levels": [
+    0
+   ],
+   "layers": [
+    {
+     "weight": "nets.0.0.weight",
+     "bias": "nets.0.0.bias",
+     "c_in": 14,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.0.2.weight",
+     "bias": "nets.0.2.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.0.4.weight",
+     "bias": "nets.0.4.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.0.6.weight",
+     "bias": "nets.0.6.bias",
+     "c_in": 24,
+     "c_out": 24,
+     "act": "clamp01"
+    },
+    {
+     "weight": "nets.0.8.weight",
+     "bias": "nets.0.8.bias",
+     "c_in": 24,
+     "c_out": 2,
+     "act": "none"
+    }
+   ]
+  }
+ ],
+ "tensors": [
+  {
+   "name": "nets.4.0.weight",
+   "shape": [
+    24,
+    14,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 0,
+   "count": 3024
+  },
+  {
+   "name": "nets.4.0.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 12096,
+   "count": 24
+  },
+  {
+   "name": "nets.4.2.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 12192,
+   "count": 5184
+  },
+  {
+   "name": "nets.4.2.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 32928,
+   "count": 24
+  },
+  {
+   "name": "nets.4.4.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 33024,
+   "count": 5184
+  },
+  {
+   "name": "nets.4.4.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 53760,
+   "count": 24
+  },
+  {
+   "name": "nets.4.6.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 53856,
+   "count": 5184
+  },
+  {
+   "name": "nets.4.6.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 74592,
+   "count": 24
+  },
+  {
+   "name": "nets.4.8.weight",
+   "shape": [
+    2,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 74688,
+   "count": 432
+  },
+  {
+   "name": "nets.4.8.bias",
+   "shape": [
+    2
+   ],
+   "layout": "O",
+   "offset_bytes": 76416,
+   "count": 2
+  },
+  {
+   "name": "nets.3.0.weight",
+   "shape": [
+    24,
+    14,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 76424,
+   "count": 3024
+  },
+  {
+   "name": "nets.3.0.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 88520,
+   "count": 24
+  },
+  {
+   "name": "nets.3.2.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 88616,
+   "count": 5184
+  },
+  {
+   "name": "nets.3.2.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 109352,
+   "count": 24
+  },
+  {
+   "name": "nets.3.4.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 109448,
+   "count": 5184
+  },
+  {
+   "name": "nets.3.4.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 130184,
+   "count": 24
+  },
+  {
+   "name": "nets.3.6.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 130280,
+   "count": 5184
+  },
+  {
+   "name": "nets.3.6.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 151016,
+   "count": 24
+  },
+  {
+   "name": "nets.3.8.weight",
+   "shape": [
+    2,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 151112,
+   "count": 432
+  },
+  {
+   "name": "nets.3.8.bias",
+   "shape": [
+    2
+   ],
+   "layout": "O",
+   "offset_bytes": 152840,
+   "count": 2
+  },
+  {
+   "name": "nets.2.0.weight",
+   "shape": [
+    24,
+    14,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 152848,
+   "count": 3024
+  },
+  {
+   "name": "nets.2.0.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 164944,
+   "count": 24
+  },
+  {
+   "name": "nets.2.2.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 165040,
+   "count": 5184
+  },
+  {
+   "name": "nets.2.2.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 185776,
+   "count": 24
+  },
+  {
+   "name": "nets.2.4.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 185872,
+   "count": 5184
+  },
+  {
+   "name": "nets.2.4.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 206608,
+   "count": 24
+  },
+  {
+   "name": "nets.2.6.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 206704,
+   "count": 5184
+  },
+  {
+   "name": "nets.2.6.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 227440,
+   "count": 24
+  },
+  {
+   "name": "nets.2.8.weight",
+   "shape": [
+    2,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 227536,
+   "count": 432
+  },
+  {
+   "name": "nets.2.8.bias",
+   "shape": [
+    2
+   ],
+   "layout": "O",
+   "offset_bytes": 229264,
+   "count": 2
+  },
+  {
+   "name": "nets.1.0.weight",
+   "shape": [
+    24,
+    14,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 229272,
+   "count": 3024
+  },
+  {
+   "name": "nets.1.0.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 241368,
+   "count": 24
+  },
+  {
+   "name": "nets.1.2.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 241464,
+   "count": 5184
+  },
+  {
+   "name": "nets.1.2.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 262200,
+   "count": 24
+  },
+  {
+   "name": "nets.1.4.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 262296,
+   "count": 5184
+  },
+  {
+   "name": "nets.1.4.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 283032,
+   "count": 24
+  },
+  {
+   "name": "nets.1.6.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 283128,
+   "count": 5184
+  },
+  {
+   "name": "nets.1.6.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 303864,
+   "count": 24
+  },
+  {
+   "name": "nets.1.8.weight",
+   "shape": [
+    2,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 303960,
+   "count": 432
+  },
+  {
+   "name": "nets.1.8.bias",
+   "shape": [
+    2
+   ],
+   "layout": "O",
+   "offset_bytes": 305688,
+   "count": 2
+  },
+  {
+   "name": "nets.0.0.weight",
+   "shape": [
+    24,
+    14,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 305696,
+   "count": 3024
+  },
+  {
+   "name": "nets.0.0.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 317792,
+   "count": 24
+  },
+  {
+   "name": "nets.0.2.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 317888,
+   "count": 5184
+  },
+  {
+   "name": "nets.0.2.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 338624,
+   "count": 24
+  },
+  {
+   "name": "nets.0.4.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 338720,
+   "count": 5184
+  },
+  {
+   "name": "nets.0.4.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 359456,
+   "count": 24
+  },
+  {
+   "name": "nets.0.6.weight",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 359552,
+   "count": 5184
+  },
+  {
+   "name": "nets.0.6.bias",
+   "shape": [
+    24
+   ],
+   "layout": "O",
+   "offset_bytes": 380288,
+   "count": 24
+  },
+  {
+   "name": "nets.0.8.weight",
+   "shape": [
+    2,
+    24,
+    3,
+    3
+   ],
+   "layout": "OIHW (out, in, ky, kx), cross-correlation",
+   "offset_bytes": 380384,
+   "count": 432
+  },
+  {
+   "name": "nets.0.8.bias",
+   "shape": [
+    2
+   ],
+   "layout": "O",
+   "offset_bytes": 382112,
+   "count": 2
+  }
+ ]
+}
