@@ -93,7 +93,7 @@ engine.setSettings({ motion: 'search' });                                       
 | Setting | Values (default first) | |
 |---|---|---|
 | `motion` | `'search'`, `'learned'` | V1 only (V2 ignores it); `'learned'` needs `flowScale` 2 (the nets were trained at 2; else a `RangeError`) |
-| `motionNet` | `'e2v5'`, `'e1v5'`, `'e2v4'`, `'e1v4'`, `'e2v3'`, `'e1v3'` | e2v5: e2v4 fine-tuned on more varied footage (the user's failure recordings, a friend's captures, 9 gameplay videos; same architecture, weight layout and cost), ml-fg's primary (with the zero test 31.23 dB mean on 14 clips at 2x, +0.31 dB over `final`, +0.04 over e2v4, no clip worse); e1v5 (`__fg.smallNet`): e1v4 fine-tuned the same way (with the zero test +0.12 dB over `final`, +0.06 over e1v4); e2v4: e2v3 fine-tuned (same architecture, weight layout and cost), ml-fg's primary (with the zero test +0.27 dB over `final` on 14 clips); e1v4 (`__fg.smallNet`, the recommended small / fallback net): e1v3 fine-tuned, width 12, 28,330 weights, same layout and cost as e1v3, with the zero test +0.05 dB over e1v3 (better on 13 of 14 clips); e2v3: width 24, 95,530 weights (+0.23 dB over V1's `final` on its 7 clips, SPEC 9); e1v3: width 12, 28,330 weights, on par with `final` (−0.01 dB), 3.4x fewer MACs |
+| `motionNet` | `'e2v5'`, `'e1v5'`, `'e2v4'`, `'e1v4'`, `'e2v3'`, `'e1v3'` | e2v5: e2v4 fine-tuned on more varied footage (the user's failure recordings, a friend's captures, 9 gameplay videos; same architecture, weight layout and cost), ml-fg's primary (with the zero test 31.23 dB mean on 14 clips at 2x, +0.31 dB over `final`, +0.04 over e2v4, no clip worse); e1v5 (`__fg.smallNet`): e1v4 fine-tuned the same way (with the zero test +0.12 dB over `final`, +0.06 over e1v4); e2v4: e2v3 fine-tuned (same architecture, weight layout and cost), the default before e2v5 (with the zero test +0.27 dB over `final` on 14 clips); e1v4 (the small net, `__fg.smallNet`, before e1v5): e1v3 fine-tuned, width 12, 28,330 weights, same layout and cost as e1v3, with the zero test +0.05 dB over e1v3 (better on 13 of 14 clips); e2v3: width 24, 95,530 weights (+0.23 dB over V1's `final` on its 7 clips, SPEC 9); e1v3: width 12, 28,330 weights, on par with `final` (−0.01 dB), 3.4x fewer MACs |
 | `motionPrecision` | `'fp16'`, `'fp32'` | storage of the net's input and activations: half floats (8 per RGBA32UI texel) or RGBA32F; the field, pyramid, weights and all arithmetic are float32 either way |
 
 | `learnedZeroTest` | `true`, `false` | the zero-motion test after the net (below); `false` gives the net's field as is (A/B) |
@@ -220,7 +220,7 @@ PASS; 8 pairs x fp32 / fp16 + RGBA16F motion / odd, each without and with the ze
 RGBA16F input (e2v4 fp16, motion / odd): 51.7–58.2 dB without, 50.2–56.1 dB with the zero test (mask 98.90–99.22 %). Middle frame
 within 0.002 dB (RGBA16F: 0.008), engine output vs synth MAE ≤ 0.06 levels (RGBA16F: ≤ 0.49). Cost: as e2v3 (same passes), table below.
 
-**e1v4** (`__fg.smallNet`; `learned.mjs`, 2026-10-26, the same gates as e1v3; SwiftShader, ANGLE / Vulkan / RADV and ANGLE /
+**e1v4** (`__fg.smallNet` before e1v5; `learned.mjs`, 2026-10-26, the same gates as e1v3; SwiftShader, ANGLE / Vulkan / RADV and ANGLE /
 OpenGL / radeonsi, every row PASS; 5 pairs (cut, cut2, motion, odd 319 × 181, overlay) x fp32 / fp16, each without and with the
 zero test, + 4 duplicate cases per GL; on e1v4 both `cut` (sad 43.2) and `cut2` (sad 56.1) are cuts, taken from `vec.json`):
 
