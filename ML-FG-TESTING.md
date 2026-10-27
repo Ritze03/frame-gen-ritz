@@ -2,14 +2,183 @@ STATUS: READY
 
 # ml-fg learned motion estimator: testing branch `ml-fg-testing`
 
-Both ports of ml-fg's learned motion estimator pass ml-fg's test vectors (`export/SPEC.md` §8), including round 2's zero-motion
-test (`*_zt` vectors) and the two new nets **e2v4** (the new default) and **e1v4** (the new small net). The two ports are the
-Vulkan library (`gpu/`) and the WebGL2 backend (`webgl/`). The results below come from an independent QC re-run on
-2026-10-26 on an RX 7900 XTX with RADV and Chromium 156, at `bb73df0` (round 2).
+Both ports of ml-fg's learned motion estimator pass ml-fg's test vectors (`export/SPEC.md` §8), including the zero-motion test
+(`*_zt` vectors) and round 3's two new nets **e2v5** (the new default) and **e1v5** (the new small net). The two ports are the
+Vulkan library (`gpu/`) and the WebGL2 backend (`webgl/`). The round-3 results come from an independent QC re-run on
+2026-10-27 on an RX 7900 XTX with RADV and Chromium 156, at `d4a71e3`. The round-2 sections further down (QC of 2026-10-26 at
+`bb73df0`) still hold for e2v4 / e1v4 / e2v3 / e1v3, whose output is unchanged; where they say "the default" or "the small
+net", read e2v4 / e1v4 as round 2's.
 
-The estimator is still **opt-in**. V1 and V2 stay the defaults, and their output is byte-identical to `fd5c163` (round 1).
+The estimator is still **opt-in**. V1 and V2 stay the defaults, and their output is byte-identical to `6133a4a` (round 2) and
+`fd5c163` (round 1).
 
-## What changed since round 1 (for browser-frame-gen and gamescope-ritz)
+## What changed in round 3 (for browser-frame-gen and gamescope-ritz)
+
+Round 2 was `6133a4a`. Round 3 is at `d4a71e3` and later (gpu `9cad3e6`, webgl `019bd59`).
+
+- **New default net `e2v5`, new small net `e1v5`.** ml-fg fine-tuned e2v4 / e1v4 further on more varied footage (the user's
+  failure recordings, a friend's captures, 9 gameplay videos). The architecture, layout, tensor shapes, cost and memory are
+  unchanged: e2 = width 24, 95,530 weights; e1 = width 12, 28,330 weights. ml-fg's 14-clip score at 2x with the zero test:
+  e2v5 31.23 dB (+0.31 over `final`, +0.04 over e2v4, no clip worse), e1v5 31.05 dB (+0.12 over `final`, +0.06 over e1v4).
+- **e2v4, e1v4, e2v3 and e1v3 stay selectable** for A/B, with byte-identical output (see "Round 3 regression").
+- **Vulkan:** `LearnedNet::E2v5 = 4` (the `Settings{}` default) and `LearnedNet::E1v5 = 5` (the small net) are appended.
+  `kLearnedNets` is 6, and `learnedNetName()` / `learnedNetFromName()` know `"e2v5"` / `"e1v5"`. Old values keep their numbers.
+- **WebGL:** `ML_NETS` = `['e2v5', 'e1v5', 'e2v4', 'e1v4', 'e2v3', 'e1v3']`. The default `motionNet` and `__fg.defaultNet` are
+  `'e2v5'`, `__fg.smallNet` is `'e1v5'`, and **`__fg.version` is `'5'`** (the default learned output changed).
+- **Browser cost-guard order: e2v5 → e1v5 → V1.** A caller that picks nets through `__fg.defaultNet` / `__fg.smallNet` instead
+  of names follows the change without code edits. It only has to load the two new net files.
+- **Vulkan host build (gamescope-ritz) must embed the two new weight sets.** meson's `ml_nets` grew to
+  `['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5']` (in `LearnedNet` order). Add `gpu/ml/e2v5/` and `gpu/ml/e1v5/` to the
+  `ml_weights` inputs. No shader changed: all 121 generated SPIR-V headers are byte-identical to `6133a4a`'s.
+  - The weights buffer (binding 15) now holds six nets: 1.49 MB (1,486,320 bytes; 1.0 MB before).
+  - Switching to Learned now creates 76 pipelines (16 + 10 per net; 56 before). uitest reports 85 pipelines after init (65
+    before).
+- **WebGL vendor set (browser-frame-gen) must add `nets/e2v5.js` (540 KB) and `nets/e1v5.js` (162 KB).** `motion: 'learned'`
+  without `nets/e2v5.js` throws a `RangeError` naming the file. No shader file changed (62 files, all in `__fg.shaderFiles`).
+- The zero test, the static guard, the duplicate skip, the cut rule (`sad > 30`) and V1's synthesis are unchanged.
+
+### Round 3 QC summary
+
+- **Vulkan parity:** `mltest` 44 test cases, 3990 assertions, 0 failed. `synthcheck.py` 333/333 PASS. This covers e2v5 (8 pairs)
+  and e1v5 (5 pairs), each on the ref and FGR paths, fp32 and `learnedHalf`, zero test off and on, plus the duplicate cases of
+  all six nets.
+- **WebGL parity:** `learned.mjs` 80/80 rows and 24/24 duplicate cases PASS on SwiftShader and on ANGLE/Vulkan (RADV). That is
+  all six nets at fp32 and fp16, each with and without the zero test, plus 6 RGBA16F rows (e2v5 / e2v4 / e2v3). `validate`
+  209/209 OK. The QC did not re-run ANGLE/OpenGL; the worker reports PASS there.
+- **Cut decisions** match `vec.json` on both backends and every path (table below).
+- **Thinnest margin:** WebGL e2v5 fp32 with the zero test, `hd` pair, t = 0.25: synth **71.7 dB against the 70 dB gate**. It is
+  the same on SwiftShader (71.67) and ANGLE/Vulkan (71.69). 7 of 518,400 mask pixels flip (99.9986 % agreement). e2v4 had 80.6 dB
+  on that row (SwiftShader). It passes, but it has the least headroom of any gate. The same row in Vulkan (refzt) is 79.2 dB.
+- **Regression:** V1 / V2 / e2v4 / e1v4 / e2v3 output is byte-identical to `6133a4a` (42 of 42 fgtest outputs over 3 pairs).
+- **Cost:** equal to e2v4 / e1v4 (same shapes) in both backends.
+- **Real footage:** e2v5 recovers most of e2v4's loss on obs1 13100 (34.00 vs 32.98 dB; V1 34.80) and gives up 0.13 dB on
+  battlefield. e1v5 is the best of all on battlefield (36.66) and the worst on obs1 13100 (32.09).
+- **uitest Learned:** 14 failures with e2v5, 12 with e2v4. The 2 extra are both "smooth noise, pan 30,0: V2 leaves no more
+  artifact px than Off" checks. See Known issues (a).
+
+### Settings and A/B for round 3
+
+```sh
+gpu/build/fgtest --set algo=learned W H prev.rgba curr.rgba out.rgba                    # e2v5, zero test on, guard off
+gpu/build/fgtest --set algo=learned,learnedNet=e1v5[,learnedHalf=1] ...                # the small net
+gpu/build/fgtest --set algo=learned,learnedNet=e2v4 ...                                # round 2's default, byte-identical to 6133a4a
+gpu/build/uitest|formattest|blurtest check --algo learned [--zt 0|1] [--guard 0|1] [--net e2v5|e1v5|e2v4|e1v4|e2v3|e1v3]
+MLFG_EXPORT=<ml-fg>/export MLTEST_DUMP=<dir> gpu/build/mltest && python3 -I gpu/ml/synthcheck.py <dir>
+webgl/tests/run.sh learned learned-gpu                                                  # SwiftShader, then ANGLE/Vulkan (FG_ANGLE=gl for GL)
+```
+
+```js
+engine.setSettings({ motionVersion: 1, motion: 'learned' });          // e2v5 (__fg.defaultNet), fp16, zero test on, guard off
+engine.setSettings({ motionNet: __fg.smallNet });                     // e1v5
+engine.setSettings({ motionNet: 'e2v4' });                            // A/B against round 2's default
+```
+
+### Round 3 parity (QC re-run)
+
+**Cut decisions.** `vec.json` gives `sad` / `cut` and `sad_zt` / `cut_zt`. The QC compared them on Vulkan (ref, FGR, ref + half,
+FGR + half) and on WebGL (fp32, fp16; SwiftShader and ANGLE/Vulkan).
+
+| net | pair | sad (net) | cut | sad_zt | cut_zt | Vulkan | WebGL |
+|---|---|---|---|---|---|---|---|
+| e2v5 | cut | 32.208 | true | 30.169 | true | same on every path; closest: ref + half + zt, sad 30.1656 | same |
+| e2v5 | cut2 | 45.469 | true | 42.961 | true | same | same |
+| e1v5 | cut | 31.257 | true | 29.114 | **false** | same: a cut net-only, **not a cut with the zero test** | same |
+| e1v5 | cut2 | 53.052 | true | 50.794 | true | same | same |
+| (e2v4) | cut | 28.305 | false | 26.445 | false | same (round 2) | same |
+| (e1v4) | cut | 43.177 | true | 40.004 | true | same (round 2) | same |
+
+Every other e2v5 / e1v5 pair (static, motion, far, odd, hd, overlay) is no cut, with and without the zero test, on every path.
+e2v5's `cut` with the zero test sits only 0.17 above the threshold of 30, and e1v5's `cut` crosses it (31.3 → 29.1). `cut2` is
+the safe cut check for both nets.
+
+**Vulkan:** `mltest` 44 cases, 3990 assertions, 0 failed; `synthcheck.py` 333/333 PASS. The columns are as in the round-2 table
+below ("ref+half" is the ref path with `learnedHalf`).
+
+| net | ref pf max (px) | ref sad rel | zt mask agree: stage / ref / fgr / ref+half / fgr+half | synth dB ref / refzt / fgrzt / fgrzt+half | cuts |
+|---|---|---|---|---|---|
+| **e2v5** (8) | ≤ 3.4e-2 (hd) | ≤ 6.7e-6 | ≥ 99.9998 (hd: 1 px) / ≥ 99.9983 / ≥ 99.90 / ≥ 99.91 / ≥ 99.85 % | 83.6–93.5 / 79.2–98.1 / 64.3–83.7 / 62.6–78.8 | same (cut, cut2: true) |
+| **e1v5** (5) | ≤ 7.6e-3 | ≤ 4.5e-6 | 100 / ≥ 99.9983 / ≥ 99.96 / ≥ 99.94 / ≥ 99.93 % | 88.5–91.5 / 81.3–92.7 / 65.5–66.6 / 64.5–65.6 | same (cut: true, cut_zt: false; cut2: true) |
+
+- ref `ya`/`yc` are exact for every pair. ref sad_zt rel ≤ 3.8e-5 (e2v5) / 3.1e-5 (e1v5).
+- The lowest mask agreement, 99.85 % (e2v5 `far`, FGR + half, 85 px), is on a shortcut path. Those paths are gated by the synth
+  (≥ 45 dB), not by the mask. e2v4 had 99.91 % there.
+- Duplicates (all 6 nets): identical frames give a zero field, SAD 0 and output = input. Mean |a−c| 0.5 is skipped, 1.0 runs the
+  net.
+
+**WebGL** (`webgl/tests/run.sh learned` and `learned-gpu`; every row PASS on both). Each cell is e2v5 · e1v5.
+
+| | SwiftShader | ANGLE / Vulkan (RADV) |
+|---|---|---|
+| fp32 net pf mean / max (px) | ≤ 7.4e-5 / ≤ 3.9e-2 · ≤ 4.6e-5 / ≤ 9.7e-3 | ≤ 7.4e-5 / ≤ 3.7e-2 · ≤ 4.1e-5 / ≤ 7.0e-3 |
+| fp32 sad rel / zt sad_zt rel | ≤ 8.1e-6 / ≤ 5.1e-5 · ≤ 3.1e-6 / ≤ 3.9e-6 | ≤ 7.0e-6 / ≤ 3.8e-5 · ≤ 2.4e-6 / ≤ 3.1e-6 |
+| fp32 zt mask agreement | ≥ 99.9965 % (≤ 7 px) · 100 % | ≥ 99.9983 % (≤ 7 px) · 100 % |
+| fp32 synth dB, net / zt (t = 0.5, 0.25) | 81.8–95.4 / **71.7**–96.5 · 88.3–92.1 / 88.8–94.5 | 82.1–94.2 / **71.7**–99.5 · 88.1–91.5 / 88.7–92.7 |
+| fp16 synth dB, net / zt | 67.4–78.3 / 62.4–79.9 · 69.9–71.2 / 63.3–68.1 | 63.7–76.3 / 59.2–76.9 · 66.0–68.7 / 61.4–66.6 |
+| fp16 sad rel / sad_zt rel (gate 1e-2) | ≤ 2.2e-4 / ≤ 4.6e-4 · ≤ 2.5e-4 / ≤ 4.2e-4 | ≤ 7.2e-4 / ≤ 7.1e-4 · ≤ 5.8e-4 / ≤ 3.2e-4 |
+| fp16 zt mask agreement (reported) | ≥ 99.91 % · ≥ 99.93 % | ≥ 99.80 % · ≥ 99.91 % |
+| RGBA16F input (e2v5 fp16), net / zt | 51.9–58.0 / 50.4–55.7 dB | 51.9–58.0 / 50.3–55.7 dB |
+| cut / cut_zt decisions | identical to `vec.json` | identical |
+| net field with the zero test (`ml.pfNet`) vs without | bit-identical | bit-identical |
+
+The 71.7 dB is e2v5 `hd` (1920×1080) at t = 0.25 with the zero test. The same row is 77.0 dB at t = 0.5. The static-guard rows
+(5/5) and the rows of the older nets pass as in round 2.
+
+**Weights and defaults.**
+- `gpu/ml/e2v5|e1v5/weights.bin` and the base64 in `webgl/nets/e2v5|e1v5.js` decode to the export's sha256 (e2v5 `7ee3da3a…`,
+  e1v5 `357811ac…`). The manifests are byte-identical to the export's.
+- `framegen.js` with all six net files loads in a bare VM context. It reports `__fg.version` `'5'`, `defaultNet` `'e2v5'`,
+  `smallNet` `'e1v5'` and `defaultSettings().motionNet` `'e2v5'`, with 62 shader files listed and present.
+- Vulkan: `mltest` "Learned settings" checks `Settings{}.learnedNet == LearnedNet::E2v5`. `framegen.h` names `E1v5` the small
+  net (there is still no "small net" constant).
+
+### Round 3 regression vs 6133a4a
+
+Built side by side from `git archive 6133a4a`:
+- SPIR-V: all 121 generated shader headers are byte-identical. Only `ml_weights.h` differs (six nets).
+- fgtest at 1080p: 42 outputs are `cmp`-identical over obs2 5000, battlefield 2000 and obs1 13100. The configurations:
+  - V1 at fs 1/2/4, `--bgra`, `--split`, `ui=crosshair`;
+  - V2 Quality / Performance, V2 + `crosshairv2`;
+  - Learned **`learnedNet=e2v4` against 6133a4a's default**, e2v4 with `learnedZeroTest=0`, e2v4 + guard, e1v4 + half, e2v3.
+- `uitest check --algo learned --net e2v4` is line-for-line identical to 6133a4a's `uitest check --algo learned` (timing and
+  pipeline-count lines excluded).
+- WebGL: `framegen.js` changed only in the net list, the small net, the default `motionNet` and `__fg.version`.
+
+### Round 3 real footage (fgtest 1080p 2x, PSNR vs the real middle frame, dB; QC re-run)
+
+| pair | V1 | e2v4 | **e2v5** (default) | e2v5 zt off | e2v5 half | e2v5 + guard | e1v4 | **e1v5** | e1v5 zt off |
+|---|---|---|---|---|---|---|---|---|---|
+| obs2 5000→5002 | 27.14 | 27.13 | 27.11 | 27.00 | 27.11 | 27.11 | 27.17 | 27.19 | 27.06 |
+| battlefield 2000→2002 | 36.09 | 36.33 | 36.20 | 35.55 | 36.20 | 36.21 | 36.31 | 36.66 | 35.88 |
+| obs1 13100→13102 | 34.80 | 32.98 | 34.00 | 33.88 | 34.00 | 34.03 | 32.58 | 32.09 | 31.97 |
+
+This reproduces the worker's table to the 0.01 dB.
+- e2v5 closes most of e2v4's gap to V1 on obs1 13100 (−0.80 dB instead of −1.82).
+- e1v5 is the best of all on battlefield (+0.57 over V1) and the worst on obs1 13100 (−2.71).
+- The zero test still helps every moving pair, by +0.11 to +0.78 dB.
+
+### Round 3 cost (RX 7900 XTX, ms of GPU time; QC re-measured)
+
+**Vulkan**, `fgtest --bench 100 --mult 2`, battlefield 2000→2002, 3 runs each. At 1440p the frames are scaled to 2560×1440.
+"b2b" is the back-to-back median per pair, and "profiled" is the per-pass sum of one profiled pair.
+
+| | V1 | **e2v5** | e2v5 half | e2v4 | e2v4 half | **e1v5** | e1v5 half | e1v4 | e1v4 half |
+|---|---|---|---|---|---|---|---|---|---|
+| 1080p b2b | 0.30–0.46 | 1.35–1.66 | 1.02–1.28 | 1.33–1.44 | 1.03–1.04 | 0.53–0.54 | 0.49 | 0.56 | 0.49 |
+| 1080p profiled | 0.35–0.36 | 1.37–1.40 | 1.06–1.12 | 1.39–1.40 | 1.08–1.09 | 0.57 | 0.51–0.53 | 0.59–0.60 | 0.53–0.54 |
+| 1440p b2b | 0.45–0.46 | 2.70–4.20 | 1.75–1.98 | 3.14–3.18 | 1.75–2.04 | 0.90 | 0.80–1.01 | 0.90–0.93 | 0.80–1.02 |
+| 1440p profiled | 0.52 | 2.72–3.74 | 1.82–2.32 | 2.83–2.85 | 1.85–1.87 | 0.96–0.98 | 0.82–0.91 | 0.94–0.98 | 0.82–0.87 |
+
+- e2v5 = e2v4 and e1v5 = e1v4 within the run-to-run noise. The wide e2v5 1440p ranges come from single slow runs; the minima
+  match.
+- The worker's figures (1080p e2v5 1.33 / half 1.02, e1v5 0.53 / half 0.49) are consistent with these.
+
+**WebGL**, ANGLE/Vulkan, `bench.mjs --gpu`, battlefield 1080p 2x, one run, estimate ms (back-to-back): e2v5 fp16 1.50 (e2v4
+1.70), e1v5 fp16 0.91 (e1v4 0.94), e2v5 fp32 2.80 (e2v4 2.82), V1 0.76. They are equal within the noise.
+
+Memory is unchanged: e2v5 = e2v4 = e2v3 and e1v5 = e1v4 = e1v3 (memory table below). Only the Vulkan weights buffer grows, to
+1.49 MB.
+
+## What changed in round 2 (since round 1; e2v4 / e1v4 were then the default / small net)
 
 Round 1 was `fd5c163`. Round 2 is at `bb73df0` and later.
 
@@ -38,13 +207,13 @@ Round 1 was `fd5c163`. Round 2 is at `bb73df0` and later.
 - Settings to expose for A/B testing: `learnedZeroTest`, `learnedStaticGuard`, and `learnedNet` / `motionNet` with the new
   names. They are the same names in both backends (see below).
 
-## Settings and defaults
+## Settings and defaults (current, round 3)
 
 | | Vulkan `gpu/framegen.h` `Settings` | WebGL `setSettings` / `createEngine` |
 |---|---|---|
 | Select Learned | `motionVersion = MotionVersion::Learned` (= 2) | `motionVersion: 1, motion: 'learned'` (V2 ignores `motion`) |
-| Net | `learnedNet`: **`LearnedNet::E2v4`** (= 2, default), `E1v4` (= 3, the small net), `E2v3` (= 0), `E1v3` (= 1) | `motionNet`: **`'e2v4'`** (default, `__fg.defaultNet`), `'e1v4'` (`__fg.smallNet`), `'e2v3'`, `'e1v3'` |
-| Net by name | `framegen::learnedNetName()` / `learnedNetFromName()` (`"e2v4"`, ...), `kLearnedNets` = 4 | the strings above; `nets/<name>.js` must be loaded |
+| Net | `learnedNet`: **`LearnedNet::E2v5`** (= 4, default), `E1v5` (= 5, the small net), `E2v4` (= 2), `E1v4` (= 3), `E2v3` (= 0), `E1v3` (= 1) | `motionNet`: **`'e2v5'`** (default, `__fg.defaultNet`), `'e1v5'` (`__fg.smallNet`), `'e2v4'`, `'e1v4'`, `'e2v3'`, `'e1v3'` |
+| Net by name | `framegen::learnedNetName()` / `learnedNetFromName()` (`"e2v5"`, ...), `kLearnedNets` = 6 | the strings above; `nets/<name>.js` must be loaded |
 | Zero test | `learnedZeroTest` = **true** | `learnedZeroTest: true` |
 | Static guard | `learnedStaticGuard` = **false** | `learnedStaticGuard: false` |
 | Precision | `learnedHalf` = **false** (fp32 activations) | `motionPrecision: 'fp16'` (**default**) / `'fp32'` |
@@ -55,21 +224,23 @@ Round 1 was `fd5c163`. Round 2 is at `bb73df0` and later.
 
 ```sh
 # Vulkan (fgtest)
-gpu/build/fgtest --set algo=learned W H prev.rgba curr.rgba out.rgba                               # e2v4, zero test on, guard off
+gpu/build/fgtest --set algo=learned W H prev.rgba curr.rgba out.rgba                               # e2v5, zero test on, guard off
 gpu/build/fgtest --set algo=learned,learnedZeroTest=0 ...                                         # the net's raw field (+ learnedNet=e2v3: round 1's output, byte-identical)
 gpu/build/fgtest --set algo=learned,learnedStaticGuard=1 ...                                      # + static guard
-gpu/build/fgtest --set algo=learned,learnedNet=e1v4[,learnedHalf=1] ...                           # the small net
-gpu/build/uitest|formattest|blurtest check --algo learned [--zt 0|1] [--guard 0|1] [--net e2v4|e1v4|e2v3|e1v3]
+gpu/build/fgtest --set algo=learned,learnedNet=e1v5[,learnedHalf=1] ...                           # the small net
+gpu/build/fgtest --set algo=learned,learnedNet=e2v4 ...                                           # round 2's default (byte-identical to 6133a4a)
+gpu/build/uitest|formattest|blurtest check --algo learned [--zt 0|1] [--guard 0|1] [--net e2v5|e1v5|e2v4|e1v4|e2v3|e1v3]
 MLFG_EXPORT=<ml-fg>/export MLTEST_DUMP=<dir> gpu/build/mltest && python3 -I gpu/ml/synthcheck.py <dir>
 python3 -I gpu/ml/guardcheck.py W H a.rgba c.rgba off.rgba on.rgba DIR/pair_0000.fgmaps [--t T]    # guard vs static_guard.py
 ```
 
 ```js
 // WebGL
-engine.setSettings({ motionVersion: 1, motion: 'learned' });          // e2v4, fp16, zero test on, guard off
+engine.setSettings({ motionVersion: 1, motion: 'learned' });          // e2v5, fp16, zero test on, guard off
 engine.setSettings({ learnedZeroTest: false });                       // A/B: no zero test (drops the estimate)
 engine.setSettings({ learnedStaticGuard: true });                     // static guard (next synth)
-engine.setSettings({ motionNet: __fg.smallNet });                     // e1v4
+engine.setSettings({ motionNet: __fg.smallNet });                     // e1v5
+engine.setSettings({ motionNet: 'e2v4' });                            // A/B: round 2's default
 ```
 
 A gamescope host maps its own settings to `Settings::learnedZeroTest`, `learnedStaticGuard` and `learnedNet`. Use
@@ -78,20 +249,24 @@ A gamescope host maps its own settings to `Settings::learnedZeroTest`, `learnedS
 ## Files a host needs
 
 **gamescope-ritz (Vulkan), on top of round 1:**
-- Shaders: `gpu/shaders/ml_zero.comp`, `ml_guard.comp`, and `ml_guard` with `-DFG_FORMAT_<FMT>=1` for every non-RGBA8 format in
-  use (meson `ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp']`). The full Learned list is now `ml_dup`,
-  `ml_reduce`, `ml_pyr`, `ml_match`, `ml_conv`, `ml_out`, `ml_zero`, `ml_guard` (+ `ml_common.glsl`).
-- Weights: `gpu/ml/e2v4/` and `gpu/ml/e1v4/` (`manifest.json` + `weights.bin`, sha256-identical to ml-fg's export).
-  `embed_weights.py` gets all four nets in `LearnedNet` order: meson `ml_nets = ['e2v3', 'e1v3', 'e2v4', 'e1v4']`.
-- The weights buffer (binding 15) now holds all four nets: 1.0 MB, uploaded in the first Learned estimate's command buffer as
+- Shaders (round 2; round 3 changed none): `gpu/shaders/ml_zero.comp`, `ml_guard.comp`, and `ml_guard` with
+  `-DFG_FORMAT_<FMT>=1` for every non-RGBA8 format in use (meson `ml_colour_srcs = ['shaders/ml_dup.comp',
+  'shaders/ml_guard.comp']`). The full Learned list is `ml_dup`, `ml_reduce`, `ml_pyr`, `ml_match`, `ml_conv`, `ml_out`,
+  `ml_zero`, `ml_guard` (+ `ml_common.glsl`).
+- Weights: `gpu/ml/e2v4/`, `gpu/ml/e1v4/` (round 2) and **`gpu/ml/e2v5/`, `gpu/ml/e1v5/` (round 3)** (`manifest.json` +
+  `weights.bin`, sha256-identical to ml-fg's export). `embed_weights.py` gets all six nets in `LearnedNet` order: meson
+  `ml_nets = ['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5']`. A host that keeps round 2's four-net list builds a library
+  whose default net has no weights, so it must embed the two new sets.
+- The weights buffer (binding 15) now holds all six nets: 1.49 MB, uploaded in the first Learned estimate's command buffer as
   before.
 
 **browser-frame-gen (WebGL):**
 - Vendor `webgl/framegen.js`, `webgl/shaders/` (62 files, all in `__fg.shaderFiles`; 13 under `learned/`) and `webgl/nets/`
-  (`e2v4.js` 540 KB, `e1v4.js` 162 KB, `e2v3.js`, `e1v3.js`). The QC loaded `framegen.js` and the four nets in a bare VM
-  context with no fs, fetch or DOM. Every listed shader exists, no file under `shaders/` is unlisted, and the weights' sha256
-  match the export (e2v4 `ba6981cf…`, e1v4 `28128da2…`).
-- Load at least `nets/e2v4.js` (the default) and, for a fallback, `nets/e1v4.js`, in any order with `framegen.js`.
+  (`e2v5.js` 540 KB, `e1v5.js` 162 KB, `e2v4.js`, `e1v4.js`, `e2v3.js`, `e1v3.js`). The QC loaded `framegen.js` and the six
+  nets in a bare VM context with no fs, fetch or DOM. Every listed shader exists, no file under `shaders/` is unlisted, and the
+  weights' sha256 match the export (e2v5 `7ee3da3a…`, e1v5 `357811ac…`, e2v4 `ba6981cf…`, e1v4 `28128da2…`).
+- Load at least `nets/e2v5.js` (the default) and, for a fallback, `nets/e1v5.js`, in any order with `framegen.js`. Load
+  `nets/e2v4.js` / `nets/e1v4.js` too for an A/B against round 2.
 
 ## Duplicate skip (unchanged, both backends)
 
@@ -122,11 +297,14 @@ cursor moving on a still desktop is also held. `obs1` 3000 → 3002 (mean |a−c
   once to the average. WebGL: `ml_sg_h` + `ml_sg_v` (RG16F, once per pair) and `final_sg` in place of `final`. WebGL has no UI
   protection.
 
-## Measured parity (QC re-runs)
+## Measured parity (round 2 QC re-runs; round 3 above)
 
-Tolerances (SPEC §8): for an exact fp32 port, pf mean ≤ 2e-4 px, max ≤ 5e-2 px, sad rel ≤ 1e-3, the same cut and synth ≥ 80 dB.
-For the zero test: mask agreement ≥ 99.9 %, pf compared where the masks agree, sad_zt rel ≤ 1e-3, the same cut_zt and synth
-≥ 70 dB. With shortcuts (fp16, FGR luma), synth ≥ 45 dB and the middle-frame PSNR within 0.05 dB.
+Tolerances (SPEC §8, the same in round 3): for an exact fp32 port, pf mean ≤ 2e-4 px, max ≤ 5e-2 px, sad rel ≤ 1e-3, the same
+cut and synth ≥ 80 dB. For the zero test: mask agreement ≥ 99.9 %, pf compared where the masks agree, sad_zt rel ≤ 1e-3, the
+same cut_zt and synth ≥ 70 dB. With shortcuts (fp16, FGR luma), synth ≥ 45 dB and the middle-frame PSNR within 0.05 dB.
+
+The round-3 run of the same suites (44 mltest cases, 333 synthcheck rows, 80 + 24 `learned.mjs` rows) reproduced every row of
+the older nets below as PASS. The figures below are round 2's.
 
 Vectors: e2v3 static, motion, far, cut, odd, hd and overlay; e1v3 motion, cut, odd and overlay; e2v4 static, motion, far, cut,
 cut2, odd, hd and overlay; e1v4 motion, cut, cut2, odd and overlay. The cut flags come from each `vec.json`. On **e2v4, `cut` is
@@ -223,7 +401,7 @@ input, also for the near-duplicate.
 `blurtest check --algo learned --guard 1` under the validation layer gave no messages either; it fails its 3 by-design checks,
 see Known issues.
 
-## Real footage (fgtest 1080p 2x, PSNR vs the real middle frame, dB; QC re-run)
+## Real footage, round 2 (fgtest 1080p 2x, PSNR vs the real middle frame, dB; QC re-run)
 
 | pair | V1 | e2v3 zt off (round 1) | e2v3 zt | e2v4 zt off | **e2v4 defaults** | e2v4 + guard | e2v4 half | e1v4 zt off | **e1v4** | e1v4 + guard |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -256,7 +434,7 @@ menu is close to V1. The residue is on "$69": the glyph edges are notched or tor
 does not visibly change this pair.** Its motion gate closes wherever the field moves more than ~1 px, and the field around the
 counter still does. So the guard is no HUD fix here.
 
-## Cost (RX 7900 XTX, 1080p 2x, ms of GPU time; QC re-measured)
+## Cost, round 2 (RX 7900 XTX, 1080p 2x, ms of GPU time; QC re-measured)
 
 **Vulkan**, `fgtest --bench 100 --mult 2`, battlefield. "b2b" is the back-to-back median per real pair (estimate + synth, 31
 pairs per command buffer). "profiled" is the per-pass sum of one profiled pair.
@@ -309,17 +487,18 @@ WebGL adds fw×fh RG32F ×2 + RGBA32F for the zero test (~16 MB at 1080p) and 2 
   (`kMlNotBuilt`), not just the new features.
 - Bindings 13 (state), 14 (activations) and 15 (weights) are as in round 1. The weights upload is as in round 1:
   `vkCmdUpdateBuffer` inside the first Learned estimate's command buffer, which must be submitted.
-- Switching to Learned creates 56 pipelines (16 + 10 per net) at once.
+- Switching to Learned creates 76 pipelines (16 + 10 per net, six nets) at once (56 in round 2).
 - `flowScale` must be 2.
 - UI protection: the net and the zero test read `P_LUMA` (the clean copies), and the guard reads the frames the synthesis read
   and runs before the UI paste-back.
-- Expose `learnedZeroTest` (default on), `learnedStaticGuard` (default off) and `learnedNet` (`e2v4` default, `e1v4` small) for
-  the morning A/B test.
+- Expose `learnedZeroTest` (default on), `learnedStaticGuard` (default off) and `learnedNet` (`e2v5` default, `e1v5` small;
+  `e2v4` / `e1v4` for an A/B against round 2) for the morning A/B test. A host that falls back to a cheaper net picks `E1v5`.
 
 **browser-frame-gen (WebGL):**
-- Vendor the files listed above and load `nets/e2v4.js` (+ `nets/e1v4.js`).
-- `__fg.version` is `'4'`. New fields: `__fg.defaultNet`, `__fg.smallNet`, `debugRead('ml.pfNet' | 'ml.ztCost' | 'ml.zt' |
-  'sg')`.
+- Vendor the files listed above and load `nets/e2v5.js` (+ `nets/e1v5.js`; `nets/e2v4.js` / `nets/e1v4.js` for an A/B).
+- The cost guard steps e2v5 → e1v5 → V1. Through `__fg.defaultNet` / `__fg.smallNet` it needs no code change.
+- `__fg.version` is `'5'` (`'4'` in round 2). The fields `__fg.defaultNet`, `__fg.smallNet` and `debugRead('ml.pfNet' |
+  'ml.ztCost' | 'ml.zt' | 'sg')` are unchanged since round 2.
 - The first `motion: 'learned'` compiles 22 programs (17 in round 1).
 - The default precision is still **fp16**.
 - `estimate()` with learned leaves a uniform buffer bound, as in round 1.
@@ -330,8 +509,8 @@ WebGL adds fw×fh RG32F ×2 + RGBA32F for the zero test (~16 MB at 1080p) and 2 
 | | Vulkan | WebGL |
 |---|---|---|
 | How it is selected | its own `MotionVersion::Learned` (= 2) | `motion: 'learned'` inside `motionVersion` 1 (V2 ignores it) |
-| Net | `learnedNet` (`E2v4` default / `E1v4` / `E2v3` / `E1v3`) | `motionNet` (`'e2v4'` default / `'e1v4'` / `'e2v3'` / `'e1v3'`) |
-| Small net | `LearnedNet::E1v4` (documented in `framegen.h`; no "small net" constant) | `__fg.smallNet` (`'e1v4'`) |
+| Net | `learnedNet` (`E2v5` default / `E1v5` / `E2v4` / `E1v4` / `E2v3` / `E1v3`) | `motionNet` (`'e2v5'` default / `'e1v5'` / `'e2v4'` / `'e1v4'` / `'e2v3'` / `'e1v3'`) |
+| Small net | `LearnedNet::E1v5` (documented in `framegen.h`; no "small net" constant) | `__fg.smallNet` (`'e1v5'`) |
 | Precision | `learnedHalf` (bool, **default false = fp32**) | `motionPrecision` (`'fp16'` **default** / `'fp32'`) |
 | Zero test / guard | `learnedZeroTest` (true) / `learnedStaticGuard` (false) | the same names and defaults |
 | Zero-test switch | applies from the next estimate, keeps the current one | drops the current estimate |
@@ -341,10 +520,26 @@ WebGL adds fw×fh RG32F ×2 + RGBA32F for the zero test (~16 MB at 1080p) and 2 
 ## Known issues
 
 - (a) The synthetic quality tests are V1/V2-tuned and were not loosened. All counts are QC re-runs.
+  - Round 3: `uitest check --algo learned` fails **14** checks with e2v5 (the default) and 11 with e1v5. With `--net e2v4` it
+    fails 12, line-for-line the same as `6133a4a`'s default. `--zt 0` gives the same counts (14 / 12), so the zero test is not
+    the cause.
+  - The 2 extra e2v5 failures are exactly "smooth noise, pan 30,0, default settings" and "... host settings": "V2 leaves no
+    more artifact px than Off". The worker's explanation (a better Off baseline) is only half of it. The artifact px at t = 0.5
+    / 0.25 are:
+    - e2v4: Off 5 / 7 (host 5 / 16), V2 1 / 5;
+    - e2v5: Off 1 / 8 (host 2 / 14), V2 3 / 4.
+
+    So Off got better at t = 0.5 *and* CrosshairV2 on top of e2v5 leaves 2 more px there (3 vs 1). V2 + fill stays 0 / 0. It is
+    a 1–3 px difference on one synthetic scene, inside the "CrosshairV2 leaves more pixels than with V1" limit already known.
+  - With `--guard 1`, e2v5 also fails 14: its guard adds no failure. e2v4 + guard still fails 13; the extra one is "without
+    re-entry the arm needs uiStillFrames = 8 still frames ...".
+  - The other failing checks are "control, Off shows the doubled crosshair" and "V2 [+ fill] leaves at most 1 artifact px".
+  - `formattest --algo learned` fails 3 with e2v5, e2v4 and e1v5. `blurtest --algo learned` passes with e2v5 and e2v4 and
+    fails 4 with e1v5 (as e1v4).
+  - Round 2 counts follow.
   - `uitest check --algo learned` fails 12 checks with e2v4 (10 with e2v3, 11 with e1v4), and the zero test does not change
     the count.
   - With `--guard 1` it fails 13. The extra one is "without re-entry the arm needs uiStillFrames = 8 still frames ...".
-  - The failing checks are "control, Off shows the doubled crosshair" and "V2 [+ fill] leaves at most 1 artifact px".
   - Correction to the worker's note: the "control, Off shows the doubled crosshair" failure is **not** caused by the zero test.
     It fails the same way with `--zt 0`, and with e2v3 in round 1.
   - `formattest --algo learned` fails 3 (+1 with the guard). `blurtest --algo learned` now **passes** with e2v4 (e2v3 failed
@@ -353,16 +548,27 @@ WebGL adds fw×fh RG32F ×2 + RGBA32F for the zero test (~16 MB at 1080p) and 2 
   recordSynth sub-frames" checks (up to 36 levels on 0.5–18k bytes per configuration), and formattest has the matching extra
   failure. Learned's "scene cut forced" variant (sceneCutSad 0.5) is not a cut on that synthetic scene: its guarded differences
   equal the default variant's. So the guard's fallback skip for blur is covered only by the flick variants, which pass.
-- (c) e2v4 hd, stage alone: the zero test flips 3 of 518,400 mask pixels (gate 99.9 %, passed by a wide margin). These are
-  pixels at the `C(0) − 1 = C(h)` boundary, where fp32 summation order decides.
+- (c) Thin margin (round 3): WebGL e2v5 fp32 with the zero test on `hd`, t = 0.25, is **71.7 dB against the 70 dB gate** on
+  SwiftShader and ANGLE/Vulkan (e2v4: 80.6). 7 of 518,400 mask pixels flip there, at the `C(0) − 1 = C(h)` boundary where fp32
+  summation order decides, and each flipped vector moves a few output pixels a lot (engine max error 48 levels). The Vulkan
+  ref path gives 79.2 dB on that row, and e2v5 hd stage-alone flips 1 px (e2v4: 3). A future net could cross the gate on
+  this row without a port bug.
 - (d) Hosts must add the new shaders and the ml dirs, or Learned is refused (Vulkan) or the default net is missing (WebGL).
+  Round 3 adds only `gpu/ml/e2v5`, `gpu/ml/e1v5` (meson `ml_nets`) and `webgl/nets/e2v5.js`, `e1v5.js`.
 - (e) The whole-frame duplicate test holds a small moving cursor on a still desktop (unchanged).
 - (f) The static guard does not fix the dragged HUD where the field around it moves more than ~1 px (the motion gate,
   `static_guard.py` demo (a) asserts this as a known limit). The zero test is what fixes the HUD.
 - (g) Static HUD is still not as clean as V1. Glyph edges on obs2's "$69" stay notched with the zero test (see "HUD").
-- (h) obs1 13100: e2v4 and e1v4 are ~1.3 dB below e2v3 and ~2 dB below V1.
+- (h) obs1 13100: e2v5 is 0.8 dB below V1 (e2v4 1.8). e1v5 is 2.7 dB below V1, worse than e1v4 (2.2), although it is the best
+  net on battlefield.
 - (i) The `far` and `cut` (cut2) vector pairs cannot test the synthesis end to end (global fallback / cut).
 - (j) Pre-existing, not Learned: syncval `SYNC-HAZARD-WRITE-AFTER-WRITE` on binding 2 with `ui=crosshair` (round 1 (g)). Syncval
   was not re-run in round 2; GPU-AV was.
 - (k) WebGL: not tested on Firefox or D3D11, V1 only, no UI protection.
-- (l) 1440p timings and the WebGL memory figures are the workers'. The QC measured 1080p only.
+- (l) The WebGL memory figures are the workers'. Round 2's 1440p timings are the workers'; round 3's QC measured Vulkan 1440p
+  itself (table above).
+- (m) Round 3 QC did not re-run GPU-AV / syncval, the static-guard `guardcheck.py`, the HUD crops or WebGL `golden` /
+  `xbackend` / `hdr` / `blur`. Round 3 changed no shader and no engine code besides the net lists and defaults, and V1 / V2 /
+  old-net outputs are byte-identical to `6133a4a`. ANGLE/OpenGL was not re-run (worker: PASS).
+- (n) e2v5's `cut` vector sits 0.17 above the cut threshold with the zero test, and e1v5's crosses it (cut net-only, no cut with
+  the zero test). Both backends agree with `vec.json`, but a cut test built on that pair is fragile; use `cut2`.
