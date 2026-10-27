@@ -278,7 +278,7 @@ const char* const kMlFlowScale = "MotionVersion::Learned needs flowScale 2 (its 
 // (framegen.h), append its name + width here and its ML_NET entry to kMlNet below, copy ml-fg's export/<run>/manifest.json +
 // weights.bin into gpu/ml/<run>/ and append <run> to gpu/meson.build's ml_nets (the same order). Tests: mltest's TEST_CASEs.
 struct MlNetInfo { const char* name; int width; };
-constexpr MlNetInfo kMlNetInfo[] = {{"e2v3", 24}, {"e1v3", 12}, {"e2v4", 24}, {"e1v4", 12}};
+constexpr MlNetInfo kMlNetInfo[] = {{"e2v3", 24}, {"e1v3", 12}, {"e2v4", 24}, {"e1v4", 12}, {"e2v5", 24}, {"e1v5", 12}};
 constexpr int kMlNets = (int)(sizeof(kMlNetInfo) / sizeof(kMlNetInfo[0]));
 static_assert(kMlNets == (int)kLearnedNets, "a name and width per LearnedNet");
 #ifdef FG_HAVE_ML
@@ -286,7 +286,7 @@ static_assert(kMlNets == (int)kLearnedNets, "a name and width per LearnedNet");
 // (level, layer)'s weight / bias offsets (vec4 units, relative to the net's start in the weights buffer)
 struct MlNet { const uint32_t* w; size_t words; uint32_t width; const uint32_t (*table)[5][2]; };
 #define ML_NET(n) MlNet{kMlWeights_##n, sizeof(kMlWeights_##n) / 4, kMlWidth_##n, kMlTable_##n}
-constexpr MlNet kMlNet[] = {ML_NET(e2v3), ML_NET(e1v3), ML_NET(e2v4), ML_NET(e1v4)};
+constexpr MlNet kMlNet[] = {ML_NET(e2v3), ML_NET(e1v3), ML_NET(e2v4), ML_NET(e1v4), ML_NET(e2v5), ML_NET(e1v5)};
 static_assert(sizeof(kMlNet) / sizeof(kMlNet[0]) == kMlNets, "an embedded net per LearnedNet");
 constexpr bool mlWidthsMatch() {
     for (int i = 0; i < kMlNets; i++)

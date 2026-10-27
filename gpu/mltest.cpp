@@ -8,8 +8,8 @@
 //                `<run>_<pair>_{ref,fgr}.json` (sad, cut; also refh / fgrh = learnedHalf, and the zero test's kinds below), for gpu/ml/synthcheck.py (the end-to-end dB check through proto/interp.py).
 //
 // Per net (e2v3: static motion far cut odd hd overlay; e1v3: motion cut odd overlay; e2v4: static motion far cut cut2 odd hd overlay;
-// e1v4: motion cut cut2 odd overlay) and pair, SPEC.md section 8 in order (steps 1-6
-// with Settings::learnedZeroTest off: the net's own field):
+// e1v4: motion cut cut2 odd overlay; e2v5: static motion far cut cut2 odd hd overlay; e1v5: motion cut cut2 odd overlay) and pair,
+// SPEC.md section 8 in order (steps 1-6 with Settings::learnedZeroTest off: the net's own field):
 //   ref  the library's net fed the reference's flow-res lumas (cv2 5.0.0's 15-bit luma, computed here; Interpolator::
 //        setDebugLearned lumaSrc): the exact-port check. The lumas the net read == ya / yc exactly, its level-0 pyramid == ya / 255
 //        and every coarser level == the 2x2 means (bit-exact, computed here); the coarsest level's in_top, act_top0..3, raw_top
@@ -702,6 +702,22 @@ TEST_CASE("e1v4 cut", "[vectors][e1v4]") { checkPair("e1v4", "cut"); }
 TEST_CASE("e1v4 cut2", "[vectors][e1v4]") { checkPair("e1v4", "cut2"); }
 TEST_CASE("e1v4 odd", "[vectors][e1v4]") { checkPair("e1v4", "odd"); }
 TEST_CASE("e1v4 overlay", "[vectors][e1v4]") { checkPair("e1v4", "overlay"); }
+// e2v5: "cut" is a cut both ways but only just with the zero test (sad 32.2 net-only, 30.17 with it, threshold 30); "cut2" (sad 45.5 /
+// 43.0) is the safe cut (vec.json)
+TEST_CASE("e2v5 static", "[vectors][e2v5]") { checkPair("e2v5", "static"); }
+TEST_CASE("e2v5 motion", "[vectors][e2v5]") { checkPair("e2v5", "motion"); }
+TEST_CASE("e2v5 far", "[vectors][e2v5]") { checkPair("e2v5", "far"); }
+TEST_CASE("e2v5 cut", "[vectors][e2v5]") { checkPair("e2v5", "cut"); }
+TEST_CASE("e2v5 cut2", "[vectors][e2v5]") { checkPair("e2v5", "cut2"); }
+TEST_CASE("e2v5 odd", "[vectors][e2v5]") { checkPair("e2v5", "odd"); }
+TEST_CASE("e2v5 hd", "[vectors][e2v5]") { checkPair("e2v5", "hd"); }
+TEST_CASE("e2v5 overlay", "[vectors][e2v5]") { checkPair("e2v5", "overlay"); }
+// e1v5: "cut" is a cut net-only (sad 31.3) but NOT with the zero test (29.1); "cut2" (53.1 / 50.8) is a cut both ways (vec.json)
+TEST_CASE("e1v5 motion", "[vectors][e1v5]") { checkPair("e1v5", "motion"); }
+TEST_CASE("e1v5 cut", "[vectors][e1v5]") { checkPair("e1v5", "cut"); }
+TEST_CASE("e1v5 cut2", "[vectors][e1v5]") { checkPair("e1v5", "cut2"); }
+TEST_CASE("e1v5 odd", "[vectors][e1v5]") { checkPair("e1v5", "odd"); }
+TEST_CASE("e1v5 overlay", "[vectors][e1v5]") { checkPair("e1v5", "overlay"); }
 
 // ---- duplicates (shaders/ml_dup.comp: FGR's DUP_DIFF test)
 // A frame of the motion pair (or a smooth synthetic one if the vectors are missing)
@@ -775,6 +791,8 @@ TEST_CASE("e2v3 duplicate frames", "[dup][e2v3]") { duplicateCase(LearnedNet::E2
 TEST_CASE("e1v3 duplicate frames", "[dup][e1v3]") { duplicateCase(LearnedNet::E1v3); }
 TEST_CASE("e2v4 duplicate frames", "[dup][e2v4]") { duplicateCase(LearnedNet::E2v4); }
 TEST_CASE("e1v4 duplicate frames", "[dup][e1v4]") { duplicateCase(LearnedNet::E1v4); }
+TEST_CASE("e2v5 duplicate frames", "[dup][e2v5]") { duplicateCase(LearnedNet::E2v5); }
+TEST_CASE("e1v5 duplicate frames", "[dup][e1v5]") { duplicateCase(LearnedNet::E1v5); }
 
 // ---- the settings API
 TEST_CASE("Learned settings", "[api]") {
@@ -786,7 +804,7 @@ TEST_CASE("Learned settings", "[api]") {
     f4.flowScale = 4;
     CHECK(Interpolator::validate(f4));   // in range, but not for Learned:
     CHECK(Interpolator::settingsError(f4, Format::Rgba8) != nullptr);
-    CHECK(s.learnedNet == LearnedNet::E2v4);   // the default net
+    CHECK(s.learnedNet == LearnedNet::E2v5);   // the default net
     CHECK(s.learnedZeroTest);                  // the zero test: on by default
     CHECK_FALSE(s.learnedStaticGuard);         // the static guard: off by default
     Settings bad = s;
@@ -794,6 +812,8 @@ TEST_CASE("Learned settings", "[api]") {
     CHECK_FALSE(Interpolator::validate(bad));
     CHECK(learnedNetName((LearnedNet)kLearnedNets) == nullptr);
     CHECK(!strcmp(learnedNetName(LearnedNet::E2v4), "e2v4"));
+    CHECK(!strcmp(learnedNetName(LearnedNet::E2v5), "e2v5"));
+    CHECK(!strcmp(learnedNetName(LearnedNet::E1v5), "e1v5"));
     LearnedNet byName = LearnedNet::E2v3;
     CHECK(learnedNetFromName("e1v3", &byName));
     CHECK(byName == LearnedNet::E1v3);
@@ -840,6 +860,12 @@ TEST_CASE("Learned settings", "[api]") {
     s.learnedNet = LearnedNet::E2v4;   // the same width: the third net's weights (after the other two in the weights buffer)
     REQUIRE(rig.fg.setSettings(s));
     REQUIRE(rig.run(true, false));
+    CHECK(rig.pf != pf3);
+    const std::vector<float> pf4 = rig.pf;
+    s.learnedNet = LearnedNet::E2v5;   // the same width again: the fifth net's weights
+    REQUIRE(rig.fg.setSettings(s));
+    REQUIRE(rig.run(true, false));
+    CHECK(rig.pf != pf4);
     CHECK(rig.pf != pf3);
     REQUIRE(rig.fg.setSettings(Settings{}));
     rig.fg.releaseUnusedMotion();
