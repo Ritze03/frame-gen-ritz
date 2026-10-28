@@ -10,7 +10,7 @@
 //                               object's edge against the ideal model, the crosshair pixel-exact under UI protection, the
 //                               descriptor rings, validation of the settings.
 //   option --algo v1|v2|learned the motion version (Settings::motionVersion) every Interpolator is created and set with (default v1)
-//   option --zt 0|1, --guard 0|1, --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|c2smoke  Settings::learnedZeroTest (default 1) / learnedStaticGuard (default 0) / learnedNet (default the library's) of them (Learned only)
+//   option --zt 0|1, --guard 0|1, --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3  Settings::learnedZeroTest (default 1) / learnedStaticGuard (default 0) / learnedNet (default the library's) of them (Learned only)
 #include "framegen.h"
 #include "blendbench_spv.h"
 
@@ -248,7 +248,7 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
 static MotionVersion gAlgo = MotionVersion::V1;
 static V2Mode gMode = V2Mode::Quality;   // --mode: Settings::v2Mode (V1 ignores it)
 static bool gZt = true, gGuard = false;   // --zt, --guard: Settings::learnedZeroTest / learnedStaticGuard (Learned only)
-static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|c2smoke: Settings::learnedNet (Learned only; default: the library's)
+static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3: Settings::learnedNet (Learned only; default: the library's)
 static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
 static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
 #else
@@ -1017,7 +1017,7 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--zt") && i + 1 < argc) gZt = atoi(argv[++i]) != 0;
         else if (!strcmp(argv[i], "--guard") && i + 1 < argc) gGuard = atoi(argv[++i]) != 0;
-        else if (!strcmp(argv[i], "--net") && i + 1 < argc) { if (!parseNet(argv[++i])) { fprintf(stderr, "--net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|c2smoke\n"); return 2; } }
+        else if (!strcmp(argv[i], "--net") && i + 1 < argc) { if (!parseNet(argv[++i])) { fprintf(stderr, "--net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3\n"); return 2; } }
 #endif
         else pos.push_back(argv[i]);
     }

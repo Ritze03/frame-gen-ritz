@@ -67,16 +67,16 @@ enum class LearnedNet : uint32_t {
     E1v5 = 5,   // THE SMALL NET, the recommended fallback when E2v5 costs too much (a host that drops to a cheaper net at high resolution or
                 // refresh rate picks this one): E1v4 fine-tuned further, the same architecture, size and cost as E1v3 (width 12, 28,330
                 // weights, 3.9 GMAC, ~0.5 ms per 1080p pair). With the zero test: +0.12 dB over V1 on ml-fg's 14 clips, +0.06 dB over E1v4.
-    C2Smoke = 6, // TEST ONLY, a 600-step stand-in for the colour variant (ml-fg export/c2smoke-colour): width 24, 107,410 weights, 14.9 GMAC
+    G2v2 = 6,   // the colour variant, a game net (ml-fg export/g2v2): width 24, 107,410 weights, 14.9 GMAC
                 // (+12.5 % over E2v5). A colour net (SPEC.md section 10) also matches the frames' chroma (Cb, Cr): 25 conv inputs
-                // instead of 14, two more planes per frame. Not a quality net; the real colour nets (ml-fg's g2v2, m2v2) will be
+                // instead of 14, two more planes per frame. The allrounder m2v2 will be
                 // appended after it. Opt-in; the default stays E2v5.
-    C2Feat = 7, // TEST ONLY, a 600-step stand-in for the learned-features variant (ml-fg export/c2smoke-features, SPEC.md section 11): width
+    G2v3 = 7,   // the learned-features variant, a game net (ml-fg export/g2v3, SPEC.md section 11): width
                 // 24, 110,086 weights, 15.5 GMAC per pair (+17.5 % over E2v5; 27 conv inputs: the luma's 14 plus 4 learned maps' differences
-                // and a 9-channel map cost, from a 3 -> 8 -> 4 extractor run on every pooled RGB level of both frames). Not a quality net.
+                // and a 9-channel map cost, from a 3 -> 8 -> 4 extractor run on every pooled RGB level of both frames).
 };
 // The number of LearnedNet values (every net is built into the library), and their names as ml-fg's export calls them ("e2v3", "e1v3",
-// "e2v4", "e1v4", "e2v5", "e1v5", "c2smoke", "c2feat"), for a host's or a test's settings parser: learnedNetName() is null for a value out of range, learnedNetFromName() false
+// "e2v4", "e1v4", "e2v5", "e1v5", "g2v2", "g2v3"), for a host's or a test's settings parser: learnedNetName() is null for a value out of range, learnedNetFromName() false
 // (out untouched) for an unknown name.
 constexpr uint32_t kLearnedNets = 8;
 const char* learnedNetName(LearnedNet n);

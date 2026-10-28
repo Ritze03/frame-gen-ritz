@@ -1,8 +1,8 @@
 {
- "run": "c2smoke-colour",
- "checkpoint_sha256": "c075ce829d54b715530fb9b639d83e920cdc7c3f2e7eda262640eb9994b02224",
- "checkpoint_step": 600,
- "checkpoint_val_score": 31.835,
+ "run": "g2v2",
+ "checkpoint_sha256": "4720c32019e0b6c3143002f7750da17b96cfc14535fc2e43c6e0b7b42c5b5596",
+ "checkpoint_step": 10000,
+ "checkpoint_val_score": 31.914,
  "config": {
   "levels": 5,
   "width": 24,
@@ -13,7 +13,9 @@
  },
  "variant": "colour",
  "colour": 1,
+ "features": 0,
  "needs_chroma": true,
+ "needs_rgb": false,
  "in_channels": 25,
  "input_channels": [
   "wa",
@@ -48,10 +50,10 @@
  "pad_multiple": 16,
  "weights_file": "weights.bin",
  "weights_dtype": "float32 little-endian, packed, no padding between tensors",
- "weights_sha256": "a2f167feac3cf9c4d19dbee00e673e277abc09892d6638b3c5ae1da6187da859",
+ "weights_sha256": "3582669398b0f02f51a9443b32873d7fed62144f04fad3db2ef19666cf97bf23",
  "weights_f16_file": "weights.f16.bin",
  "weights_f16_note": "same tensors rounded to IEEE half; offsets = offset_bytes / 2; max abs rounding error below",
- "weights_f16_max_abs_err": 0.001247406005859375,
+ "weights_f16_max_abs_err": 0.0013661384582519531,
  "total_elements": 107410,
  "forward_order": "tensors are listed coarsest pyramid level first (level index L-1), then ..., finest (level 0)",
  "level_to_stack": [
