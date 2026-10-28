@@ -39,7 +39,7 @@ def nets():
     return sorted(f[:-3] for f in os.listdir(d) if f.endswith('.js'))
 
 
-EXPORT_DIR = {'c2smoke': 'c2smoke-colour', 'c2feat': 'c2smoke-features'}   # nets/<net>.js whose export directory has another name (make_nets.py NAME=DIR)
+EXPORT_DIR = {}   # nets/<net>.js whose export directory has another name (make_nets.py NAME=DIR); none now
 
 
 def pairs():
