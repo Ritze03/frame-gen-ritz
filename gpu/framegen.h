@@ -48,7 +48,7 @@ enum class MotionVersion : uint32_t {
                   // 1080p: the net's output pass is 0.011-0.016 ms without it, 0.017-0.022 with it; the static guard adds 0.047-0.050
                   // ms per generated frame at 1080p, per-pass GPU profile.) Memory on top of V1 (activations + state): 1080p E2v3 / E2v4 /
                   // E2v5 100 + 11 MB, E1v3 / E1v4 / E1v5 58 + 11 MB; 1440p E2v3 / E2v4 / E2v5 177 + 20 MB, E1v3 / E1v4 / E1v5 103 + 20 MB
-                  // (learnedHalf: half the activations); the zero test and the static guard need none; the weights of all six nets 1.5 MB.
+                  // (learnedHalf: half the activations); the zero test and the static guard need none; the weights of all seven nets 1.9 MB.
 };
 
 // The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. All nets are the same
@@ -67,11 +67,15 @@ enum class LearnedNet : uint32_t {
     E1v5 = 5,   // THE SMALL NET, the recommended fallback when E2v5 costs too much (a host that drops to a cheaper net at high resolution or
                 // refresh rate picks this one): E1v4 fine-tuned further, the same architecture, size and cost as E1v3 (width 12, 28,330
                 // weights, 3.9 GMAC, ~0.5 ms per 1080p pair). With the zero test: +0.12 dB over V1 on ml-fg's 14 clips, +0.06 dB over E1v4.
+    C2Smoke = 6, // TEST ONLY, a 600-step stand-in for the colour variant (ml-fg export/c2smoke-colour): width 24, 107,410 weights, 14.9 GMAC
+                // (+12.5 % over E2v5). A colour net (SPEC.md section 10) also matches the frames' chroma (Cb, Cr): 25 conv inputs
+                // instead of 14, two more planes per frame. Not a quality net; the real colour nets (ml-fg's g2v2, m2v2) will be
+                // appended after it. Opt-in; the default stays E2v5.
 };
 // The number of LearnedNet values (every net is built into the library), and their names as ml-fg's export calls them ("e2v3", "e1v3",
-// "e2v4", "e1v4", "e2v5", "e1v5"), for a host's or a test's settings parser: learnedNetName() is null for a value out of range, learnedNetFromName() false
+// "e2v4", "e1v4", "e2v5", "e1v5", "c2smoke"), for a host's or a test's settings parser: learnedNetName() is null for a value out of range, learnedNetFromName() false
 // (out untouched) for an unknown name.
-constexpr uint32_t kLearnedNets = 6;
+constexpr uint32_t kLearnedNets = 7;
 const char* learnedNetName(LearnedNet n);
 bool learnedNetFromName(const char* name, LearnedNet* out);
 
@@ -682,6 +686,10 @@ public:
         uint32_t fw, fh, pw, ph, width;    // flow size, the net's padded level 0, the selected net's width
         bool half;                         // Settings::learnedHalf: a channel group is 4 IEEE half (8 bytes) instead of a vec4
         VkDeviceSize pyrOff[5], hOff[5], actOff[2], size;
+        // the net variant's extra planes (colour: Cb, Cr; 0 for a luma net): ext planes, and per level l at xOff[l] the pyramid of plane p
+        // (0 = Cb, 1 = Cr): a then c, n(l) float32 each (/255, signed), a at xOff[l] + 2 * p * n(l) * 4 bytes
+        uint32_t ext;
+        VkDeviceSize xOff[5];
     };
     bool debugLearnedLayout(DebugLearnedLayout& l) const;
     bool recordDebugLearned(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);

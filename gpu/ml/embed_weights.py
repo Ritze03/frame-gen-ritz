@@ -7,7 +7,7 @@ unchanged into gpu/ml/<run>/. The manifest is checked (sha256 of weights.bin, to
 count, 5 levels of 5 layers: 14 -> w -> w -> w -> w -> 2), so a broken copy fails the build instead of producing a wrong field.
 
 Output per net, the layout shaders/ml_conv.comp reads (binding 15, vec4 units): per level l (0 = finest) and layer k, the weights
-re-laid out as W'[ky][kx][i][o] with the input channels padded to a multiple of 4 (14 -> 16) and the output channels padded to a
+re-laid out as W'[ky][kx][i][o] with the input channels padded to a multiple of 4 (14 -> 16, colour 25 -> 28) and the output channels padded to a
 multiple of 4 (2 -> 4), zeros in the padding, then the bias b'[o] (padded likewise). One table entry per (level, layer): the vec4
 offset of the weights and of the bias. All values are the float32 bits of weights.bin, unchanged.
 """
@@ -16,7 +16,10 @@ import json
 import struct
 import sys
 
-LEVELS, LAYERS, IN_CH = 5, 5, 14
+LEVELS, LAYERS = 5, 5
+# The input variants of the net (SPEC.md section 10.7), in framegen.cpp MlVariant order: the manifest's `variant` (absent = luma) and
+# its first-layer input channels. A new variant: one entry here, one in framegen.cpp kMlVariants (+ its extra-plane pass).
+VARIANTS = [('luma', 14), ('colour', 25)]
 
 
 def ceil4(n):
@@ -30,7 +33,12 @@ def load(manifest, weights):
     assert hashlib.sha256(raw).hexdigest() == man['weights_sha256'], f'{weights}: sha256 differs from the manifest'
     assert len(raw) == 4 * man['total_elements'], f'{weights}: {len(raw)} bytes, manifest total_elements {man["total_elements"]}'
     cfg = man['config']
+    vname = man.get('variant', 'luma')
+    vi = [v for v, _ in VARIANTS].index(vname)   # an unknown variant fails the build
+    IN_CH = VARIANTS[vi][1]
     assert cfg['levels'] == LEVELS and cfg['depth'] == LAYERS - 1 and man['in_channels'] == IN_CH and man['flow_scale'] == 2
+    assert bool(man.get('colour', 0)) == bool(cfg.get('colour', 0)) == (vname == 'colour'), f'{manifest}: variant {vname} vs its colour flags'
+    assert bool(man.get('needs_chroma', False)) == (vname == 'colour')
     assert man['pad_multiple'] == 1 << (LEVELS - 1) and cfg['cost'] == 1
     vals = struct.unpack(f'<{len(raw) // 4}I', raw)   # float32 bits
     t, pos = {}, 0
@@ -58,7 +66,7 @@ def load(manifest, weights):
             assert ws == [co, ci, 3, 3] and bs == [co]
             layers.append((ci, co, w, b))
         levels.append(layers)
-    return man, width, levels
+    return man, width, levels, vi
 
 
 def relayout(ci, co, w, b):
@@ -80,7 +88,7 @@ def main():
              '#pragma once', '#include <cstdint>', '']
     for j in range(0, len(args), 3):
         name, man_path, w_path = args[j:j + 3]
-        man, width, levels = load(man_path, w_path)
+        man, width, levels, vi = load(man_path, w_path)
         data, table = [], []
         for layers in levels:
             row = []
@@ -95,7 +103,7 @@ def main():
         assert len(data) % 4 == 0
         lines.append(f'// {man["run"]}: width {width}, {man["total_elements"]} weights (checkpoint sha256 {man["checkpoint_sha256"]},')
         lines.append(f'// step {man["checkpoint_step"]}, weights.bin sha256 {man["weights_sha256"]})')
-        lines.append(f'static const uint32_t kMlWidth_{name} = {width}, kMlElements_{name} = {man["total_elements"]};')
+        lines.append(f'static const uint32_t kMlWidth_{name} = {width}, kMlElements_{name} = {man["total_elements"]}, kMlVariant_{name} = {vi};   // {VARIANTS[vi][0]}')
         lines.append(f'// [level 0 = finest .. 4][layer 0..4] = {{weights, bias}} offsets in vec4 units')
         lines.append(f'static const uint32_t kMlTable_{name}[{LEVELS}][{LAYERS}][2] = {{')
         for row in table:

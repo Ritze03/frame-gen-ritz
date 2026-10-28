@@ -10,7 +10,7 @@
 // readback; rgb10 / f16 / p010 as PQ HDR, f16lin as scRGB, see Fmt below).
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
 // smoothBonus searchPenalty subpixel flowScale v2StaticMask; algo=v1|v2|learned = motionVersion; v2Mode=quality|performance;
-// learnedNet=e2v3|e1v3|e2v4|e1v4|e2v5|e1v5 (MotionVersion::Learned's net), learnedHalf, learnedZeroTest, learnedStaticGuard (0|1); ui=off|crosshair|wholescreen|crosshairv2 =
+// learnedNet=e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|c2smoke (MotionVersion::Learned's net), learnedHalf, learnedZeroTest, learnedStaticGuard (0|1); ui=off|crosshair|wholescreen|crosshairv2 =
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill), passed to init.
 // UI protection (ui != off in --set or --then): every real frame is recordObserve'd once, in pair order, into a ring of 3 input
@@ -59,7 +59,7 @@ static bool parseSettings(char* str, framegen::Settings& s) {
             else if (a == "learned") s.motionVersion = framegen::MotionVersion::Learned;
             else { fprintf(stderr, "algo=v1|v2|learned, not %s\n", eq + 1); return false; }
         }
-        else if (k == "learnedNet") {   // MotionVersion::Learned's net by its name (framegen::learnedNetName: e2v3 | e1v3 | e2v4 | e1v4 | e2v5 | e1v5)
+        else if (k == "learnedNet") {   // MotionVersion::Learned's net by its name (framegen::learnedNetName: e2v3 | e1v3 | e2v4 | e1v4 | e2v5 | e1v5 | c2smoke)
             if (!framegen::learnedNetFromName(eq + 1, &s.learnedNet)) {
                 fprintf(stderr, "learnedNet=");
                 for (uint32_t n = 0; n < framegen::kLearnedNets; n++) fprintf(stderr, "%s%s", n ? "|" : "", framegen::learnedNetName((framegen::LearnedNet)n));
