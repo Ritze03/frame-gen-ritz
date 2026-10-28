@@ -27,8 +27,8 @@ sys.path.insert(0, os.path.join(HERE, '..', '..', 'proto'))
 import interp  # noqa: E402  (FGR's synthesis, unchanged)
 
 
-# export directory of a net where it differs from its name (the colour variant's test stand-in; mltest.cpp runDir())
-EXPORT_DIR = {'c2smoke': 'c2smoke-colour'}
+# export directory of a net where it differs from its name (the colour / features variants' test stand-ins; mltest.cpp runDir())
+EXPORT_DIR = {'c2smoke': 'c2smoke-colour', 'c2feat': 'c2smoke-features'}
 
 
 def psnr(x, y):

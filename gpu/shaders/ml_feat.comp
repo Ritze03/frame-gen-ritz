@@ -1,0 +1,61 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::Learned, the features variant's extractor (ml-fg export/SPEC.md section 11.3, reference.py extract()): per frame
+// (gl_WorkGroupID.z: 0 = a, 1 = c) and pyramid level pc.lvl, F = clamp(conv3x3(clamp(conv3x3(X, E0) + e0, 0, 1), E1) + e1, 0, 1), X the
+// level's RGB image (ml_pyr.comp's scratch pyramids, 0..1, the padded level including the replicated rows / columns), E0 3 -> 8, E1
+// 8 -> 4, the same weights for every level and both frames, ZERO padding outside the level image for both convs (the hidden maps t
+// outside the level are set to 0 before the second conv reads them: they are not the bias-only value the first conv would give
+// there). The 4 maps go to the matched-plane pyramid (mlX: map j of frame f at (2 j + f) n(l)), which ml_match.comp reads.
+// One workgroup per 16x16 tile and frame: X over the tile + 2 px, t over the tile + 1 px, fused in shared memory. Weights: wt[] in
+// gpu/ml/embed_weights.py's layout W'[ky][kx][i][o] (input channels padded to 4: RGB + 0; outputs in vec4s), E0 at wOff / bOff, E1 at
+// xwOff / xbOff. Float32 (the order of the sums differs from numpy's: ~1e-7).
+#include "common.glsl"
+#include "ml_common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int TS = 16, TX = TS + 4, TT = TS + 2;   // tile, X tile (halo 2), t tile (halo 1)
+shared float sx[3 * TX * TX];
+shared float st[8 * TT * TT];
+
+void main() {
+    if (mlDup()) return;
+    const int lw = pc.pw >> pc.lvl, lh = pc.ph >> pc.lvl, n = lw * lh, f = int(gl_WorkGroupID.z);
+    const int rgb = mlScr(pc.lvl) + f * n;   // plane c (R, G, B) at + 2 c n
+    const ivec2 org = ivec2(gl_WorkGroupID.xy) * TS;
+    const int lid = int(gl_LocalInvocationIndex);
+    for (int i = lid; i < TX * TX; i += TS * TS) {
+        ivec2 s = org - 2 + ivec2(i % TX, i / TX);
+        const bool in_ = s.x >= 0 && s.y >= 0 && s.x < lw && s.y < lh;
+        for (int c = 0; c < 3; c++) sx[c * TX * TX + i] = in_ ? ml[rgb + 2 * c * n + s.y * lw + s.x] : 0.0;
+    }
+    barrier();
+    for (int i = lid; i < TT * TT; i += TS * TS) {
+        const int ix = i % TT, iy = i / TT;
+        ivec2 s = org - 1 + ivec2(ix, iy);
+        vec4 a0 = wt[pc.bOff], a1 = wt[pc.bOff + 1];
+        for (int t = 0; t < 9; t++) {
+            const int ky = t / 3, kx = t - 3 * ky;
+            for (int c = 0; c < 3; c++) {
+                const float v = sx[c * TX * TX + (iy + ky) * TX + ix + kx];
+                a0 = fma(vec4(v), wt[pc.wOff + (t * 4 + c) * 2], a0);
+                a1 = fma(vec4(v), wt[pc.wOff + (t * 4 + c) * 2 + 1], a1);
+            }
+        }
+        const bool in_ = s.x >= 0 && s.y >= 0 && s.x < lw && s.y < lh;   // outside the level: 0, not the activation of zero input
+        a0 = in_ ? clamp(a0, 0.0, 1.0) : vec4(0.0);
+        a1 = in_ ? clamp(a1, 0.0, 1.0) : vec4(0.0);
+        for (int k = 0; k < 4; k++) { st[k * TT * TT + i] = a0[k]; st[(4 + k) * TT * TT + i] = a1[k]; }
+    }
+    barrier();
+    const ivec2 l = ivec2(gl_LocalInvocationID.xy), q = org + l;
+    if (q.x >= lw || q.y >= lh) return;
+    vec4 acc = wt[pc.xbOff];
+    for (int t = 0; t < 9; t++) {
+        const int ky = t / 3, kx = t - 3 * ky;
+        for (int i = 0; i < 8; i++)
+            acc = fma(vec4(st[i * TT * TT + (l.y + ky) * TT + l.x + kx]), wt[pc.xwOff + t * 8 + i], acc);
+    }
+    acc = clamp(acc, 0.0, 1.0);
+    const int xo = mlX(pc.lvl) + f * n + q.y * lw + q.x;
+    for (int j = 0; j < 4; j++) ml[xo + 2 * j * n] = acc[j];
+}

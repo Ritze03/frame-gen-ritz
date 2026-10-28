@@ -19,7 +19,8 @@ import sys
 LEVELS, LAYERS = 5, 5
 # The input variants of the net (SPEC.md section 10.7), in framegen.cpp MlVariant order: the manifest's `variant` (absent = luma) and
 # its first-layer input channels. A new variant: one entry here, one in framegen.cpp kMlVariants (+ its extra-plane pass).
-VARIANTS = [('luma', 14), ('colour', 25)]
+VARIANTS = [('luma', 14), ('colour', 25), ('features', 27)]
+FEATURES = 4   # the features variant's maps per frame (config.features): ml_feat.comp and ml_match.comp are written for 4
 
 
 def ceil4(n):
@@ -39,6 +40,9 @@ def load(manifest, weights):
     assert cfg['levels'] == LEVELS and cfg['depth'] == LAYERS - 1 and man['in_channels'] == IN_CH and man['flow_scale'] == 2
     assert bool(man.get('colour', 0)) == bool(cfg.get('colour', 0)) == (vname == 'colour'), f'{manifest}: variant {vname} vs its colour flags'
     assert bool(man.get('needs_chroma', False)) == (vname == 'colour')
+    assert (man.get('features', 0) == cfg.get('features', 0)) and (cfg.get('features', 0) == FEATURES) == (vname == 'features') \
+        and bool(man.get('needs_rgb', False)) == (vname == 'features') and ('extractor' in man) == (vname == 'features'), \
+        f'{manifest}: variant {vname} vs its features flags'
     assert man['pad_multiple'] == 1 << (LEVELS - 1) and cfg['cost'] == 1
     vals = struct.unpack(f'<{len(raw) // 4}I', raw)   # float32 bits
     t, pos = {}, 0
@@ -66,7 +70,16 @@ def load(manifest, weights):
             assert ws == [co, ci, 3, 3] and bs == [co]
             layers.append((ci, co, w, b))
         levels.append(layers)
-    return man, width, levels, vi
+    extr = None
+    if vname == 'features':   # the per-frame extractor (SPEC.md section 11.3): 3 -> 8 -> 4, clamp01 both, zero padding
+        ly = man['extractor']['layers']
+        assert [(l['c_in'], l['c_out'], l['act'], l['padding']) for l in ly] == [(3, 8, 'clamp01', 'zero'), (8, FEATURES, 'clamp01', 'zero')]
+        extr = []
+        for l in ly:
+            (ws, w), (bs, b) = t[l['weight']], t[l['bias']]
+            assert ws == [l['c_out'], l['c_in'], 3, 3] and bs == [l['c_out']]
+            extr.append((l['c_in'], l['c_out'], w, b))
+    return man, width, levels, vi, extr
 
 
 def relayout(ci, co, w, b):
@@ -88,8 +101,14 @@ def main():
              '#pragma once', '#include <cstdint>', '']
     for j in range(0, len(args), 3):
         name, man_path, w_path = args[j:j + 3]
-        man, width, levels, vi = load(man_path, w_path)
-        data, table = [], []
+        man, width, levels, vi, extr = load(man_path, w_path)
+        data, table, xt = [], [], [0, 0, 0, 0]   # xt: the extractor's {weights0, bias0, weights1, bias1} (zeros without one)
+        for k, (ci, co, w, b) in enumerate(extr or []):
+            wr, br = relayout(ci, co, w, b)
+            xt[2 * k] = len(data) // 4
+            data += wr
+            xt[2 * k + 1] = len(data) // 4
+            data += br
         for layers in levels:
             row = []
             for ci, co, w, b in layers:
@@ -109,6 +128,8 @@ def main():
         for row in table:
             lines.append('    {' + ', '.join(f'{{{a}, {b}}}' for a, b in row) + '},')
         lines.append('};')
+        lines.append(f'static const uint32_t kMlExtr_{name}[4] = {{{", ".join(map(str, xt))}}};   // the features extractor\'s offsets (vec4 units)')
+        lines.append(f'static const uint32_t kMlInCh_{name} = {VARIANTS[vi][1]};')
         lines.append(f'static const uint32_t kMlWeights_{name}[{len(data)}] = {{')
         for k in range(0, len(data), 12):
             lines.append('    ' + ', '.join(f'0x{v:08x}u' for v in data[k:k + 12]) + ',')

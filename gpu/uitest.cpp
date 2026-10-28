@@ -1664,8 +1664,8 @@ static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "
 // modes), Performance's morph, Quality's per-pixel field, splat, coverage and morph; no motion-blur passes (its morphs blur): 11.
 // Learned = V1's luma, 4 synth passes and 3 motion-blur passes, its duplicate test, reduction, pyramid, output, zero-test and static-guard
 // passes, its match (2) pipelines per activation storage and its conv pipelines, 10 per net (per activation storage, layer shape and
-// split): 19 + 10 per LearnedNet (framegen.h kLearnedNets); 19 = 16 + the colour variant's chroma pass (1) and its 2 match pipelines.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : v == MotionVersion::Learned ? 19 + 10 * (int64_t)kLearnedNets : 14; }
+// split): 22 + 10 per LearnedNet (framegen.h kLearnedNets); 22 = 16 + the variants' planes pass and extractor (2) and their 4 match pipelines.
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : 14; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.

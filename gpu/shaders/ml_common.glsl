@@ -22,15 +22,20 @@ layout(push_constant) uniform MLPC {
     int pf;            // field[] offset of the per-pixel half-vector field (V1's fieldPF)
     int mode;          // reduce: 0 = the duplicate test, 1 = the scene-cut sum
     float dupDiff;     // reduce, mode 0: the duplicate threshold (mean |a - c| per channel, levels)
-    int ext;           // the net variant's extra per-frame planes beyond the luma (framegen.cpp kMlVariants: 0 luma, 2 colour = Cb, Cr)
+    int ext;           // the net variant's extra planes matched next to the luma (framegen.cpp kMlVariants: 0 luma, 2 colour = Cb, Cr, 4 features)
+    int nin;           // the variant's flow-res planes per frame, made by ml_planes.comp and pyramided by ml_pyr.comp (colour 2: Cb, Cr; features 3: R, G, B)
+    int feat;          // 1 = a features net: the pyramided planes are RGB, ml_feat.comp turns them into the ext matched planes
+    int xwOff, xbOff;  // ml_feat: the extractor's second layer in wt[] (the first is wOff, bOff)
 } pc;
 
 // Binding 13: the net's float state, laid out per the padded level sizes n(l) = (pw >> l) * (ph >> l), S = n(0) + .. + n(4):
 //   [0, 2S)    the pyramid: per level, la then lc (0..1)
 //   [2S, 4S)   the field h per level (x, y interleaved, in that level's pixels)
-//   [4S, 4S + 2 ext S)  the variant's extra planes' pyramids (ext = pc.ext, 0 for a luma net), per level: for each extra plane p
-//              (colour: 0 = Cb, 1 = Cr) a then c (/255, signed); the planes are those of ml_chroma.comp (the variant's per-frame pass)
-//   [.., + 2 ext fw fh)  ml_chroma.comp's output, the flow-res extra planes (levels), plane p of frame f (0 = a, 1 = c) at (2 p + f) fw fh
+//   [4S, 4S + 2 ext S)  the matched extra planes' pyramids (ext = pc.ext, 0 for a luma net), per level: for each plane p a then c
+//              (colour: p = 0 Cb, 1 Cr, /255, signed; features: p = the extractor's maps 0..3, 0..1). ml_pyr.comp writes the colour planes,
+//              ml_feat.comp the feature maps
+//   [.., + 2 scr S)  a features net's RGB pyramids (scr = pc.feat ? pc.nin : 0), per level: plane p (R, G, B) a then c, /255
+//   [.., + 2 nin fw fh)  ml_planes.comp's output, the flow-res planes (levels), plane p of frame f (0 = a, 1 = c) at (2 p + f) fw fh
 //   [.., ..)   partial sums of the reductions (ml_dup.comp, ml_out.comp -> ml_reduce.comp)
 // Binding 14: the activations, vec4 (4 channels), two regions of level-0 size: R0 (the 14-channel input (25 for colour), then layers 1 and 3) and
 // R1 (layers 0 and 2), each channel group planar per level. Binding 15: the weights (both nets, gpu/ml/embed_weights.py's layout).
@@ -70,5 +75,7 @@ int mlS() { int s = 0; for (int l = 0; l < ML_LEVELS; l++) s += mlN(l); return s
 int mlPyr(int l) { int o = 0; for (int k = 0; k < l; k++) o += 2 * mlN(k); return o; }   // la of level l; lc at + mlN(l)
 int mlH(int l) { int o = 2 * mlS(); for (int k = 0; k < l; k++) o += 2 * mlN(k); return o; }
 int mlX(int l) { int o = 4 * mlS(); for (int k = 0; k < l; k++) o += 2 * pc.ext * mlN(k); return o; }   // extra plane pyramids of level l
-int mlFlowX() { return 4 * mlS() + 2 * pc.ext * mlS(); }                                              // ml_chroma.comp's flow-res planes
-int mlPart() { return mlFlowX() + 2 * pc.ext * pc.fw * pc.fh; }
+int mlScrN() { return pc.feat != 0 ? pc.nin : 0; }
+int mlScr(int l) { int o = 4 * mlS() + 2 * pc.ext * mlS(); for (int k = 0; k < l; k++) o += 2 * mlScrN() * mlN(k); return o; }   // RGB pyramids of level l
+int mlFlowX() { return 4 * mlS() + 2 * (pc.ext + mlScrN()) * mlS(); }                                  // ml_planes.comp's flow-res planes
+int mlPart() { return mlFlowX() + 2 * pc.nin * pc.fw * pc.fh; }
