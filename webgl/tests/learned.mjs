@@ -48,8 +48,9 @@ for (let i = 0; i < argv.length; i++) {
   else { console.error('learned: unknown argument ' + a); process.exit(2); }
 }
 const TOL = { top: 5e-5, pfMean: 2e-4, pfMax: 5e-2, sadRel: 1e-3, sadRel16: 1e-2, synthDb: 45, midDb: 0.05, engineMae: 1.0,
-  pfMaxColour: 1.5e-1, feat: 1e-4, chroma: 2e-3, ztAgree: 0.999, ztSynthDb: 70, cost: 2e-3, sgMax: 1.0 };
-const HDR_NETS = ['e2v5', 'e2v4', 'e2v3', 'c2smoke'];   // the RGBA16F-input rows (motion / odd, fp16)
+  pfMaxColour: 1.5e-1, pfMaxFeat: 2.5e-1,   // max pf: luma 5e-2; colour 0.15 (SPEC 10); features 0.25 (SPEC section 8 / 11.6, PF_MAX_TOL_FEATURES)
+  feat: 1e-4, chroma: 2e-3, ztAgree: 0.999, ztSynthDb: 70, cost: 2e-3, sgMax: 1.0 };
+const HDR_NETS = ['e2v5', 'e2v4', 'e2v3', 'g2v2'];   // the RGBA16F-input rows (motion / odd, fp16)
 const SG_NET = 'e2v3';               // the static guard check's net (pinned: the guard does not depend on the net)
 const py = (mode) => {
   const r = spawnSync('python3', ['-I', path.join(here, 'learned_ref.py'), mode], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', env: { ...process.env, FG_WORK: work } });
@@ -341,7 +342,7 @@ for (const row of rows) {
   if (exact) {   // the exact float32 port: SPEC section 8's tolerances
     if (!(row.topMax <= TOL.top)) fails.push('top ' + e1(row.topMax));
     if (!(row.pf.mean <= TOL.pfMean)) fails.push('pf mean ' + e1(row.pf.mean));
-    if (!(row.pf.max <= (row.colour ? TOL.pfMaxColour : TOL.pfMax))) fails.push('pf max ' + e1(row.pf.max));
+    if (!(row.pf.max <= (row.features ? TOL.pfMaxFeat : row.colour ? TOL.pfMaxColour : TOL.pfMax))) fails.push('pf max ' + e1(row.pf.max));
   }
   if (row.ca !== undefined && !(Math.max(row.ca, row.cc) <= TOL.chroma)) fails.push(`chroma planes ${e1(row.ca)} / ${e1(row.cc)} levels`);
   if (row.feat !== undefined && row.prec !== 'hdr' && !(row.feat <= TOL.feat)) fails.push('feature maps ' + e1(row.feat));
@@ -380,7 +381,7 @@ for (const row of rows) {
   if (exact) {
     if (!(z.agree >= TOL.ztAgree)) fails.push('mask agreement ' + (100 * z.agree).toFixed(4) + '%');
     if (!(z.pfMean <= TOL.pfMean)) fails.push('pf mean ' + e1(z.pfMean));
-    if (!(z.pfMax <= (row.colour ? TOL.pfMaxColour : TOL.pfMax))) fails.push('pf max ' + e1(z.pfMax));
+    if (!(z.pfMax <= (row.features ? TOL.pfMaxFeat : row.colour ? TOL.pfMaxColour : TOL.pfMax))) fails.push('pf max ' + e1(z.pfMax));
     if (z.c0Max !== null && row.ya && !(z.c0Max <= TOL.cost)) fails.push('C(0) ' + e1(z.c0Max));
   }
   if (!(z.sadRel <= (exact ? TOL.sadRel : TOL.sadRel16))) fails.push('sad_zt ' + e1(z.sadRel));

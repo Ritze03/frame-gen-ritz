@@ -28,7 +28,7 @@
   // Static tables
   // ---------------------------------------------------------------------------------------------
 
-  fg.version = '6';   // 6: the colour net variant (nets/*.js `variant`, ML_VARIANTS; the stand-in net c2smoke, selectable, defaults unchanged); 5: nets e2v5 (the default motionNet) and e1v5 (smallNet), the default learned output changed; 4: nets e2v4
+  fg.version = '7';   // 6: the colour net variant (nets/*.js `variant`, ML_VARIANTS; the stand-in net c2smoke, selectable, defaults unchanged); 5: nets e2v5 (the default motionNet) and e1v5 (smallNet), the default learned output changed; 4: nets e2v4
   // and e1v4, learnedZeroTest (default on), learnedStaticGuard, smallNet / defaultNet; 3: the learned motion estimator (settings motion / motionNet, __fg.nets, checkSupport learned); 2: V2 Quality,
   // RGBA16F input, synthBlur, frameSizeError, checkSupport sizeError / quality (API of the earlier versions unchanged otherwise)
   fg.requiredExtensions = ['EXT_color_buffer_float', 'EXT_float_blend', 'OES_texture_float_linear'];
@@ -172,7 +172,7 @@
       '#define FG_SGUARD 1\n'],
   ];
   const ML_DUP_DIFF = 0.6;                   // learned/ml_common.inc.glsl's (the duplicate-pair test)
-  const ML_NETS = ['e2v5', 'e1v5', 'e2v4', 'e1v4', 'e2v3', 'e1v3', 'c2smoke', 'c2feat'];  // settings.motionNet values (DEFAULTS.motionNet is the first); weights: webgl/nets/<name>.js
+  const ML_NETS = ['e2v5', 'e1v5', 'e2v4', 'e1v4', 'e2v3', 'e1v3', 'g2v2', 'g2v3', 'm2v2', 'm2v3'];  // settings.motionNet values (DEFAULTS.motionNet is the first); weights: webgl/nets/<name>.js
   const ML_SMALL_NET = 'e1v5';               // the recommended small / fallback net (width 12, ~3.4x cheaper than the default)
   // Read-only: __fg.defaultNet (= DEFAULTS.motionNet) and __fg.smallNet, so a caller picks the small net without naming it
   for (const [k, v] of [['defaultNet', ML_NETS[0]], ['smallNet', ML_SMALL_NET]]) {
