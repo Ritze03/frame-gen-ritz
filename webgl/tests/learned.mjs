@@ -53,7 +53,7 @@ const TOL = { top: 5e-5, pfMean: 2e-4, pfMax: 5e-2, sadRel: 1e-3, sadRel16: 1e-2
 const HDR_NETS = ['e2v5', 'e2v4', 'e2v3', 'g2v2'];   // the RGBA16F-input rows (motion / odd, fp16)
 const SG_NET = 'e2v3';               // the static guard check's net (pinned: the guard does not depend on the net)
 const py = (mode) => {
-  const r = spawnSync('python3', ['-I', path.join(here, 'learned_ref.py'), mode], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', env: { ...process.env, FG_WORK: work } });
+  const r = spawnSync('python3', ['-I', path.join(here, 'learned_ref.py'), mode], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', env: { ...process.env, FG_WORK: work, ...(opt.nets ? { FG_NETS: opt.nets.join(',') } : {}), ...(opt.pairs ? { FG_PAIRS: opt.pairs.join(',') } : {}) } });
   if (r.status !== 0) { console.error(`learned: learned_ref.py ${mode} failed (${r.status})`); process.exit(2); }
   return r.stdout;
 };
@@ -437,7 +437,7 @@ const sgRows = [];
   fs.rmSync(sgo, { recursive: true, force: true });
   const cutPair = (man.pairs.find((q) => q.net === SG_NET && q.cut_zt) || {}).pair;   // a fallback frame (vec.json's cut_zt)
   const cases = [['overlay', false, [0.5, 0.25]], ['motion', false, [0.25]], [cutPair, false, [0.5]], ['overlay', true, [0.25]]];
-  if (!cutPair) { console.log(`static guard: no ${SG_NET} pair with cut_zt: FAIL`); allOk = false; }
+  if (!cutPair && !opt.pairs && (!opt.nets || opt.nets.includes(SG_NET))) { console.log(`static guard: no ${SG_NET} pair with cut_zt: FAIL`); allOk = false; }
   for (const [pair, f16in, ts] of cases) {
     const p = man.pairs.find((q) => q.net === SG_NET && q.pair === pair);
     if (!p || (opt.nets && !opt.nets.includes(SG_NET)) || !opt.prec.includes('fp32')) continue;
