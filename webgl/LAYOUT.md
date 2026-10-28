@@ -335,7 +335,7 @@ Classic script. Attaches **`globalThis.__fg`**; defines nothing else globally. N
 __fg.version                       // string, '5' (changed; history below, README "API" lists the additions)
 __fg.requiredExtensions            // ['EXT_color_buffer_float','EXT_float_blend','OES_texture_float_linear']
 __fg.checkSupport(gl, frame?)      // -> { ok, missing: string[], sizeError: string|null, quality: boolean, qualityError: string|null, learned: boolean, learnedError: string|null } (changed)
-__fg.nets                          // { e2v5, e1v5, e2v4, e1v4, e2v3, e1v3 }: the learned estimator's weights, attached by webgl/nets/<name>.js (§10; new)
+__fg.nets                          // { e2v5, e1v5, e2v4, e1v4, e2v3, e1v3, c2smoke }: the learned estimator's weights, attached by webgl/nets/<name>.js (§10; new)
 __fg.defaultNet                    // 'e2v5' (read-only; = defaultSettings().motionNet; new)
 __fg.smallNet                      // 'e1v5' (read-only): the recommended small / fallback net; set motionNet: __fg.smallNet to drop to it (new)
 __fg.shaderFiles                   // string[] — every key `sources` must contain (§1), e.g. 'common.glsl', 'vert.glsl', 'estimate/luma.frag.glsl', ...
@@ -345,7 +345,7 @@ __fg.createEngine(gl, sources, settings) // -> engine ; throws Error('framegen: 
 ```
 
 * `checkSupport(gl, frame?)` (changed): `missing` contains `'webgl2'` if `gl` is not a `WebGL2RenderingContext` (then nothing else is probed), otherwise each name of `requiredExtensions` for which `gl.getExtension(name)` is null, plus `'MAX_DRAW_BUFFERS>=3'` / `'MAX_VERTEX_TEXTURE_IMAGE_UNITS>=1'` if those limits fail; feature names only. `sizeError` = `frameSizeError(gl, frame.width, frame.height, frame)` for the optional `frame = { width, height, flowScale }`, else null (before, that text was pushed into `missing`). `ok = missing.length === 0 && !sizeError`. `quality` / `qualityError`: V2 Quality's MIN-blend probe (README "API": a 1 × 1 R32F framebuffer, three points, read back; cached per context; restores the GL state it touches); `quality` does not affect `ok`, and with anything in `missing` it is false with `qualityError = 'needs ' + missing`. It calls `getExtension` (so it also *enables* the extensions). The probe allocates (and deletes) one 1 × 1 texture, framebuffer, program and VAO, the first time per context.
-* `version` history: `'5'`: nets e2v5 (now the default `motionNet` and `defaultNet`) and e1v5 (now `smallNet`), ml-fg's fine-tunes of e2v4 / e1v4 on more varied footage (same architecture, layout and cost); bumped because the default learned output and `smallNet` changed, the API is unchanged; e2v4 / e1v4 / e2v3 / e1v3 stay selectable. `'4'`: nets e2v4 (now the default `motionNet`) and e1v4, `learnedZeroTest` (default `true`: the learned default output changed), `learnedStaticGuard`, `defaultNet` / `smallNet`. `'3'`: the learned estimator (`motion`, `motionNet` default `'e2v3'`, `motionPrecision`, `__fg.nets`, `checkSupport` `learned`, `stats()` `duplicate`). `'2'`: V2 Quality, RGBA16F input, `synthBlur`, `frameSizeError`, `checkSupport` `sizeError` / `quality`. Nothing was removed in any of them.
+* `version` history: `'6'`: the colour net variant (§10.10): a new selectable net `c2smoke` (ml-fg's stand-in colour net, `motionNet` value; the real `g2v2` / `m2v2` plug in the same way) whose conv input is 25 channels built from the frames' chroma; bumped because a new net variant (a different input contract) and a new `motionNet` value exist; the defaults (`motionNet` `'e2v5'`, `defaultNet`, `smallNet`) and every existing net's output are unchanged. `'5'`: nets e2v5 (now the default `motionNet` and `defaultNet`) and e1v5 (now `smallNet`), ml-fg's fine-tunes of e2v4 / e1v4 on more varied footage (same architecture, layout and cost); bumped because the default learned output and `smallNet` changed, the API is unchanged; e2v4 / e1v4 / e2v3 / e1v3 stay selectable. `'4'`: nets e2v4 (now the default `motionNet`) and e1v4, `learnedZeroTest` (default `true`: the learned default output changed), `learnedStaticGuard`, `defaultNet` / `smallNet`. `'3'`: the learned estimator (`motion`, `motionNet` default `'e2v3'`, `motionPrecision`, `__fg.nets`, `checkSupport` `learned`, `stats()` `duplicate`). `'2'`: V2 Quality, RGBA16F input, `synthBlur`, `frameSizeError`, `checkSupport` `sizeError` / `quality`. Nothing was removed in any of them.
 * `defaultNet` / `smallNet`: non-writable properties of `__fg` (assigning to them is ignored, or throws in strict mode); a host that switches to a cheaper net reads `smallNet` instead of naming one, so a newer small net needs no host change. Both nets' scripts must be loaded to select them.
 * `createEngine` / `setSettings` (changed): where `checkSupport(gl).quality` is false, settings with `motionVersion: 2, v2Mode: 'quality'` throw a `RangeError` naming `qualityError`; the engine keeps its settings. `engine.support` is the `checkSupport(gl)` result of `createEngine`.
 * `createEngine(gl, sources, settings)`: `gl` is a `WebGL2RenderingContext`; `sources` maps path-relative-to-`shaders/` → string (`{ 'common.glsl': str, 'vert.glsl': str, 'estimate/luma.frag.glsl': str, … }`); `settings` is partial (missing keys take §4 defaults). Calls `checkSupport` and throws if not ok. Compiles and links every program (assembly per §1.1) and creates the empty VAO; textures and FBOs are allocated lazily on the first `resize`/`pushFrame`.
@@ -437,7 +437,7 @@ An opt-in replacement of V1's motion estimate (§3.3 E1–E14) by ml-fg's learne
 unchanged and consumes its output. The porting contract is ml-fg's `export/SPEC.md` (stages 1–7, abbreviated **SP**) with its
 executable reference `export/reference.py` (**REF**); the nets are `e2v5` (width 24, 95,530 weights, the default: e2v4 fine-tuned, identical
 architecture and weight layout), `e1v5` (width 12, 28,330 weights, the small net `__fg.smallNet`: e1v4 fine-tuned, identical
-layout), `e2v4` (width 24, e2v3 fine-tuned), `e1v4` (width 12, e1v3 fine-tuned), `e2v3` (width 24, 95,530 weights) and `e1v3` (width 12, 28,330 weights). Cites are SP sections.
+layout), `e2v4` (width 24, e2v3 fine-tuned), `e1v4` (width 12, e1v3 fine-tuned), `e2v3` (width 24, 95,530 weights) and `e1v3` (width 12, 28,330 weights); the opt-in **colour** variant (`c2smoke`, §10.10) is a net whose first conv takes 11 more chroma inputs. Cites are SP sections.
 
 ### 10.1 Contract with V1
 
@@ -562,6 +562,32 @@ conv writes `pixfield` and `ml_sad` runs, exactly as without the test. Exactness
 `*_zt` files, whole chain = the engine's own net field through its own test): fp32 mask agreement 99.998–100 % (0–5 flipped
 pixels per pair; REF itself flips 0–6), pf on the agreeing pixels within SP 8's pf tolerances, `sad_zt` relative ≤ 8e-5,
 identical cut, C(0) within 1.5e-5 levels; fp16 mask agreement 99.88–99.997 %.
+
+### 10.10 The colour variant (`nets/<name>.js` `variant: 'colour'`; SP 10)
+
+A net carries its **variant** (manifest `variant`; absent = `luma`): `ML_VARIANTS` in `framegen.js` maps it to the conv input's channel
+count (`luma` 14, `colour` 25 → `mlNetDef` refuses a net whose `inChannels` differs, no silent drop of the chroma) and to the number of
+per-frame extra **planes** (`planes`: 0 none, 1 the chroma pyramid). Everything else of the estimator is shared; a colour net differs in:
+
+* **Chroma planes (SP 10.1, `ml_lv0_c` = `lv0` + `ML_COLOUR`)**: a third lv0 output `ml.ex.0` (RGBA32F, PW × PH) = (Cb_a, Cr_a, Cb_c,
+  Cr_c) / 255 with Cb = 0.564 (B − Y), Cr = 0.713 (R − Y), Y the **unrounded** 0.299 R + 0.587 G + 0.114 B of the same pixels (RGBA16F
+  input: the `FG_LV` levels), the same 2 × 2 cell mean and replicate padding as the luma. `ml_down4` (`down` + `ML_V4`) builds
+  `ml.ex.<l>` (RGBA32F, level size) like the luma pyramid (SP 10.2). `ml.ex.*` is the one place the per-frame extra planes live (allocated in
+  `allocMl` under `if (colour)`, filled in `estimateLearned` next to `ml_down`); no per-frame caching across pairs (c of pair n is not reused
+  as a of pair n + 1: the pyramid is recomputed per pair, +2 passes of 4 channels, small next to the convs).
+* **Match (SP 10.3)**: the chroma is sampled at exactly the luma's coordinates (`mlBil` of `uEx`), channels 14, 15 = (Cb_a − Cb_c,
+  Cr_a − Cr_c) at d = 0, 16..24 = |dCb_d| + |dCr_d|. fp16 (`ml_match_hc`): 4 RGBA32UI textures (32 half slots for 25 channels) in one
+  pass (4 draw buffers). fp32 (`ml_match_c`, `ml_match_c2`): 7 RGBA32F textures need more than the 4 draw buffers WebGL2 guarantees, so
+  two passes per level (`ml_match.l`: channels 0..15 into `ml.x.0..3`, `ml_match2.l`: 16..24 into `ml.x.4..6`).
+* **First conv**: 7 input groups (28 slots, channel 4j + c of group j): fp32 `ml_conv7x3` (7 textures + `uDup` = 8 texture units,
+  within the 16 WebGL2 guarantees), fp16 `ml_h4g7o<G>` (4 packed textures, 7 groups). Layers 1.. are the luma net's. The weight block
+  grows to 3 · 9 · 7 mat4 (3,024 + 48 bytes, `ML_BLOCK_MAX`).
+* Sad, cut and the zero test (`learnedZeroTest`) are luma-only and unchanged (SP 10.4): with the test on, chroma-only motion is snapped to 0
+  where the luma is flat (the `colour` test pair is 100% zeroed with the test on; its `pf` with it off shows the net uses chroma).
+
+Adding a variant (e.g. learned features): a row in `ML_VARIANTS` (input channels, planes), its plane passes next to the `m.ex` ones, a
+match program with its channels, nothing else (the first conv's group count derives from the channel count, the generated net file carries
+the variant).
 
 ### 10.9 The static guard (`learnedStaticGuard`, default off)
 

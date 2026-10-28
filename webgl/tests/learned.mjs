@@ -48,8 +48,8 @@ for (let i = 0; i < argv.length; i++) {
   else { console.error('learned: unknown argument ' + a); process.exit(2); }
 }
 const TOL = { top: 5e-5, pfMean: 2e-4, pfMax: 5e-2, sadRel: 1e-3, sadRel16: 1e-2, synthDb: 45, midDb: 0.05, engineMae: 1.0,
-  ztAgree: 0.999, ztSynthDb: 70, cost: 2e-3, sgMax: 1.0 };
-const HDR_NETS = ['e2v5', 'e2v4', 'e2v3'];   // the RGBA16F-input rows (motion / odd, fp16)
+  pfMaxColour: 1.5e-1, chroma: 2e-3, ztAgree: 0.999, ztSynthDb: 70, cost: 2e-3, sgMax: 1.0 };
+const HDR_NETS = ['e2v5', 'e2v4', 'e2v3', 'c2smoke'];   // the RGBA16F-input rows (motion / odd, fp16)
 const SG_NET = 'e2v3';               // the static guard check's net (pinned: the guard does not depend on the net)
 const py = (mode) => {
   const r = spawnSync('python3', ['-I', path.join(here, 'learned_ref.py'), mode], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', env: { ...process.env, FG_WORK: work } });
@@ -102,11 +102,11 @@ await E.page.addScriptTag({ content: `
       const net = __fg.nets[job.net], G = net.width / 4, top = net.levels - 1;
       const tw = job.padded[0] >> top, th = job.padded[1] >> top;
       const fp16 = job.prec === 'fp16', sfx = G === 6 && !fp16 ? 'b' : '';   // (fp32, width 24: a layer is passes a and b)
-      const nx = fp16 ? 2 : 4, nAct = fp16 ? Math.ceil(G / 2) : G;
+      const colour = net.variant === 'colour', nIn = job.inCh, nx = fp16 ? Math.ceil(nIn / 8) : colour ? 7 : 4, nAct = fp16 ? Math.ceil(G / 2) : G;
       const cap = {};
       eng.setPassHook((name, ph) => {
         if (ph !== 1) return;
-        if (name === 'ml_match.' + top) cap.in_top = chw(eng, Array.from({ length: nx }, (_, k) => 'ml.x.' + k), 14, tw, th);
+        if (name === (colour && !fp16 ? 'ml_match2.' : 'ml_match.') + top) cap.in_top = chw(eng, Array.from({ length: nx }, (_, k) => 'ml.x.' + k), nIn, tw, th);
         for (let k = 0; k < net.depth; k++) {
           if (name === 'ml_c' + k + sfx + '.' + top) cap['act_top' + k] = chw(eng, Array.from({ length: nAct }, (_, g) => 'ml.act.' + (k & 1) + '.' + g), net.width, tw, th);
         }
@@ -127,6 +127,14 @@ await E.page.addScriptTag({ content: `
       const ya = new Float32Array(fw * fh), yc = new Float32Array(fw * fh);
       for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) { const i = (y * lv0.width + x) * 4; ya[y * fw + x] = lv0.data[i + 2]; yc[y * fw + x] = lv0.data[i + 3]; }
       await post(job.tag + '/ya', ya); await post(job.tag + '/yc', yc);
+      if (colour) {   // the chroma planes (ml.ex.0: Cb_a, Cr_a, Cb_c, Cr_c, /255) -> [2][fh][fw] levels, as ca.f32 / cc.f32
+        const ex = eng.debugRead('ml.ex.0'), ca = new Float32Array(2 * fw * fh), cc = new Float32Array(2 * fw * fh);
+        for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) for (let k = 0; k < 2; k++) {
+          const i = (y * ex.width + x) * 4;
+          ca[(k * fh + y) * fw + x] = ex.data[i + k] * 255; cc[(k * fh + y) * fw + x] = ex.data[i + 2 + k] * 255;
+        }
+        await post(job.tag + '/ca', ca); await post(job.tag + '/cc', cc);
+      }
       for (const t of [0.5, 0.25]) {
         R.t[t] = eng.synth(t, undefined);
         if (R.t[t]) {
@@ -251,7 +259,7 @@ for (const { p, prec, variant } of jobs) {
     if (opt.nets && !opt.nets.includes(p.net)) continue;
     if (opt.pairs && !opt.pairs.includes(p.pair)) continue;
     const tag = `${p.net}_${p.pair}_${variant}`, f16in = variant === 'hdr';
-    const r = await E.page.evaluate((j) => window.__learned(j), { net: p.net, prec, f16in, dir: `learned/${p.net}/${p.pair}`, W: p.W, H: p.H, flow: p.flow, padded: p.padded, tag });
+    const r = await E.page.evaluate((j) => window.__learned(j), { net: p.net, prec, f16in, inCh: p.files.in_top.shape[0], dir: `learned/${p.net}/${p.pair}`, W: p.W, H: p.H, flow: p.flow, padded: p.padded, tag });
     if (r.error) { console.log(`${tag}: ENGINE ERROR ${r.error.error}\n${r.error.stack}`); allOk = false; rows.push({ net: p.net, pair: p.pair, prec: variant, ok: false, err: r.error.error }); continue; }
     const dump = (k) => { const b = E.dumps.get(`${tag}/${k}`); return new Float32Array(b.buffer, b.byteOffset, b.length / 4); };
     const x = (k) => rdF32(p.files[k].file);
@@ -260,8 +268,9 @@ for (const { p, prec, variant } of jobs) {
     fs.writeFileSync(path.join(o, 'pf.f32'), E.dumps.get(`${tag}/pf`));
     fs.writeFileSync(path.join(o, 'est.json'), JSON.stringify({ sad: r.sad, cut: r.cut }));
     for (const t of [0.5, 0.25]) { const b = E.dumps.get(`${tag}/out_t${t}`); if (b) fs.writeFileSync(path.join(o, `out_t${t}.rgba`), b); }
-    const row = { net: p.net, pair: p.pair, prec: variant, size: `${p.W}x${p.H}` };
+    const row = { net: p.net, pair: p.pair, colour: !!p.colour, prec: variant, size: `${p.W}x${p.H}` };
     if (p.files.ya && !f16in) { row.ya = cmp(dump('ya'), x('ya')); row.yc = cmp(dump('yc'), x('yc')); }
+    if (p.colour && p.files.ca && !f16in) { row.ca = cmp(dump('ca'), x('ca')).max; row.cc = cmp(dump('cc'), x('cc')).max; }
     row.top = {};
     for (const k of ['in_top', 'act_top0', 'act_top1', 'act_top2', 'act_top3', 'raw_top']) row.top[k] = cmp(dump(k), x(k)).max;
     row.topMax = Math.max(...Object.values(row.top));
@@ -316,8 +325,9 @@ for (const row of rows) {
   if (exact) {   // the exact float32 port: SPEC section 8's tolerances
     if (!(row.topMax <= TOL.top)) fails.push('top ' + e1(row.topMax));
     if (!(row.pf.mean <= TOL.pfMean)) fails.push('pf mean ' + e1(row.pf.mean));
-    if (!(row.pf.max <= TOL.pfMax)) fails.push('pf max ' + e1(row.pf.max));
+    if (!(row.pf.max <= (row.colour ? TOL.pfMaxColour : TOL.pfMax))) fails.push('pf max ' + e1(row.pf.max));
   }
+  if (row.ca !== undefined && !(Math.max(row.ca, row.cc) <= TOL.chroma)) fails.push(`chroma planes ${e1(row.ca)} / ${e1(row.cc)} levels`);
   if (!(row.sadRel <= (exact ? TOL.sadRel : TOL.sadRel16))) fails.push('sad ' + e1(row.sadRel));
   if (row.cut !== row.cutExp) fails.push('cut');
   if (row.duplicate !== false) fails.push('duplicate ' + row.duplicate);
@@ -352,7 +362,7 @@ for (const row of rows) {
   if (exact) {
     if (!(z.agree >= TOL.ztAgree)) fails.push('mask agreement ' + (100 * z.agree).toFixed(4) + '%');
     if (!(z.pfMean <= TOL.pfMean)) fails.push('pf mean ' + e1(z.pfMean));
-    if (!(z.pfMax <= TOL.pfMax)) fails.push('pf max ' + e1(z.pfMax));
+    if (!(z.pfMax <= (row.colour ? TOL.pfMaxColour : TOL.pfMax))) fails.push('pf max ' + e1(z.pfMax));
     if (z.c0Max !== null && row.ya && !(z.c0Max <= TOL.cost)) fails.push('C(0) ' + e1(z.c0Max));
   }
   if (!(z.sadRel <= (exact ? TOL.sadRel : TOL.sadRel16))) fails.push('sad_zt ' + e1(z.sadRel));

@@ -1,6 +1,6 @@
 // One 3x3 conv layer of the net (SPEC stage 4c/4d; reference.py conv3x3 + level_net), or the part of it that writes ML_COUT RGBA
 // textures (4 channels each). Compiled per shape by the host's #defines:
-//   ML_CIN   input textures (RGBA, 4 channels each; the 14-channel input is 4 with 2 zero channels), 1..6
+//   ML_CIN   input textures (RGBA, 4 channels each; the 14-channel input is 4 with 2 zero channels, a colour net's 25 are 7), 1..7
 //   ML_COUT  output textures of this pass, 1..3 (a layer of width 24 is two passes)
 //   ML_LAST  the layer's linear 2-channel output: writes h + 2 * out instead of clamp(out, 0, 1), h = this level's input field in
 //            float32 (mlFieldUp of the coarser level's uHc, 0 at the top level uTop), as the match pass computed it
@@ -25,6 +25,9 @@ uniform sampler2D uIn4;
 #endif
 #if ML_CIN > 5
 uniform sampler2D uIn5;
+#endif
+#if ML_CIN > 6
+uniform sampler2D uIn6;
 #endif
 #if ML_LAST
 uniform sampler2D uHc;
@@ -84,6 +87,9 @@ void main() {
 #endif
 #if ML_CIN > 5
         ML_TAP(5, uIn5)
+#endif
+#if ML_CIN > 6
+        ML_TAP(6, uIn6)
 #endif
     }
 #if ML_LAST
