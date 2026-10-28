@@ -811,6 +811,17 @@ TEST_CASE("g2v3 hd", "[vectors][g2v3]") { checkPair("g2v3", "hd"); }
 TEST_CASE("g2v3 overlay", "[vectors][g2v3]") { checkPair("g2v3", "overlay"); }
 TEST_CASE("g2v3 features", "[vectors][g2v3]") { checkPair("g2v3", "features"); }
 
+// m2v2: the colour variant, the allrounder: the g2v2 set again (cut decisions from vec.json)
+TEST_CASE("m2v2 static", "[vectors][m2v2]") { checkPair("m2v2", "static"); }
+TEST_CASE("m2v2 motion", "[vectors][m2v2]") { checkPair("m2v2", "motion"); }
+TEST_CASE("m2v2 far", "[vectors][m2v2]") { checkPair("m2v2", "far"); }
+TEST_CASE("m2v2 cut", "[vectors][m2v2]") { checkPair("m2v2", "cut"); }
+TEST_CASE("m2v2 cut2", "[vectors][m2v2]") { checkPair("m2v2", "cut2"); }
+TEST_CASE("m2v2 odd", "[vectors][m2v2]") { checkPair("m2v2", "odd"); }
+TEST_CASE("m2v2 hd", "[vectors][m2v2]") { checkPair("m2v2", "hd"); }
+TEST_CASE("m2v2 overlay", "[vectors][m2v2]") { checkPair("m2v2", "overlay"); }
+TEST_CASE("m2v2 colour", "[vectors][m2v2]") { checkPair("m2v2", "colour"); }
+
 // ---- duplicates (shaders/ml_dup.comp: FGR's DUP_DIFF test)
 // A frame of the motion pair (or a smooth synthetic one if the vectors are missing)
 static std::vector<uint8_t> someFrame(uint32_t& W, uint32_t& H) {
@@ -887,6 +898,7 @@ TEST_CASE("e2v5 duplicate frames", "[dup][e2v5]") { duplicateCase(LearnedNet::E2
 TEST_CASE("e1v5 duplicate frames", "[dup][e1v5]") { duplicateCase(LearnedNet::E1v5); }
 TEST_CASE("g2v2 duplicate frames", "[dup][g2v2]") { duplicateCase(LearnedNet::G2v2); }
 TEST_CASE("g2v3 duplicate frames", "[dup][g2v3]") { duplicateCase(LearnedNet::G2v3); }
+TEST_CASE("m2v2 duplicate frames", "[dup][m2v2]") { duplicateCase(LearnedNet::M2v2); }
 
 // ---- the settings API
 TEST_CASE("Learned settings", "[api]") {
@@ -913,7 +925,9 @@ TEST_CASE("Learned settings", "[api]") {
     CHECK((uint32_t)LearnedNet::G2v2 == 6);
     CHECK(!strcmp(learnedNetName(LearnedNet::G2v3), "g2v3"));
     CHECK((uint32_t)LearnedNet::G2v3 == 7);
-    CHECK(kLearnedNets == 8);
+    CHECK(!strcmp(learnedNetName(LearnedNet::M2v2), "m2v2"));
+    CHECK((uint32_t)LearnedNet::M2v2 == 8);
+    CHECK(kLearnedNets == 9);
     LearnedNet byName = LearnedNet::E2v3;
     CHECK(learnedNetFromName("e1v3", &byName));
     CHECK(byName == LearnedNet::E1v3);

@@ -74,11 +74,13 @@ enum class LearnedNet : uint32_t {
     G2v3 = 7,   // the learned-features variant, a game net (ml-fg export/g2v3, SPEC.md section 11): width
                 // 24, 110,086 weights, 15.5 GMAC per pair (+17.5 % over E2v5; 27 conv inputs: the luma's 14 plus 4 learned maps' differences
                 // and a 9-channel map cost, from a 3 -> 8 -> 4 extractor run on every pooled RGB level of both frames).
+    M2v2 = 8,   // the colour variant, the allrounder (ml-fg export/m2v2): the same architecture, size and cost as G2v2 (width 24, 107,410
+                // weights, 14.9 GMAC), trained on the broad mix instead of game footage.
 };
 // The number of LearnedNet values (every net is built into the library), and their names as ml-fg's export calls them ("e2v3", "e1v3",
-// "e2v4", "e1v4", "e2v5", "e1v5", "g2v2", "g2v3"), for a host's or a test's settings parser: learnedNetName() is null for a value out of range, learnedNetFromName() false
+// "e2v4", "e1v4", "e2v5", "e1v5", "g2v2", "g2v3", "m2v2"), for a host's or a test's settings parser: learnedNetName() is null for a value out of range, learnedNetFromName() false
 // (out untouched) for an unknown name.
-constexpr uint32_t kLearnedNets = 8;
+constexpr uint32_t kLearnedNets = 9;
 const char* learnedNetName(LearnedNet n);
 bool learnedNetFromName(const char* name, LearnedNet* out);
 
