@@ -8,7 +8,7 @@
 // level (uSize: the textures are level-0 sized, the region beyond the level holds other levels' data and is never read).
 // Weights (uniform block MlW, bound per pass by the host from the net's buffer): uW[(o * 9 + tap) * ML_CIN + j] is the 4x4 block
 // from input texture j to output texture o at tap = ky * 3 + kx, column c = input channel 4j + c, row r = output channel 4o + r
-// (zero beyond the layer's channels); uB[o] the biases.
+// (zero beyond the layer's channels); uB[o] the biases. ML_NODUP (defined): no duplicate-pair zeroing.
 uniform ivec2 uSize;
 uniform sampler2D uIn0;
 #if ML_CIN > 1
@@ -53,6 +53,7 @@ layout(location = 2) out vec4 o2;
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
+#ifndef ML_NODUP   // ML_NODUP: the learned-features extractor (per frame, cached: it must not follow a pair's duplicate test)
     if (mlDup()) {
 #if ML_LAST
         oH = vec4(0.0);
@@ -67,6 +68,7 @@ void main() {
 #endif
         return;
     }
+#endif
     vec4 acc[ML_COUT];
     for (int o = 0; o < ML_COUT; o++) acc[o] = uB[o];
     for (int t = 0; t < 9; t++) {

@@ -48,7 +48,7 @@ for (let i = 0; i < argv.length; i++) {
   else { console.error('learned: unknown argument ' + a); process.exit(2); }
 }
 const TOL = { top: 5e-5, pfMean: 2e-4, pfMax: 5e-2, sadRel: 1e-3, sadRel16: 1e-2, synthDb: 45, midDb: 0.05, engineMae: 1.0,
-  pfMaxColour: 1.5e-1, chroma: 2e-3, ztAgree: 0.999, ztSynthDb: 70, cost: 2e-3, sgMax: 1.0 };
+  pfMaxColour: 1.5e-1, feat: 1e-4, chroma: 2e-3, ztAgree: 0.999, ztSynthDb: 70, cost: 2e-3, sgMax: 1.0 };
 const HDR_NETS = ['e2v5', 'e2v4', 'e2v3', 'c2smoke'];   // the RGBA16F-input rows (motion / odd, fp16)
 const SG_NET = 'e2v3';               // the static guard check's net (pinned: the guard does not depend on the net)
 const py = (mode) => {
@@ -89,6 +89,7 @@ await E.page.addScriptTag({ content: `
     }
     return out;
   }
+  const nIn_ = (net) => ({ colour: 25, features: 27 }[net.variant] || 14);
   window.__learned = async function (job) {
     const R = { t: {} };
     const eng = window.__x._engine();
@@ -102,11 +103,11 @@ await E.page.addScriptTag({ content: `
       const net = __fg.nets[job.net], G = net.width / 4, top = net.levels - 1;
       const tw = job.padded[0] >> top, th = job.padded[1] >> top;
       const fp16 = job.prec === 'fp16', sfx = G === 6 && !fp16 ? 'b' : '';   // (fp32, width 24: a layer is passes a and b)
-      const colour = net.variant === 'colour', nIn = job.inCh, nx = fp16 ? Math.ceil(nIn / 8) : colour ? 7 : 4, nAct = fp16 ? Math.ceil(G / 2) : G;
+      const extra = nIn_(net) > 14, nIn = job.inCh, nx = fp16 ? Math.ceil(nIn / 8) : extra ? 7 : 4, nAct = fp16 ? Math.ceil(G / 2) : G;
       const cap = {};
       eng.setPassHook((name, ph) => {
         if (ph !== 1) return;
-        if (name === (colour && !fp16 ? 'ml_match2.' : 'ml_match.') + top) cap.in_top = chw(eng, Array.from({ length: nx }, (_, k) => 'ml.x.' + k), nIn, tw, th);
+        if (name === (extra && !fp16 ? 'ml_match2.' : 'ml_match.') + top) cap.in_top = chw(eng, Array.from({ length: nx }, (_, k) => 'ml.x.' + k), nIn, tw, th);
         for (let k = 0; k < net.depth; k++) {
           if (name === 'ml_c' + k + sfx + '.' + top) cap['act_top' + k] = chw(eng, Array.from({ length: nAct }, (_, g) => 'ml.act.' + (k & 1) + '.' + g), net.width, tw, th);
         }
@@ -127,13 +128,23 @@ await E.page.addScriptTag({ content: `
       const ya = new Float32Array(fw * fh), yc = new Float32Array(fw * fh);
       for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) { const i = (y * lv0.width + x) * 4; ya[y * fw + x] = lv0.data[i + 2]; yc[y * fw + x] = lv0.data[i + 3]; }
       await post(job.tag + '/ya', ya); await post(job.tag + '/yc', yc);
-      if (colour) {   // the chroma planes (ml.ex.0: Cb_a, Cr_a, Cb_c, Cr_c, /255) -> [2][fh][fw] levels, as ca.f32 / cc.f32
+      if (net.variant === 'colour') {   // the chroma planes (ml.ex.0: Cb_a, Cr_a, Cb_c, Cr_c, /255) -> [2][fh][fw] levels, as ca.f32 / cc.f32
         const ex = eng.debugRead('ml.ex.0'), ca = new Float32Array(2 * fw * fh), cc = new Float32Array(2 * fw * fh);
         for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) for (let k = 0; k < 2; k++) {
           const i = (y * ex.width + x) * 4;
           ca[(k * fh + y) * fw + x] = ex.data[i + k] * 255; cc[(k * fh + y) * fw + x] = ex.data[i + 2 + k] * 255;
         }
         await post(job.tag + '/ca', ca); await post(job.tag + '/cc', cc);
+      }
+      if (net.variant === 'features') {   // the flow-res RGB of c (ml.rgb.0, the last frame the extractor ran on; levels) and both frames' per-level feature maps
+        const rg = eng.debugRead('ml.rgb.0'), rc = new Float32Array(3 * fw * fh);
+        for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) for (let k = 0; k < 3; k++) rc[(k * fh + y) * fw + x] = rg.data[(y * rg.width + x) * 4 + k] * 255;
+        await post(job.tag + '/rc', rc);
+        for (const w of ['a', 'c']) for (let l = 0; l < net.levels; l++) {
+          const f = eng.debugRead('ml.feat.' + w + '.' + l), o = new Float32Array(4 * f.height * f.width);
+          for (let y = 0; y < f.height; y++) for (let x = 0; x < f.width; x++) for (let k = 0; k < 4; k++) o[(k * f.height + y) * f.width + x] = f.data[(y * f.width + x) * 4 + k];
+          await post(job.tag + '/feat_' + w + '_l' + l, o);
+        }
       }
       for (const t of [0.5, 0.25]) {
         R.t[t] = eng.synth(t, undefined);
@@ -268,9 +279,14 @@ for (const { p, prec, variant } of jobs) {
     fs.writeFileSync(path.join(o, 'pf.f32'), E.dumps.get(`${tag}/pf`));
     fs.writeFileSync(path.join(o, 'est.json'), JSON.stringify({ sad: r.sad, cut: r.cut }));
     for (const t of [0.5, 0.25]) { const b = E.dumps.get(`${tag}/out_t${t}`); if (b) fs.writeFileSync(path.join(o, `out_t${t}.rgba`), b); }
-    const row = { net: p.net, pair: p.pair, colour: !!p.colour, prec: variant, size: `${p.W}x${p.H}` };
+    const row = { net: p.net, pair: p.pair, colour: !!(p.colour || p.features), features: !!p.features, prec: variant, size: `${p.W}x${p.H}` };
     if (p.files.ya && !f16in) { row.ya = cmp(dump('ya'), x('ya')); row.yc = cmp(dump('yc'), x('yc')); }
     if (p.colour && p.files.ca && !f16in) { row.ca = cmp(dump('ca'), x('ca')).max; row.cc = cmp(dump('cc'), x('cc')).max; }
+    if (p.features) {
+      row.feat = 0;
+      for (const w of ['a', 'c']) for (let l = 0; l < 5; l++) if (p.files[`feat_${w}_l${l}`]) row.feat = Math.max(row.feat, cmp(dump(`feat_${w}_l${l}`), x(`feat_${w}_l${l}`)).max);
+      if (p.files.rc && !f16in) row.rgb = cmp(dump('rc'), x('rc')).max;
+    }
     row.top = {};
     for (const k of ['in_top', 'act_top0', 'act_top1', 'act_top2', 'act_top3', 'raw_top']) row.top[k] = cmp(dump(k), x(k)).max;
     row.topMax = Math.max(...Object.values(row.top));
@@ -328,6 +344,8 @@ for (const row of rows) {
     if (!(row.pf.max <= (row.colour ? TOL.pfMaxColour : TOL.pfMax))) fails.push('pf max ' + e1(row.pf.max));
   }
   if (row.ca !== undefined && !(Math.max(row.ca, row.cc) <= TOL.chroma)) fails.push(`chroma planes ${e1(row.ca)} / ${e1(row.cc)} levels`);
+  if (row.feat !== undefined && row.prec !== 'hdr' && !(row.feat <= TOL.feat)) fails.push('feature maps ' + e1(row.feat));
+  if (row.rgb !== undefined && !(row.rgb <= TOL.chroma)) fails.push('rgb planes ' + e1(row.rgb));
   if (!(row.sadRel <= (exact ? TOL.sadRel : TOL.sadRel16))) fails.push('sad ' + e1(row.sadRel));
   if (row.cut !== row.cutExp) fails.push('cut');
   if (row.duplicate !== false) fails.push('duplicate ' + row.duplicate);

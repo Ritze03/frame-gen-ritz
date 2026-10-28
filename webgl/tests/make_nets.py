@@ -2,9 +2,9 @@
 """Writes webgl/nets/<run>.js (the learned motion estimator's weights as a classic script) from the ml-fg hand-off package.
 
     python3 -I webgl/tests/make_nets.py [EXPORT_DIR] [RUN ...]     defaults: $FG_MLFG_EXPORT or ~/Schinken/Programming/Local/ml-fg/export,
-                                                                   runs e2v5 e1v5 e2v4 e1v4 e2v3 e1v3 c2smoke=c2smoke-colour (NAME=DIR: nets/NAME.js from EXPORT/DIR)
+                                                                   runs e2v5 e1v5 e2v4 e1v4 e2v3 e1v3 c2smoke=c2smoke-colour c2feat=c2smoke-features (NAME=DIR: nets/NAME.js from EXPORT/DIR)
 
-Each file attaches globalThis.__fg.nets[<run>] = { name, variant ('luma' | 'colour', manifest.json variant), width, levels, depth, inChannels, padMultiple, flowScale, cutSad,
+Each file attaches globalThis.__fg.nets[<run>] = { name, variant ('luma' | 'colour' | 'features', manifest.json variant; features: extractor {w0, b0, w1, b1, k} element offsets), width, levels, depth, inChannels, padMultiple, flowScale, cutSad,
 levelToStack, stacks: [[{ w, b, cin, cout, act }]] (element offsets into the weight stream), count, sha256 (weights.bin),
 checkpointSha256, weights: base64 of weights.bin (float32 little-endian, OIHW, export/SPEC.md section 3) }. The weights are the
 float32 file byte for byte (sha256 checked here); the engine (framegen.js) decodes them once per context.
@@ -20,9 +20,9 @@ out_dir = os.path.join(here, '..', 'nets')
 args = sys.argv[1:]
 export = args.pop(0) if args and os.path.isdir(args[0]) and not os.path.isdir(os.path.join(args[0], 'testvec')) else \
     os.environ.get('FG_MLFG_EXPORT', os.path.expanduser('~/Schinken/Programming/Local/ml-fg/export'))
-runs = args or ['e2v5', 'e1v5', 'e2v4', 'e1v4', 'e2v3', 'e1v3', 'c2smoke=c2smoke-colour']
+runs = args or ['e2v5', 'e1v5', 'e2v4', 'e1v4', 'e2v3', 'e1v3', 'c2smoke=c2smoke-colour', 'c2feat=c2smoke-features']
 # a run is a directory name under EXPORT (a hand-off package); NAME=DIR (e.g. c2smoke=c2smoke-colour) generates nets/NAME.js from EXPORT/DIR
-VARIANT_IN = {'luma': 14, 'colour': 25}   # in_channels per manifest variant (framegen.js ML_VARIANTS); a package without `variant` is luma
+VARIANT_IN = {'luma': 14, 'colour': 25, 'features': 27}   # in_channels per manifest variant (framegen.js ML_VARIANTS); a package without `variant` is luma
 os.makedirs(out_dir, exist_ok=True)
 for spec in runs:
     run, _, src = spec.partition('=')
@@ -37,6 +37,15 @@ for spec in runs:
     cfg = man['config']
     variant = man.get('variant', 'luma')
     assert variant in VARIANT_IN and man['in_channels'] == VARIANT_IN[variant], (run, variant, man['in_channels'])
+    ext = None
+    if variant == 'features':   # the extractor's 4 tensors come first in weights.bin (SPEC 11.3); element offsets
+        assert cfg.get('features') == 4 and not cfg.get('colour')
+        e = {x['name']: x for x in man['tensors']}
+        shapes = {'feat.0.weight': [8, 3, 3, 3], 'feat.0.bias': [8], 'feat.2.weight': [4, 8, 3, 3], 'feat.2.bias': [4]}
+        for k, v in shapes.items():
+            assert e[k]['shape'] == v, (run, k, e[k]['shape'])
+        ext = dict(w0=e['feat.0.weight']['offset_bytes'] // 4, b0=e['feat.0.bias']['offset_bytes'] // 4,
+                   w1=e['feat.2.weight']['offset_bytes'] // 4, b1=e['feat.2.bias']['offset_bytes'] // 4, k=4)
     assert variant != 'colour' or (man.get('colour') == 1 and cfg.get('colour') == 1), run
     t = {x['name']: x for x in man['tensors']}
     stacks = []
@@ -52,6 +61,8 @@ for spec in runs:
                padMultiple=man['pad_multiple'], flowScale=man['flow_scale'], cutSad=man['cut_sad'], levelToStack=man['level_to_stack'],
                stacks=stacks, count=man['total_elements'], sha256=sha, checkpointSha256=man['checkpoint_sha256'],
                checkpointStep=man['checkpoint_step'])
+    if ext:
+        net['extractor'] = ext
     assert net['levels'] == 5 and net['padMultiple'] == 16 and net['width'] % 4 == 0
     meta = json.dumps(net, separators=(',', ':'))
     b64 = base64.b64encode(raw).decode('ascii')

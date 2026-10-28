@@ -103,13 +103,13 @@
   // output textures. 'fp16' (conv_h.frag.glsl, 8 half floats per RGBA32UI texel): ml_h<CIN>g<CG>o<COUT>[L], one pass per layer.
   const ML_INC = 'learned/ml_common.inc.glsl';
   const SG_INC = 'learned/sguard.inc.glsl';   // the static guard's constants and weight (learned/sguard.inc.glsl's top block)
-  function mlConv(cin, cout, last) {
+  function mlConv(cin, cout, last, nodup) {
     const s = [];
     for (let j = 0; j < cin; j++) s.push('uIn' + j);
     if (last) s.push('uHc');
-    s.push('uDup');
-    return [last ? 'ml_last' + cin : 'ml_conv' + cin + 'x' + cout, 'learned/conv.frag.glsl', null, s, ML_INC,
-      '#define ML_CIN ' + cin + '\n#define ML_COUT ' + cout + '\n#define ML_LAST ' + (last ? 1 : 0) + '\n'];
+    if (!nodup) s.push('uDup');
+    return [nodup ? 'ml_ext' + (cin === 1 ? 0 : 1) : last ? 'ml_last' + cin : 'ml_conv' + cin + 'x' + cout, 'learned/conv.frag.glsl', null, s, ML_INC,
+      '#define ML_CIN ' + cin + '\n#define ML_COUT ' + cout + '\n#define ML_LAST ' + (last ? 1 : 0) + '\n' + (nodup ? '#define ML_NODUP 1\n' : '')];
   }
   // cin packed input textures, cg 4-channel input groups, cout 4-channel output groups
   function mlConvH(cin, cg, cout, last) {
@@ -122,10 +122,12 @@
       '\n#define ML_LAST ' + (last ? 1 : 0) + '\n'];
   }
   // Net variants (the nets/*.js `variant`, from manifest.json; SPEC section 10.7): what a variant changes is the conv input: its
-  // channel count, and the per-frame planes the input is assembled from besides the luma (`planes`: 0 none, 1 = the chroma pyramid
-  // ml.ex, learned/lv0.frag.glsl ML_COLOUR + learned/match.frag.glsl ML_COLOUR). A new variant adds a row here, its plane pass in
-  // allocMl / estimateLearned (the `m.ex` blocks) and its match programs.
-  const ML_VARIANTS = { luma: { inChannels: 14, planes: 0 }, colour: { inChannels: 25, planes: 1 } };
+  // channel count, and the per-frame planes the input is assembled from besides the luma (`planes`: null none, 'chroma' = the chroma
+  // pyramid ml.ex, learned/lv0.frag.glsl ML_COLOUR + learned/match.frag.glsl ML_COLOUR; 'feat' = the per-frame, cached learned feature
+  // pyramid ml.feat, rgb0 + the extractor convs + learned/match.frag.glsl ML_FEAT). A new variant adds a row here, its plane pass in
+  // allocMl / estimateLearned (the `m.ex` / `m.feat` blocks) and its match programs.
+  const ML_VARIANTS = { luma: { inChannels: 14, planes: null }, colour: { inChannels: 25, planes: 'chroma' },
+    features: { inChannels: 27, planes: 'feat' } };
   function mlVariant(net) { return ML_VARIANTS[net.variant || 'luma']; }
   // the number of 4-channel input groups (textures at fp32; fp16 packs two per texture) of layer 0 of a net with inC input channels
   function mlInGroups(inC) { return Math.ceil(inC / 4); }
@@ -147,6 +149,13 @@
     ['ml_down4', 'learned/down.frag.glsl', null, ['uSrc'], null, '#define ML_V4 1\n'],
     ['ml_match_c', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup', 'uEx'], ML_INC, '#define ML_COLOUR 1\n#define ML_CB 0\n'],
     ['ml_match_c2', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup', 'uEx'], ML_INC, '#define ML_COLOUR 1\n#define ML_CB 1\n'],
+    // learned-features nets (ML_VARIANTS.features): per frame the flow-res RGB (level 0 of its pyramid, down4 pools it) and the two
+    // extractor convs 3 -> 8 -> 4 (conv.frag with ML_NODUP: they are cached per frame, not per pair); the 27-channel match as colour's
+    ['ml_rgb0', 'learned/rgb0.frag.glsl', null, ['uSrc'], ML_INC],
+    mlConv(1, 2, false, true), mlConv(2, 1, false, true),
+    ['ml_match_f', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup', 'uFa', 'uFc'], ML_INC, '#define ML_FEAT 1\n#define ML_CB 0\n'],
+    ['ml_match_f2', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup', 'uFa', 'uFc'], ML_INC, '#define ML_FEAT 1\n#define ML_CB 1\n'],
+    ['ml_match_hf', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup', 'uFa', 'uFc'], ML_INC, '#define ML_PACKED 1\n#define ML_FEAT 1\n#define ML_CB 0\n'],
     ['ml_match_hc', 'learned/match.frag.glsl', null, ['uPyr', 'uHc', 'uDup', 'uEx'], ML_INC, '#define ML_PACKED 1\n#define ML_COLOUR 1\n#define ML_CB 0\n'],
     ['ml_sad', 'learned/sad.frag.glsl', null, ['uLv0', 'uField'], ML_INC],
     ['ml_sadout', 'learned/sadout.frag.glsl', null, ['uSrc', 'uDup'], ML_INC],
@@ -163,7 +172,7 @@
       '#define FG_SGUARD 1\n'],
   ];
   const ML_DUP_DIFF = 0.6;                   // learned/ml_common.inc.glsl's (the duplicate-pair test)
-  const ML_NETS = ['e2v5', 'e1v5', 'e2v4', 'e1v4', 'e2v3', 'e1v3', 'c2smoke'];  // settings.motionNet values (DEFAULTS.motionNet is the first); weights: webgl/nets/<name>.js
+  const ML_NETS = ['e2v5', 'e1v5', 'e2v4', 'e1v4', 'e2v3', 'e1v3', 'c2smoke', 'c2feat'];  // settings.motionNet values (DEFAULTS.motionNet is the first); weights: webgl/nets/<name>.js
   const ML_SMALL_NET = 'e1v5';               // the recommended small / fallback net (width 12, ~3.4x cheaper than the default)
   // Read-only: __fg.defaultNet (= DEFAULTS.motionNet) and __fg.smallNet, so a caller picks the small net without naming it
   for (const [k, v] of [['defaultNet', ML_NETS[0]], ['smallNet', ML_SMALL_NET]]) {
@@ -451,6 +460,17 @@
   // which estimate the settings produce: a change drops the current estimate (like a motionVersion switch)
   function estKey(s) { return s.motionVersion === 2 ? 'v2' : mlOn(s) ? 'ml:' + s.motionNet + ':' + s.motionPrecision + (s.learnedZeroTest ? ':zt' : '') : 'v1'; }
   // the loaded net `name` (webgl/nets/<name>.js attaches fg.nets[name]) or null
+  // why a loaded net cannot run here (a variant this build does not know, or an input contract that is not the variant's: a package
+  // never silently runs on fewer channels than its first conv has), or null
+  function mlNetError(name) {
+    const n = fg.nets && fg.nets[name];
+    if (!n) return null;
+    const v = mlVariant(n);
+    if (!v) return "net '" + name + "' has variant '" + n.variant + "', which this framegen.js does not implement";
+    if (n.inChannels !== v.inChannels) return "net '" + name + "' (variant " + (n.variant || 'luma') + ') has ' + n.inChannels + ' input channels, the variant needs ' + v.inChannels;
+    if (v.planes === 'feat' && !(n.extractor && n.extractor.k === 4)) return "net '" + name + "' (variant features) has no extractor weights";
+    return null;
+  }
   function mlNetDef(name) {
     const n = fg.nets && fg.nets[name];
     if (!n || typeof n.weights !== 'string' || n.levels !== 5 || !mlVariant(n) || n.inChannels !== mlVariant(n).inChannels || n.padMultiple !== 16 || !(n.width === 12 || n.width === 24) ||
@@ -478,6 +498,7 @@
     function learnedGate(s) {
       if (!mlOn(s)) return s;
       if (!sup.learned) throw new RangeError("framegen: settings.motion 'learned' is not supported on this context (" + sup.learnedError + ')');
+      if (mlNetError(s.motionNet)) throw new RangeError("framegen: settings.motion 'learned': " + mlNetError(s.motionNet));
       if (!mlNetDef(s.motionNet)) {
         throw new RangeError("framegen: settings.motion 'learned': the weights of net '" + s.motionNet + "' are not loaded (load webgl/nets/" +
           s.motionNet + '.js next to framegen.js)');
@@ -850,13 +871,38 @@
         }
         blocks.push(lv);
       }
+      let ext = null;
+      if (net.extractor) {   // the features extractor (SPEC 11.3) as conv.frag blocks: 3 -> 8 (CIN 1, COUT 2), 8 -> k (CIN 2, COUT 1)
+        const E = net.extractor;
+        ext = [[1, 2, 3, 8, E.w0, E.b0], [2, 1, 8, E.k, E.w1, E.b1]].map(function (d) {
+          const CIN = d[0], COUT = d[1], cin = d[2], cout = d[3], f = new Float32Array(COUT * 9 * CIN * 16 + COUT * 4);
+          for (let o = 0; o < COUT; o++) {
+            for (let t = 0; t < 9; t++) {
+              for (let j = 0; j < CIN; j++) {
+                for (let c = 0; c < 4; c++) {
+                  for (let r = 0; r < 4; r++) {
+                    const oc = 4 * o + r, ic = 4 * j + c;
+                    if (oc < cout && ic < cin) f[((o * 9 + t) * CIN + j) * 16 + 4 * c + r] = wt[d[4] + (oc * cin + ic) * 9 + t];
+                  }
+                }
+              }
+            }
+            for (let r = 0; r < 4; r++) if (4 * o + r < cout) f[COUT * 9 * CIN * 16 + 4 * o + r] = wt[d[5] + 4 * o + r];
+          }
+          total = Math.ceil(total / align) * align;
+          datas.push([total, f]);
+          const b = { off: total, size: f.byteLength };
+          total += f.byteLength;
+          return b;
+        });
+      }
       const buf = gl.createBuffer();
       gl.bindBuffer(gl.UNIFORM_BUFFER, buf);
       gl.bufferData(gl.UNIFORM_BUFFER, total, gl.STATIC_DRAW);
       for (const [off, f] of datas) gl.bufferSubData(gl.UNIFORM_BUFFER, off, f);
       gl.bindBuffer(gl.UNIFORM_BUFFER, null);
       if (debug) chk('mlNetBuffer');
-      return (mlBufs[name] = { name: name, net: net, buf: buf, blocks: blocks, bytes: total });
+      return (mlBufs[name] = { name: name, net: net, buf: buf, blocks: blocks, ext: ext, bytes: total });
     }
 
     // drop some of the owned textures / FBOs (the learned set on a net switch)
@@ -894,10 +940,10 @@
       const t0 = ownedTex.length, f0 = ownedFbo.length;
       let m = null;
       try {
-        m = { name: name, prec: prec, net: net, buf: nb.buf, G: G, PW: PW, PH: PH, pyr: [], h: [null], act: [[], []], actMrt: [[], []], plan: [] };
+        m = { name: name, prec: prec, net: net, buf: nb.buf, ext: nb.ext, G: G, PW: PW, PH: PH, pyr: [], h: [null], act: [[], []], actMrt: [[], []], plan: [] };
         m.pyr.push(mk('ml.pyr[0]', 'RGBA32F', PW, PH));
         m.dupSrc = mk('ml.dupSrc', 'R32F', PW, PH);
-        const colour = mlVariant(net).planes === 1;
+        const planes = mlVariant(net).planes, colour = planes === 'chroma', feat = planes === 'feat', extra = colour || feat;
         if (colour) m.ex = [mk('ml.ex[0]', 'RGBA32F', PW, PH)];   // the per-frame extra planes: a colour net's chroma pyramid (lv0's third output)
         m.lvMrt = mkMrt('ml_lv0', colour ? [m.pyr[0], m.dupSrc, m.ex[0]] : [m.pyr[0], m.dupSrc]);
         for (let l = 1; l < NL; l++) {
@@ -905,13 +951,24 @@
           if (colour) m.ex.push(mk('ml.ex[' + l + ']', 'RGBA32F', PW >> l, PH >> l));
           m.h.push(mk('ml.h[' + l + ']', 'RG32F', PW >> l, PH >> l));
         }
+        if (feat) {   // per frame (slot) feature pyramid F[slot][l] (4 maps, RGBA32F), cached across pairs; the RGB pyramid and the 8-map hidden are scratch
+          m.F = [[], []]; m.fser = [-1, -1]; m.fkey = '';
+          m.rgb = [];
+          for (let l = 0; l < NL; l++) {
+            m.rgb.push(mk('ml.rgb[' + l + ']', 'RGBA32F', PW >> l, PH >> l));
+            m.F[0].push(mk('ml.feat[0][' + l + ']', 'RGBA32F', PW >> l, PH >> l));
+            m.F[1].push(mk('ml.feat[1][' + l + ']', 'RGBA32F', PW >> l, PH >> l));
+          }
+          m.et = [mk('ml.ext[0]', 'RGBA32F', PW, PH), mk('ml.ext[1]', 'RGBA32F', PW, PH)];   // the hidden 8 maps, level-0 sized
+          m.etMrt = mkMrt('ml_ext0', m.et);
+        }
         // the conv input x: fp32 RGBA32F per 4 channels (luma: the 4th, channels 12, 13, is RG32F), fp16 RGBA32UI per 8
         const xf = half ? ['RGBA32UI', 'RGBA32UI'] : ['RGBA32F', 'RGBA32F', 'RGBA32F', 'RG32F'];
         const nIn = mlInGroups(net.inChannels);
-        if (colour) xf.length = 0, xf.push.apply(xf, half ? ['RGBA32UI', 'RGBA32UI', 'RGBA32UI', 'RGBA32UI'] : ['RGBA32F', 'RGBA32F', 'RGBA32F', 'RGBA32F', 'RGBA32F', 'RGBA32F', 'RGBA32F']);
+        if (extra) xf.length = 0, xf.push.apply(xf, half ? ['RGBA32UI', 'RGBA32UI', 'RGBA32UI', 'RGBA32UI'] : ['RGBA32F', 'RGBA32F', 'RGBA32F', 'RGBA32F', 'RGBA32F', 'RGBA32F', 'RGBA32F']);
         m.nIn = nIn;
         m.x = xf.map(function (f, k) { return mk('ml.x[' + k + ']', f, PW, PH); });
-        if (colour && !half) {   // two match passes (channels 0..15: x[0..3], 16..24: x[4..6])
+        if (extra && !half) {   // two match passes (channels 0..15: x[0..3], 16..24: x[4..6])
           m.xMrt = mkMrt('ml_match', m.x.slice(0, 4));
           m.xMrt2 = mkMrt('ml_match', m.x.slice(4));
         } else {
@@ -934,15 +991,15 @@
         // pixfield, fw x fh; its taps still read the padded level)
         for (let l = NL - 1; l >= 0; l--) {
           const lw = PW >> l, lh = PH >> l, size = [lw, lh], top = l === NL - 1 ? 1 : 0, hc = top ? m.pyr[l] : m.h[l + 1];   // (hc unread at the top)
-          if (!colour) {
+          if (!extra) {
             m.plan.push({ name: 'ml_match.' + l, p: P[half ? 'ml_match_h' : 'ml_match'], out: { fbo: m.xMrt.fbo, w: lw, h: lh }, size: size, top: top,
               ins: [m.pyr[l], hc, dup], block: null, block2: null });
-          } else {   // + the level's chroma planes; fp32: the second pass writes channels 16..24
-            const ins = [m.pyr[l], hc, dup, m.ex[l]];
-            m.plan.push({ name: 'ml_match.' + l, p: P[half ? 'ml_match_hc' : 'ml_match_c'], out: { fbo: m.xMrt.fbo, w: lw, h: lh }, size: size, top: top,
-              ins: ins, block: null, block2: null });
-            if (!half) m.plan.push({ name: 'ml_match2.' + l, p: P.ml_match_c2, out: { fbo: m.xMrt2.fbo, w: lw, h: lh }, size: size, top: top,
-              ins: ins, block: null, block2: null });
+          } else {   // + the level's chroma planes / feature maps (feat: ins 3, 4 = a's, c's maps of the level, set per estimate: `lvl`)
+            const ins = colour ? [m.pyr[l], hc, dup, m.ex[l]] : [m.pyr[l], hc, dup], sfx = colour ? 'c' : 'f';
+            m.plan.push({ name: 'ml_match.' + l, p: P[half ? 'ml_match_h' + sfx : 'ml_match_' + sfx], out: { fbo: m.xMrt.fbo, w: lw, h: lh }, size: size,
+              top: top, ins: ins, block: null, block2: null, lvl: feat ? l : -1 });
+            if (!half) m.plan.push({ name: 'ml_match2.' + l, p: P['ml_match_' + sfx + '2'], out: { fbo: m.xMrt2.fbo, w: lw, h: lh }, size: size, top: top,
+              ins: ins, block: null, block2: null, lvl: feat ? l : -1 });
           }
           for (let k = 0; k <= net.depth; k++) {
             const last = k === net.depth, src = k === 0 ? m.x : m.act[(k - 1) & 1], parts = nb.blocks[l][k];
@@ -1370,6 +1427,39 @@
     // per level), the zero-motion test (settings.learnedZeroTest: the net's level 0 writes pfNet, ml_zt_cost + ml_zt write the final
     // field into pixfield and the per-pixel SAD terms), then V1's contract: the field in pixfield (fw x fh, flow-res half-vectors)
     // and sadSum = sad * bw * bh in sadRed's last texel. V1's synthesis reads both unchanged (cut: sad > sceneCutSad).
+    // The learned-features net's extractor (SPEC 11.1-11.3) for the frames of the current pair that have no feature pyramid yet: per
+    // frame the flow-res RGB planes (ml_rgb0), its pyramid (ml_down4), and per level the extractor's two convs (ml_ext0: 3 -> 8, into
+    // the scratch ml.ext, ml_ext1: 8 -> 4, into ml.feat[slot][l]); zero padding at the level border (uSize), the same weights on every
+    // level. Frame c of this pair is frame a of the next: the pyramid is kept per frame slot (m.fser[slot] = the pushFrame count of the
+    // frame it holds, so a new frame, a resize or a net switch invalidates it) and only recomputed for a frame it does not hold.
+    function mlFeatures(m) {
+      const key = settings.inputFormat + ':' + settings.transfer + ':' + settings.linearWhiteNits;
+      if (m.fkey !== key) { m.fkey = key; m.fser = [-1, -1]; }
+      for (const slot of [prevS, currS]) {
+        const ser = slot === currS ? count : count - 1;
+        if (m.fser[slot] === ser) continue;
+        m.fser[slot] = ser;
+        begin(P.ml_rgb0, m.rgb[0], T.frame[slot]);
+        gl.uniform2i(P.ml_rgb0.u.uSize, FW, FH);
+        tri('ml_rgb0');
+        for (let l = 1; l < m.rgb.length; l++) {
+          begin(P.ml_down4, m.rgb[l], m.rgb[l - 1]);
+          tri('ml_down4');
+        }
+        for (let l = 0; l < m.rgb.length; l++) {
+          const lw = m.PW >> l, lh = m.PH >> l;
+          beginArr(P.ml_ext0, { fbo: m.etMrt.fbo, w: lw, h: lh }, [m.rgb[l]]);
+          gl.uniform2i(P.ml_ext0.u.uSize, lw, lh);
+          gl.bindBufferRange(gl.UNIFORM_BUFFER, 0, m.buf, m.ext[0].off, m.ext[0].size);
+          tri('ml_ext0.' + l);
+          beginArr(P.ml_ext1, m.F[slot][l], m.et);
+          gl.uniform2i(P.ml_ext1.u.uSize, lw, lh);
+          gl.bindBufferRange(gl.UNIFORM_BUFFER, 0, m.buf, m.ext[1].off, m.ext[1].size);
+          tri('ml_ext1.' + l);
+        }
+      }
+    }
+
     function estimateLearned() {
       const m = allocMl(settings.motionNet, settings.motionPrecision), A = T.frame[prevS], C = T.frame[currS];
       const zt = settings.learnedZeroTest;
@@ -1388,9 +1478,10 @@
           tri('ml_down4');
         }
       }
+      if (m.F) mlFeatures(m);   // the learned-features net's per-frame feature pyramids (cached across pairs)
       for (let i = 0; i < m.plan.length; i++) {
         const d = m.plan[i], u = d.p.u;
-        beginArr(d.p, d.pf && zt ? m.pfNet : d.out, d.ins);
+        beginArr(d.p, d.pf && zt ? m.pfNet : d.out, d.lvl >= 0 ? d.ins.concat([m.F[prevS][d.lvl], m.F[currS][d.lvl]]) : d.ins);
         gl.uniform2i(u.uSize, d.size[0], d.size[1]);
         if (u.uTop) gl.uniform1i(u.uTop, d.top);
         if (d.block) gl.bindBufferRange(gl.UNIFORM_BUFFER, 0, m.buf, d.block.off, d.block.size);
@@ -1763,6 +1854,8 @@
           if (!T.ml) throw new Error('framegen: debugRead("' + name + '"): no learned estimate yet');
           const m = T.ml, key = parts[1];
           if (key === 'pyr') return m.pyr[level(parts, 2, m.pyr.length, name)];
+          if (key === 'feat' && m.F) return m.F[parts[2] === 'a' ? prevS : currS][level(parts, 3, m.F[0].length, name)];   // ml.feat.<a|c>.<l>: the 4 maps
+          if (key === 'rgb' && m.rgb) return m.rgb[level(parts, 2, m.rgb.length, name)];   // the scratch RGB pyramid of the last frame processed
           if (key === 'x') return m.x[level(parts, 2, m.x.length, name)];
           if (key === 'ex' && m.ex) return m.ex[level(parts, 2, m.ex.length, name)];   // a colour net's chroma pyramid: r = Cb_a, g = Cr_a, b = Cb_c, a = Cr_c (/255)
           if (key === 'act') return m.act[level(parts, 2, 2, name)][level(parts, 3, m.act[0].length, name)];
