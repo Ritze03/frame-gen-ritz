@@ -44,13 +44,16 @@ EXPORT_DIR = {}   # nets/<net>.js whose export directory has another name (make_
 
 def pairs():
     """Every (net, pair, dir) of the loadable nets: the pairs are the export's testvec/<pair>/ directories with a vec.json."""
+    only_n, only_p = os.environ.get('FG_NETS'), os.environ.get('FG_PAIRS')   # learned.mjs --nets / --pairs: skip the rest (they are not run)
     for net in nets():
+        if only_n and net not in only_n.split(','):
+            continue
         root = os.path.join(EXPORT, EXPORT_DIR.get(net, net), 'testvec')
         if not os.path.isdir(root):
             continue
         for name in sorted(os.listdir(root)):
             d = os.path.join(root, name)
-            if os.path.isfile(os.path.join(d, 'vec.json')):
+            if os.path.isfile(os.path.join(d, 'vec.json')) and not (only_p and name not in only_p.split(',')):
                 yield net, name, d
 
 
@@ -124,12 +127,19 @@ def synth():
     db = lambda x: 'identical' if x is None else f'{x:.1f} dB'
     for p in man:
         base = os.path.join(OUT, p['net'], p['pair'])
+        if not any(os.path.exists(os.path.join(base, q, 'est.json')) for q in ('fp32', 'fp16', 'hdr')):
+            continue   # not run this time (--nets / --pairs / --prec)
         W, H = p['W'], p['H']
         fw, fh = p['flow']
         rd = lambda k: np.fromfile(os.path.join(base, k + '.rgba'), np.uint8).reshape(H, W, 4)[..., 2::-1].copy()   # -> BGR
         a, c = rd('a'), rd('c')
         b = np.fromfile(os.path.join(base, 'b.bgr'), np.uint8).reshape(H, W, 3) if p['middle'] else None
         pf_x = np.fromfile(p['files']['pf']['file'], '<f4').reshape(fh, fw, 2)
+        sx_cache = {}   # synth of the expected field per (key, t): identical for every precision, computed once
+        def synth_x(key, t, sad, pf):
+            if (key, t) not in sx_cache:
+                sx_cache[(key, t)] = interp.synth(a, c, {'sad': sad, 'pf': pf}, t)
+            return sx_cache[(key, t)]
         for prec in ('fp32', 'fp16', 'hdr'):   # (hdr: fp16 with RGBA16F input, learned.mjs)
             o = os.path.join(base, prec)
             if not os.path.exists(os.path.join(o, 'est.json')):
@@ -140,7 +150,7 @@ def synth():
             r = {}
             for t in TS:
                 s_e = interp.synth(a, c, {'sad': est['sad'], 'pf': pf_e}, t)
-                s_x = interp.synth(a, c, {'sad': p['sad'], 'pf': pf_x}, t)
+                s_x = synth_x('pf', t, p['sad'], pf_x)
                 row = dict(synthDb=psnr(s_e, s_x))
                 if b is not None and t == 0.5:
                     row.update(midDb=psnr(s_e, b), midDbExp=psnr(s_x, b))
@@ -165,7 +175,7 @@ def synth():
                 rz = {}
                 for t in TS:
                     s_e = interp.synth(a, c, {'sad': estz['sad'], 'pf': pz_e}, t)
-                    s_x = interp.synth(a, c, {'sad': p['sad_zt'], 'pf': pz_x}, t)
+                    s_x = synth_x('zt', t, p['sad_zt'], pz_x)
                     row = dict(synthDb=psnr(s_e, s_x))
                     if b is not None and t == 0.5:
                         row.update(midDb=psnr(s_e, b), midDbExp=psnr(s_x, b))

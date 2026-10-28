@@ -39,7 +39,7 @@ const SET = { v1: { motionVersion: 1, motion: 'search' }, v2p: { motionVersion: 
   ml2: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3', motionPrecision: 'fp16' }, ml1: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3', motionPrecision: 'fp16' },
   ml2f: { motionVersion: 1, motion: 'learned', motionNet: 'e2v3', motionPrecision: 'fp32' }, ml1f: { motionVersion: 1, motion: 'learned', motionNet: 'e1v3', motionPrecision: 'fp32' } };
 const setOf = (mode) => {   // (every learned mode sets both switches: settings persist across modes)
-  const m = /^(ml[12]f?)(n?)(g?)$/.exec(mode), k = /^(e\d+v\d+|g2v2|g2v3)(f?)(n?)(g?)$/.exec(mode);
+  const m = /^(ml[12]f?)(n?)(g?)$/.exec(mode), k = /^([a-z]\d+v\d+)(f?)(n?)(g?)$/.exec(mode);
   if (k) return { motionVersion: 1, motion: 'learned', motionNet: k[1], motionPrecision: k[2] ? 'fp32' : 'fp16', learnedZeroTest: !k[3], learnedStaticGuard: !!k[4] };
   if (!m) return SET[mode];
   return { ...SET[m[1]], learnedZeroTest: !m[2], learnedStaticGuard: !!m[3] };
