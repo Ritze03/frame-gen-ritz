@@ -784,5 +784,4 @@ WebGL adds fw×fh RG32F ×2 + RGBA32F for the zero test (~16 MB at 1080p) and 2 
   (only the direct bit-diff of V1 / V2 / old nets against `4bae33a`), ANGLE/OpenGL, WebGL cost or the stand-in nets on real
   footage (they are 600-step smoke nets).
 - (r) The WebGL fp32 thin margin has moved: `hd`, t = 0.25, zero test on: c2smoke 73.8 dB on ANGLE/Vulkan (gate 70).
-- (s) The round-3 text elsewhere says "six nets" and `__fg.version` `'5'`; read eight nets and `'6'`. `webgl/README.md` (not
-  edited by this QC) still lists `'5'` as the version and six nets.
+- (s) Resolved: `webgl/README.md` now says version `'6'` and eight nets.

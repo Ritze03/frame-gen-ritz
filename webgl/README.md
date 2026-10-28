@@ -15,7 +15,7 @@ hundredths of a level on average and the whole-frame decisions are identical.
 Copy `webgl/framegen.js`, `webgl/nets/` and `webgl/shaders/` (the whole trees; `__fg.shaderFiles` lists the shader files the
 engine needs, as paths relative to `shaders/`). `framegen.js` is a classic script: it attaches `globalThis.__fg` and nothing else,
 never fetches, never touches the DOM or a `<video>`. The caller loads the shader texts (for the extension: through its asset relay)
-and passes them to `createEngine`. `nets/e2v5.js`, `nets/e1v5.js`, `nets/e2v4.js`, `nets/e1v4.js`, `nets/e2v3.js` and `nets/e1v3.js` are classic scripts too (the learned
+and passes them to `createEngine`. `nets/e2v5.js`, `nets/e1v5.js`, `nets/e2v4.js`, `nets/e1v4.js`, `nets/e2v3.js`, `nets/e1v3.js`, `nets/c2smoke.js` and `nets/c2feat.js` are classic scripts too (the learned
 estimator's weights, 540 KB for each e2 and 162 KB for each e1; each attaches `globalThis.__fg.nets[<name>]`, in either order with `framegen.js`): load them next to
 `framegen.js` (for the extension: in the same content-script list), only needed for `motion: 'learned'`. `LAYOUT.md` and
 `README.md` are the design docs; `tests/` stays here.
@@ -29,7 +29,7 @@ that contract, updated. Additions (nothing removed):
 
 | Addition | What |
 |---|---|
-| `__fg.version` | `'5'` (`'4'`: e2v4 / e1v4 as the default / small net; `'3'`: the learned estimator before e2v4 / e1v4, the zero test, the static guard and `smallNet`; `'2'` before the learned estimator) |
+| `__fg.version` | `'6'` (`'5'`: e2v5 / e1v5 as the default / small net, before the colour and learned-features variants; `'4'`: e2v4 / e1v4 as the default / small net; `'3'`: the learned estimator before e2v4 / e1v4, the zero test, the static guard and `smallNet`; `'2'` before the learned estimator) |
 | settings `v2Mode` | `'quality'` (default, as the library) or `'performance'`. Runtime; a switch keeps the estimate (the other mode's part is derived by its first `synth`, with the same output as that mode's own estimate) |
 | settings `blurSamples`, `blurWeights` | V2's motion blur (`synthBlur`): 0 / 1 = off, 2..16 sub-frames; `'gaussian'` (default) or `'even'`. Runtime |
 | settings `inputFormat` | `'rgba8'` (default) or `'rgba16f'`: frames, warps and output in RGBA16F. Structural (recompiles the programs, drops the frames) |
@@ -93,7 +93,7 @@ engine.setSettings({ motion: 'search' });                                       
 | Setting | Values (default first) | |
 |---|---|---|
 | `motion` | `'search'`, `'learned'` | V1 only (V2 ignores it); `'learned'` needs `flowScale` 2 (the nets were trained at 2; else a `RangeError`) |
-| `motionNet` | `'e2v5'`, `'e1v5'`, `'e2v4'`, `'e1v4'`, `'e2v3'`, `'e1v3'` | e2v5: e2v4 fine-tuned on more varied footage (the user's failure recordings, a friend's captures, 9 gameplay videos; same architecture, weight layout and cost), ml-fg's primary (with the zero test 31.23 dB mean on 14 clips at 2x, +0.31 dB over `final`, +0.04 over e2v4, no clip worse); e1v5 (`__fg.smallNet`): e1v4 fine-tuned the same way (with the zero test +0.12 dB over `final`, +0.06 over e1v4); e2v4: e2v3 fine-tuned (same architecture, weight layout and cost), the default before e2v5 (with the zero test +0.27 dB over `final` on 14 clips); e1v4 (the small net, `__fg.smallNet`, before e1v5): e1v3 fine-tuned, width 12, 28,330 weights, same layout and cost as e1v3, with the zero test +0.05 dB over e1v3 (better on 13 of 14 clips); e2v3: width 24, 95,530 weights (+0.23 dB over V1's `final` on its 7 clips, SPEC 9); e1v3: width 12, 28,330 weights, on par with `final` (−0.01 dB), 3.4x fewer MACs |
+| `motionNet` | `'e2v5'`, `'e1v5'`, `'e2v4'`, `'e1v4'`, `'e2v3'`, `'e1v3'`, `'c2smoke'`, `'c2feat'` | e2v5: e2v4 fine-tuned on more varied footage (the user's failure recordings, a friend's captures, 9 gameplay videos; same architecture, weight layout and cost), ml-fg's primary (with the zero test 31.23 dB mean on 14 clips at 2x, +0.31 dB over `final`, +0.04 over e2v4, no clip worse); e1v5 (`__fg.smallNet`): e1v4 fine-tuned the same way (with the zero test +0.12 dB over `final`, +0.06 over e1v4); e2v4: e2v3 fine-tuned (same architecture, weight layout and cost), the default before e2v5 (with the zero test +0.27 dB over `final` on 14 clips); e1v4 (the small net, `__fg.smallNet`, before e1v5): e1v3 fine-tuned, width 12, 28,330 weights, same layout and cost as e1v3, with the zero test +0.05 dB over e1v3 (better on 13 of 14 clips); e2v3: width 24, 95,530 weights (+0.23 dB over V1's `final` on its 7 clips, SPEC 9); e1v3: width 12, 28,330 weights, on par with `final` (−0.01 dB), 3.4x fewer MACs |
 | `motionPrecision` | `'fp16'`, `'fp32'` | storage of the net's input and activations: half floats (8 per RGBA32UI texel) or RGBA32F; the field, pyramid, weights and all arithmetic are float32 either way |
 
 | `learnedZeroTest` | `true`, `false` | the zero-motion test after the net (below); `false` gives the net's field as is (A/B) |
@@ -129,7 +129,7 @@ and `final_sg` (`synth/final.frag.glsl` with `FG_SGUARD`) in place of `final`. T
 with the guard off the output is byte-identical.
 
 **Weights**: `webgl/nets/e2v5.js`, `webgl/nets/e2v4.js`, `webgl/nets/e2v3.js` (540 KB each), `webgl/nets/e1v5.js`, `webgl/nets/e1v4.js`
-and `webgl/nets/e1v3.js` (162 KB each), classic scripts that attach `__fg.nets.e2v5` / `.e1v5` / `.e2v4` / `.e1v4` / `.e2v3` / `.e1v3` (the float32 weights as base64, byte for byte ml-fg's `export/<net>/weights.bin`, sha256 checked by
+and `webgl/nets/e1v3.js` (162 KB each), plus the test stand-ins `webgl/nets/c2smoke.js` (colour, SPEC 10) and `webgl/nets/c2feat.js` (learned features, SPEC 11), classic scripts that attach `__fg.nets.e2v5` / `.e1v5` / `.e2v4` / `.e1v4` / `.e2v3` / `.e1v3` / `.c2smoke` / `.c2feat` (the float32 weights as base64, byte for byte ml-fg's `export/<net>/weights.bin`, sha256 checked by
 the generator `tests/make_nets.py`; plus the manifest's layer table). No fetch: the page or extension loads them like
 `framegen.js`. Selecting a net whose script is not loaded throws a `RangeError` naming the file (`framegen: settings.motion
 'learned': the weights of net 'e2v5' are not loaded (load webgl/nets/e2v5.js next to framegen.js)`); with the default net that
