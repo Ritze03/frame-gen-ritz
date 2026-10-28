@@ -1,8 +1,8 @@
 // conv.frag.glsl for settings.motionPrecision 'fp16': the activations are half floats packed 8 to an RGBA32UI texel
 // (packHalf2x16: texel channel k holds channels 2k, 2k + 1 of the texture's 8), so a layer of width 24 is one pass with 3 output
 // textures and each tap is one 128-bit fetch per 8 channels. Arithmetic, weights and the field stay float32. #defines:
-//   ML_CIN   packed input textures, 1..3 (the 14-channel input: 2)
-//   ML_CG    4-channel input groups the weights cover, 3..6 (= ceil(channels / 4); odd: the last texture's upper half is unused)
+//   ML_CIN   packed input textures, 1..4 (the 14-channel input: 2, a colour net's 25: 4)
+//   ML_CG    4-channel input groups the weights cover, 3..7 (= ceil(channels / 4); odd: the last texture's upper half is unused)
 //   ML_COUT  4-channel output groups, 1..6: groups 0..2 take their weights from block MlW, 3..5 from MlW2 (each block within the
 //            16 KB uniform block minimum); output texture k packs groups 2k, 2k + 1
 //   ML_LAST  the 2-channel output layer (ML_COUT 1): writes h + 2 * out to an RG32F target, as conv.frag.glsl
@@ -16,6 +16,9 @@ uniform highp usampler2D uIn1;
 #endif
 #if ML_CIN > 2
 uniform highp usampler2D uIn2;
+#endif
+#if ML_CIN > 3
+uniform highp usampler2D uIn3;
 #endif
 #if ML_LAST
 uniform sampler2D uHc;
@@ -97,6 +100,13 @@ void main() {
         ML_GRP(4, ML_LO(u))
 #if ML_CG > 5
         ML_GRP(5, ML_HI(u))
+#endif
+#endif
+#if ML_CIN > 3
+        u = texelFetch(uIn3, q, 0);
+        ML_GRP(6, ML_LO(u))
+#if ML_CG > 7
+        ML_GRP(7, ML_HI(u))
 #endif
 #endif
     }

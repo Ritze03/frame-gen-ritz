@@ -39,10 +39,13 @@ def nets():
     return sorted(f[:-3] for f in os.listdir(d) if f.endswith('.js'))
 
 
+EXPORT_DIR = {'c2smoke': 'c2smoke-colour', 'c2feat': 'c2smoke-features'}   # nets/<net>.js whose export directory has another name (make_nets.py NAME=DIR)
+
+
 def pairs():
     """Every (net, pair, dir) of the loadable nets: the pairs are the export's testvec/<pair>/ directories with a vec.json."""
     for net in nets():
-        root = os.path.join(EXPORT, net, 'testvec')
+        root = os.path.join(EXPORT, EXPORT_DIR.get(net, net), 'testvec')
         if not os.path.isdir(root):
             continue
         for name in sorted(os.listdir(root)):
@@ -104,7 +107,7 @@ def prep():
                 f.write(why)
         with open(mid_why) as f:
             why = f.read()
-        man.append(dict(net=net, pair=name, dir=d, W=W, H=H, flow=v['flow_size'], padded=v['padded_flow_size'], sad=v['sad'], cut=v['cut'],
+        man.append(dict(net=net, pair=name, dir=d, W=W, H=H, flow=v['flow_size'], padded=v['padded_flow_size'], sad=v['sad'], cut=v['cut'], colour=int(v.get('colour', 0)), features=int(v.get('features', 0)),
                         sad_zt=v.get('sad_zt'), cut_zt=v.get('cut_zt'), zeroed_zt=v.get('zeroed_zt'),
                         middle=os.path.exists(mid), middleWhy=why,
                         files={k: dict(file=os.path.join(d, x['file']), shape=x['shape']) for k, x in v['files'].items()}))

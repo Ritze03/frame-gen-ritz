@@ -41,7 +41,7 @@ that contract, updated. Additions (nothing removed):
 | V2 Quality refusal | where `checkSupport(gl).quality` is false, `createEngine` / `setSettings` throw a `RangeError` (`framegen: settings.v2Mode 'quality' is not supported on this context (<qualityError>); use v2Mode 'performance' or motionVersion 1`) for any settings with `motionVersion` 2 and `v2Mode` `'quality'`, and keep the current settings. V1 (whatever `v2Mode` says) and V2 Performance run as before |
 | `__fg.assemblePrograms(sources, settings)` | the exact text of every program the host compiles (for validation) |
 | `engine.setPassHook(fn)` | profiling only: `fn(passName, 0 / 1)` around every draw |
-| settings `motion`, `motionNet`, `motionPrecision` | V1's learned motion estimate (below): `motion` `'search'` (default: V1's block search) or `'learned'`; `motionNet` `'e2v5'` (default), `'e1v5'` (the small net), `'e2v4'`, `'e1v4'`, `'e2v3'` or `'e1v3'`; `motionPrecision` `'fp16'` (default) or `'fp32'`. Runtime (a change drops the estimate, like a `motionVersion` switch); ignored by V2; `'learned'` needs `flowScale` 2 |
+| settings `motion`, `motionNet`, `motionPrecision` | V1's learned motion estimate (below): `motion` `'search'` (default: V1's block search) or `'learned'`; `motionNet` `'e2v5'` (default), `'e1v5'` (the small net), `'e2v4'`, `'e1v4'`, `'e2v3'` or `'e1v3'`, or the opt-in stand-ins `'c2smoke'` (colour variant, 25 inputs) and `'c2feat'` (learned-features variant, 27 inputs) for ml-fg's later `g2v2`/`m2v2`/`g2v3`/`m2v3` (LAYOUT.md 10.10, 10.11); `motionPrecision` `'fp16'` (default) or `'fp32'`. Runtime (a change drops the estimate, like a `motionVersion` switch); ignored by V2; `'learned'` needs `flowScale` 2 |
 | settings `learnedZeroTest`, `learnedStaticGuard` | learned estimate only (below): the zero-motion test after the net (`true` default; a change drops the estimate) and the static guard after the synthesis (`false` default; runtime, no drop). Same names as the Vulkan library's settings |
 | `__fg.nets` | the learned nets' weights, attached by `webgl/nets/<name>.js` |
 | `__fg.defaultNet`, `__fg.smallNet` | read-only strings: `'e2v5'` (= `defaultSettings().motionNet`) and `'e1v5'`, the recommended small / fallback net (~1.9x faster at 1080p). A caller that drops to a cheaper net (e.g. at 1080p / high refresh rates) sets `motionNet: __fg.smallNet` instead of naming a net; both follow future nets |
@@ -139,7 +139,7 @@ Adding a net from ml-fg (same family: 5 levels, 14 input channels, width 12 or 2
 (writes `nets/<net>.js`, checks the sha256), add `'<net>'` to `ML_NETS` in `framegen.js` (its first entry is `DEFAULTS.motionNet`;
 change both to make it the default; `ML_SMALL_NET` is `__fg.smallNet`), and ship `nets/<net>.js`. The tests pick it up by themselves: `learned.mjs` runs every
 `nets/<net>.js` that has an `export/<net>/testvec`, on every pair directory there (cut flags from each `vec.json`), and
-`bench.mjs` takes the net's name as a mode (`<net>`, `<net>f`, `...n`, `...g`).
+The colour (`c2smoke`) and features (`c2feat`) variants pass `learned.mjs` on all their pairs (the extra chroma / feature inputs; max `pf` tolerance 0.15 px); `__fg.version` '6'. `bench.mjs` takes the net's name as a mode (`<net>`, `<net>f`, `...n`, `...g`).
 
 **Duplicate pairs** (required: the net has no zero-motion prior; on two identical frames it still outputs motion, mean 0.3 px,
 up to 5 px, and the synthesis would change ~40 % of the pixels): the estimate first applies FGR's duplicate test, the mean

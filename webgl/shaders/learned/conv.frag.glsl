@@ -1,6 +1,6 @@
 // One 3x3 conv layer of the net (SPEC stage 4c/4d; reference.py conv3x3 + level_net), or the part of it that writes ML_COUT RGBA
 // textures (4 channels each). Compiled per shape by the host's #defines:
-//   ML_CIN   input textures (RGBA, 4 channels each; the 14-channel input is 4 with 2 zero channels), 1..6
+//   ML_CIN   input textures (RGBA, 4 channels each; the 14-channel input is 4 with 2 zero channels, a colour net's 25 are 7), 1..7
 //   ML_COUT  output textures of this pass, 1..3 (a layer of width 24 is two passes)
 //   ML_LAST  the layer's linear 2-channel output: writes h + 2 * out instead of clamp(out, 0, 1), h = this level's input field in
 //            float32 (mlFieldUp of the coarser level's uHc, 0 at the top level uTop), as the match pass computed it
@@ -8,7 +8,7 @@
 // level (uSize: the textures are level-0 sized, the region beyond the level holds other levels' data and is never read).
 // Weights (uniform block MlW, bound per pass by the host from the net's buffer): uW[(o * 9 + tap) * ML_CIN + j] is the 4x4 block
 // from input texture j to output texture o at tap = ky * 3 + kx, column c = input channel 4j + c, row r = output channel 4o + r
-// (zero beyond the layer's channels); uB[o] the biases.
+// (zero beyond the layer's channels); uB[o] the biases. ML_NODUP (defined): no duplicate-pair zeroing.
 uniform ivec2 uSize;
 uniform sampler2D uIn0;
 #if ML_CIN > 1
@@ -25,6 +25,9 @@ uniform sampler2D uIn4;
 #endif
 #if ML_CIN > 5
 uniform sampler2D uIn5;
+#endif
+#if ML_CIN > 6
+uniform sampler2D uIn6;
 #endif
 #if ML_LAST
 uniform sampler2D uHc;
@@ -50,6 +53,7 @@ layout(location = 2) out vec4 o2;
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
+#ifndef ML_NODUP   // ML_NODUP: the learned-features extractor (per frame, cached: it must not follow a pair's duplicate test)
     if (mlDup()) {
 #if ML_LAST
         oH = vec4(0.0);
@@ -64,6 +68,7 @@ void main() {
 #endif
         return;
     }
+#endif
     vec4 acc[ML_COUT];
     for (int o = 0; o < ML_COUT; o++) acc[o] = uB[o];
     for (int t = 0; t < 9; t++) {
@@ -84,6 +89,9 @@ void main() {
 #endif
 #if ML_CIN > 5
         ML_TAP(5, uIn5)
+#endif
+#if ML_CIN > 6
+        ML_TAP(6, uIn6)
 #endif
     }
 #if ML_LAST
