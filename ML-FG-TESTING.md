@@ -209,8 +209,7 @@ SwiftShader) against the 70 dB gate** (e2v5 had 71.7 there in round 3). All 38 r
   | c2feat, `extractor` deleted | `net 'c2feat' (variant features) has no extractor weights` |
   | c2feat unchanged (control) | no error |
 
-  `motionNet` outside `ML_NETS` is a `RangeError` too (in round 4 the list ended `'c2smoke','c2feat'`; now `'g2v2','g2v3','m2v2','m2v3'`).
-  appended to `ML_NETS` first (see "Adding a net" below).
+  `motionNet` outside `ML_NETS` is a `RangeError` too (in round 4 the list ended `'c2smoke','c2feat'`; now `'g2v2','g2v3','m2v2','m2v3'`). New names are appended to `ML_NETS` first (see "Adding a net" below).
 
 ### Round 4 cost (stand-ins; RX 7900 XTX, ms of GPU time; QC re-measured)
 
