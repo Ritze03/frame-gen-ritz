@@ -7,7 +7,7 @@
 //   MLTEST_DUMP  a directory (created): per net and pair the library's pf, `<run>_<pair>_{ref,fgr}.f32` ([fh][fw][2] float32) and
 //                `<run>_<pair>_{ref,fgr}.json` (sad, cut; also refh / fgrh = learnedHalf, and the zero test's kinds below), for gpu/ml/synthcheck.py (the end-to-end dB check through proto/interp.py).
 //
-// c2smoke (the stand-in of the colour variant, ml-fg export/c2smoke-colour, SPEC.md section 10): the nine pairs of e2v5 plus `colour`,
+// g2v2 (the colour variant, ml-fg export/g2v2, SPEC.md section 10): the nine pairs of e2v5 plus `colour`,
 // 25 input channels (in_top), the flow-res chroma planes (ca.f32 / cc.f32) read back from the net's chroma pyramids, the max pf
 // tolerance 0.15 px.
 //
@@ -217,8 +217,6 @@ static std::string exportDir() {
     const char* e = getenv("MLFG_EXPORT");
     return e && *e ? e : "/home/mo/Schinken/Programming/Local/ml-fg/export";
 }
-// the export directory of a net: its name, except the test stand-in of the colour variant (the real g2v2 / m2v2 are g2v2 / m2v2)
-static std::string runDir(const std::string& run) { return run == "c2smoke" ? "c2smoke-colour" : run == "c2feat" ? "c2smoke-features" : run; }
 static bool readFile(const std::string& path, std::vector<uint8_t>& out) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -419,7 +417,7 @@ static LearnedNet netOf(const char* run) {
 // The whole SPEC.md section 8 procedure for one net and pair (see the top of the file), then the zero test's (zeroChecks).
 static void checkPair(const char* run, const char* pair) {
     const LearnedNet net = netOf(run);
-    const std::string dir = exportDir() + "/" + runDir(run) + "/testvec/" + pair + "/";
+    const std::string dir = exportDir() + "/" + run + "/testvec/" + pair + "/";
     INFO(run << " " << pair << " (" << dir << ")");
     std::vector<uint8_t> js8, pa, pc;
     uint32_t W = 0, H = 0, W2 = 0, H2 = 0;
@@ -787,31 +785,31 @@ TEST_CASE("e1v5 cut2", "[vectors][e1v5]") { checkPair("e1v5", "cut2"); }
 TEST_CASE("e1v5 odd", "[vectors][e1v5]") { checkPair("e1v5", "odd"); }
 TEST_CASE("e1v5 overlay", "[vectors][e1v5]") { checkPair("e1v5", "overlay"); }
 
-// c2smoke: the stand-in of the colour variant. Its cut decisions come from vec.json (cut = the net alone, cut_zt = with the zero test).
+// g2v2: the colour variant. Its cut decisions come from vec.json (cut = the net alone, cut_zt = with the zero test).
 // "colour" is the chroma-only pair: a port that ignores chroma fails its pf check by several px (SPEC.md section 10.6); with the zero test
 // on it is 100 % zeroed (the luma-only zero test, section 10.4)
-TEST_CASE("c2smoke static", "[vectors][c2smoke]") { checkPair("c2smoke", "static"); }
-TEST_CASE("c2smoke motion", "[vectors][c2smoke]") { checkPair("c2smoke", "motion"); }
-TEST_CASE("c2smoke far", "[vectors][c2smoke]") { checkPair("c2smoke", "far"); }
-TEST_CASE("c2smoke cut", "[vectors][c2smoke]") { checkPair("c2smoke", "cut"); }
-TEST_CASE("c2smoke cut2", "[vectors][c2smoke]") { checkPair("c2smoke", "cut2"); }
-TEST_CASE("c2smoke odd", "[vectors][c2smoke]") { checkPair("c2smoke", "odd"); }
-TEST_CASE("c2smoke hd", "[vectors][c2smoke]") { checkPair("c2smoke", "hd"); }
-TEST_CASE("c2smoke overlay", "[vectors][c2smoke]") { checkPair("c2smoke", "overlay"); }
-TEST_CASE("c2smoke colour", "[vectors][c2smoke]") { checkPair("c2smoke", "colour"); }
+TEST_CASE("g2v2 static", "[vectors][g2v2]") { checkPair("g2v2", "static"); }
+TEST_CASE("g2v2 motion", "[vectors][g2v2]") { checkPair("g2v2", "motion"); }
+TEST_CASE("g2v2 far", "[vectors][g2v2]") { checkPair("g2v2", "far"); }
+TEST_CASE("g2v2 cut", "[vectors][g2v2]") { checkPair("g2v2", "cut"); }
+TEST_CASE("g2v2 cut2", "[vectors][g2v2]") { checkPair("g2v2", "cut2"); }
+TEST_CASE("g2v2 odd", "[vectors][g2v2]") { checkPair("g2v2", "odd"); }
+TEST_CASE("g2v2 hd", "[vectors][g2v2]") { checkPair("g2v2", "hd"); }
+TEST_CASE("g2v2 overlay", "[vectors][g2v2]") { checkPair("g2v2", "overlay"); }
+TEST_CASE("g2v2 colour", "[vectors][g2v2]") { checkPair("g2v2", "colour"); }
 
-// c2feat: the stand-in of the learned-features variant (ml-fg export/c2smoke-features, SPEC.md section 11): the same nine-pair set with `features`
+// g2v3: the learned-features variant (ml-fg export/g2v3, SPEC.md section 11): the same nine-pair set with `features`
 // (the chroma-only picture again) instead of `colour`; 27 inputs, the RGB planes and the extractor's maps checked per level on the pairs
 // that have them (features, motion), tolerance 0.15 px.
-TEST_CASE("c2feat static", "[vectors][c2feat]") { checkPair("c2feat", "static"); }
-TEST_CASE("c2feat motion", "[vectors][c2feat]") { checkPair("c2feat", "motion"); }
-TEST_CASE("c2feat far", "[vectors][c2feat]") { checkPair("c2feat", "far"); }
-TEST_CASE("c2feat cut", "[vectors][c2feat]") { checkPair("c2feat", "cut"); }
-TEST_CASE("c2feat cut2", "[vectors][c2feat]") { checkPair("c2feat", "cut2"); }
-TEST_CASE("c2feat odd", "[vectors][c2feat]") { checkPair("c2feat", "odd"); }
-TEST_CASE("c2feat hd", "[vectors][c2feat]") { checkPair("c2feat", "hd"); }
-TEST_CASE("c2feat overlay", "[vectors][c2feat]") { checkPair("c2feat", "overlay"); }
-TEST_CASE("c2feat features", "[vectors][c2feat]") { checkPair("c2feat", "features"); }
+TEST_CASE("g2v3 static", "[vectors][g2v3]") { checkPair("g2v3", "static"); }
+TEST_CASE("g2v3 motion", "[vectors][g2v3]") { checkPair("g2v3", "motion"); }
+TEST_CASE("g2v3 far", "[vectors][g2v3]") { checkPair("g2v3", "far"); }
+TEST_CASE("g2v3 cut", "[vectors][g2v3]") { checkPair("g2v3", "cut"); }
+TEST_CASE("g2v3 cut2", "[vectors][g2v3]") { checkPair("g2v3", "cut2"); }
+TEST_CASE("g2v3 odd", "[vectors][g2v3]") { checkPair("g2v3", "odd"); }
+TEST_CASE("g2v3 hd", "[vectors][g2v3]") { checkPair("g2v3", "hd"); }
+TEST_CASE("g2v3 overlay", "[vectors][g2v3]") { checkPair("g2v3", "overlay"); }
+TEST_CASE("g2v3 features", "[vectors][g2v3]") { checkPair("g2v3", "features"); }
 
 // ---- duplicates (shaders/ml_dup.comp: FGR's DUP_DIFF test)
 // A frame of the motion pair (or a smooth synthetic one if the vectors are missing)
@@ -887,8 +885,8 @@ TEST_CASE("e2v4 duplicate frames", "[dup][e2v4]") { duplicateCase(LearnedNet::E2
 TEST_CASE("e1v4 duplicate frames", "[dup][e1v4]") { duplicateCase(LearnedNet::E1v4); }
 TEST_CASE("e2v5 duplicate frames", "[dup][e2v5]") { duplicateCase(LearnedNet::E2v5); }
 TEST_CASE("e1v5 duplicate frames", "[dup][e1v5]") { duplicateCase(LearnedNet::E1v5); }
-TEST_CASE("c2smoke duplicate frames", "[dup][c2smoke]") { duplicateCase(LearnedNet::C2Smoke); }
-TEST_CASE("c2feat duplicate frames", "[dup][c2feat]") { duplicateCase(LearnedNet::C2Feat); }
+TEST_CASE("g2v2 duplicate frames", "[dup][g2v2]") { duplicateCase(LearnedNet::G2v2); }
+TEST_CASE("g2v3 duplicate frames", "[dup][g2v3]") { duplicateCase(LearnedNet::G2v3); }
 
 // ---- the settings API
 TEST_CASE("Learned settings", "[api]") {
@@ -910,11 +908,11 @@ TEST_CASE("Learned settings", "[api]") {
     CHECK(!strcmp(learnedNetName(LearnedNet::E2v4), "e2v4"));
     CHECK(!strcmp(learnedNetName(LearnedNet::E2v5), "e2v5"));
     CHECK(!strcmp(learnedNetName(LearnedNet::E1v5), "e1v5"));
-    CHECK(!strcmp(learnedNetName(LearnedNet::C2Smoke), "c2smoke"));
+    CHECK(!strcmp(learnedNetName(LearnedNet::G2v2), "g2v2"));
     CHECK((uint32_t)LearnedNet::E1v5 == 5);    // the values are never renumbered
-    CHECK((uint32_t)LearnedNet::C2Smoke == 6);
-    CHECK(!strcmp(learnedNetName(LearnedNet::C2Feat), "c2feat"));
-    CHECK((uint32_t)LearnedNet::C2Feat == 7);
+    CHECK((uint32_t)LearnedNet::G2v2 == 6);
+    CHECK(!strcmp(learnedNetName(LearnedNet::G2v3), "g2v3"));
+    CHECK((uint32_t)LearnedNet::G2v3 == 7);
     CHECK(kLearnedNets == 8);
     LearnedNet byName = LearnedNet::E2v3;
     CHECK(learnedNetFromName("e1v3", &byName));
@@ -970,7 +968,7 @@ TEST_CASE("Learned settings", "[api]") {
     CHECK(rig.pf != pf4);
     CHECK(rig.pf != pf3);
     const std::vector<float> pf5 = rig.pf;
-    s.learnedNet = LearnedNet::C2Smoke;   // the colour variant: the state grows (its extra planes), another input layout
+    s.learnedNet = LearnedNet::G2v2;   // the colour variant: the state grows (its extra planes), another input layout
     REQUIRE(rig.fg.setSettings(s));
     REQUIRE(rig.run(true, false));
     CHECK(rig.pf != pf5);
@@ -978,7 +976,7 @@ TEST_CASE("Learned settings", "[api]") {
     REQUIRE(rig.fg.setSettings(s));
     REQUIRE(rig.run(true, false));
     CHECK(rig.pf == pf5);
-    s.learnedNet = LearnedNet::C2Feat;    // the features variant: the state grows again (RGB scratch pyramids)
+    s.learnedNet = LearnedNet::G2v3;    // the features variant: the state grows again (RGB scratch pyramids)
     REQUIRE(rig.fg.setSettings(s));
     REQUIRE(rig.run(true, false));
     CHECK(rig.pf != pf5);

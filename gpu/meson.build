@@ -25,8 +25,8 @@ shaders = shader_gen.process(
 
 # MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked
 # against the manifest (sha256, shapes, offsets) and re-laid out for shaders/ml_conv.comp. Order = LearnedNet (E2v3, E1v3, E2v4, E1v4,
-# E2v5, E1v5, C2Smoke, C2Feat): a new net is appended here and in framegen.cpp kMlNetInfo / kMlNet.
-ml_nets = ['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5', 'c2smoke', 'c2feat']
+# E2v5, E1v5, G2v2, G2v3): a new net is appended here and in framegen.cpp kMlNetInfo / kMlNet.
+ml_nets = ['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5', 'g2v2', 'g2v3']
 python = find_program('python3')
 ml_inputs = ['ml/embed_weights.py']
 ml_args = [python, '-I', '@INPUT0@', '@OUTPUT@']

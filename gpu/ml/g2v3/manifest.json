@@ -1,8 +1,8 @@
 {
- "run": "c2smoke-features",
- "checkpoint_sha256": "d9b9b379bca3403f5f47c5f78520cf076aaea70d3f688a58ad20006dc2f14725",
- "checkpoint_step": 600,
- "checkpoint_val_score": null,
+ "run": "g2v3",
+ "checkpoint_sha256": "09856f4683ecce793ff847732606c3f97bee49a4ae5d67382146a9592895167d",
+ "checkpoint_step": 10000,
+ "checkpoint_val_score": 31.94,
  "config": {
   "levels": 5,
   "width": 24,
@@ -52,10 +52,10 @@
  "pad_multiple": 16,
  "weights_file": "weights.bin",
  "weights_dtype": "float32 little-endian, packed, no padding between tensors",
- "weights_sha256": "aa5eed54636507ad87d2da9c2e9a31db0e6caad4a0d131b3f911bc96266f450e",
+ "weights_sha256": "fabca6ab0d6aa02722b7300fb93815b2c919a9c499b0a2cc58d47e5b080b3301",
  "weights_f16_file": "weights.f16.bin",
  "weights_f16_note": "same tensors rounded to IEEE half; offsets = offset_bytes / 2; max abs rounding error below",
- "weights_f16_max_abs_err": 0.0015149116516113281,
+ "weights_f16_max_abs_err": 0.001766204833984375,
  "total_elements": 110086,
  "forward_order": "tensors are listed coarsest pyramid level first (level index L-1), then ..., finest (level 0)",
  "level_to_stack": [
