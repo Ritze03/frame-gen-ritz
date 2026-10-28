@@ -4,8 +4,10 @@ STATUS: READY
 
 Both ports of ml-fg's learned motion estimator pass ml-fg's test vectors (`export/SPEC.md` §8, §10, §11), including the
 zero-motion test (`*_zt` vectors), round 3's nets **e2v5** (the default) and **e1v5** (the small net) and **round 4's two new
-net variants** (colour, learned features; stand-in nets `c2smoke` and `c2feat`). The two ports are the Vulkan library (`gpu/`)
-and the WebGL2 backend (`webgl/`). The round-4 results come from an independent QC re-run on 2026-10-28 on an RX 7900 XTX with
+net variants** (colour, learned features) with round 4b's **real nets g2v2, g2v3, m2v2 and m2v3**, which replaced round 4's
+test stand-ins (`c2smoke`, `c2feat`; removed from both backends). The two ports are the Vulkan library (`gpu/`)
+and the WebGL2 backend (`webgl/`). The round-4b results are in "Round 4b: the real nets" (below "What changed in round 4"); the
+tolerance for the features variant moved to 0.25 px there. The round-4 results come from an independent QC re-run on 2026-10-28 on an RX 7900 XTX with
 RADV and Chromium 156, at `eeb12a9` (gpu `6213959`, webgl `74ba982` + `08c9816`). The round-3 results come from an independent
 QC re-run on 2026-10-27, at `d4a71e3`; the round-3 sections below still hold for the six luma nets, whose output is
 unchanged. The round-2 sections further down (QC of 2026-10-26 at
@@ -13,29 +15,30 @@ unchanged. The round-2 sections further down (QC of 2026-10-26 at
 net", read e2v4 / e1v4 as round 2's.
 
 The estimator is still **opt-in**. V1 and V2 stay the defaults, and their output is byte-identical to `6133a4a` (round 2) and
-`fd5c163` (round 1). Round 4 changed no default: the default net is still e2v5 and the small net e1v5.
+`fd5c163` (round 1). Rounds 4 and 4b changed no default: the default net is still e2v5 and the small net e1v5.
 
 ## What changed in round 4 (for browser-frame-gen and gamescope-ritz)
 
 Round 4 adds two **architecture variants** of the learned estimator, each selectable next to the current nets and opt-in only.
-This is not a weight swap like rounds 2 and 3: the first conv's input contract changes. Until the real nets finish training
-the variants are tested with ml-fg's smoke stand-ins (600 training steps, the real nets' shapes).
+This is not a weight swap like rounds 2 and 3: the first conv's input contract changes. Round 4 tested the variants with ml-fg's smoke
+stand-ins (600 training steps, the real nets' shapes); round 4b replaced them with the real nets (the stand-in rows below are history).
 
-| variant | real nets (training) | stand-in (test vectors) | loaded as | first-conv inputs | spec |
-|---|---|---|---|---|---|
-| luma (rounds 1-3) | e2v5, e1v5, ... | | | 14 | §3-§8 |
-| **colour** | `g2v2` (game), `m2v2` (allrounder) | `export/c2smoke-colour/` | **`c2smoke`** | 25 = 14 + 2 colour-mismatch + 9 colour-cost | §10 |
-| **learned features** | `g2v3` (game), `m2v3` (allrounder) | `export/c2smoke-features/` | **`c2feat`** | 27 = 14 + 4 feature-diff + 9 feature-cost | §11 |
+| variant | real nets | round-4 stand-in (removed in 4b) | first-conv inputs | spec |
+|---|---|---|---|---|
+| luma (rounds 1-3) | e2v5, e1v5, ... | | 14 | §3-§8 |
+| **colour** | `g2v2` (game), `m2v2` (allrounder) | `c2smoke` (`export/c2smoke-colour/`) | 25 = 14 + 2 colour-mismatch + 9 colour-cost | §10 |
+| **learned features** | `g2v3` (game), `m2v3` (allrounder) | `c2feat` (`export/c2smoke-features/`) | 27 = 14 + 4 feature-diff + 9 feature-cost | §11 |
 
 - **Colour:** per frame, flow-res Cb = 0.564 (B - Y) and Cr = 0.713 (R - Y) from the *unrounded* BT.601 Y, same pad and
   pyramid as the luma; the chroma is warped with the same h; only the first conv of each level grows. The zero test, sad and
   cut stay luma-only.
 - **Features:** a shared conv3x3 3 -> 8 -> 4 extractor (clamp01, zero padding) runs on each RGB pyramid level; the four maps
   are matched like the luma (warped difference + a 9-channel cost).
-- **Selecting them.** Vulkan: `Settings::learnedNet = LearnedNet::C2Smoke` (= 6) or `C2Feat` (= 7); fgtest / uitest / formattest
-  / blurtest take `learnedNet=c2smoke|c2feat` / `--net c2smoke|c2feat`. WebGL: `motionNet: 'c2smoke'` or `'c2feat'` (load
-  `nets/c2smoke.js` / `nets/c2feat.js`). `kLearnedNets` is **8**; `__fg.version` is **`'6'`**. The names `g2v2`, `m2v2`, `g2v3`
-  and `m2v3` are reserved for the real nets (steps below). The zero test, static guard, fp16 / fp32 and the duplicate skip work
+- **Selecting them (4b).** Vulkan: `Settings::learnedNet = LearnedNet::G2v2` (= 6), `G2v3` (= 7), `M2v2` (= 8) or `M2v3` (= 9);
+  fgtest `--set algo=learned,learnedNet=g2v2|g2v3|m2v2|m2v3`, and `--net g2v2|...` in uitest / formattest / blurtest. WebGL:
+  `motionNet: 'g2v2' | 'g2v3' | 'm2v2' | 'm2v3'` (load `nets/<name>.js`). `kLearnedNets` is **10**; `__fg.version` is **`'7'`**
+  (`'6'` was the round-4 stand-ins). `c2smoke` / `c2feat` no longer exist in either backend: a host that referenced them must
+  switch to the real names. The zero test, static guard, fp16 / fp32 and the duplicate skip work
   per net as before.
 - **Wrong net, wrong pipeline = loud failure.** Vulkan: a build error (see "Round 4 QC"). WebGL: a `RangeError` from
   `createEngine` / `setSettings` naming the net and the mismatch.
@@ -47,11 +50,92 @@ the variants are tested with ml-fg's smoke stand-ins (600 training steps, the re
 - **New files a host needs:** see "Files a host needs". New shaders: Vulkan `ml_planes.comp`, `ml_feat.comp` (and `ml_planes`
   per non-RGBA8 format); WebGL `learned/rgb0.frag.glsl` (63 files now, 14 under `learned/`; `lv0`, `down`, `match`, `conv` and
   `conv_h` changed).
-- **Pipelines / memory:** switching to Learned creates `22 + 10 x 8` = **102** Vulkan pipelines (76 before). The embedded
-  weights are 2,469,232 bytes (sum of the eight `kMlWeights_*` arrays; 1.56 MB for the six luma nets) and the net files are
-  `c2smoke.js` 608 KB, `c2feat.js` 623 KB.
+- **Pipelines / memory:** round 4 measured `22 + 10 x 8` = **102** Vulkan pipelines with 8 nets (76 before) and 2,469,232 bytes of
+  embedded weights (stand-ins). With the 10 real nets the same formula gives `22 + 10 x 10` = **122** pipelines (not re-counted at
+  runtime), and the embedded weights are **3,226,288 bytes** (3.23 MB: sum of the `gpu/ml/*/weights.bin` sizes: 3 x 113,320 for
+  e1v3/e1v4/e1v5, 3 x 382,120 for e2v3/e2v4/e2v5, 2 x 429,640 for g2v2/m2v2, 2 x 440,344 for g2v3/m2v3). The stand-in net files were
+  `c2smoke.js` 608 KB, `c2feat.js` 623 KB; the real nets' `webgl/nets/g2v2.js` etc. were not re-measured here.
 
-### Round 4 QC summary (independent re-run at `eeb12a9`)
+### Round 4b: the real nets (g2v2, g2v3, m2v2, m2v3)
+
+The four real nets replace the stand-ins; no code change except the net tables, the enum / `ML_NETS`, the help strings and the
+features-variant tolerance. Verified by the workers (not an independent QC re-run) at `5dcdc5c`.
+
+| enum value | net | variant | inputs |
+|---|---|---|---|
+| `G2v2` = 6 | g2v2 | colour game net | 25 |
+| `G2v3` = 7 | g2v3 | learned-features game net | 27 |
+| `M2v2` = 8 | m2v2 | colour allrounder | 25 |
+| `M2v3` = 9 | m2v3 | features allrounder | 27 |
+
+- **Vulkan:** `kLearnedNets = 10`. Values 0-5 unchanged: E2v3, E1v3, E2v4, E1v4, E2v5 (default), E1v5 (small net).
+- **WebGL:** `ML_NETS = ['e2v5','e1v5','e2v4','e1v4','e2v3','e1v3','g2v2','g2v3','m2v2','m2v3']`, selected with `motionNet`.
+  `__fg.version` is `'7'`.
+- **Defaults unchanged:** e2v5 default, e1v5 small net. **The stand-ins are removed** from both backends.
+- **New tolerance:** the features-variant max-pf tolerance is **0.25 px** (SPEC §8 / §11.6, fp32 noise on trained nets). Colour stays
+  0.15, luma 0.05. Applied in `gpu/mltest.cpp:50` (`kPfMaxTolFeatures`, threaded into `zeroChecks`) and `webgl/tests/learned.mjs`
+  (`TOL.pfMaxFeat`).
+
+**Vulkan verification (RX 7900 XTX):** mltest **84 cases, 7916 assertions, 0 failed**; synthcheck **657/657**. Worst fp32 ref pf
+max: g2v2 0.120 (hd), g2v3 0.095 (hd), m2v2 0.131 (cut2), m2v3 0.108 (far). Both features nets would have passed the old 0.15
+too. Regression: fgtest output is byte-identical to the previous main at each step; the uitest Learned counts are unchanged
+(14 with e2v5, 12 with e2v4).
+
+**WebGL verification:** `learned.mjs --gpu` on ANGLE/Vulkan (RADV) gives RESULT: PASS for every net: all 9 pairs, fp32 and fp16,
+zero test off and on, plus the duplicate checks; g2v2 also passes the HDR rows. fp32 pf max: g2v2 0.079, g2v3 0.073, m2v2 0.065,
+m2v3 0.100. `run.sh validate` is 251/251. **SwiftShader and ANGLE/GL were NOT run for the real nets** (known issue (t)); the
+stand-ins with identical shapes passed on all three backends. Harness fix (`06e5ed8`): `learned_ref.py` prep / synth used to ignore
+`--nets` / `--pairs` and recompute everything (an earlier run timed out under heavy machine load); it now honours the filters and
+caches the expected-field synth. `bench.mjs` accepts any net name (it needs `--fs 2` for learned).
+
+**Cut decisions** (identical on both backends; match `vec.json`, format `cut` / `cut_zt`):
+
+| net | `cut` | `cut2` | other pairs |
+|---|---|---|---|
+| g2v2 | true / true | true / true | false |
+| g2v3 | true / true | true / true | false |
+| m2v2 | true / false | true / true | false |
+| m2v3 | false / false (sad 27.8 / 26.1) | true / true (37.3 / 35.1) | false |
+
+**Cost, Vulkan** (1080p x2, zt on, fgtest `--bench 100 --mult 2`, battlefield, TOTAL per pair min, ms):
+
+| net | fp32 | half |
+|---|---|---|
+| V1 | ~0.32 | |
+| e2v5 | 1.31 | 1.02 |
+| g2v2 | 1.74 | 1.25 |
+| m2v2 | 1.73 | 1.24 |
+| g2v3 | 1.89 | 1.40 |
+| m2v3 | 1.89 | 1.40 |
+
+That is +32 % fp32 / +22 % half for colour and +45 % / +37 % for features, against SPEC's +12 %. The variants are untuned.
+
+**Cost, WebGL** (1080p, ANGLE/Vulkan, back-to-back estimate + synth per pair, ms; noisy, the GPU was shared with ml-fg scoring jobs):
+
+| net | fp16 | fp32 |
+|---|---|---|
+| e2v5 | 2.08 | 3.04 |
+| g2v2 | 2.10 | 3.67 |
+| m2v2 | 2.42 | 3.71 |
+| g2v3 | 2.22 | 3.50 |
+| m2v3 | 2.64 | 3.85 |
+
+The per-pair minimum was 3.28-4.33 ms at fp16.
+
+**PSNR against the real middle frame** (Vulkan, 1080p, t = 0.5, zt on, dB):
+
+| net | obs2 5000 | battlefield 2000 | obs1 13100 |
+|---|---|---|---|
+| V1 | 27.14 | 36.09 | 34.80 |
+| e2v5 | 27.11 | 36.20 | 34.00 |
+| g2v2 | 27.17 | 36.25 | 31.73 |
+| g2v3 | 27.20 | 36.35 | 32.03 |
+| m2v2 | 27.19 | 36.30 | 32.57 |
+| m2v3 | **27.21** | **36.43** | **35.56** |
+
+m2v3 is the best on all three pairs and the first learned net to beat V1 on obs1 13100. g2v2, g2v3 and m2v2 lose 2-3 dB there.
+
+### Round 4 QC summary (stand-ins `c2smoke` / `c2feat`, independent re-run at `eeb12a9`; history)
 
 - **Vulkan parity:** `mltest` **64 cases, 5960 assertions, 0 failed**; `synthcheck.py` **495/495** (162 of them c2smoke /
   c2feat), 0 failed. c2smoke and c2feat each ran all 9 pairs on the ref and FGR paths, fp32 and `learnedHalf`, zero test off
@@ -70,7 +154,7 @@ the variants are tested with ml-fg's smoke stand-ins (600 training steps, the re
   `__fg.smallNet` `'e1v5'`, `__fg.version` `'6'`.
 - **Cost:** above the spec's +12% (below).
 
-### Round 4 parity (QC re-run; tolerance for the variants: max |pf| 0.15 px in fp32)
+### Round 4 parity (stand-ins; QC re-run; tolerance for the variants then: max |pf| 0.15 px in fp32, 0.25 for features from 4b)
 
 **Vulkan** (worst over the 9 pairs, ref path = the vector's own luma, fp32; zero test on gives the same maxima):
 
@@ -97,7 +181,7 @@ The worker's 6.2e-2 for c2smoke is 7.25e-2 here (still half of the tolerance): s
 Thinnest margin of round 4: **WebGL c2smoke fp32 with the zero test on `hd`, t = 0.25: 73.8 dB on ANGLE/Vulkan (78.7 on
 SwiftShader) against the 70 dB gate** (e2v5 had 71.7 there in round 3). All 38 rows per backend pass.
 
-### Round 4 cut decisions (net-only `cut` / with the zero test `cut_zt`, both backends)
+### Round 4 cut decisions (stand-ins; net-only `cut` / with the zero test `cut_zt`, both backends)
 
 | pair | c2smoke (vec.json) | c2feat (vec.json) | Vulkan | WebGL |
 |---|---|---|---|---|
@@ -125,10 +209,10 @@ SwiftShader) against the 70 dB gate** (e2v5 had 71.7 there in round 3). All 38 r
   | c2feat, `extractor` deleted | `net 'c2feat' (variant features) has no extractor weights` |
   | c2feat unchanged (control) | no error |
 
-  `motionNet` outside `ML_NETS` is a `RangeError` too (the list now ends `'c2smoke','c2feat'`). The names `g2v2` etc. must be
-  appended to `ML_NETS` first (step 3 below).
+  `motionNet` outside `ML_NETS` is a `RangeError` too (in round 4 the list ended `'c2smoke','c2feat'`; now `'g2v2','g2v3','m2v2','m2v3'`).
+  appended to `ML_NETS` first (see "Adding a net" below).
 
-### Round 4 cost (RX 7900 XTX, ms of GPU time; QC re-measured)
+### Round 4 cost (stand-ins; RX 7900 XTX, ms of GPU time; QC re-measured)
 
 `fgtest --bench 100 --mult 2`, 1080p, battlefield, zero test on, "TOTAL per pair" **min** of 3 runs (median range in brackets):
 
@@ -159,25 +243,26 @@ steady-state pair.
 - **Vulkan has no features cache** (WebGL has one).
 - The zero test is luma-only by spec, so chroma-only motion is snapped to 0 (the `colour` pair is 100 % zeroed with the test
   on). Whether the real colour nets want `learnedZeroTest` off is for ml-fg's measurements; the toggle works per net.
-- The stand-ins are 600-step nets: their quality says nothing about g2v2 / m2v2 / g2v3 / m2v3. Only port correctness is tested.
+- The stand-ins were 600-step nets: their quality said nothing about the real nets (4b measured those: PSNR table above).
 
-### Adding the real nets (g2v2, m2v2, g2v3, m2v3; no code change)
+### Adding a net of an existing variant (no code change beyond the tables; this is what the workers did for the real nets)
 
 **Vulkan (`gpu/`):**
 1. Copy ml-fg's `export/<name>/manifest.json` and `weights.bin` into `gpu/ml/<name>/`.
 2. Append `<name>` to `ml_nets` in `gpu/meson.build` (same order as the enum).
 3. Append a `LearnedNet` value and bump `kLearnedNets` (`gpu/framegen.h`; names in `learnedNetName()`).
-4. Append `{"<name>", 24, MLV_COLOUR|MLV_FEATURES}` to `kMlNetInfo` and `ML_NET(<name>)` to `kMlNet` (`gpu/framegen.cpp`). A wrong
-   variant is a `static_assert` failure.
+4. Append `{"<name>", 24, MLV_COLOUR|MLV_FEATURES}` (the variant of the net) to `kMlNetInfo` and `ML_NET(<name>)` to `kMlNet`
+   (`gpu/framegen.cpp`). A wrong variant is a `static_assert` failure.
 5. Add the name to the four `--net` / `learnedNet=` help strings (fgtest, uitest, formattest, blurtest).
 6. Add the mltest cases; if the export directory differs from the net name add it to `runDir()` (`gpu/mltest.cpp`) and
-   `EXPORT_DIR` (`gpu/ml/synthcheck.py`).
+   `EXPORT_DIR` (`gpu/ml/synthcheck.py`). A variant with a new tolerance goes through `zeroChecks` (`kPfMaxTolFeatures`).
 
 **WebGL (`webgl/`):**
-1. `python3 webgl/tests/make_nets.py <ml-fg>/export g2v2 m2v2 g2v3 m2v3` (`NAME=DIR` maps a differently named directory); it
+1. `python3 webgl/tests/make_nets.py <ml-fg>/export <name>...` (`NAME=DIR` maps a differently named directory); it
    writes `webgl/nets/<name>.js` with `variant` and the extractor offsets.
-2. Append the names to `ML_NETS` in `webgl/framegen.js` (and to the `HDR_NETS` list if they should be HDR-tested).
-3. Run `webgl/tests/run.sh learned learned-gpu`.
+2. Append the names to `ML_NETS` in `webgl/framegen.js` (and to the `HDR_NETS` list if they should be HDR-tested); bump
+   `__fg.version`.
+3. Run `webgl/tests/run.sh learned learned-gpu` (`--nets` / `--pairs` now filter the prep / synth too).
 
 ## What changed in round 3 (for browser-frame-gen and gamescope-ritz)
 
@@ -226,13 +311,13 @@ Round 2 was `6133a4a`. Round 3 is at `d4a71e3` and later (gpu `9cad3e6`, webgl `
 ### Settings and A/B for round 3 and 4
 
 ```sh
-gpu/build/fgtest --set algo=learned,learnedNet=c2smoke[,learnedHalf=1][,learnedZeroTest=0] ...   # round 4: colour stand-in
-gpu/build/fgtest --set algo=learned,learnedNet=c2feat ...                                        # round 4: learned-features stand-in
-gpu/build/uitest|formattest|blurtest check --algo learned --net c2smoke|c2feat
+gpu/build/fgtest --set algo=learned,learnedNet=g2v2|m2v2[,learnedHalf=1][,learnedZeroTest=0] ...   # round 4b: colour nets
+gpu/build/fgtest --set algo=learned,learnedNet=g2v3|m2v3 ...                                        # round 4b: learned-features nets
+gpu/build/uitest|formattest|blurtest check --algo learned --net g2v2|g2v3|m2v2|m2v3
 ```
 ```js
-engine.setSettings({ motionVersion: 1, motion: 'learned', motionNet: 'c2smoke' });   // round 4: colour (needs nets/c2smoke.js)
-engine.setSettings({ motionNet: 'c2feat' });                                          // round 4: learned features
+engine.setSettings({ motionVersion: 1, motion: 'learned', motionNet: 'g2v2' });   // round 4b: colour (needs nets/g2v2.js; m2v2 likewise)
+engine.setSettings({ motionNet: 'm2v3' });                                         // round 4b: learned features (g2v3 likewise)
 ```
 
 Round 3:
@@ -391,8 +476,8 @@ Round 1 was `fd5c163`. Round 2 is at `bb73df0` and later.
 | | Vulkan `gpu/framegen.h` `Settings` | WebGL `setSettings` / `createEngine` |
 |---|---|---|
 | Select Learned | `motionVersion = MotionVersion::Learned` (= 2) | `motionVersion: 1, motion: 'learned'` (V2 ignores `motion`) |
-| Net | `learnedNet`: **`LearnedNet::E2v5`** (= 4, default), `E1v5` (= 5, the small net), `E2v4` (= 2), `E1v4` (= 3), `E2v3` (= 0), `E1v3` (= 1), **`C2Smoke` (= 6, colour stand-in), `C2Feat` (= 7, features stand-in)** | `motionNet`: **`'e2v5'`** (default, `__fg.defaultNet`), `'e1v5'` (`__fg.smallNet`), `'e2v4'`, `'e1v4'`, `'e2v3'`, `'e1v3'`, **`'c2smoke'`, `'c2feat'`** |
-| Net by name | `framegen::learnedNetName()` / `learnedNetFromName()` (`"e2v5"`, ...), `kLearnedNets` = **8** | the strings above; `nets/<name>.js` must be loaded |
+| Net | `learnedNet`: **`LearnedNet::E2v5`** (= 4, default), `E1v5` (= 5, the small net), `E2v4` (= 2), `E1v4` (= 3), `E2v3` (= 0), `E1v3` (= 1), **`G2v2` (= 6, colour game), `G2v3` (= 7, features game), `M2v2` (= 8, colour allrounder), `M2v3` (= 9, features allrounder)** | `motionNet`: **`'e2v5'`** (default, `__fg.defaultNet`), `'e1v5'` (`__fg.smallNet`), `'e2v4'`, `'e1v4'`, `'e2v3'`, `'e1v3'`, **`'g2v2'`, `'g2v3'`, `'m2v2'`, `'m2v3'`** |
+| Net by name | `framegen::learnedNetName()` / `learnedNetFromName()` (`"e2v5"`, ...), `kLearnedNets` = **10** | the strings above; `nets/<name>.js` must be loaded |
 | Zero test | `learnedZeroTest` = **true** | `learnedZeroTest: true` |
 | Static guard | `learnedStaticGuard` = **false** | `learnedStaticGuard: false` |
 | Precision | `learnedHalf` = **false** (fp32 activations) | `motionPrecision: 'fp16'` (**default**) / `'fp32'` |
@@ -408,8 +493,8 @@ gpu/build/fgtest --set algo=learned,learnedZeroTest=0 ...                       
 gpu/build/fgtest --set algo=learned,learnedStaticGuard=1 ...                                      # + static guard
 gpu/build/fgtest --set algo=learned,learnedNet=e1v5[,learnedHalf=1] ...                           # the small net
 gpu/build/fgtest --set algo=learned,learnedNet=e2v4 ...                                           # round 2's default (byte-identical to 6133a4a)
-gpu/build/fgtest --set algo=learned,learnedNet=c2smoke ...                                         # round 4: colour stand-in (c2feat: features)
-gpu/build/uitest|formattest|blurtest check --algo learned [--zt 0|1] [--guard 0|1] [--net e2v5|e1v5|e2v4|e1v4|e2v3|e1v3|c2smoke|c2feat]
+gpu/build/fgtest --set algo=learned,learnedNet=g2v2 ...                                             # round 4b: colour (g2v3 / m2v3: features)
+gpu/build/uitest|formattest|blurtest check --algo learned [--zt 0|1] [--guard 0|1] [--net e2v5|e1v5|e2v4|e1v4|e2v3|e1v3|g2v2|g2v3|m2v2|m2v3]
 MLFG_EXPORT=<ml-fg>/export MLTEST_DUMP=<dir> gpu/build/mltest && python3 -I gpu/ml/synthcheck.py <dir>
 python3 -I gpu/ml/guardcheck.py W H a.rgba c.rgba off.rgba on.rgba DIR/pair_0000.fgmaps [--t T]    # guard vs static_guard.py
 ```
@@ -421,8 +506,8 @@ engine.setSettings({ learnedZeroTest: false });                       // A/B: no
 engine.setSettings({ learnedStaticGuard: true });                     // static guard (next synth)
 engine.setSettings({ motionNet: __fg.smallNet });                     // e1v5
 engine.setSettings({ motionNet: 'e2v4' });                            // A/B: round 2's default
-engine.setSettings({ motionNet: 'c2smoke' });                         // round 4: colour variant (nets/c2smoke.js loaded)
-engine.setSettings({ motionNet: 'c2feat' });                          // round 4: learned-features variant (nets/c2feat.js loaded)
+engine.setSettings({ motionNet: 'g2v2' });                            // round 4b: colour variant (nets/g2v2.js loaded; m2v2 likewise)
+engine.setSettings({ motionNet: 'm2v3' });                            // round 4b: learned-features variant (nets/m2v3.js loaded; g2v3 likewise)
 ```
 
 A gamescope host maps its own settings to `Settings::learnedZeroTest`, `learnedStaticGuard` and `learnedNet`. Use
@@ -430,19 +515,19 @@ A gamescope host maps its own settings to `Settings::learnedZeroTest`, `learnedS
 
 ## Files a host needs
 
-**Round 4 additions (read first):**
-- **gamescope-ritz (Vulkan):** embed **`gpu/ml/c2smoke/`** and **`gpu/ml/c2feat/`** (`manifest.json` + `weights.bin`; they keep the stand-in
-  names until the real nets arrive) and add the shaders **`gpu/shaders/ml_planes.comp`** and **`gpu/shaders/ml_feat.comp`**; changed
-  files: `ml_common.glsl`, `ml_match.comp`, `ml_pyr.comp`. `ml_planes` is also built per non-RGBA8 format
-  (`ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp', 'shaders/ml_planes.comp']`). meson `ml_nets` is now
-  `['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5', 'c2smoke', 'c2feat']` (the `LearnedNet` order) and `gpu/ml/embed_weights.py`
-  is the new variant-aware one. A host that does not embed the two new nets fails the `kMlNet` static_assert (`kLearnedNets` is 8).
-  Without `ml_planes` / `ml_feat`, Learned is refused as a whole (`kMlNotBuilt`).
-- **browser-frame-gen (WebGL):** vendor **`nets/c2smoke.js`** (608 KB) and **`nets/c2feat.js`** (623 KB) and the new shader
-  **`shaders/learned/rgb0.frag.glsl`** with the changed `learned/{lv0,down,match,conv,conv_h}.frag.glsl` (63 files, all in
-  `__fg.shaderFiles`; the set is checked: every listed file exists). `__fg.version` is `'6'`. A net that is selected but not loaded throws
+**Round 4 / 4b additions (read first):**
+- **gamescope-ritz (Vulkan):** embed **`gpu/ml/g2v2/`**, **`g2v3/`**, **`m2v2/`** and **`m2v3/`** (`manifest.json` + `weights.bin`) and
+  **drop `gpu/ml/c2smoke/` and `c2feat/`**. The round-4 shaders **`gpu/shaders/ml_planes.comp`** and **`gpu/shaders/ml_feat.comp`** stay;
+  changed files since round 3: `ml_common.glsl`, `ml_match.comp`, `ml_pyr.comp`. `ml_planes` is also built per non-RGBA8 format
+  (`ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp', 'shaders/ml_planes.comp']`). meson `ml_nets` has grown to
+  **10 nets**: `['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5', 'g2v2', 'g2v3', 'm2v2', 'm2v3']` (the `LearnedNet` order) and
+  `gpu/ml/embed_weights.py` is the variant-aware one. A host that does not embed the four nets fails the `kMlNet` static_assert
+  (`kLearnedNets` is 10). Without `ml_planes` / `ml_feat`, Learned is refused as a whole (`kMlNotBuilt`).
+- **browser-frame-gen (WebGL):** vendor **`nets/g2v2.js`**, **`g2v3.js`**, **`m2v2.js`** and **`m2v3.js`**, drop `nets/c2smoke.js` /
+  `c2feat.js`, and keep the round-4 shader **`shaders/learned/rgb0.frag.glsl`** with the changed `learned/{lv0,down,match,conv,conv_h}.frag.glsl`
+  (63 files, all in `__fg.shaderFiles`; the set is checked: every listed file exists). `__fg.version` is `'7'`. A net that is selected but not loaded throws
   a `RangeError` naming the file; a loaded one that does not match its variant throws one naming the channel counts.
-- Everything below is the round-3 list; the net lists there become eight.
+- Everything below is the round-3 list; the net lists there become ten.
 
 **gamescope-ritz (Vulkan), on top of round 1:**
 - Shaders (round 2; round 3 changed none): `gpu/shaders/ml_zero.comp`, `ml_guard.comp`, and `ml_guard` with
@@ -697,7 +782,7 @@ WebGL adds fw×fh RG32F ×2 + RGBA32F for the zero test (~16 MB at 1080p) and 2 
 - The cost guard steps e2v5 → e1v5 → V1. Through `__fg.defaultNet` / `__fg.smallNet` it needs no code change. For a colour or
   features net pick the fallback the same way: they cost about 20-45 % more than e2v5, so a guard that triggers on e2v5's cost
   triggers sooner on them.
-- Round 4: `__fg.version` is `'6'`; `motionNet: 'c2smoke' | 'c2feat'` with `nets/c2smoke.js` / `c2feat.js` loaded.
+- Round 4b: `__fg.version` is `'7'`; `motionNet: 'g2v2' | 'g2v3' | 'm2v2' | 'm2v3'` with `nets/<name>.js` loaded (the stand-ins are gone).
 - `__fg.version` is `'5'` (`'4'` in round 2). The fields `__fg.defaultNet`, `__fg.smallNet` and `debugRead('ml.pfNet' |
   'ml.ztCost' | 'ml.zt' | 'sg')` are unchanged since round 2.
 - The first `motion: 'learned'` compiles 22 programs (17 in round 1).
@@ -710,9 +795,9 @@ WebGL adds fw×fh RG32F ×2 + RGBA32F for the zero test (~16 MB at 1080p) and 2 
 | | Vulkan | WebGL |
 |---|---|---|
 | How it is selected | its own `MotionVersion::Learned` (= 2) | `motion: 'learned'` inside `motionVersion` 1 (V2 ignores it) |
-| Net | `learnedNet` (`E2v5` default / `E1v5` / `E2v4` / `E1v4` / `E2v3` / `E1v3` / `C2Smoke` / `C2Feat`) | `motionNet` (`'e2v5'` default / `'e1v5'` / `'e2v4'` / `'e1v4'` / `'e2v3'` / `'e1v3'` / `'c2smoke'` / `'c2feat'`) |
+| Net | `learnedNet` (`E2v5` default / `E1v5` / `E2v4` / `E1v4` / `E2v3` / `E1v3` / `G2v2` / `G2v3` / `M2v2` / `M2v3`) | `motionNet` (`'e2v5'` default / `'e1v5'` / `'e2v4'` / `'e1v4'` / `'e2v3'` / `'e1v3'` / `'g2v2'` / `'g2v3'` / `'m2v2'` / `'m2v3'`) |
 | Variant check | compile time (`static_assert` + `embed_weights.py`) | run time `RangeError` (`createEngine` / `setSettings`) |
-| Features cache | none | per-frame, keyed on `pushFrame` count (c2feat) |
+| Features cache | none | per-frame, keyed on `pushFrame` count (features nets) |
 | Small net | `LearnedNet::E1v5` (documented in `framegen.h`; no "small net" constant) | `__fg.smallNet` (`'e1v5'`) |
 | Precision | `learnedHalf` (bool, **default false = fp32**) | `motionPrecision` (`'fp16'` **default** / `'fp32'`) |
 | Zero test / guard | `learnedZeroTest` (true) / `learnedStaticGuard` (false) | the same names and defaults |
@@ -776,12 +861,16 @@ WebGL adds fw×fh RG32F ×2 + RGBA32F for the zero test (~16 MB at 1080p) and 2 
   old-net outputs are byte-identical to `6133a4a`. ANGLE/OpenGL was not re-run (worker: PASS).
 - (n) e2v5's `cut` vector sits 0.17 above the cut threshold with the zero test, and e1v5's crosses it (cut net-only, no cut with
   the zero test). Both backends agree with `vec.json`, but a cut test built on that pair is fragile; use `cut2`.
-- (o) Round 4 cost: the colour and features variants cost 34 % / 45 % more than e2v5 at fp32 (22 % / 37 % at half), above the
+- (o) Round 4 / 4b cost: the colour and features variants cost 32 % / 45 % more than e2v5 at fp32 (22 % / 37 % at half; real nets, Vulkan), above the
   spec's +12 %. The worker's explanation (level-0 traffic, 36 KB LDS) is unverified and nothing is tuned.
-- (p) Round 4: the CrosshairV2 luma fill does not patch the chroma / RGB planes; `formattest --algo learned` fails 7 (c2smoke) /
-  3 (c2feat) checks against 3 (e2v5); Vulkan has no features cache (WebGL has).
+- (p) The CrosshairV2 luma fill does not patch the chroma / RGB planes; Vulkan has no features cache (WebGL has). Round 4's
+  `formattest --algo learned` fails 7 (c2smoke) / 3 (c2feat) checks against 3 (e2v5) showed extra CrosshairV2 artifact-px lines on the
+  stand-ins; **not re-checked on the real nets**.
 - (q) Round 4 QC did not re-run GPU-AV / syncval, the HUD crops, `guardcheck.py`, WebGL `golden` / `xbackend` / `hdr` / `blur`
   (only the direct bit-diff of V1 / V2 / old nets against `4bae33a`), ANGLE/OpenGL, WebGL cost or the stand-in nets on real
   footage (they are 600-step smoke nets).
-- (r) The WebGL fp32 thin margin has moved: `hd`, t = 0.25, zero test on: c2smoke 73.8 dB on ANGLE/Vulkan (gate 70).
+- (r) The WebGL fp32 thin margin moved in round 4: `hd`, t = 0.25, zero test on: c2smoke (stand-in) 73.8 dB on ANGLE/Vulkan (gate 70). Not re-measured for the real nets.
 - (s) Resolved: `webgl/README.md` now says version `'6'` and eight nets.
+- (t) Round 4b, WebGL: **SwiftShader and ANGLE/GL were not run for g2v2 / g2v3 / m2v2 / m2v3** (only ANGLE/Vulkan on RADV). The
+  round-4 stand-ins with identical shapes passed on all three backends. The Vulkan 4b results are worker figures, not an independent QC re-run.
+- (u) Round 4b WebGL cost figures are noisy (shared GPU). The Vulkan variants stay untuned (+32 % / +45 % at fp32).
