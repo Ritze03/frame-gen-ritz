@@ -27,6 +27,10 @@ sys.path.insert(0, os.path.join(HERE, '..', '..', 'proto'))
 import interp  # noqa: E402  (FGR's synthesis, unchanged)
 
 
+# export directory of a net where it differs from its name (the colour / features variants' test stand-ins; mltest.cpp runDir())
+EXPORT_DIR = {'c2smoke': 'c2smoke-colour', 'c2feat': 'c2smoke-features'}
+
+
 def psnr(x, y):
     d = np.mean((x.astype(np.float64) - y.astype(np.float64)) ** 2)
     return float('inf') if d == 0 else 10 * np.log10(255.0 ** 2 / d)
@@ -57,7 +61,7 @@ def main():
     fails = 0
     for path in sorted(glob.glob(os.path.join(args.dump, '*_*_*.f32'))):
         run, pair, kind = os.path.basename(path)[:-4].split('_')
-        d = os.path.join(args.export, run, 'testvec', pair)
+        d = os.path.join(args.export, EXPORT_DIR.get(run, run), 'testvec', pair)
         with open(os.path.join(d, 'vec.json')) as f:
             v = json.load(f)
         with open(path[:-4] + '.json') as f:

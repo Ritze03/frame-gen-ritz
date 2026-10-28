@@ -7,6 +7,10 @@
 //   MLTEST_DUMP  a directory (created): per net and pair the library's pf, `<run>_<pair>_{ref,fgr}.f32` ([fh][fw][2] float32) and
 //                `<run>_<pair>_{ref,fgr}.json` (sad, cut; also refh / fgrh = learnedHalf, and the zero test's kinds below), for gpu/ml/synthcheck.py (the end-to-end dB check through proto/interp.py).
 //
+// c2smoke (the stand-in of the colour variant, ml-fg export/c2smoke-colour, SPEC.md section 10): the nine pairs of e2v5 plus `colour`,
+// 25 input channels (in_top), the flow-res chroma planes (ca.f32 / cc.f32) read back from the net's chroma pyramids, the max pf
+// tolerance 0.15 px.
+//
 // Per net (e2v3: static motion far cut odd hd overlay; e1v3: motion cut odd overlay; e2v4: static motion far cut cut2 odd hd overlay;
 // e1v4: motion cut cut2 odd overlay; e2v5: static motion far cut cut2 odd hd overlay; e1v5: motion cut cut2 odd overlay) and pair,
 // SPEC.md section 8 in order (steps 1-6 with Settings::learnedZeroTest off: the net's own field):
@@ -41,7 +45,9 @@
 using namespace framegen;
 
 // ---- tolerances: ml-fg reference.py PF_MAX_TOL, PF_MEAN_TOL, SAD_TOL, TOP_TOL (SPEC.md section 8)
-static const double kPfMaxTol = 5e-2, kPfMeanTol = 2e-4, kSadTol = 1e-3, kTopTol = 5e-5;
+// (colour nets: SPEC.md section 8 / 10, reference.py PF_MAX_TOL_COLOUR: the max pf tolerance is 0.15 px, they amplify fp32 noise ~3x more;
+// the flow-res chroma planes within CHROMA_TOL levels)
+static const double kPfMaxTol = 5e-2, kPfMaxTolColour = 1.5e-1, kPfMeanTol = 2e-4, kSadTol = 1e-3, kTopTol = 5e-5, kChromaTol = 2e-3, kFeatTol = 1e-4;   // (features nets: the same pf tolerance as colour; maps FEAT_TOL, RGB planes RGB_TOL)
 
 // ---- Vulkan context, created by the first case that needs it
 static VkInstance inst;
@@ -211,6 +217,8 @@ static std::string exportDir() {
     const char* e = getenv("MLFG_EXPORT");
     return e && *e ? e : "/home/mo/Schinken/Programming/Local/ml-fg/export";
 }
+// the export directory of a net: its name, except the test stand-in of the colour variant (the real g2v2 / m2v2 are g2v2 / m2v2)
+static std::string runDir(const std::string& run) { return run == "c2smoke" ? "c2smoke-colour" : run == "c2feat" ? "c2smoke-features" : run; }
 static bool readFile(const std::string& path, std::vector<uint8_t>& out) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -398,7 +406,7 @@ static void dumpPf(const std::string& net, const std::string& pair, const char* 
 }
 
 static void zeroChecks(const char* run, const char* pair, const std::string& dir, const std::string& js, const Settings& s, Rig& rig,
-                       const std::vector<float>& expPf, int fw, int fh);
+                       const std::vector<float>& expPf, int fw, int fh, bool colour);
 
 // The LearnedNet of an export run (its directory name = framegen::learnedNetName). A new net: its TEST_CASEs below.
 static LearnedNet netOf(const char* run) {
@@ -411,7 +419,7 @@ static LearnedNet netOf(const char* run) {
 // The whole SPEC.md section 8 procedure for one net and pair (see the top of the file), then the zero test's (zeroChecks).
 static void checkPair(const char* run, const char* pair) {
     const LearnedNet net = netOf(run);
-    const std::string dir = exportDir() + "/" + run + "/testvec/" + pair + "/";
+    const std::string dir = exportDir() + "/" + runDir(run) + "/testvec/" + pair + "/";
     INFO(run << " " << pair << " (" << dir << ")");
     std::vector<uint8_t> js8, pa, pc;
     uint32_t W = 0, H = 0, W2 = 0, H2 = 0;
@@ -450,6 +458,66 @@ static void checkPair(const char* run, const char* pair) {
     Interpolator::DebugLearnedLayout L{};
     REQUIRE(rig.fg.debugLearnedLayout(L));
     REQUIRE((L.fw == (uint32_t)fw && L.fh == (uint32_t)fh));
+    const bool colour = L.ext != 0;   // an extra-plane variant (colour, features: SPEC.md sections 10, 11): the 0.15 px tolerance, 14 + ext + 9 inputs
+    const double pfMaxTol = colour ? kPfMaxTolColour : kPfMaxTol;
+    // colour nets: the flow-res chroma planes the library computed (level 0 of its chroma pyramids, x 255) against ca.f32 / cc.f32
+    // (not given for hd): within CHROMA_TOL levels. Both runs below use them (the lumaSrc hook replaces the luma only).
+    double chromaMax = 0;
+    if (L.scr) {   // features nets: RGB planes (ra.f32 / rc.f32, within RGB_TOL = CHROMA_TOL levels, from the scratch pyramids' level 0) and the
+                   // extractor's maps per level (feat_a_l*.f32 / feat_c_l*.f32, within FEAT_TOL 1e-4), the sharp bisection of SPEC.md section 11.7
+        std::vector<float> era, erc;
+        if (readF32(dir + "ra.f32", era) && readF32(dir + "rc.f32", erc)) {
+            REQUIRE((era.size() == (size_t)3 * fw * fh && erc.size() == era.size()));
+            for (int c = 0; c < 3; c++)
+                for (int which = 0; which < 2; which++) {
+                    const std::vector<float>& e = which ? erc : era;
+                    const float* g = (const float*)(rig.dbg.map + L.sOff[0]) + (size_t)(2 * c + which) * L.pw * L.ph;
+                    for (int j = 0; j < fh; j++)
+                        for (int i = 0; i < fw; i++)
+                            chromaMax = std::max(chromaMax, std::fabs((double)g[(size_t)j * L.pw + i] * 255.0 - e[((size_t)c * fh + j) * fw + i]));
+                }
+            printf("  %s %-6s RGB planes: max |d| %.2e levels (tolerance %.0e)\n", run, pair, chromaMax, kChromaTol);
+            CHECK(chromaMax <= kChromaTol);
+        }
+        for (int l = 4; l >= 0; l--) {
+            const size_t n = (size_t)(L.pw >> l) * (L.ph >> l);
+            double fm = 0;
+            bool any = false;
+            for (int which = 0; which < 2; which++) {
+                std::vector<float> e;
+                if (!readF32(dir + (which ? "feat_c_l" : "feat_a_l") + std::to_string(l) + ".f32", e)) continue;
+                any = true;
+                REQUIRE(e.size() == 4 * n);
+                for (int j = 0; j < 4; j++) {
+                    const float* g = (const float*)(rig.dbg.map + L.xOff[l]) + (size_t)(2 * j + which) * n;
+                    fm = std::max(fm, diff(g, &e[(size_t)j * n], n).max);
+                }
+            }
+            if (any) {
+                printf("  %s %-6s feature maps level %d: max |d| %.2e (tolerance %.0e)\n", run, pair, l, fm, kFeatTol);
+                CHECK(fm <= kFeatTol);
+            }
+        }
+    }
+    if (colour && !L.scr) {
+        std::vector<float> eca, ecc;
+        const bool have = readF32(dir + "ca.f32", eca) && readF32(dir + "cc.f32", ecc);
+        if (have) {
+            REQUIRE((eca.size() == (size_t)2 * fw * fh && ecc.size() == eca.size()));
+            for (int p = 0; p < 2; p++)
+                for (int which = 0; which < 2; which++) {
+                    const std::vector<float>& e = which ? ecc : eca;
+                    const float* g = (const float*)(rig.dbg.map + L.xOff[0]) + (size_t)(2 * p + which) * L.pw * L.ph;
+                    for (int j = 0; j < fh; j++)
+                        for (int i = 0; i < fw; i++)
+                            chromaMax = std::max(chromaMax, std::fabs((double)g[(size_t)j * L.pw + i] * 255.0 - e[((size_t)p * fh + j) * fw + i]));
+                }
+            printf("  %s %-6s chroma planes: max |d| %.2e levels (tolerance %.0e)\n", run, pair, chromaMax, kChromaTol);
+            CHECK(chromaMax <= kChromaTol);
+        } else {
+            printf("  %s %-6s chroma planes: no ca.f32 / cc.f32 (not checked)\n", run, pair);
+        }
+    }
     auto lumaOf = [&](int which) {   // the flow-res luma the net read, from its level-0 pyramid (luma / 255, correctly rounded)
         std::vector<float> y((size_t)fw * fh);
         const float* p = (const float*)(rig.dbg.map + L.pyrOff[0]) + (which ? (size_t)L.pw * L.ph : 0);
@@ -532,7 +600,7 @@ static void checkPair(const char* run, const char* pair) {
         printf("  %s %-6s ref: h_level%d max %.2e mean %.2e px\n", run, pair, l, st.max, st.mean);
         lvMax = std::max(lvMax, st.max);
         lvMean = std::max(lvMean, st.mean);
-        CHECK(st.max <= kPfMaxTol);
+        CHECK(st.max <= pfMaxTol);
         CHECK(st.mean <= kPfMeanTol);
     }
     const Stat refPf = diff(rig.pf.data(), expPf.data(), expPf.size());
@@ -540,7 +608,7 @@ static void checkPair(const char* run, const char* pair) {
     const bool refCut = refSad > s.sceneCutSad;
     printf("  %s %-6s ref: pf max %.2e mean %.2e px, sad %.4f vs %.4f (rel %.1e), cut %d vs %d\n", run, pair, refPf.max, refPf.mean,
            refSad, expSad, sadRel, refCut, expCut);
-    CHECK(refPf.max <= kPfMaxTol);
+    CHECK(refPf.max <= pfMaxTol);
     CHECK(refPf.mean <= kPfMeanTol);
     CHECK(sadRel <= kSadTol);
     CHECK(refCut == expCut);
@@ -556,7 +624,7 @@ static void checkPair(const char* run, const char* pair) {
         std::string name = step == 0 ? "in_top" : step == 5 ? "raw_top" : "act_top" + std::to_string(step - 1);
         std::vector<float> e;
         REQUIRE(readF32(dir + name + ".f32", e));
-        const int ch = step == 0 ? 14 : step == 5 ? 2 : width;
+        const int ch = step == 0 ? (colour ? 14 + (int)L.ext + 9 : 14) : step == 5 ? 2 : width;
         REQUIRE(e.size() == (size_t)ch * tn);
         std::vector<float> g((size_t)ch * tn);
         if (step == 5) {
@@ -592,7 +660,7 @@ static void checkPair(const char* run, const char* pair) {
            "fgr pf max %.2e mean %.2e sad %.4f (exp %.4f) cut %s\n", run, pair, haveY ? "exact" : "(none)", topMax, lvMax, lvMean,
            refPf.max, refPf.mean, sadRel, refCut == expCut ? "same" : "DIFFERENT", fgrPf.max, fgrPf.mean, fgrSad, expSad,
            fgrCut == expCut ? "same" : "DIFFERENT");
-    zeroChecks(run, pair, dir, js, s, rig, expPf, fw, fh);
+    zeroChecks(run, pair, dir, js, s, rig, expPf, fw, fh, colour);
 }
 
 // ---- Settings::learnedZeroTest (SPEC.md stage 7; section 8 step 7 and its tolerances) against the pair's *_zt vectors, five ways:
@@ -607,7 +675,7 @@ static void checkPair(const char* run, const char* pair) {
 // Each run's field is dumped as <run>_<pair>_<kind> for synthcheck.py (which compares it with synth(pf_zt.f32, sad_zt)).
 static const double kZeroAgree = 0.999, kCostTol = 2e-3;   // reference.py ZERO_AGREE, COST_TOL
 static void zeroChecks(const char* run, const char* pair, const std::string& dir, const std::string& js, const Settings& s, Rig& rig,
-                       const std::vector<float>& expPf, int fw, int fh) {
+                       const std::vector<float>& expPf, int fw, int fh, bool colour) {
     std::vector<float> expZt, eCh, eC0;
     std::vector<uint8_t> expMask;
     if (!readF32(dir + "pf_zt.f32", expZt) || !readFile(dir + "zero_zt.u8", expMask)) {
@@ -666,7 +734,7 @@ static void zeroChecks(const char* run, const char* pair, const std::string& dir
         CHECK(cut == expCut);
         if (z.ref && !z.half) {   // the exact float32 port's gates
             CHECK(agreeFrac >= kZeroAgree);
-            CHECK(pfMax <= kPfMaxTol);
+            CHECK(pfMax <= (colour ? kPfMaxTolColour : kPfMaxTol));
             CHECK(pfMean <= kPfMeanTol);
             CHECK(rel <= kSadTol);
             if (haveCost && z.stage) { CHECK(chS.max <= kCostTol); CHECK(c0S.max <= kCostTol); }
@@ -718,6 +786,32 @@ TEST_CASE("e1v5 cut", "[vectors][e1v5]") { checkPair("e1v5", "cut"); }
 TEST_CASE("e1v5 cut2", "[vectors][e1v5]") { checkPair("e1v5", "cut2"); }
 TEST_CASE("e1v5 odd", "[vectors][e1v5]") { checkPair("e1v5", "odd"); }
 TEST_CASE("e1v5 overlay", "[vectors][e1v5]") { checkPair("e1v5", "overlay"); }
+
+// c2smoke: the stand-in of the colour variant. Its cut decisions come from vec.json (cut = the net alone, cut_zt = with the zero test).
+// "colour" is the chroma-only pair: a port that ignores chroma fails its pf check by several px (SPEC.md section 10.6); with the zero test
+// on it is 100 % zeroed (the luma-only zero test, section 10.4)
+TEST_CASE("c2smoke static", "[vectors][c2smoke]") { checkPair("c2smoke", "static"); }
+TEST_CASE("c2smoke motion", "[vectors][c2smoke]") { checkPair("c2smoke", "motion"); }
+TEST_CASE("c2smoke far", "[vectors][c2smoke]") { checkPair("c2smoke", "far"); }
+TEST_CASE("c2smoke cut", "[vectors][c2smoke]") { checkPair("c2smoke", "cut"); }
+TEST_CASE("c2smoke cut2", "[vectors][c2smoke]") { checkPair("c2smoke", "cut2"); }
+TEST_CASE("c2smoke odd", "[vectors][c2smoke]") { checkPair("c2smoke", "odd"); }
+TEST_CASE("c2smoke hd", "[vectors][c2smoke]") { checkPair("c2smoke", "hd"); }
+TEST_CASE("c2smoke overlay", "[vectors][c2smoke]") { checkPair("c2smoke", "overlay"); }
+TEST_CASE("c2smoke colour", "[vectors][c2smoke]") { checkPair("c2smoke", "colour"); }
+
+// c2feat: the stand-in of the learned-features variant (ml-fg export/c2smoke-features, SPEC.md section 11): the same nine-pair set with `features`
+// (the chroma-only picture again) instead of `colour`; 27 inputs, the RGB planes and the extractor's maps checked per level on the pairs
+// that have them (features, motion), tolerance 0.15 px.
+TEST_CASE("c2feat static", "[vectors][c2feat]") { checkPair("c2feat", "static"); }
+TEST_CASE("c2feat motion", "[vectors][c2feat]") { checkPair("c2feat", "motion"); }
+TEST_CASE("c2feat far", "[vectors][c2feat]") { checkPair("c2feat", "far"); }
+TEST_CASE("c2feat cut", "[vectors][c2feat]") { checkPair("c2feat", "cut"); }
+TEST_CASE("c2feat cut2", "[vectors][c2feat]") { checkPair("c2feat", "cut2"); }
+TEST_CASE("c2feat odd", "[vectors][c2feat]") { checkPair("c2feat", "odd"); }
+TEST_CASE("c2feat hd", "[vectors][c2feat]") { checkPair("c2feat", "hd"); }
+TEST_CASE("c2feat overlay", "[vectors][c2feat]") { checkPair("c2feat", "overlay"); }
+TEST_CASE("c2feat features", "[vectors][c2feat]") { checkPair("c2feat", "features"); }
 
 // ---- duplicates (shaders/ml_dup.comp: FGR's DUP_DIFF test)
 // A frame of the motion pair (or a smooth synthetic one if the vectors are missing)
@@ -793,6 +887,8 @@ TEST_CASE("e2v4 duplicate frames", "[dup][e2v4]") { duplicateCase(LearnedNet::E2
 TEST_CASE("e1v4 duplicate frames", "[dup][e1v4]") { duplicateCase(LearnedNet::E1v4); }
 TEST_CASE("e2v5 duplicate frames", "[dup][e2v5]") { duplicateCase(LearnedNet::E2v5); }
 TEST_CASE("e1v5 duplicate frames", "[dup][e1v5]") { duplicateCase(LearnedNet::E1v5); }
+TEST_CASE("c2smoke duplicate frames", "[dup][c2smoke]") { duplicateCase(LearnedNet::C2Smoke); }
+TEST_CASE("c2feat duplicate frames", "[dup][c2feat]") { duplicateCase(LearnedNet::C2Feat); }
 
 // ---- the settings API
 TEST_CASE("Learned settings", "[api]") {
@@ -814,6 +910,12 @@ TEST_CASE("Learned settings", "[api]") {
     CHECK(!strcmp(learnedNetName(LearnedNet::E2v4), "e2v4"));
     CHECK(!strcmp(learnedNetName(LearnedNet::E2v5), "e2v5"));
     CHECK(!strcmp(learnedNetName(LearnedNet::E1v5), "e1v5"));
+    CHECK(!strcmp(learnedNetName(LearnedNet::C2Smoke), "c2smoke"));
+    CHECK((uint32_t)LearnedNet::E1v5 == 5);    // the values are never renumbered
+    CHECK((uint32_t)LearnedNet::C2Smoke == 6);
+    CHECK(!strcmp(learnedNetName(LearnedNet::C2Feat), "c2feat"));
+    CHECK((uint32_t)LearnedNet::C2Feat == 7);
+    CHECK(kLearnedNets == 8);
     LearnedNet byName = LearnedNet::E2v3;
     CHECK(learnedNetFromName("e1v3", &byName));
     CHECK(byName == LearnedNet::E1v3);
@@ -867,6 +969,23 @@ TEST_CASE("Learned settings", "[api]") {
     REQUIRE(rig.run(true, false));
     CHECK(rig.pf != pf4);
     CHECK(rig.pf != pf3);
+    const std::vector<float> pf5 = rig.pf;
+    s.learnedNet = LearnedNet::C2Smoke;   // the colour variant: the state grows (its extra planes), another input layout
+    REQUIRE(rig.fg.setSettings(s));
+    REQUIRE(rig.run(true, false));
+    CHECK(rig.pf != pf5);
+    s.learnedNet = LearnedNet::E2v5;      // and back: the same field as before (the luma variant ignores the grown state)
+    REQUIRE(rig.fg.setSettings(s));
+    REQUIRE(rig.run(true, false));
+    CHECK(rig.pf == pf5);
+    s.learnedNet = LearnedNet::C2Feat;    // the features variant: the state grows again (RGB scratch pyramids)
+    REQUIRE(rig.fg.setSettings(s));
+    REQUIRE(rig.run(true, false));
+    CHECK(rig.pf != pf5);
+    s.learnedNet = LearnedNet::E2v5;
+    REQUIRE(rig.fg.setSettings(s));
+    REQUIRE(rig.run(true, false));
+    CHECK(rig.pf == pf5);
     REQUIRE(rig.fg.setSettings(Settings{}));
     rig.fg.releaseUnusedMotion();
     REQUIRE(rig.run(true, false));

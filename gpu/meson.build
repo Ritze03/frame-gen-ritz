@@ -21,12 +21,12 @@ shaders = shader_gen.process(
   'shaders/v2_qfield.comp', 'shaders/v2_qown.comp', 'shaders/v2_qcov.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_static.comp', 'shaders/v2_enclose.comp',
   'shaders/v2_morph_s.comp', 'shaders/v2_qmorph_s.comp',
   'shaders/ml_dup.comp', 'shaders/ml_reduce.comp', 'shaders/ml_pyr.comp', 'shaders/ml_match.comp', 'shaders/ml_conv.comp', 'shaders/ml_out.comp',
-  'shaders/ml_zero.comp', 'shaders/ml_guard.comp')
+  'shaders/ml_zero.comp', 'shaders/ml_guard.comp', 'shaders/ml_planes.comp', 'shaders/ml_feat.comp')
 
 # MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked
 # against the manifest (sha256, shapes, offsets) and re-laid out for shaders/ml_conv.comp. Order = LearnedNet (E2v3, E1v3, E2v4, E1v4,
-# E2v5, E1v5): a new net is appended here and in framegen.cpp kMlNetInfo / kMlNet.
-ml_nets = ['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5']
+# E2v5, E1v5, C2Smoke, C2Feat): a new net is appended here and in framegen.cpp kMlNetInfo / kMlNet.
+ml_nets = ['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5', 'c2smoke', 'c2feat']
 python = find_program('python3')
 ml_inputs = ['ml/embed_weights.py']
 ml_args = [python, '-I', '@INPUT0@', '@OUTPUT@']
@@ -47,8 +47,8 @@ chroma_srcs = ['shaders/ui_inpaint_chroma.comp', 'shaders/ui_patch_chroma.comp']
 # MotionVersion::V2: only its synthesis reads and writes colour (both modes, with and without the static-overlay tests; YUV: both
 # planes); its other passes read the luma, which luma.comp already gives per format
 v2_colour_srcs = ['shaders/v2_morph.comp', 'shaders/v2_morph_s.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_qmorph_s.comp']
-# MotionVersion::Learned: only its duplicate test and its static guard read colour; the net and the zero test read the luma
-ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp']
+# MotionVersion::Learned: only its duplicate test, its static guard and the colour variant's chroma planes read colour; the net and the zero test read the luma
+ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp', 'shaders/ml_planes.comp']
 variant_shaders = []
 foreach f : get_option('formats')
   g = generator(glslang,

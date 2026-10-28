@@ -3,7 +3,8 @@
 // MotionVersion::Learned, SPEC.md stage 3: the net's own pyramid (not V1's: padded, 5 levels, exact 2x2 means). One workgroup per
 // 16x16 tile of the padded level 0, which is one pixel of level 4. Level 0 = the flow-res luma of P_LUMA (luma[offYa], fw x fh),
 // edge-replicated to pw x ph, / 255 (correctly rounded, as numpy's float32 division); level l + 1 = ((P(2x, 2y) + P(2x+1, 2y)) +
-// (P(2x, 2y+1) + P(2x+1, 2y+1))) * 0.25, in that order (reference.py pyramid()).
+// (P(2x, 2y+1) + P(2x+1, 2y+1))) * 0.25, in that order (reference.py pyramid()). A colour net (pc.nin = 2) runs the same for its two
+// chroma planes (ml_planes.comp's, signed), a features net (3) for its R, G, B planes, reference.py pyramids().
 #include "common.glsl"
 #include "ml_common.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -27,15 +28,28 @@ float div255(float x) {
     return abs(rem255(x, n)) < abs(e) ? n : q;
 }
 
+float div255s(float x) { return x < 0.0 ? -div255(-x) : div255(x); }   // (numpy's division is sign-symmetric)
+
+// The source of plane pl (0 = the luma of P_LUMA, 1 .. nin = the variant's planes of ml_planes.comp) of frame f at flow pixel s,
+// and where its level lv goes (mlPyr: the luma, mlX: the extra planes; a at + 0, c at + mlN(lv))
+float srcAt(int pl, int f, ivec2 s) {
+    if (pl == 0) return luma[(f != 0 ? pc.offYc : pc.offYa) + s.y * pc.fw + s.x];
+    return ml[mlFlowX() + (2 * (pl - 1) + f) * pc.fw * pc.fh + s.y * pc.fw + s.x];
+}
+int dstAt(int pl, int lv, int f) {   // (a features net's RGB goes to its scratch pyramids: ml_feat.comp makes the matched maps from them)
+    return (pl == 0 ? mlPyr(lv) : (pc.feat != 0 ? mlScr(lv) : mlX(lv)) + 2 * (pl - 1) * mlN(lv)) + f * mlN(lv);
+}
+
 void main() {
     ivec2 l = ivec2(gl_LocalInvocationID.xy);
     ivec2 q = ivec2(gl_GlobalInvocationID.xy);   // the dispatch covers pw x ph exactly (multiples of 16)
     int lid = l.y * 16 + l.x;
     ivec2 s = min(q, ivec2(pc.fw - 1, pc.fh - 1));   // edge replication (right and bottom only)
-    float a = div255(luma[pc.offYa + s.y * pc.fw + s.x]);
-    float c = div255(luma[pc.offYc + s.y * pc.fw + s.x]);
-    ml[mlPyr(0) + q.y * pc.pw + q.x] = a;
-    ml[mlPyr(0) + mlN(0) + q.y * pc.pw + q.x] = c;
+    for (int pl = 0; pl <= pc.nin; pl++) {   // the luma, then each extra plane (SPEC.md section 10.2: the same pad, / 255 and means)
+    float a = div255s(srcAt(pl, 0, s));
+    float c = div255s(srcAt(pl, 1, s));
+    ml[dstAt(pl, 0, 0) + q.y * pc.pw + q.x] = a;
+    ml[dstAt(pl, 0, 1) + q.y * pc.pw + q.x] = c;
     sa[lid] = a;
     sc[lid] = c;
     barrier();
@@ -53,9 +67,10 @@ void main() {
             sc[lid] = nc;
             int w = pc.pw >> lv;
             ivec2 o = ivec2(gl_WorkGroupID.xy) * n + l;
-            ml[mlPyr(lv) + o.y * w + o.x] = na;
-            ml[mlPyr(lv) + mlN(lv) + o.y * w + o.x] = nc;
+            ml[dstAt(pl, lv, 0) + o.y * w + o.x] = na;
+            ml[dstAt(pl, lv, 1) + o.y * w + o.x] = nc;
         }
         barrier();
+    }
     }
 }

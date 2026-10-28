@@ -1,0 +1,62 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::Learned, the net variants' per-frame flow-res planes (a colour pass: one variant per format), for both frames, the
+// mean of the valid pixels of each 2x2 cell (the luma's area average) of:
+//   a colour net (pc.feat == 0, ml-fg export/SPEC.md section 10.1, reference.py flow_chroma()): Cb = 0.564 (B - Yf), Cr = 0.713 (R - Yf),
+//     Yf = 0.299 R + 0.587 G + 0.114 B the UNROUNDED float luma (not P_LUMA's integer one), no offset, in 8-bit levels;
+//   a features net (pc.feat == 1, section 11.1, reference.py flow_rgb()): R, G, B in 8-bit levels (multiples of 0.25: exact).
+// One thread per flow pixel; the output goes to ml_common.glsl's flow-res planes (mlFlowX: plane p of frame f at (2 p + f) fw fh),
+// ml_pyr.comp pads / scales / pyramids them. Same pixels as P_LUMA reads (texPrev / texCurr). Float32 in the order of numpy: no
+// contraction (precise), (R * .299 + G * .587) + B * .114, cells summed (p00 + p01) + (p10 + p11).
+// Other formats: the R'G'B' levels of the format's mismatch metric (format.glsl, as ml_dup.comp), YCbCr converted to R'G'B'.
+#include "common.glsl"
+#include "ml_common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+vec3 rgbLevels(bool cur, ivec2 p) {
+#if defined(FG_YUV)
+    float y = fgLuma(cur ? texelFetch(texCurr, p, 0).r : texelFetch(texPrev, p, 0).r);
+    vec2 c = (cur ? texelFetch(texCurrC, p >> 1, 0).rg : texelFetch(texPrevC, p >> 1, 0).rg) * YU_SCALE - 128.0;   // (Cb, Cr)
+    return vec3(y + YU_RCR * c.y, y + YU_GCB * c.x + YU_GCR * c.y, y + YU_BCB * c.x);
+#elif defined(FG_FORMAT_F16)
+    return fgMetric((cur ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0)).rgb);
+#else
+    return FG_FETCH((cur ? texelFetch(texCurr, p, 0) : texelFetch(texPrev, p, 0)).rgb);
+#endif
+}
+
+void main() {
+    if (mlDup()) return;
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= pc.fw || o.y >= pc.fh) return;
+    const int at = o.y * pc.fw + o.x, pl = pc.fw * pc.fh;
+    for (int f = 0; f < 2; f++) {
+        precise float p0[4], p1[4], p2[4];   // the cell's four pixels of each plane
+        int n = 0;
+        for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 2; i++) {
+                ivec2 p = 2 * o + ivec2(i, j);
+                precise float a = 0.0, b = 0.0, c = 0.0;
+                if (p.x < pc.W && p.y < pc.H) {
+                    vec3 v = rgbLevels(f != 0, p);
+                    if (pc.feat != 0) {
+                        a = v.r; b = v.g; c = v.b;
+                    } else {
+                        precise float y = (v.r * 0.299 + v.g * 0.587) + v.b * 0.114;
+                        a = 0.564 * (v.b - y);   // Cb
+                        b = 0.713 * (v.r - y);   // Cr
+                    }
+                    n++;
+                }
+                p0[2 * j + i] = a;
+                p1[2 * j + i] = b;
+                p2[2 * j + i] = c;
+            }
+        precise float s0 = (p0[0] + p0[1]) + (p0[2] + p0[3]);
+        precise float s1 = (p1[0] + p1[1]) + (p1[2] + p1[3]);
+        precise float s2 = (p2[0] + p2[1]) + (p2[2] + p2[3]);
+        ml[mlFlowX() + f * pl + at] = n == 4 ? s0 * 0.25 : s0 / float(n);          // plane 0 (Cb | R) of frame f
+        ml[mlFlowX() + (2 + f) * pl + at] = n == 4 ? s1 * 0.25 : s1 / float(n);    // plane 1 (Cr | G)
+        if (pc.feat != 0) ml[mlFlowX() + (4 + f) * pl + at] = n == 4 ? s2 * 0.25 : s2 / float(n);   // plane 2 (B)
+    }
+}
