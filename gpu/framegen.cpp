@@ -297,7 +297,7 @@ constexpr int groups4(int c) { return (c + 3) / 4; }
 // variant is checked against the manifest's at build time (kMlVariant_<run>). Tests: mltest's TEST_CASEs, the --net help strings.
 struct MlNetInfo { const char* name; int width; MlVariant variant; };
 constexpr MlNetInfo kMlNetInfo[] = {{"e2v3", 24, MLV_LUMA}, {"e1v3", 12, MLV_LUMA}, {"e2v4", 24, MLV_LUMA}, {"e1v4", 12, MLV_LUMA},
-                                    {"e2v5", 24, MLV_LUMA}, {"e1v5", 12, MLV_LUMA}, {"g2v2", 24, MLV_COLOUR}, {"g2v3", 24, MLV_FEATURES}, {"m2v2", 24, MLV_COLOUR}};
+                                    {"e2v5", 24, MLV_LUMA}, {"e1v5", 12, MLV_LUMA}, {"g2v2", 24, MLV_COLOUR}, {"g2v3", 24, MLV_FEATURES}, {"m2v2", 24, MLV_COLOUR}, {"m2v3", 24, MLV_FEATURES}};
 constexpr int kMlNets = (int)(sizeof(kMlNetInfo) / sizeof(kMlNetInfo[0]));
 static_assert(kMlNets == (int)kLearnedNets, "a name and width per LearnedNet");
 #ifdef FG_HAVE_ML
@@ -305,7 +305,7 @@ static_assert(kMlNets == (int)kLearnedNets, "a name and width per LearnedNet");
 // (level, layer)'s weight / bias offsets (vec4 units, relative to the net's start in the weights buffer)
 struct MlNet { const uint32_t* w; size_t words; uint32_t width; uint32_t variant, inCh; const uint32_t* extr; const uint32_t (*table)[5][2]; };
 #define ML_NET(n) MlNet{kMlWeights_##n, sizeof(kMlWeights_##n) / 4, kMlWidth_##n, kMlVariant_##n, kMlInCh_##n, kMlExtr_##n, kMlTable_##n}
-constexpr MlNet kMlNet[] = {ML_NET(e2v3), ML_NET(e1v3), ML_NET(e2v4), ML_NET(e1v4), ML_NET(e2v5), ML_NET(e1v5), ML_NET(g2v2), ML_NET(g2v3), ML_NET(m2v2)};
+constexpr MlNet kMlNet[] = {ML_NET(e2v3), ML_NET(e1v3), ML_NET(e2v4), ML_NET(e1v4), ML_NET(e2v5), ML_NET(e1v5), ML_NET(g2v2), ML_NET(g2v3), ML_NET(m2v2), ML_NET(m2v3)};
 static_assert(sizeof(kMlNet) / sizeof(kMlNet[0]) == kMlNets, "an embedded net per LearnedNet");
 constexpr bool mlWidthsMatch() {
     for (int i = 0; i < kMlNets; i++)

@@ -47,7 +47,7 @@ using namespace framegen;
 // ---- tolerances: ml-fg reference.py PF_MAX_TOL, PF_MEAN_TOL, SAD_TOL, TOP_TOL (SPEC.md section 8)
 // (colour nets: SPEC.md section 8 / 10, reference.py PF_MAX_TOL_COLOUR: the max pf tolerance is 0.15 px, they amplify fp32 noise ~3x more;
 // the flow-res chroma planes within CHROMA_TOL levels)
-static const double kPfMaxTol = 5e-2, kPfMaxTolColour = 1.5e-1, kPfMeanTol = 2e-4, kSadTol = 1e-3, kTopTol = 5e-5, kChromaTol = 2e-3, kFeatTol = 1e-4;   // (features nets: the same pf tolerance as colour; maps FEAT_TOL, RGB planes RGB_TOL)
+static const double kPfMaxTol = 5e-2, kPfMaxTolColour = 1.5e-1, kPfMaxTolFeatures = 2.5e-1, kPfMeanTol = 2e-4, kSadTol = 1e-3, kTopTol = 5e-5, kChromaTol = 2e-3, kFeatTol = 1e-4;   // (features nets: pf tolerance kPfMaxTolFeatures = 0.25 px, ml-fg export/SPEC.md section 8 / 11.6 (PF_MAX_TOL_FEATURES, widened after the real m2v3 measured 0.154); maps FEAT_TOL, RGB planes RGB_TOL)
 
 // ---- Vulkan context, created by the first case that needs it
 static VkInstance inst;
@@ -404,7 +404,7 @@ static void dumpPf(const std::string& net, const std::string& pair, const char* 
 }
 
 static void zeroChecks(const char* run, const char* pair, const std::string& dir, const std::string& js, const Settings& s, Rig& rig,
-                       const std::vector<float>& expPf, int fw, int fh, bool colour);
+                       const std::vector<float>& expPf, int fw, int fh, bool colour, double pfMaxTol);
 
 // The LearnedNet of an export run (its directory name = framegen::learnedNetName). A new net: its TEST_CASEs below.
 static LearnedNet netOf(const char* run) {
@@ -457,7 +457,7 @@ static void checkPair(const char* run, const char* pair) {
     REQUIRE(rig.fg.debugLearnedLayout(L));
     REQUIRE((L.fw == (uint32_t)fw && L.fh == (uint32_t)fh));
     const bool colour = L.ext != 0;   // an extra-plane variant (colour, features: SPEC.md sections 10, 11): the 0.15 px tolerance, 14 + ext + 9 inputs
-    const double pfMaxTol = colour ? kPfMaxTolColour : kPfMaxTol;
+    const double pfMaxTol = L.scr ? kPfMaxTolFeatures : colour ? kPfMaxTolColour : kPfMaxTol;   // features 0.25 px (SPEC.md section 8 / 11.6), colour 0.15 px (section 10), luma 0.05 px
     // colour nets: the flow-res chroma planes the library computed (level 0 of its chroma pyramids, x 255) against ca.f32 / cc.f32
     // (not given for hd): within CHROMA_TOL levels. Both runs below use them (the lumaSrc hook replaces the luma only).
     double chromaMax = 0;
@@ -658,7 +658,7 @@ static void checkPair(const char* run, const char* pair) {
            "fgr pf max %.2e mean %.2e sad %.4f (exp %.4f) cut %s\n", run, pair, haveY ? "exact" : "(none)", topMax, lvMax, lvMean,
            refPf.max, refPf.mean, sadRel, refCut == expCut ? "same" : "DIFFERENT", fgrPf.max, fgrPf.mean, fgrSad, expSad,
            fgrCut == expCut ? "same" : "DIFFERENT");
-    zeroChecks(run, pair, dir, js, s, rig, expPf, fw, fh, colour);
+    zeroChecks(run, pair, dir, js, s, rig, expPf, fw, fh, colour, pfMaxTol);
 }
 
 // ---- Settings::learnedZeroTest (SPEC.md stage 7; section 8 step 7 and its tolerances) against the pair's *_zt vectors, five ways:
@@ -673,7 +673,7 @@ static void checkPair(const char* run, const char* pair) {
 // Each run's field is dumped as <run>_<pair>_<kind> for synthcheck.py (which compares it with synth(pf_zt.f32, sad_zt)).
 static const double kZeroAgree = 0.999, kCostTol = 2e-3;   // reference.py ZERO_AGREE, COST_TOL
 static void zeroChecks(const char* run, const char* pair, const std::string& dir, const std::string& js, const Settings& s, Rig& rig,
-                       const std::vector<float>& expPf, int fw, int fh, bool colour) {
+                       const std::vector<float>& expPf, int fw, int fh, bool colour, double pfMaxTol) {
     std::vector<float> expZt, eCh, eC0;
     std::vector<uint8_t> expMask;
     if (!readF32(dir + "pf_zt.f32", expZt) || !readFile(dir + "zero_zt.u8", expMask)) {
@@ -732,7 +732,7 @@ static void zeroChecks(const char* run, const char* pair, const std::string& dir
         CHECK(cut == expCut);
         if (z.ref && !z.half) {   // the exact float32 port's gates
             CHECK(agreeFrac >= kZeroAgree);
-            CHECK(pfMax <= (colour ? kPfMaxTolColour : kPfMaxTol));
+            CHECK(pfMax <= pfMaxTol);
             CHECK(pfMean <= kPfMeanTol);
             CHECK(rel <= kSadTol);
             if (haveCost && z.stage) { CHECK(chS.max <= kCostTol); CHECK(c0S.max <= kCostTol); }
@@ -800,7 +800,7 @@ TEST_CASE("g2v2 colour", "[vectors][g2v2]") { checkPair("g2v2", "colour"); }
 
 // g2v3: the learned-features variant (ml-fg export/g2v3, SPEC.md section 11): the same nine-pair set with `features`
 // (the chroma-only picture again) instead of `colour`; 27 inputs, the RGB planes and the extractor's maps checked per level on the pairs
-// that have them (features, motion), tolerance 0.15 px.
+// that have them (features, motion), max pf tolerance 0.25 px (SPEC.md section 8 / 11.6; was 0.15).
 TEST_CASE("g2v3 static", "[vectors][g2v3]") { checkPair("g2v3", "static"); }
 TEST_CASE("g2v3 motion", "[vectors][g2v3]") { checkPair("g2v3", "motion"); }
 TEST_CASE("g2v3 far", "[vectors][g2v3]") { checkPair("g2v3", "far"); }
@@ -821,6 +821,17 @@ TEST_CASE("m2v2 odd", "[vectors][m2v2]") { checkPair("m2v2", "odd"); }
 TEST_CASE("m2v2 hd", "[vectors][m2v2]") { checkPair("m2v2", "hd"); }
 TEST_CASE("m2v2 overlay", "[vectors][m2v2]") { checkPair("m2v2", "overlay"); }
 TEST_CASE("m2v2 colour", "[vectors][m2v2]") { checkPair("m2v2", "colour"); }
+
+// m2v3: the features variant, the allrounder: the g2v3 set again (cut decisions from vec.json), max pf tolerance 0.25 px
+TEST_CASE("m2v3 static", "[vectors][m2v3]") { checkPair("m2v3", "static"); }
+TEST_CASE("m2v3 motion", "[vectors][m2v3]") { checkPair("m2v3", "motion"); }
+TEST_CASE("m2v3 far", "[vectors][m2v3]") { checkPair("m2v3", "far"); }
+TEST_CASE("m2v3 cut", "[vectors][m2v3]") { checkPair("m2v3", "cut"); }
+TEST_CASE("m2v3 cut2", "[vectors][m2v3]") { checkPair("m2v3", "cut2"); }
+TEST_CASE("m2v3 odd", "[vectors][m2v3]") { checkPair("m2v3", "odd"); }
+TEST_CASE("m2v3 hd", "[vectors][m2v3]") { checkPair("m2v3", "hd"); }
+TEST_CASE("m2v3 overlay", "[vectors][m2v3]") { checkPair("m2v3", "overlay"); }
+TEST_CASE("m2v3 features", "[vectors][m2v3]") { checkPair("m2v3", "features"); }
 
 // ---- duplicates (shaders/ml_dup.comp: FGR's DUP_DIFF test)
 // A frame of the motion pair (or a smooth synthetic one if the vectors are missing)
@@ -899,6 +910,7 @@ TEST_CASE("e1v5 duplicate frames", "[dup][e1v5]") { duplicateCase(LearnedNet::E1
 TEST_CASE("g2v2 duplicate frames", "[dup][g2v2]") { duplicateCase(LearnedNet::G2v2); }
 TEST_CASE("g2v3 duplicate frames", "[dup][g2v3]") { duplicateCase(LearnedNet::G2v3); }
 TEST_CASE("m2v2 duplicate frames", "[dup][m2v2]") { duplicateCase(LearnedNet::M2v2); }
+TEST_CASE("m2v3 duplicate frames", "[dup][m2v3]") { duplicateCase(LearnedNet::M2v3); }
 
 // ---- the settings API
 TEST_CASE("Learned settings", "[api]") {
@@ -927,7 +939,9 @@ TEST_CASE("Learned settings", "[api]") {
     CHECK((uint32_t)LearnedNet::G2v3 == 7);
     CHECK(!strcmp(learnedNetName(LearnedNet::M2v2), "m2v2"));
     CHECK((uint32_t)LearnedNet::M2v2 == 8);
-    CHECK(kLearnedNets == 9);
+    CHECK(!strcmp(learnedNetName(LearnedNet::M2v3), "m2v3"));
+    CHECK((uint32_t)LearnedNet::M2v3 == 9);
+    CHECK(kLearnedNets == 10);
     LearnedNet byName = LearnedNet::E2v3;
     CHECK(learnedNetFromName("e1v3", &byName));
     CHECK(byName == LearnedNet::E1v3);
