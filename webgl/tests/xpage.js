@@ -208,6 +208,44 @@
       return R;
     },
 
+    // Learned / self-consistency blur job: { pair, W, H, settings, windows }. Per window: synthBlur vs the weighted average (as the
+    // engine's formula, in doubles, rounded once) of the engine's own synth(t_k) outputs, + the negative check "blur does not throw"
+    async runBlurSelf(job) {
+      const R = { w: {} };
+      try {
+        const a = new Uint8Array(await get(`pairs/${job.pair}/a.rgba`)), c = new Uint8Array(await get(`pairs/${job.pair}/c.rgba`));
+        engine.setSettings(job.settings);
+        engine.pushFrame({ width: job.W, height: job.H, data: a });
+        engine.pushFrame({ width: job.W, height: job.H, data: c });
+        engine.estimate();
+        const n = job.W * job.H;
+        for (const w of job.windows) {
+          const T = R.w[w.tag] = {};
+          const N = w.n, gauss = w.weights === 'gaussian';
+          const acc = new Float64Array(n * 3);
+          let ws = 0;
+          for (let k = 0; k < N; k++) {
+            const t = Math.min(Math.max(Math.fround(w.t0 + (w.t1 - w.t0) * (k + 0.5) / N), w.t0), w.t1);
+            const x = Math.fround((2 * k + 1 - N) / N);
+            const wt = Math.fround(gauss ? Math.exp(-2 * x * x) : 1);
+            ws += wt;
+            engine.synth(t, undefined);
+            const o = engine.debugRead('out').data;
+            for (let i = 0; i < n; i++) for (let q = 0; q < 3; q++) acc[i * 3 + q] += wt * o[i * 4 + q];
+          }
+          const ref = new Uint8Array(n * 4);
+          for (let i = 0; i < n; i++) for (let q = 0; q < 3; q++) ref[i * 4 + q] = Math.round(acc[i * 3 + q] / ws);
+          engine.setSettings({ blurSamples: N, blurWeights: w.weights });
+          try { T.ok = engine.synthBlur(w.t0, w.t1, undefined); } catch (e) { T.ok = false; T.threw = String(e && e.message || e); }
+          const out = engine.debugRead('out').data;
+          T.cmp = rgbCmp(out, ref, n);
+          engine.setSettings({ blurSamples: 0 });
+        }
+        R.glError = gl.getError();
+      } catch (e) { R.error = err(e); }
+      return R;
+    },
+
     // HDR job: { dir (under $FG_WORK, with a.f16 / c.f16), W, H, settings (inputFormat rgba16f, transfer, ...), ts, refs: {t: {file,
     // fmt: 'f16' | 'rgba8', stats}} } -> per t: the output compared in levels of the perceptual encoding (linear: PQ x 255; encoded:
     // x 255; an rgba8 reference: its levels), decisions, finiteness

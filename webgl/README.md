@@ -2,7 +2,7 @@
 
 The frame interpolation of this library (`gpu/`, Vulkan) for a WebGL2 context: GLSL ES 3.00 fragment passes and a small JS host.
 It runs V1 (the algorithm of `proto/interp.py`) and V2, the morphing interpolator, in both modes (Performance and Quality), with
-V2's static-overlay mask, V2's motion blur and RGBA16F (HDR / float) input, and, opt-in for V1, ml-fg's learned motion estimator
+V2's static-overlay mask, motion blur (V1, learned and V2) and RGBA16F (HDR / float) input, and, opt-in for V1, ml-fg's learned motion estimator
 in place of V1's block search ("Learned motion estimate" below). It is meant for pages, where WebGL2 is all there is
 (no compute shaders, subgroups or atomics): the Firefox extension browser-frame-gen vendors it instead of keeping its own port, and
 exposes the settings in its popup.
@@ -29,12 +29,13 @@ that contract, updated. Additions (nothing removed):
 
 | Addition | What |
 |---|---|
-| `__fg.version` | `'6'` (`'5'`: e2v5 / e1v5 as the default / small net, before the colour and learned-features variants; `'4'`: e2v4 / e1v4 as the default / small net; `'3'`: the learned estimator before e2v4 / e1v4, the zero test, the static guard and `smallNet`; `'2'` before the learned estimator) |
+| `__fg.blurMotionVersions` | `[1, 2]` (frozen, read-only): the `motionVersion` values `synthBlur` supports (V1 covers `motion: 'learned'`) |
+| `__fg.version` | `'8'` (`'7'`: the real game nets g2v2 / g2v3 / m2v2 / m2v3; `'8'` adds `synthBlur` for V1 and learned; `'6'`: the colour net variant; `'5'`: e2v5 / e1v5 as the default / small net, before the colour and learned-features variants; `'4'`: e2v4 / e1v4 as the default / small net; `'3'`: the learned estimator before e2v4 / e1v4, the zero test, the static guard and `smallNet`; `'2'` before the learned estimator) |
 | settings `v2Mode` | `'quality'` (default, as the library) or `'performance'`. Runtime; a switch keeps the estimate (the other mode's part is derived by its first `synth`, with the same output as that mode's own estimate) |
-| settings `blurSamples`, `blurWeights` | V2's motion blur (`synthBlur`): 0 / 1 = off, 2..16 sub-frames; `'gaussian'` (default) or `'even'`. Runtime |
+| settings `blurSamples`, `blurWeights` | motion blur (`synthBlur`, V1 / learned / V2): 0 / 1 = off, 2..16 sub-frames; `'gaussian'` (default) or `'even'`. Runtime |
 | settings `inputFormat` | `'rgba8'` (default) or `'rgba16f'`: frames, warps and output in RGBA16F. Structural (recompiles the programs, drops the frames) |
 | settings `transfer`, `linearWhiteNits` | `rgba16f` only: `'encoded'` (default: display-encoded values, PQ / HLG / sRGB; a level is value × 255) or `'linear'` (scRGB / linear light, measured as PQ codes; 1.0 = `linearWhiteNits`, default 80). Structural |
-| `engine.synthBlur(t0, t1, framebuffer, viewport, opts)` | the library's `recordSynthBlur` for V2: the weighted average of `blurSamples` sub-frames at the midpoints of N equal slices of [t0, t1], each exactly `synth(t_k)`'s output; `0 <= t0 <= t1 <= 1`; blur off or t0 == t1: the instant t1. V1 with blur on throws (see "Gaps") |
+| `engine.synthBlur(t0, t1, framebuffer, viewport, opts)` | the library's `recordSynthBlur` (V1, learned or V2): the weighted average of `blurSamples` sub-frames at the midpoints of N equal slices of [t0, t1], each exactly `synth(t_k)`'s output; `0 <= t0 <= t1 <= 1`; blur off or t0 == t1: the instant t1. works for every motion version (`__fg.blurMotionVersions`) |
 | `__fg.frameSizeError(gl, w, h, settings)`, `__fg.minSize` | why a frame size cannot run (below 16 × 16, the library's minimum, or a texture above `MAX_TEXTURE_SIZE`), else null. `resize` / `pushFrame` throw a `RangeError` with that text and keep the engine at its old size |
 | `__fg.checkSupport(gl, frame)` (changed) | returns `{ ok, missing, sizeError, quality, qualityError }`. `missing`: GL feature names only, as before. `sizeError`: the optional second argument `{width, height, flowScale}` checked by `frameSizeError`, else null (it used to be pushed into `missing`; `ok` is still false when it is set). `quality` / `qualityError`: whether V2 Quality can run here (the MIN-blend probe below) and, if not, why; does not affect `ok` (V1 and V2 Performance do not need it) |
 | `engine.support` | the `checkSupport(gl)` result the engine was created with |
@@ -357,12 +358,12 @@ are a full-screen pass that also initialises the target. Checked against the lib
 Cost and memory: about 56 bytes per flow pixel for Quality's textures (1080p at flowScale 2: 29 MB), allocated the first time
 Quality runs.
 
-### Motion blur (`synthBlur`, V2)
+### Motion blur (`synthBlur`, V1 / learned / V2)
 
 The library's V2 blur is its synthesis with n samples; each sample is exactly `recordSynth(t_k)`'s stored output (8-bit or
 half-float, with its own scene-cut / flick fallback), averaged with the weights. Here: per sample the full synthesis into `out`,
 `v2/blur_accum` adds it × weight into an RGBA32F accumulator (blend ONE, ONE, sample order as the library's register sum),
-`v2/blur_resolve` divides by the weight sum and stores. About 7 draws per sample.
+`v2/blur_resolve` divides by the weight sum and stores. About 7 draws per sample (V1 and learned: their `synth` passes, `motionVersion` 1 including `motion: 'learned'`, see `blur.mjs` modes `v1` / `learned`). The library's V1 blur (`blur_*.comp`) is documented bit-identical per sub-frame to `recordSynth(t)`, so the same per-sample loop is its contract.
 
 ## Frame formats
 
@@ -396,7 +397,7 @@ meson + ninja + the Vulkan headers (the library's build) and a Vulkan GPU with c
 | golden | `ref_gen.py`, `golden.mjs` (+ `compare.mjs`, `page.js`) | V1 vs `proto/interp.py` with per-stage diagnostics (the extension's golden harness) |
 | xbackend | `xbackend.mjs` (+ `server.mjs`, `xpage.js`) | WebGL2 (SwiftShader) vs the library: V1, V2 P, V2 Q; block field, per-pixel field and coverage per stage; switch semantics; API checks; the V2 Quality MIN-blend probe (real result, cached, GL state kept; a context with MIN broken by a Proxy: `quality` false, Quality refused, V1 / V2 P run) |
 | hdr | `hdr_pairs.py`, `hdr.mjs`, `vkhdr.cpp` | rgba16f (scRGB linear, PQ-encoded, identity) vs the library in R16G16B16A16_SFLOAT / Rgba8 |
-| blur | `blur.mjs`, `vkhdr.cpp --blur` | `synthBlur` vs `recordSynthBlur` (V2 P, V2 Q) |
+| blur | `blur.mjs`, `vkhdr.cpp --blur` | `synthBlur` vs `recordSynthBlur` (V2 P, V2 Q, V1) and vs the engine's own `synth(t_k)` average (learned e2v5, m2v3) |
 | learned | `learned.mjs`, `learned_ref.py` (+ `make_nets.py`) | the learned estimator vs ml-fg's test vectors, every net (`nets/*.js`) x both precisions + RGBA16F input, without and with the zero-motion test (`*_zt` vectors), the duplicate skip, the static guard vs ml-fg's `scripts/static_guard.py` (`learned-gpu`: hardware GL) |
 | bench | `bench.mjs` | ms per pair (`--gpu`: hardware GL, timer queries, `--passes`: per pass; modes `v1 v2p v2q ml2 ml1 ml2f ml1f` and any net by name, e.g. `e2v5 e2v5f`, `--size WxH`) |
 
@@ -470,7 +471,6 @@ scatter, the serial median scan and the coverage splat's 4 point draws were the 
 
 ## Gaps
 
-- V1's motion blur (`blur_*.comp`, `recordSynthBlur` with V1) is not ported: `synthBlur` throws for V1 with blur on.
 - UI protection (`uiProtection`: Crosshair, WholeScreen, CrosshairV2) is not ported; V2's own static mask (`v2StaticMask`) is.
 - RGBA16F with V2 is checked against `v2-formats` @ e215f83 (not yet on `framegen-v2`, whose library refuses V2 outside Rgba8:
   `hdr.mjs` against this branch's own build reports those rows as "no Vulkan reference"). V2's motion blur with RGBA16F is not

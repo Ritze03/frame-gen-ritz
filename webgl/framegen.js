@@ -28,7 +28,7 @@
   // Static tables
   // ---------------------------------------------------------------------------------------------
 
-  fg.version = '7';   // 6: the colour net variant (nets/*.js `variant`, ML_VARIANTS; the stand-in net c2smoke, selectable, defaults unchanged); 5: nets e2v5 (the default motionNet) and e1v5 (smallNet), the default learned output changed; 4: nets e2v4
+  fg.version = '8';   // 8: synthBlur for motionVersion 1 (V1 block matching and the learned motion), __fg.blurMotionVersions; 7: nets g2v2, g2v3, m2v2, m2v3 (round 4b); 6: the colour net variant (nets/*.js `variant`, ML_VARIANTS; the stand-in net c2smoke, selectable, defaults unchanged); 5: nets e2v5 (the default motionNet) and e1v5 (smallNet), the default learned output changed; 4: nets e2v4
   // and e1v4, learnedZeroTest (default on), learnedStaticGuard, smallNet / defaultNet; 3: the learned motion estimator (settings motion / motionNet, __fg.nets, checkSupport learned); 2: V2 Quality,
   // RGBA16F input, synthBlur, frameSizeError, checkSupport sizeError / quality (API of the earlier versions unchanged otherwise)
   fg.requiredExtensions = ['EXT_color_buffer_float', 'EXT_float_blend', 'OES_texture_float_linear'];
@@ -178,6 +178,8 @@
   for (const [k, v] of [['defaultNet', ML_NETS[0]], ['smallNet', ML_SMALL_NET]]) {
     Object.defineProperty(fg, k, { value: v, enumerable: true, writable: false, configurable: true });
   }
+  // Read-only: the motionVersion values synthBlur supports (V1 incl. motion 'learned', and V2)
+  Object.defineProperty(fg, 'blurMotionVersions', { value: Object.freeze([1, 2]), enumerable: true, writable: false, configurable: true });
   const ML_BLOCK_MAX = (3 * 9 * 7 * 16 + 3 * 4) * 4;   // bytes of the largest weight block (conv7x3 = a colour net's layer 0, conv_h's MlW / MlW2)
 
   fg.shaderFiles = (function () {
@@ -237,7 +239,7 @@
     motionVersion: 1,       // 1 = V1 (block matching + per-pixel trust, proto/interp.py), 2 = V2 (the morphing interpolator)
     v2Mode: 'quality',      // V2 only: 'quality' (the coverage morph, library default) or 'performance' (the grid morph)
     v2StaticMask: true,     // V2 only: keep static HUD / text / subtitles in place (Settings::v2StaticMask)
-    blurSamples: 0,         // synthBlur (V2): sub-frames per output, 0 / 1 = off, 2..16 (Settings::blurSamples)
+    blurSamples: 0,         // synthBlur (V1, learned, V2): sub-frames per output, 0 / 1 = off, 2..16 (Settings::blurSamples)
     blurWeights: 'gaussian', // synthBlur: 'gaussian' or 'even' (Settings::blurWeights)
     motion: 'search',       // V1 only: 'search' (V1's block search, proto/interp.py) or 'learned' (the learned estimator: needs flowScale 2
                             // and the net's weights, webgl/nets/<motionNet>.js; ignored by V2)
@@ -1692,19 +1694,19 @@
       return true;
     };
 
-    // Motion blur (the library's recordSynthBlur; V2 only here): one output = the weighted average of settings.blurSamples (N)
+    // Motion blur (the library's recordSynthBlur; V1, learned and V2): one output = the weighted average of settings.blurSamples (N)
     // sub-frames at the midpoints of N equal slices of [t0, t1], t_k = t0 + (t1 - t0)(k + 0.5)/N, weights settings.blurWeights
     // ('gaussian': exp(-2 x_k^2), x_k = (2k + 1 - N)/N; 'even': 1/N). Each sub-frame is exactly synth(t_k)'s output (its own
     // scene-cut / flick fallback); a sample at t <= 0 / t >= 1 is the real frame prev / curr. Blur off (N < 2) or t0 == t1: the
-    // instant t1 (synth(t1); t1 = 0 / 1: a copy of prev / curr). 0 <= t0 <= t1 <= 1, else false. V1 with blur on throws (the
-    // library's V1 blur, blur_*.comp, is a different algorithm and is not ported). stats() after it: the last sample's counts.
+    // instant t1 (synth(t1); t1 = 0 / 1: a copy of prev / curr). 0 <= t0 <= t1 <= 1, else false. V1 and
+    // learned (motion 'learned') blur the same way, per sample exactly synth(t_k) (the Vulkan V1 blur, blur_*.comp, is documented
+    // bit-identical per sub-frame to recordSynth(t)); each sub-frame is the 8-bit T.out, the average rounded once. stats() after it: the last sample's counts.
     engine.synthBlur = function (t0, t1, framebuffer, viewport, opts) {
       alive();
       if (!(t0 >= 0 && t1 <= 1 && t0 <= t1)) return false;
       const N = settings.blurSamples, blur = N >= 2 && t0 < t1;
       if (!blur && t1 > 0 && t1 < 1) return engine.synth(t1, framebuffer, viewport, opts);
       if (!info || !estimatedPair) return false;
-      if (blur && settings.motionVersion !== 2) throw new Error('framegen: synthBlur: motion blur is implemented for motionVersion 2 only');
       beginCall();
       nDraw = 0;
       const n = blur ? N : 1, gauss = settings.blurWeights === 'gaussian';
