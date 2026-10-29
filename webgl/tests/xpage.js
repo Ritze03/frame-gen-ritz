@@ -210,6 +210,22 @@
 
     // Learned / self-consistency blur job: { pair, W, H, settings, windows }. Per window: synthBlur vs the weighted average (as the
     // engine's formula, in doubles, rounded once) of the engine's own synth(t_k) outputs, + the negative check "blur does not throw"
+    // A FRESH engine that never selected V2 (regression: blur_accum / blur_resolve used to be compiled only with V2).
+    async runBlurFresh(job) {
+      try {
+        const a = new Uint8Array(await get(`pairs/${job.pair}/a.rgba`)), c = new Uint8Array(await get(`pairs/${job.pair}/c.rgba`));
+        const g2 = new OffscreenCanvas(64, 64).getContext('webgl2', { antialias: false, alpha: true, depth: false, stencil: false, premultipliedAlpha: false });
+        const e = __fg.createEngine(g2, srcs, { ...job.settings, blurSamples: 4 });
+        e.pushFrame({ width: job.W, height: job.H, data: a });
+        e.pushFrame({ width: job.W, height: job.H, data: c });
+        e.estimate();
+        const ok = e.synthBlur(0.25, 0.75, undefined);
+        const out = e.debugRead('out').data;
+        let sum = 0;
+        for (let i = 0; i < out.length; i += 4) sum += out[i] + out[i + 1] + out[i + 2];
+        return { ok, sum, glError: g2.getError() };
+      } catch (e) { return { error: err(e) }; }
+    },
     async runBlurSelf(job) {
       const R = { w: {} };
       try {

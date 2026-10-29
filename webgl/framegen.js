@@ -57,6 +57,9 @@
     ['final', 'synth/final.frag.glsl', null,
       ['uPrev', 'uCurr', 'uWarpA', 'uWarpC', 'uTrust', 'uSadSum', 'uUntrusted']],
     ['blit', 'synth/blit.frag.glsl', null, ['uSrc']],
+    // motion blur (V1, learned and V2 all use them), so always compiled
+    ['blur_accum', 'v2/blur_accum.frag.glsl', null, ['uSrc']],
+    ['blur_resolve', 'v2/blur_resolve.frag.glsl', null, ['uAcc']],
   ];
 
   // Motion version 2 programs, compiled when V2 is first selected (createEngine / setSettings). Optional 5th element: a shared
@@ -82,8 +85,6 @@
     ['v2_morph', 'v2/morph.frag.glsl', null, ['uPrev', 'uCurr', 'uVf', 'uSmask', 'uEC', 'uEm', 'uGroup'], V2_INC],
     ['v2_tile', 'v2/tile.frag.glsl', null, ['uE']],
     ['v2_final', 'v2/final.frag.glsl', null, ['uPrev', 'uCurr', 'uMorph', 'uSadSum', 'uUntrusted']],
-    ['blur_accum', 'v2/blur_accum.frag.glsl', null, ['uSrc']],
-    ['blur_resolve', 'v2/blur_resolve.frag.glsl', null, ['uAcc']],
     // V2 Quality (the coverage morph): its estimate tail and its synthesis (the Performance programs with V2_QUALITY)
     ['v2_qfield', 'v2/qfield.frag.glsl', null, ['uLumaA', 'uLumaC', 'uVf'], Q_INC],
     ['v2_qclaim', 'v2/qclaim.frag.glsl', null, ['uLumaA', 'uLumaC', 'uQf'], Q_INC],

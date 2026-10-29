@@ -59,6 +59,14 @@ for (const mode of opt.modes) for (const p of pairs) {
     console.log(`${mode}_fs2 ${p.name.padEnd(12)} ${w.tag.padEnd(18)} ${ok ? 'PASS' : 'FAIL'}  MAE ${f3(T.cmp && T.cmp.mae)} max ${T.cmp && T.cmp.max} %>4 ${f3(T.cmp && T.cmp.pct4)} PSNR ${f3(T.cmp && T.cmp.psnr)}`);
   }
 }
+// Regression: a fresh engine that never selected V2 must run synthBlur (blur_accum / blur_resolve are base programs).
+if (pairs.length) for (const [name, settings] of [['v1', { motionVersion: 1 }], ['learned', { motionVersion: 1, motion: 'learned' }]]) {
+  const p = pairs[0];
+  const r = await E.page.evaluate((j) => window.__x.runBlurFresh(j), { pair: p.name, W: p.width, H: p.height, settings });
+  const ok = !r.error && r.ok !== false && r.sum > 0;
+  if (!ok) allOk = false;
+  console.log(`fresh ${name.padEnd(8)} synthBlur on a never-V2 engine ${ok ? 'PASS' : 'FAIL'}${r.error ? '  ' + r.error.error : ''}`);
+}
 await E.browser.close();
 console.log(`RESULT: ${allOk ? 'PASS' : 'FAIL'}`);
 process.exit(allOk ? 0 : 1);
