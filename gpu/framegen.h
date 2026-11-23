@@ -128,6 +128,16 @@ enum class BlurWeights : uint32_t {
                     // window, so the ends of the window carry exp(-2) = 13.5 % of the centre's weight
 };
 
+// Settings::debugView: what the library draws over every generated frame as the very last pass (a debug aid for a host's "Debug view" option; real frames are
+// never touched). One byte (the Settings field sits in the padding after v3Blend: sizeof(Settings) stays 164). Values are append-only and never renumbered.
+// Only the RGB formats (Rgba8 / Bgra8, Rgb10, RgbaF16) draw: with Nv12 / P010 every value is accepted and nothing is drawn.
+enum class DebugView : uint8_t {
+    Off = 0,       // the default: exactly the library without the setting (byte-identical output, nothing recorded, created or allocated)
+    Motion = 1,    // tint the pixels that move: hue = direction, strength = magnitude of this frame's motion field (see Settings::debugView)
+    UiMask = 2,    // tint what static UI protection treats as UI in this frame, plus a 1 px outline of the box
+    UiClean = 3,   // show the library's clean copy of the frame (the UI inpainted out: what the motion estimate works on)
+};
+
 // Image formats (README.md / INTEGRATION.md "Formats"). Chosen at init() by InitInfo::viewFormat, which maps to exactly one:
 //   Rgba8    B8G8R8A8_UNORM, R8G8B8A8_UNORM                            the default; the shaders and output are unchanged
 //   Rgb10    A2B10G10R10_UNORM_PACK32, A2R10G10B10_UNORM_PACK32
@@ -359,6 +369,21 @@ struct Settings {
     // without the setting. Only the Rgba8 / Bgra8 and Rgb10 builds have the nets (v3BlendActive() says whether they run): with another Format, or with v3DetailSplit on, a non-zero value falls back to the rule (gpu/V3.md
     // 3.16 "As built (learned blend)"). Acts in the synthesis (from the next recordSynth, no re-estimate), selects a third build of it (P_V3_SYNTH_B).
     uint8_t v3Blend = 0;
+    // debugView (see DebugView; 0..3, anything above is refused): a debug picture drawn over every generated frame (recordSynth / recordSynthBlur / record) as the LAST write to
+    // `out`, after the synthesis and the UI patch (a blur window: once, over the average): it shows what is really shown plus the tint; out stays GENERAL and the final barrier
+    // is the one of every record. Off = the default records nothing, creates nothing, takes no descriptor set. Runtime: setSettings() at any time (no reconfigure, no estimate
+    // dropped), from the next record; the first time a view is on, setSettings() creates its pipelines (no GPU wait; false if that fails or this build lacks them: nothing changes),
+    // they stay until destroy(). Nv12 / P010: accepted, nothing drawn.
+    //   Motion  : where m = the prev -> curr displacement in full-resolution pixels exceeds flowScale (half a flow pixel of half-vector), the pixel is blended towards a colour: hue = direction
+    //             (atan2, as gpu/fgmaps.py flow_rgb()), strength rising smoothly to about 60 % at m = 16 px; every other pixel is untouched (bit-exact). m = 2 S |h| for V1, V2 and Learned
+    //             (their fields hold half-vectors h in flow pixels), S |g| for V3 (g = (gA - gB) / 2, the mean of its two hypotheses' prev -> curr vectors (gB points curr -> prev), from the T-field of this frame; a blur window: the
+    //             mean over its interior samples). The field, not the post-corrected motion; V2 and V3 at t != 0.5: their field is on the grid of the midpoint, shifted by (2t - 1) g from the
+    //             frame's. Nothing is drawn where the output is a real frame (V3 scene cut, a window of real frames only).
+    //   UiMask  : the pixels UI protection treats as UI in this frame: pasted pixels in one colour, CrosshairV2's confirmed-but-changed pixels (not pasted) in a second, the feathered ring of Crosshair
+    //             / WholeScreen weaker, plus a 1 px outline of the box. Nothing with protection Off or a pair that was not observed.
+    //   UiClean : the clean copy of curr replaces the generated picture over the work rectangle (Crosshair) / the whole frame (WholeScreen). CrosshairV2 keeps no clean copy: it shows UiMask.
+    // HDR (Rgb10, RgbaF16): the tint colours stay at code values of about 0.6 at most. Each UI view takes up to 2 descriptor sets of the kUiSets ring per synthesis, besides the patch's 2.
+    DebugView debugView = DebugView::Off;
     // v3Guard (see V3Guard): V2 Quality's motion estimate also runs on each pair and corrects (Guard) or replaces (V2Motion) V3's dense motion field
     // before V3's occlusion / fill / synthesis; Off = the default, V3 exactly as without it. Needs V2's subgroup requirements (a device that cannot
     // run MotionVersion::V2, Interpolator::settingsError, refuses it with the reason V2 gets). While on, searchRadius, searchRadiusTop,
@@ -552,7 +577,8 @@ public:
     // The caller must also keep the estimates and the synths of all not-yet-retired submissions
     // <= kSetRing each, in total. With protection on, recordObserve takes 1 (Crosshair) or 2 (WholeScreen)
     // sets of a third ring of kUiSets, and so does every recordSynth (plus an implicit observe in a
-    // recordEstimate): keep those per beginFrame() and per not-yet-retired submission <= kUiSets too.
+    // recordEstimate): keep those per beginFrame() and per not-yet-retired submission <= kUiSets too. While Settings::debugView is UiMask / UiClean every
+    // recordSynth takes up to 2 more (4 in all, the call is refused when they do not fit); Motion takes none.
     // recordSynth also returns false if no recordEstimate was recorded since init/resize, or if prev/curr
     // are not the views of the latest recordEstimate (it always uses the latest estimate).
     bool recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr);

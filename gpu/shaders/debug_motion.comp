@@ -1,0 +1,109 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Settings::debugView = Motion (framegen.h DebugView): tints the finished generated frame, in place, where this frame's motion field says the
+// picture moves; hue = direction, strength = magnitude; everywhere else the pixel is not written (bit-exact). It runs after the synthesis and the UI patch.
+// The unit (the same on-screen motion gives the same tint in every motion version): d = the prev -> curr displacement in full-resolution pixels,
+//   V1 / Learned: d = 2 S h        h = fieldT / fieldPF (half-vector, flow px), bilinear at full res (motion_v1.glsl halfVec)
+//   V2 Performance: d = 2 hvAt(x)  the cleaned block field (v2_motion.glsl), V2 Quality: d = 2 hvQ(x) the per-pixel field (v2_quality.glsl)
+//   V3: d = S (gA - gB) / 2        the T-field slot(s) of this frame (v3_project.comp; gA = F01 at prev's side, gB = F10 at curr's side points curr -> prev), mean over the interior samples
+// m = |d|: no tint up to m0 = S (half a flow pixel of half-vector), strength smoothstep(m0, m1, m) * maxA, saturating at m1 = 16 px, maxA about 0.6.
+// Hue = atan2(d.y, d.x) / 2 pi as gpu/fgmaps.py flow_rgb() (HSV, value 1), scaled by cscale (HDR: PQ code values stay moderate).
+// One source, three builds: none = V1 / Learned (binding 1), -DDBG_V2=1 (binding 13), -DDBG_V3=1 (bindings 14, 15). Each declares only its own bindings.
+#include "format.glsl"
+
+layout(set = 0, binding = 5, FG_FMT) uniform restrict image2D outImg;
+#if defined(DBG_V2)
+layout(set = 0, binding = 13, std430) restrict readonly buffer V2Field { vec2 vf[]; };
+#elif defined(DBG_V3)
+layout(set = 0, binding = 14, std430) restrict readonly buffer V3Aux { uint ax[]; };
+layout(set = 0, binding = 15, std430) restrict readonly buffer V3Flow { float fl[]; };
+#else
+layout(set = 0, binding = 1, std430) restrict readonly buffer FieldBuf { vec2 field[]; };
+#endif
+
+// framegen.cpp DbgPC, field for field (pushed over PC's range of the synth pipeline layout)
+layout(push_constant) uniform DPC {
+    int W, H, fw, fh, fscale;
+    int pf;          // V1 / Learned: field[] offset of the field of this frame (fieldT, or fieldPF at t = 0.5 and in blur)
+    int bw, bh;      // V2: the block grid
+    int quality;     // V2: 1 = Quality's per-pixel field at 2 bw bh
+    int fdOff;       // V3: word offset of the filled / T fields in the flow buffer (16 B)
+    int gOff;        // V3: word offset of the pair's state G in the aux buffer
+    int nInt;        // V3: interior samples = T-field slots of this record
+    float m0, m1, maxA, cscale;
+} pc;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#if defined(DBG_V2)
+vec2 VF(ivec2 b) {
+    b = clamp(b, ivec2(0), ivec2(pc.bw - 1, pc.bh - 1));
+    return vf[b.y * pc.bw + b.x];
+}
+vec2 QF(ivec2 m) {
+    m = clamp(m, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    return vf[2 * pc.bw * pc.bh + m.y * pc.fw + m.x];
+}
+// the prev -> curr displacement in full-res px at pixel p (V2's hvAt / hvQ, doubled)
+vec2 disp(ivec2 p) {
+    const float S = float(pc.fscale);
+    const vec2 x = vec2(p);
+    if (pc.quality != 0) {
+        const vec2 s = (x + 0.5) * (1.0 / S) - 0.5;
+        const vec2 fl0 = floor(s), f = s - fl0;
+        const ivec2 i = ivec2(fl0);
+        return 2.0 * S * mix(mix(QF(i), QF(i + ivec2(1, 0)), f.x), mix(QF(i + ivec2(0, 1)), QF(i + ivec2(1, 1)), f.x), f.y);
+    }
+    const vec2 s = (x + 0.5) * (1.0 / (8.0 * S)) - 0.5;
+    const vec2 fl0 = floor(s), f = s - fl0;
+    const ivec2 i = ivec2(fl0);
+    return 2.0 * S * mix(mix(VF(i), VF(i + ivec2(1, 0)), f.x), mix(VF(i + ivec2(0, 1)), VF(i + ivec2(1, 1)), f.x), f.y);
+}
+#elif defined(DBG_V3)
+const int G_MODE = 4;   // == v3_common.glsl
+vec2 disp(ivec2 p) {
+    if (pc.nInt <= 0 || ax[pc.gOff + G_MODE] == 1u) return vec2(0.0);   // no T-field: every sample a real frame, or the whole-frame scene cut (a real frame is shown)
+    const int N = pc.fw * pc.fh;
+    const float fsc = float(pc.fscale);
+    const vec2 fp = (vec2(p) - 0.5 * (fsc - 1.0)) / fsc;   // v3_synth.comp's flow-px neighbourhood
+    const ivec2 f0 = ivec2(floor(fp));
+    const vec2 fa = fp - vec2(f0);
+    vec2 g = vec2(0.0);
+    for (int z = 0; z < pc.nInt; z++) {
+        const int tf = pc.fdOff + 8 * N + z * 4 * N;
+        for (int j = 0; j < 4; j++) {
+            const ivec2 c = clamp(f0 + ivec2(j & 1, j >> 1), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+            const float w = ((j & 1) != 0 ? fa.x : 1.0 - fa.x) * ((j >> 1) != 0 ? fa.y : 1.0 - fa.y);
+            const int o = tf + 4 * (c.y * pc.fw + c.x);
+            g += w * 0.5 * (unpackHalf2x16(floatBitsToUint(fl[o])) - unpackHalf2x16(floatBitsToUint(fl[o + 1])));   // gB is F10 (curr -> prev): prev -> curr = (gA - gB) / 2
+        }
+    }
+    return fsc * g / float(pc.nInt);
+}
+#else
+vec2 disp(ivec2 p) {   // motion_v1.glsl halfVec(), doubled
+    const int S = pc.fscale;
+    p = min(p, ivec2(S * pc.fw - 1, S * pc.fh - 1));
+    const vec2 s = (vec2(p) + 0.5) * (1.0 / float(S)) - 0.5;
+    const vec2 fl0 = floor(s), f = s - fl0;
+    const ivec2 i0 = clamp(ivec2(fl0), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    const ivec2 i1 = clamp(ivec2(fl0) + 1, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    const vec2 v00 = field[pc.pf + i0.y * pc.fw + i0.x], v01 = field[pc.pf + i0.y * pc.fw + i1.x];
+    const vec2 v10 = field[pc.pf + i1.y * pc.fw + i0.x], v11 = field[pc.pf + i1.y * pc.fw + i1.x];
+    return 2.0 * float(S) * mix(mix(v00, v01, f.x), mix(v10, v11, f.x), f.y);
+}
+#endif
+
+vec3 hue(float a) {   // HSV (a in turns, S = V = 1): flow_rgb()'s sextant table
+    return clamp(abs(fract(a + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.W || p.y >= pc.H) return;
+    const vec2 d = disp(p);
+    const float s = smoothstep(pc.m0, pc.m1, length(d)) * pc.maxA;
+    if (s <= 0.0) return;   // static: untouched
+    const float a = atan(d.y, d.x) * 0.15915494309189535;
+    const vec4 o = imageLoad(outImg, p);
+    imageStore(outImg, p, vec4(mix(o.rgb, hue(a) * pc.cscale, s), o.a));
+}

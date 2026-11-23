@@ -24,7 +24,8 @@ shaders = shader_gen.process(
   'shaders/ml_zero.comp', 'shaders/ml_guard.comp', 'shaders/ml_planes.comp', 'shaders/ml_feat.comp',
   'shaders/v3_synth.comp', 'shaders/v3_planes.comp', 'shaders/v3_pyr.comp', 'shaders/v3_hist.comp', 'shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp', 'shaders/v3_wide.comp', 'shaders/v3_stats.comp',
   'shaders/v3_occl.comp', 'shaders/v3_fill.comp', 'shaders/v3_project.comp', 'shaders/v3_enclose.comp', 'shaders/v3_decide.comp',
-  'shaders/v3_anchor.comp', 'shaders/v3_guard.comp')   # task 104: Settings::v3Guard, V2 Quality's vectors correct V3's dense field
+  'shaders/v3_anchor.comp', 'shaders/v3_guard.comp',
+  'shaders/debug_motion.comp', 'shaders/debug_ui.comp')   # task 136: Settings::debugView (the motion tint for V1 / Learned, the UI views); task 104: Settings::v3Guard, V2 Quality's vectors correct V3's dense field
 
 # MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked
 # against the manifest (sha256, shapes, offsets) and re-laid out for shaders/ml_conv.comp. Order = LearnedNet (E2v3, E1v3, E2v4, E1v4,
@@ -79,6 +80,19 @@ v3b_gen = generator(glslang,
   arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                '-DV3B=1', '--vn', '@BASENAME@_b_spv', '-o', '@OUTPUT@', '@INPUT@'])
 v3b_shaders = v3b_gen.process('shaders/v3_synth.comp')
+# Settings::debugView = Motion for V2 (-DDBG_V2=1, reads V2's field, binding 13) and V3 (-DDBG_V3=1, reads V3's T-field, bindings 14, 15): the same source as debug_motion
+# (V1 / Learned) with its own bindings, into debug_motion_v2_spv / debug_motion_v3_spv (Rgba8 / Bgra8; the per-format variants debug_motion_v2_<fmt>_spv are built below, rgb10 and f16 only).
+dbg_gens = []
+foreach v : ['v2', 'v3']
+  dbg_gens += generator(glslang,
+    output : '@BASENAME@_' + v + '_spv.h',
+    depfile : '@BASENAME@_' + v + '_spv.h.d',
+    arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+                 '-DDBG_' + v.to_upper() + '=1', '--vn', '@BASENAME@_' + v + '_spv', '-o', '@OUTPUT@', '@INPUT@'])
+endforeach
+dbg_shaders = [dbg_gens[0].process('shaders/debug_motion.comp'), dbg_gens[1].process('shaders/debug_motion.comp')]
+# The debug views draw on RGB frames only (Nv12 / P010: no view, a documented no-op), so their per-format variants are built for rgb10 and f16 only.
+dbg_colour_srcs = ['shaders/debug_motion.comp', 'shaders/debug_ui.comp']
 # The wide median histogram and the wide V2 Quality claims (reach settings off their defaults and a long vector): -DFG_WIDE=1,
 # into <name>_wide_spv as well (other basenames). The plain builds keep their SPIR-V.
 wide2_gen = generator(glslang,
@@ -118,13 +132,24 @@ foreach f : get_option('formats')
   if f == 'rgb10'
     variant_shaders += [gb.process(v3l_colour_srcs)]   # learned blend (-DV3B=1) in rgb10 only so far
   endif
+  if f == 'rgb10' or f == 'f16'
+    foreach v : ['v2', 'v3']
+      gd = generator(glslang,
+        output : '@BASENAME@_' + v + '_' + f + '_spv.h',
+        depfile : '@BASENAME@_' + v + '_' + f + '_spv.h.d',
+        arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+                     '-DFG_FORMAT_' + f.to_upper() + '=1', '-DDBG_' + v.to_upper() + '=1', '--vn', '@BASENAME@_' + v + '_' + f + '_spv', '-o', '@OUTPUT@', '@INPUT@'])
+      variant_shaders += [gd.process('shaders/debug_motion.comp')]
+    endforeach
+    variant_shaders += [g.process(dbg_colour_srcs)]
+  endif
   if f == 'nv12' or f == 'p010'
     variant_shaders += [g.process(chroma_srcs)]
   endif
 endforeach
 
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
-framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, wide2_shaders, v3j_shaders, v3l_shaders, v3b_shaders, variant_shaders, ml_weights,
+framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, wide2_shaders, v3j_shaders, v3l_shaders, v3b_shaders, dbg_shaders, variant_shaders, ml_weights,
   dependencies : vulkan.partial_dependency(compile_args : true, includes : true))
 framegen_dep = declare_dependency(link_with : framegen_lib, include_directories : include_directories('.'))
 

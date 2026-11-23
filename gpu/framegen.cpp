@@ -255,6 +255,29 @@
 #include "v3_synth_l_p010_spv.h"
 #include "v3_planes_p010_spv.h"
 #endif
+// Settings::debugView (task 136), each build probed as a set (a host build that does not list them gets the view refused by setSettings, not a build error): Rgba8 / Bgra8 plain,
+// rgb10 and f16 per format (Nv12 / P010 draw nothing and have none).
+#if __has_include("debug_motion_spv.h") && __has_include("debug_motion_v2_spv.h") && __has_include("debug_motion_v3_spv.h") && __has_include("debug_ui_spv.h")
+#define FG_HAVE_DBG 1
+#include "debug_motion_spv.h"
+#include "debug_motion_v2_spv.h"
+#include "debug_motion_v3_spv.h"
+#include "debug_ui_spv.h"
+#endif
+#if __has_include("debug_motion_rgb10_spv.h") && __has_include("debug_motion_v2_rgb10_spv.h") && __has_include("debug_motion_v3_rgb10_spv.h") && __has_include("debug_ui_rgb10_spv.h") && defined(FG_HAVE_RGB10)
+#define FG_HAVE_DBG_RGB10 1
+#include "debug_motion_rgb10_spv.h"
+#include "debug_motion_v2_rgb10_spv.h"
+#include "debug_motion_v3_rgb10_spv.h"
+#include "debug_ui_rgb10_spv.h"
+#endif
+#if __has_include("debug_motion_f16_spv.h") && __has_include("debug_motion_v2_f16_spv.h") && __has_include("debug_motion_v3_f16_spv.h") && __has_include("debug_ui_f16_spv.h") && defined(FG_HAVE_F16)
+#define FG_HAVE_DBG_F16 1
+#include "debug_motion_f16_spv.h"
+#include "debug_motion_v2_f16_spv.h"
+#include "debug_motion_v3_f16_spv.h"
+#include "debug_ui_f16_spv.h"
+#endif
 
 namespace framegen {
 
@@ -277,18 +300,23 @@ struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
 struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill,
-    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, mlPlanes, v3Synth, v3Planes, v3SynthL, v3SynthB; };
+    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, mlPlanes, v3Synth, v3Planes, v3SynthL, v3SynthB,
+    dbgMotion, dbgMotionV2, dbgMotionV3, dbgUi; };   // (Settings::debugView: the motion tint of V1 / Learned, V2, V3 and the UI views; empty = this build has none)
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
     SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
     SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f), Spv{}, Spv{}, Spv{}, Spv{}}
 #define V2_SET(c, f) (c.v2Morph = SPV(v2_morph##f), c.v2MorphS = SPV(v2_morph_s##f), c.v2QMorph = SPV(v2_qmorph##f), c.v2QMorphS = SPV(v2_qmorph_s##f))
 #define V3_SET(c, f) (c.v3Synth = SPV(v3_synth##f), c.v3Planes = SPV(v3_planes##f), c.v3SynthL = SPV(v3_synth_l##f))   // (V3's two colour passes: the raw planes and the synthesis)
 #define ML_SET(c, f) (c.mlDup = SPV(ml_dup##f), c.mlGuard = SPV(ml_guard##f), c.mlPlanes = SPV(ml_planes##f))
+#define DBG_SET(c, f) (c.dbgMotion = SPV(debug_motion##f), c.dbgMotionV2 = SPV(debug_motion_v2##f), c.dbgMotionV3 = SPV(debug_motion_v3##f), c.dbgUi = SPV(debug_ui##f))
 // false = this format's variants were not built into the library (meson option `formats`)
 bool colourSpv(Format f, ColourSpv& c) {
     switch (f) {
     case Format::Rgba8:
         c = COLOUR_SET(); V2_SET(c, ); V3_SET(c, ); c.v3SynthB = SPV(v3_synth_b);   // (v3Blend: Rgba8 / Bgra8 and Rgb10; the other formats keep it empty = the rule)
+#ifdef FG_HAVE_DBG
+        DBG_SET(c, );
+#endif
 #ifdef FG_HAVE_ML
         ML_SET(c, );
 #endif
@@ -308,6 +336,9 @@ bool colourSpv(Format f, ColourSpv& c) {
         c.v3SynthB = SPV(v3_synth_b_rgb10);
 #endif
 #endif
+#ifdef FG_HAVE_DBG_RGB10
+        DBG_SET(c, _rgb10);
+#endif
         return true;
 #endif
 #ifdef FG_HAVE_F16
@@ -321,6 +352,9 @@ bool colourSpv(Format f, ColourSpv& c) {
 #endif
 #ifdef FG_HAVE_V3_F16
         V3_SET(c, _f16);
+#endif
+#ifdef FG_HAVE_DBG_F16
+        DBG_SET(c, _f16);
 #endif
         return true;
 #endif
@@ -356,6 +390,7 @@ bool colourSpv(Format f, ColourSpv& c) {
     }
 }
 inline bool isYuv(Format f) { return f == Format::Nv12 || f == Format::P010; }
+const char* const kDbgNotBuilt = "the Settings::debugView shader variants of this format (debug_motion, debug_motion_v2, debug_motion_v3, debug_ui) are not built into the library";
 const char* const kV2NotBuilt = "the MotionVersion::V2 shader variants of this format (v2_morph, v2_morph_s, v2_qmorph, v2_qmorph_s) are not built into the library";
 const char* const kV3NotBuilt = "the MotionVersion::V3 shader variants of this format (v3_planes, v3_synth, v3_synth_l) are not built into the library";
 const char* const kMlNotBuilt = "the MotionVersion::Learned shaders of this format (ml_dup, ml_reduce, ml_pyr, ml_match, ml_conv, ml_out, ml_zero, ml_guard, ml_planes) or its weights (ml_weights.h, gpu/ml/embed_weights.py) are not built into the library";
@@ -555,8 +590,17 @@ struct UiPC {
     int32_t reach, reset, tilesX, tilesY, stillLimit, maskX, maskY, maskW, maskH, maskStride, maskOff, gate, track;
     float cthr;                                          // CrosshairV2 (appended: the other passes never read these)
     int32_t leave, reentry, binary, lumaOff, open;       // open: ui_inpaint*.comp, see ui_common.glsl
+    int32_t dbg;                                         // Settings::debugView's pass (debug_ui.comp only; the other UI passes' blocks end before it): 1 = UiMask, 2 = UiClean, | 16 = the box outline
 };
 static_assert(sizeof(UiPC) <= 128, "push constants beyond the guaranteed minimum");
+
+// Must match the push-constant block in shaders/debug_motion.comp (Settings::debugView = Motion; pushed over PC's range of the synth pipeline layout).
+struct DbgPC {
+    int32_t W, H, fw, fh, fscale, pf, bw, bh, quality, fdOff, gOff, nInt;
+    float m0, m1, maxA, cscale;
+};
+static_assert(sizeof(DbgPC) <= sizeof(PC), "DbgPC is pushed over PC's range");
+enum DbgPipe { D_MOTION, D_MOTION_V2, D_MOTION_V3, D_UI, D_COUNT };
 enum UiPipe { U_DETECT, U_BOX_UPDATE, U_BOX_MASK, U_MASK, U_INPAINT, U_PATCH, U_V2_UPDATE, U_V2_MASK, U_V2_FILL, U_COUNT, U_INPAINT_C = U_COUNT, U_PATCH_C, U_COUNT_ALL };   // _C: the CbCr plane (YUV only)
 static const int kUiCell = 2;    // whole-screen detection resolution: 1/kUiCell per axis (1, 2 or 4; 8 x cell divides the tile)
 static const int kUiTile = 32;   // == TILE in ui_common.glsl
@@ -903,6 +947,15 @@ struct Interpolator::Impl {
     VkDescriptorSetLayout uiDsl = VK_NULL_HANDLE;
     VkPipelineLayout uiLayout = VK_NULL_HANDLE;
     VkPipeline uiPipes[U_COUNT_ALL]{};
+    // ---- Settings::debugView (task 136): pipelines created by dbgEnsure() the first time a view needs them (setSettings / reconfigure / init), freed by destroy() ----
+    VkPipeline dbgPipes[D_COUNT]{};
+    bool dbgEnsure();
+    bool dbgOn() const { return set.debugView != DebugView::Off && !yuv; }   // a view is selected and this format draws one
+    // descriptor sets of the UI ring one synthesis takes for the view (UiMask: the whole-screen mask's and the box mask's; UiClean: one), besides the patch's
+    uint32_t dbgUiSets() const { return dbgOn() && (set.debugView == DebugView::UiMask || set.debugView == DebugView::UiClean) ? 2u : 0u; }
+    // the last pass over a finished generated frame (after the UI patch): `synth` = the record's synth set (bound again with `layout` for the motion tint), pf = V1 / Learned's field offset,
+    // nInt = the interior samples of this record (0: every sample is a real frame: nothing is drawn)
+    void debugDraw(VkCommandBuffer cb, VkDescriptorSet synth, Frame curr, Frame out, int pf, int nInt);
     VkDescriptorPool uiPool = VK_NULL_HANDLE;
     VkDescriptorSet uiSets[kUiSets]{};
     uint32_t uiSetIdx = 0, uiFrameSets = 0;
@@ -1637,6 +1690,7 @@ bool Interpolator::init(const InitInfo& ii) {
         udsai.pSetLayouts = ul;
         if (m->AllocateDescriptorSets(d, &udsai, m->uiSets) != VK_SUCCESS) { destroy(); err_ = fail; return false; }
     }
+    if (!m->dbgEnsure()) { destroy(); err_ = kDbgNotBuilt; return false; }   // Settings::debugView set at init(): its pipelines
 
     if (!resize(ii.width, ii.height, ii.viewFormat)) {
         const char* why = m->sizeWhy ? m->sizeWhy : "a buffer of this frame size could not be allocated";
@@ -1694,7 +1748,7 @@ bool Interpolator::validate(const Settings& s) {
            s.searchRadius >= 1 && s.searchRadius <= 12 && s.searchRadiusTop >= 1 && s.searchRadiusTop <= 12 &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) && s.pyramidMinSide >= 16 && s.pyramidMinSide <= 256 &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V3 &&
-           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.v3Guard <= (uint32_t)V3Guard::V2Motion && s.v3Blend <= 6 && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
+           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.v3Guard <= (uint32_t)V3Guard::V2Motion && s.v3Blend <= 6 && (uint32_t)s.debugView <= (uint32_t)DebugView::UiClean && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
            in(s.v3Smear, 0.0f, 1.0f) && in(s.v3OcclSoft, 0.25f, 4.0f) && in(s.v3Unsure, 0.25f, 4.0f) && in(s.v3SceneCut, 0.0f, 4.0f) &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
@@ -1719,6 +1773,7 @@ const char* Interpolator::settingsError(const Settings& s) const {
     if (const char* e = settingsError(s, m ? m->fmt : Format::Rgba8)) return e;
     if (m && s.motionVersion == MotionVersion::V2 && m->v2Why) return m->v2Why;
     if (m && s.motionVersion == MotionVersion::V3 && s.v3Guard != V3Guard::Off && m->v2Why) return m->v2Why;   // (the guard runs V2's estimate: the same device requirement)
+    if (m && s.debugView != DebugView::Off && !m->yuv && !(m->cs.dbgMotion.code && m->cs.dbgMotionV2.code && m->cs.dbgMotionV3.code && m->cs.dbgUi.code)) return kDbgNotBuilt;
     if (m && s.motionVersion == MotionVersion::V2 && !m->cs.v2Morph.code) return kV2NotBuilt;
     if (m && s.motionVersion == MotionVersion::Learned && !m->cs.mlDup.code) return kMlNotBuilt;
     if (m && s.motionVersion == MotionVersion::V3 && (!m->cs.v3Synth.code || !m->cs.v3Planes.code)) return kV3NotBuilt;
@@ -1738,7 +1793,7 @@ bool Interpolator::setSettings(const Settings& s) {
     Settings old = m->set;
     const UiBox oldBox = m->computeBox(), oldWork = m->computeWork(oldBox);
     m->set = s;
-    if (!m->motionEnsure() || !m->uiEnsure()) { m->set = old; return false; }
+    if (!m->motionEnsure() || !m->uiEnsure() || !m->dbgEnsure()) { m->set = old; return false; }
     m->uiAdopted(old);
     // A switch of the motion version drops the estimate, the way the library already has for "no estimate" (after init/resize):
     // recordSynth / recordSynthBlur return false until the next recordEstimate, which runs the new version. So does a change of
@@ -1757,7 +1812,7 @@ bool Interpolator::reconfigure(const Settings& s) {
     if (!m->motionEnsure()) { m->set = old; return false; }
     // re-create only if a size is held (W == 0: a later resize() creates the buffers with the new settings)
     if (structural && m->W) return m->rebuild(m->W, m->H, m->info.viewFormat, true);   // (drops the estimate anyway)
-    if (!m->uiEnsure()) { m->set = old; return false; }
+    if (!m->uiEnsure() || !m->dbgEnsure()) { m->set = old; return false; }
     m->uiAdopted(old);
     if (s.motionVersion != old.motionVersion || m->uiChanged(old, oldBox, oldWork)) m->haveEst = false;   // as in setSettings
     return true;
@@ -2042,6 +2097,7 @@ void Interpolator::destroy() {
     if (m->pool) m->DestroyDescriptorPool(d, m->pool, nullptr);
     if (m->DestroyPipeline) for (MotionGroup& g : m->mo) m->motionFree(g);
     for (auto p : m->uiPipes) if (p) m->DestroyPipeline(d, p, nullptr);
+    for (auto p : m->dbgPipes) if (p) m->DestroyPipeline(d, p, nullptr);
     if (m->blurLayout) m->DestroyPipelineLayout(d, m->blurLayout, nullptr);
     if (m->uiPool) m->DestroyDescriptorPool(d, m->uiPool, nullptr);
     if (m->uiLayout) m->DestroyPipelineLayout(d, m->uiLayout, nullptr);
@@ -2253,7 +2309,7 @@ bool Interpolator::recordDebugV3Weights(VkCommandBuffer cb, Frame prev, Frame cu
     if (I.estUi) {
         const UiEntry &ep = I.uiE[I.estEnt[0]], &ec = I.uiE[I.estEnt[1]];
         if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || (I.estClean && (!ep.view || !ec.view))) return false;
-        if (I.uiFrameSets + 2 > kUiSets) return false;
+        if (I.uiFrameSets + 2 + I.dbgUiSets() > kUiSets) return false;
         if (I.estClean) { srcP = ep.frame(); srcC = ec.frame(); }
     }
     if (!I.v3Synth(cb, srcP, srcC, curr, out, t, t, 1, false, L.stride, L.count)) return false;
@@ -2842,6 +2898,82 @@ void Interpolator::Impl::uiRecordPatch(VkCommandBuffer cb, Frame curr, Frame out
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Settings::debugView (task 136): the last pass over a finished generated frame
+// ---------------------------------------------------------------------------------------------------------
+// Creates the pipelines the selected view needs (the motion tint of the selected motion version, or the UI pass), the first time they are needed; they stay until destroy().
+// Nothing for Off and for the YUV formats (no view is drawn). False: this build lacks the variant, or the pipeline creation failed.
+bool Interpolator::Impl::dbgEnsure() {
+    if (!dbgOn()) return true;
+    DbgPipe p = D_UI;
+    Spv sp = cs.dbgUi;
+    VkPipelineLayout lay = uiLayout;
+    if (set.debugView == DebugView::Motion) {
+        lay = layout;
+        if (mv2()) { p = D_MOTION_V2; sp = cs.dbgMotionV2; }
+        else if (mv3()) { p = D_MOTION_V3; sp = cs.dbgMotionV3; }
+        else { p = D_MOTION; sp = cs.dbgMotion; }   // V1 and Learned: the field in buf[1]
+    }
+    if (dbgPipes[p]) return true;
+    return sp.code && makePipe(sp, lay, dbgPipes[p], nullptr);
+}
+
+namespace {
+void uiDispatchP(Interpolator::Impl& I, VkCommandBuffer cb, VkPipeline pipe, VkDescriptorSet set, const UiPC& pc, uint32_t gx, uint32_t gy) {
+    I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.uiLayout, 0, 1, &set, 0, nullptr);
+    I.CmdPushConstants(cb, I.uiLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(UiPC), &pc);
+    I.CmdDispatch(cb, gx, gy, 1);
+}
+}  // namespace
+
+void Interpolator::Impl::debugDraw(VkCommandBuffer cb, VkDescriptorSet synth, Frame curr, Frame out, int pf, int nInt) {
+    if (!dbgOn() || nInt <= 0) return;
+    Rec r(*this, cb);
+    if (set.debugView == DebugView::Motion) {
+        const VkPipeline pipe = dbgPipes[mv2() ? D_MOTION_V2 : mv3() ? D_MOTION_V3 : D_MOTION];
+        if (!pipe) return;
+        DbgPC d{};
+        d.W = (int)W; d.H = (int)H; d.fw = fw; d.fh = fh; d.fscale = (int)set.flowScale;
+        d.pf = pf; d.bw = lv[0].bw; d.bh = lv[0].bh; d.quality = set.v2Mode == V2Mode::Quality;
+        const V3Layout V = v3Layout(W, H, set.flowScale);
+        d.fdOff = (int)(16 * V.B); d.gOff = (int)V.gOff(); d.nInt = nInt;
+        d.m0 = (float)set.flowScale; d.m1 = 16.0f; d.maxA = 0.6f;
+        d.cscale = fmt == Format::Rgba8 ? 0.9f : 0.6f;   // HDR formats: PQ code values stay moderate
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);   // the synthesis' / the patch's writes of `out`
+        CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &synth, 0, nullptr);   // (the patch left a UI set bound)
+        CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        CmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DbgPC), &d);
+        CmdDispatch(cb, divUp((int)W, 8), divUp((int)H, 8), 1);
+        return;
+    }
+    // UiMask / UiClean: only where the pair was observed under a protection mode (estUi), as the patch
+    if (!estUi || !dbgPipes[D_UI]) return;
+    const UiEntry& E = uiE[estEnt[1]];
+    const bool clean = set.debugView == DebugView::UiClean && !E.v2;   // CrosshairV2 keeps no clean copy: it shows the mask
+    const Frame src = clean ? E.frame() : curr;
+    UiPC pc{};
+    pc.W = (int)W; pc.H = (int)H;
+    pc.tilesX = tilesX; pc.tilesY = tilesY;
+    pc.stillLimit = (int)std::floor((double)set.uiMaxStillFraction * cw * ch);
+    r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
+    if (E.hasWs) {   // the same masks, gate and suppression as the patch
+        pc.maskW = (int)W; pc.maskH = (int)H; pc.maskStride = ((int)W + 3) / 4; pc.maskOff = 4 + tilesX * tilesY; pc.gate = 1;
+        pc.dbg = clean ? 2 : 1;
+        uiDispatchP(*this, cb, dbgPipes[D_UI], takeUiSet(src, out, uiCellState, E.ws), pc, tilesX, tilesY * 4);
+        if (clean) return;   // the whole frame is the clean copy; the box lies inside it
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
+    }
+    if (E.hasBox) {
+        pc.boxX = E.bx.x; pc.boxY = E.bx.y; pc.boxW = E.bx.w; pc.boxH = E.bx.h;
+        pc.maskX = E.wr.x; pc.maskY = E.wr.y; pc.maskW = E.wr.w; pc.maskH = E.wr.h;
+        pc.maskStride = (E.wr.w + 3) / 4; pc.maskOff = 4; pc.gate = 0;
+        pc.binary = E.v2;
+        pc.dbg = clean ? 2 : (1 | 16);
+        uiDispatchP(*this, cb, dbgPipes[D_UI], takeUiSet(src, out, uiBoxState, E.box), pc, divUp(pc.maskStride, 8), divUp(E.wr.h, 8));
+    }
+}
+
 bool Interpolator::recordObserve(VkCommandBuffer cb, Frame frame) {
     if (!m || !m->W) return false;
     Impl& I = *m;
@@ -3365,6 +3497,8 @@ bool Interpolator::Impl::v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     v.n = n;
     v.gauss = gauss;
     for (int k = 0; k < n; k++) v.t[k] = ts[k];
+    int nIntV2 = 0;   // the interior samples (a real frame is not tinted)
+    for (int k = 0; k < n; k++) nIntV2 += ts[k] > 0.0f && ts[k] < 1.0f;
     // the tiles near a static overlay go to the static variant of the pass (V2's static-structure mask), the others to the plain
     // one; both write disjoint tiles and only add to the counts: no barrier between them. (Intended: syncval with its shader-accesses
     // heuristic reports a WRITE_AFTER_WRITE on binding 5, the output image, between them, and in Nv12 / P010 also on binding 10, its
@@ -3382,10 +3516,12 @@ bool Interpolator::Impl::v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
         r.stamp(name);
         uiRecordPatch(cb, curr, out, uiE[estEnt[1]]);   // the real UI pixels back over the generated frame
+        debugDraw(cb, set_, curr, out, 0, nIntV2);   // Settings::debugView (Off: nothing)
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
         r.stamp("ui_patch");
         return true;
     }
+    debugDraw(cb, set_, curr, out, 0, nIntV2);
     r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
     r.stamp(name);
     return true;
@@ -3472,10 +3608,12 @@ bool Interpolator::Impl::v3Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
         r.stamp(name);
         uiRecordPatch(cb, curr, out, uiE[estEnt[1]]);   // the real UI pixels back over the generated frame
+        debugDraw(cb, set_, curr, out, 0, dumpCount ? 0 : nInt);   // Settings::debugView (Off: nothing)
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
         r.stamp("ui_patch");
         return true;
     }
+    debugDraw(cb, set_, curr, out, 0, dumpCount ? 0 : nInt);
     r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
     r.stamp(name);
     return true;
@@ -3492,7 +3630,7 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
         // the entries the estimate saw must still be those frames (not evicted / re-observed since); the clean copies too
         const UiEntry &ep = I.uiE[I.estEnt[0]], &ec = I.uiE[I.estEnt[1]];
         if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || (I.estClean && (!ep.view || !ec.view))) return false;
-        if (I.uiFrameSets + 2 > kUiSets) return false;
+        if (I.uiFrameSets + 2 + I.dbgUiSets() > kUiSets) return false;
         if (I.estClean) { srcP = ep.frame(); srcC = ec.frame(); }
     }
     if (I.mv2()) return I.v2Synth(cb, srcP, srcC, curr, out, &t, 1, false);
@@ -3539,10 +3677,12 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
         r.stamp(last);
         I.uiRecordPatch(cb, curr, out, I.uiE[I.estEnt[1]]);   // the real UI pixels back over the generated frame
+        I.debugDraw(cb, set, curr, out, pc.pf, 1);   // Settings::debugView (Off: nothing)
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
         r.stamp("ui_patch");
         return true;
     }
+    I.debugDraw(cb, set, curr, out, pc.pf, 1);
     r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
     r.stamp(last);
     return true;
@@ -3561,7 +3701,7 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
     if (I.estUi) {
         const UiEntry &ep = I.uiE[I.estEnt[0]], &ec = I.uiE[I.estEnt[1]];
         if (ep.seq != I.estSeq[0] || ec.seq != I.estSeq[1] || (I.estClean && (!ep.view || !ec.view))) return false;
-        if (I.uiFrameSets + 2 > kUiSets) return false;
+        if (I.uiFrameSets + 2 + I.dbgUiSets() > kUiSets) return false;
         if (I.estClean) { srcP = ep.frame(); srcC = ec.frame(); }
     }
 
@@ -3641,10 +3781,12 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
         r.stamp(last);
         I.uiRecordPatch(cb, curr, out, I.uiE[I.estEnt[1]]);   // the real UI pixels back over the blurred frame
+        I.debugDraw(cb, set, curr, out, I.fieldPF, nInt);   // Settings::debugView, once over the average (Off: nothing)
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);
         r.stamp("ui_patch");
         return true;
     }
+    I.debugDraw(cb, set, curr, out, I.fieldPF, nInt);
     r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);
     r.stamp(last);
     return true;
@@ -3655,7 +3797,7 @@ bool Interpolator::record(VkCommandBuffer cb, Frame prev, Frame curr, Frame out,
     // both rings must have room, so that a refused record() records nothing
     assert(m->frameSets[0] < kSetRing && m->frameSets[1] < kSetRing && "framegen: more than kSetRing records since beginFrame()");
     if (m->frameSets[Impl::R_EST] >= kSetRing || m->frameSets[Impl::R_SYNTH] >= kSetRing) return false;
-    if (m->uiActive() && m->uiFrameSets + 2 * m->uiObserveSets() + 2 + (m->v2Fill() ? 2 : 0) > kUiSets) return false;   // 2 implicit observes + the patch (+ V2's two luma fills)
+    if (m->uiActive() && m->uiFrameSets + 2 * m->uiObserveSets() + 2 + m->dbgUiSets() + (m->v2Fill() ? 2 : 0) > kUiSets) return false;   // 2 implicit observes + the patch (+ V2's two luma fills)
     return recordEstimate(cb, prev, curr) && recordSynth(cb, prev, curr, out, t);
 }
 

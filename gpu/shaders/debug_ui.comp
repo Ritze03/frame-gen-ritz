@@ -1,0 +1,87 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Settings::debugView = UiMask / UiClean (framegen.h DebugView): the last pass over a generated frame under static UI protection, in place, on the
+// UI pipeline layout (ui_patch.comp's structure: one thread per mask word, 4 workgroups per tile in y). It does NOT include ui_common.glsl: that
+// file's push block is shared by every UI shader and must keep its SPIR-V, so the block is repeated here with one more member, dbg, at the end.
+//   dbg & 15 == 1 (UiMask): tint what the patch treats as UI. Mask byte 255 (pasted: out equals the real frame there) -> colour 1; CrosshairV2 (binary != 0):
+//     64 (confirmed, changed in this pair, not pasted) -> colour 2; the other bytes (Crosshair / WholeScreen feather, 128) -> colour 1 weighted by byte / 255.
+//     dbg & 16: the 1 px outline of the box (boxX..boxH), in colour 3. Whole screen keeps the patch's gate (tile flag, "mostly still" suppression).
+//   dbg & 15 == 2 (UiClean): out = the library's clean copy of curr (binding 0: sampled) over the dispatched rectangle (mask rectangle; no mask is read).
+// A pasted pixel is tinted from the real frame (binding 0), not from out, so the pass is idempotent where the whole-screen and the box masks overlap.
+// Alpha is kept. The colours are scaled by CS: 0.6 in the HDR formats (Rgb10 / RgbaF16: the stored values are PQ codes, 1.0 is peak brightness), 0.9 in Rgba8.
+#include "format.glsl"
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, FG_FMT) uniform image2D img;
+layout(set = 0, binding = 2, std430) buffer StateBuf { uint st[]; };
+layout(set = 0, binding = 3, std430) buffer MaskBuf { uint mk[]; };
+
+// == framegen.cpp's UiPC, field for field (ui_common.glsl's block + dbg, cscale)
+layout(push_constant) uniform PC {
+    int W, H;
+    int boxX, boxY, boxW, boxH;
+    int cell, cw, ch;
+    int wholeScreen;
+    int still;
+    float thr;
+    int reach, reset;
+    int tilesX, tilesY;
+    int stillLimit;
+    int maskX, maskY, maskW, maskH, maskStride, maskOff;
+    int gate;
+    int track;
+    float cthr;
+    int leave, reentry, binary, lumaOff, open;
+    int dbg;
+} pc;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const int TILE = 32;
+bool tileLive(ivec2 tile) {
+    return mk[0] <= uint(pc.stillLimit) && mk[4 + tile.y * pc.tilesX + tile.x] != 0u;
+}
+
+#if defined(FG_FORMAT_RGB10) || defined(FG_FORMAT_F16)
+const float CS = 0.6;   // HDR: moderate code values
+#else
+const float CS = 0.9;
+#endif
+const vec3 C1 = vec3(1.0, 0.1, 0.85) * CS;   // pasted: magenta
+const vec3 C2 = vec3(0.1, 0.9, 1.0) * CS;    // confirmed but changed in this pair, not pasted: cyan
+const vec3 C3 = vec3(1.0, 0.9, 0.1) * CS;    // box outline: yellow
+const float ALPHA = 0.6, ALPHA_OUT = 0.9;
+
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= pc.maskStride || g.y >= pc.maskH) return;
+    const int mode = pc.dbg & 15;
+    const bool outline = (pc.dbg & 16) != 0;
+    if (mode == 1 && pc.gate != 0 && !tileLive((ivec2(pc.maskX, pc.maskY) + ivec2(g.x * 4, g.y)) / TILE)) return;
+    const uint word = mode == 1 ? mk[pc.maskOff + g.y * pc.maskStride + g.x] : 0u;
+    for (int k = 0; k < 4; k++) {
+        const ivec2 rel = ivec2(g.x * 4 + k, g.y);
+        if (rel.x >= pc.maskW) continue;
+        const ivec2 p = ivec2(pc.maskX, pc.maskY) + rel;
+        const vec4 o = imageLoad(img, p);
+        if (mode == 2) {
+            imageStore(img, p, vec4(texelFetch(src, p, 0).rgb, o.a));
+            continue;
+        }
+        const uint a = (word >> uint(8 * k)) & 255u;
+        const bool edge = outline && p.x >= pc.boxX && p.x < pc.boxX + pc.boxW && p.y >= pc.boxY && p.y < pc.boxY + pc.boxH &&
+                          (p.x == pc.boxX || p.x == pc.boxX + pc.boxW - 1 || p.y == pc.boxY || p.y == pc.boxY + pc.boxH - 1);
+        if (a == 0u && !edge) continue;
+        vec3 res = o.rgb;
+        if (a != 0u) {
+            const vec3 base = a == 255u ? texelFetch(src, p, 0).rgb : o.rgb;
+            if (pc.binary != 0) {
+                if (a == 255u) res = mix(base, C1, ALPHA);
+                else res = mix(base, C2, ALPHA);
+            } else {
+                res = mix(base, C1, ALPHA * float(a) * (1.0 / 255.0));
+            }
+        }
+        if (edge) res = mix(res, C3, ALPHA_OUT);
+        imageStore(img, p, vec4(res, o.a));
+    }
+}

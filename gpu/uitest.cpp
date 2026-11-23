@@ -1980,6 +1980,182 @@ static void motionCheck(const Scene& sc) {
 }
 #endif
 
+#ifndef UITEST_NO_UI
+// ---------------------------------------------------------------- Settings::debugView = UiMask / UiClean (task 136)
+// The 12-frame scene with its static crosshair (35x35 px, outline included) and HUD, last pair, t = 0.5 / 0.25 outputs. For each protection mode:
+//  UiMask : exactly the mask pixels and the 1 px outline of the box differ from the Off output; their colours are the view's tint of the Off pixel (RGBA8 only)
+//  UiClean: outside the pixels UI protection inpaints the output is the real frame, the UI itself is gone; CrosshairV2 (no clean copy) shows the UiMask picture
+//  protection Off: both views leave the Off picture exactly as it is.
+static int debugViewCheck(int W, int H) {
+    Scene sc(W, H, 12, 0, 0);
+    const auto real11 = sc.frame(11);
+    const float kFitFrac = 43.0f / H;
+    Settings c1; c1.uiProtection = UiProtection::Crosshair; c1.uiBoxHeightFrac = kFitFrac;
+    Settings w1 = c1; w1.uiProtection = UiProtection::WholeScreen;
+    Settings v2 = c1; v2.uiProtection = UiProtection::CrosshairV2;
+    struct Mode { const char* name; Settings s; bool ws, v2; } modes[3] = {{"Crosshair", c1, false, false}, {"WholeScreen", w1, true, false}, {"CrosshairV2", v2, false, true}};
+    printf("debugview %dx%d %s\n", W, H, bgra ? "BGRA8" : "RGBA8");
+    // distance (Chebyshev) of every pixel to the nearest UI pixel of the set, capped at 9
+    auto distFrom = [&](const std::vector<uint8_t>& seed) {
+        std::vector<uint8_t> d((size_t)W * H, 9);
+        std::vector<int> frontier;
+        for (size_t i = 0; i < (size_t)W * H; i++)
+            if (seed[i]) { d[i] = 0; frontier.push_back((int)i); }
+        for (int r = 1; r <= 8; r++) {
+            std::vector<int> next;
+            for (int i : frontier) {
+                int x = i % W, y = i / W;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int nx = x + dx, ny = y + dy;
+                        if (nx < 0 || ny < 0 || nx >= W || ny >= H || d[(size_t)ny * W + nx] <= r) continue;
+                        d[(size_t)ny * W + nx] = (uint8_t)r;
+                        next.push_back(ny * W + nx);
+                    }
+            }
+            frontier.swap(next);
+        }
+        return d;
+    };
+    auto uiSeed = [&](bool withHud) {
+        std::vector<uint8_t> m((size_t)W * H, 0);
+        for (size_t i = 0; i < m.size(); i++) m[i] = sc.ui[i] == 1 || (withHud && sc.ui[i] == 2);
+        return m;
+    };
+    // pixels that stayed still (no channel moved more than uiStillThreshold) over the 8 last frame pairs: whole screen may mask these too, wherever they are
+    std::vector<uint8_t> stillSeed((size_t)W * H, 1);
+    {
+        auto prevF = sc.frame(3);
+        for (int f = 4; f <= 11; f++) {
+            auto cur = sc.frame(f);
+            for (size_t i = 0; i < stillSeed.size(); i++)
+                for (int c = 0; c < 3; c++)
+                    if (std::abs((int)cur[i * 4 + c] - (int)prevF[i * 4 + c]) > 3) stillSeed[i] = 0;
+            prevF = cur;
+        }
+    }
+    const std::vector<uint8_t> dX = distFrom(uiSeed(false)), dXH = distFrom(uiSeed(true)), dStill = distFrom(stillSeed);
+    auto near1 = [](const uint8_t* a, const float* p) {   // 3 channels within 1 level of the prediction
+        for (int c = 0; c < 3; c++) if (std::fabs((float)a[c] - p[c]) > 1.01f) return false;
+        return true;
+    };
+    auto mix3 = [](const uint8_t* a, const float* col, float al, float* o) { for (int c = 0; c < 3; c++) o[c] = a[c] * (1.0f - al) + 255.0f * col[c] * al; };
+    const float C1[3] = {1.0f * 0.9f, 0.1f * 0.9f, 0.85f * 0.9f}, C2[3] = {0.1f * 0.9f, 0.9f * 0.9f, 1.0f * 0.9f}, C3[3] = {1.0f * 0.9f, 0.9f * 0.9f, 0.1f * 0.9f};
+    for (const Mode& md : modes) {
+        printf(" %s:\n", md.name);
+        const Result rOff = runSequence(sc, md.s, true, nullptr);
+        Settings sm = md.s; sm.debugView = DebugView::UiMask;
+        Settings sc2 = md.s; sc2.debugView = DebugView::UiClean;
+        const Result rM = runSequence(sc, sm, true, nullptr);
+        const Result rC = runSequence(sc, sc2, true, nullptr);
+        int32_t bx[4], wr[4];
+        Interpolator::boxRect(md.s, W, H, bx);
+        Interpolator::workRect(md.s, W, H, wr);
+        auto inRect = [&](int x, int y, const int32_t* r) { return x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3]; };
+        auto onOutline = [&](int x, int y) { return inRect(x, y, bx) && (x == bx[0] || x == bx[0] + bx[2] - 1 || y == bx[1] || y == bx[1] + bx[3] - 1); };
+        const std::vector<uint8_t>& dist = md.ws ? dXH : dX;
+        for (int k = 0; k < 2; k++) {   // t = 0.5 and t = 0.25
+            const auto& off = rOff.out[k];
+            const auto& mk = rM.out[k];
+            size_t nDiff = 0, nOutline = 0, outlineChanged = 0, nBad = 0, nFar = 0, nUiHit = 0, nUi = 0, nColourBad = 0;
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) {
+                    const size_t i = (size_t)y * W + x;
+                    const bool diff = memcmp(&off[i * 4], &mk[i * 4], 4) != 0;
+                    const bool ol = onOutline(x, y);
+                    if (ol) { nOutline++; outlineChanged += diff; }
+                    nDiff += diff && !ol;
+                    // an unexpected change: far from every UI pixel (the mask lies within 2 px of a still pixel; whole screen: 2x2 cells, so 3), or outside the work rectangle (box modes)
+                    if (diff && !ol && (dist[i] > (md.ws ? 3 : 2) || (!md.ws && !inRect(x, y, wr))) && !(md.ws && dStill[i] <= 3)) nFar++;   // (whole screen also masks still background far from the UI)
+                    if (!diff && !ol && dX[i] == 0 && (md.ws || inRect(x, y, wr))) nBad++;   // a crosshair pixel the view did not tint
+                    if (dX[i] == 0 && (md.ws || inRect(x, y, wr))) { nUi++; nUiHit += diff; }
+                    if (diff && !bgra && k == 0) {   // the colour: the tint of the Off pixel (pasted 255: C1, V2's 64: C2, the feather: C1 weaker), the outline over it
+                        float p1[3], p2[3], p3[3], q[3];
+                        mix3(&off[i * 4], C1, 0.6f, p1);
+                        mix3(&off[i * 4], C2, 0.6f, p2);
+                        mix3(&off[i * 4], C1, 0.6f * 128.0f / 255.0f, p3);
+                        bool ok = false;
+                        if (!ol) ok = near1(&mk[i * 4], p1) || near1(&mk[i * 4], p2) || near1(&mk[i * 4], p3);
+                        else {
+                            float base[3][3];
+                            memcpy(base[0], p1, 12); memcpy(base[1], p2, 12); memcpy(base[2], p3, 12);
+                            float none[3] = {(float)off[i * 4], (float)off[i * 4 + 1], (float)off[i * 4 + 2]};
+                            for (int b = 0; b < 4 && !ok; b++) {
+                                const float* v = b < 3 ? base[b] : none;
+                                uint8_t u[3] = {(uint8_t)std::lround(std::min(std::max(v[0], 0.0f), 255.0f)), (uint8_t)std::lround(std::min(std::max(v[1], 0.0f), 255.0f)), (uint8_t)std::lround(std::min(std::max(v[2], 0.0f), 255.0f))};
+                                mix3(u, C3, 0.9f, q);
+                                ok = near1(&mk[i * 4], q);
+                            }
+                        }
+                        nColourBad += !ok;
+                    }
+                }
+            printf("   UiMask t=%s: %zu mask px + %zu/%zu outline px differ; %zu px far from the UI, %zu UI px untinted (of %zu), %zu px of another colour\n", k ? "0.25" : "0.5", nDiff, outlineChanged, nOutline, nFar, nBad, nUi, nColourBad);
+            expect(outlineChanged == nOutline, "UiMask: the whole 1 px outline of the box differs from Off");
+            expect(nFar == 0, "UiMask: nothing differs outside the mask (within 2 px of a still UI pixel; box modes: inside the work rectangle; whole screen: 3 px, or within 3 px of a pixel that stayed still)");
+            expect(nBad == 0 && nUi > 0, "UiMask: every crosshair pixel is tinted");
+            if (!bgra && k == 0) expect(nColourBad == 0, "UiMask: every changed pixel is the Off pixel blended towards the view's colours (+-1 level)");
+            if (!md.v2 && !md.ws) {   // Crosshair: the mask is exactly the pixels within 2 px of the still crosshair (255 within 1, the feather at 2), inside the work rectangle
+                size_t want = 0;
+                for (int y = 0; y < H; y++)
+                    for (int x = 0; x < W; x++)
+                        if (dX[(size_t)y * W + x] <= 2 && inRect(x, y, wr) && !onOutline(x, y)) want++;
+                expect(nDiff == want, "UiMask (Crosshair): the changed pixels are exactly the mask: 255 within 1 px of the crosshair, the 128 ring at 2 px");
+                if (nDiff != want) printf("     (changed %zu, mask %zu)\n", nDiff, want);
+            }
+            if (k == 0) {   // no tint where the patch pasted nothing: a changed pixel is a mask pixel; the Off picture itself is the pasted one, so the check above compares against the Off run
+                (void)nUiHit;
+            }
+        }
+        // UiClean
+        {
+            const auto& off = rOff.out[0];
+            const auto& cl = rC.out[0];
+            if (md.v2) {
+                expect(cl == rM.out[0] && rC.out[1] == rM.out[1], "UiClean under CrosshairV2 (no clean copy) is the UiMask picture, t = 0.5 and 0.25");
+            } else {
+                size_t nFarBad = 0, nUiLeft = 0, nUi = 0, nOutsideChanged = 0, nInpaintDiff = 0;
+                for (int y = 0; y < H; y++)
+                    for (int x = 0; x < W; x++) {
+                        const size_t i = (size_t)y * W + x;
+                        const bool region = md.ws || inRect(x, y, wr);
+                        if (!region) { nOutsideChanged += memcmp(&off[i * 4], &cl[i * 4], 4) != 0; continue; }
+                        if (dist[i] > 3 && memcmp(&real11[i * 4], &cl[i * 4], 4) != 0 && !(md.ws && memcmp(&off[i * 4], &rM.out[0][i * 4], 4) != 0)) nFarBad++;   // (whole screen: the still background it masked is inpainted too)   // beyond the inpainted pixels the clean copy is the real frame
+                        if (dX[i] == 0) { nUi++; nUiLeft += memcmp(&sc.uiCol[i * 4], &cl[i * 4], 3) == 0; }   // the UI itself is gone
+                        nInpaintDiff += memcmp(&off[i * 4], &cl[i * 4], 4) != 0;
+                    }
+                printf("   UiClean: %zu px differ from Off; %zu px beyond the inpainted ones differ from the real frame; %zu of %zu UI px still show the UI colour; %zu px outside the region changed\n", nInpaintDiff, nFarBad, nUiLeft, nUi, nOutsideChanged);
+                expect(nFarBad == 0, "UiClean: the work rectangle (whole frame for WholeScreen) is the clean copy: the real frame beyond the inpainted pixels, bit-exact");
+                expect(nUi > 0 && nUiLeft * 20 < nUi, "UiClean: the crosshair is gone (inpainted away; at most 5 % of its pixels coincide with its colour)");
+                if (!md.ws) expect(nOutsideChanged == 0, "UiClean (Crosshair): outside the work rectangle the picture is the Off one, bit-exact");
+            }
+        }
+    }
+    // protection Off, and a pair that is not observed under a mode: nothing is drawn
+    {
+        Settings off;
+        const Result r0 = runSequence(sc, off, true, nullptr);
+        for (DebugView v : {DebugView::UiMask, DebugView::UiClean}) {
+            Settings s = off; s.debugView = v;
+            const Result r = runSequence(sc, s, true, nullptr);
+            expect(r.out[0] == r0.out[0] && r.out[1] == r0.out[1], v == DebugView::UiMask ? "protection Off + UiMask: identical to debugView Off" : "protection Off + UiClean: identical to debugView Off");
+        }
+    }
+    // validation: 0..3 accepted, above refused (the field is one byte: no wrap)
+    {
+        Settings s; s.debugView = (DebugView)3;
+        expect(Interpolator::validate(s), "validate accepts debugView 0..3");
+        s.debugView = (DebugView)4;
+        expect(!Interpolator::validate(s), "validate refuses debugView 4");
+        s.debugView = (DebugView)255;
+        expect(!Interpolator::validate(s), "validate refuses debugView 255");
+        printf("   sizeof(Settings) = %zu, offsetof(debugView) = %zu, offsetof(v3Blend) = %zu\n", sizeof(Settings), offsetof(Settings, debugView), offsetof(Settings, v3Blend));
+        expect(sizeof(Settings) == 164 && offsetof(Settings, debugView) == 143 && offsetof(Settings, v3Guard) == 144, "sizeof(Settings) stays 164, debugView at 143, v3Guard still at 144");
+    }
+    return fails;
+}
+#endif
+
 int main(int argc, char** argv) {
     std::vector<std::string> pos;
     bool hash = false;
@@ -2016,7 +2192,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench" && pos[0] != "stale")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench|stale [--bgra] [--hash] [--algo v1|v2|learned|v3] [--mode quality|performance] [--detail-split] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench" && pos[0] != "stale" && pos[0] != "debugview")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench|stale|debugview [--bgra] [--hash] [--algo v1|v2|learned|v3] [--mode quality|performance] [--detail-split] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -2069,6 +2245,16 @@ int main(int argc, char** argv) {
             if (pos.size() >= 3) trackBench(atoi(pos[1].c_str()), atoi(pos[2].c_str()));
             else { trackBench(1920, 1080); trackBench(2560, 1440); }
         }
+#endif
+    } else if (pos[0] == "debugview") {   // task 136: Settings::debugView = UiMask / UiClean (the synthetic crosshair + HUD scene; --algo / --mode apply)
+#ifdef UITEST_NO_UI
+        fprintf(stderr, "debugview needs the UI API\n");
+        return 2;
+#else
+        int W = pos.size() >= 3 ? atoi(pos[1].c_str()) : 1280, H = pos.size() >= 3 ? atoi(pos[2].c_str()) : 720;
+        initStaging((size_t)W * H * 4);
+        rc = debugViewCheck(W, H);
+        printf(rc ? "RESULT: FAIL (%d)\n" : "RESULT: PASS\n", fails);
 #endif
     } else if (pos[0] == "stale") {
 #ifdef UITEST_NO_UI

@@ -10,7 +10,7 @@
 // readback; rgb10 / f16 / p010 as PQ HDR, f16lin as scRGB, see Fmt below).
 // --seq "S0;S1;..": live-toggle test: before pair i, setSettings(--set + state min(i, n-1)) and releaseUnusedMotion() (settingsError / setSettings failures end the run).
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
-// smoothBonus searchPenalty searchRadius searchRadiusTop subpixel flowScale pyramidMinSide v2StaticMask v3Smear v3OcclSoft v3Unsure v3SceneCut v3ColourWindow v3DetailSplit v3Blend v3Guard=off|guard|v2motion (or 0|1|2); algo=v1|v2|learned|v3 = motionVersion; v2Mode=quality|performance;
+// smoothBonus searchPenalty searchRadius searchRadiusTop subpixel flowScale pyramidMinSide v2StaticMask v3Smear v3OcclSoft v3Unsure v3SceneCut v3ColourWindow v3DetailSplit v3Blend v3Guard=off|guard|v2motion (or 0|1|2); debugView=off|motion|uimask|uiclean (or 0..3); algo=v1|v2|learned|v3 = motionVersion; v2Mode=quality|performance;
 // learnedNet=e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3 (MotionVersion::Learned's net), learnedHalf, learnedZeroTest, learnedStaticGuard (0|1); ui=off|crosshair|wholescreen|crosshairv2 =
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill), passed to init.
@@ -101,6 +101,14 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         else if (k == "v3ColourWindow") s.v3ColourWindow = v != 0;
         else if (k == "v3DetailSplit") s.v3DetailSplit = v != 0;
         else if (k == "v3Blend") s.v3Blend = (uint8_t)std::min(std::max(v, 0.0), 255.0);   // learned blend (experimental): 0 = the rule, 1 | 2 | 3 = the nets, 4 | 5 | 6 = the second weight set's nets (> 6 is refused by settingsError)
+        else if (k == "debugView") {   // Settings::debugView: off | motion | uimask | uiclean (or 0..3; a value above is refused by validate)
+            std::string a = eq + 1;
+            if (a == "off") s.debugView = framegen::DebugView::Off;
+            else if (a == "motion") s.debugView = framegen::DebugView::Motion;
+            else if (a == "uimask") s.debugView = framegen::DebugView::UiMask;
+            else if (a == "uiclean") s.debugView = framegen::DebugView::UiClean;
+            else s.debugView = (framegen::DebugView)(uint8_t)v;
+        }
         else if (k == "v3Guard") {   // V3 + V2 Quality's motion: off | guard | v2motion
             std::string a = eq + 1;
             if (a == "off" || a == "0") s.v3Guard = framegen::V3Guard::Off;
@@ -891,6 +899,10 @@ int main(int argc, char** argv) {
         CK(vkCreateQueryPool(dev, &qp, nullptr, &pool));
         const int setsPer = std::max(mult - 1, 1) + (setA.motionVersion == framegen::MotionVersion::V3 && setA.v3Guard != framegen::V3Guard::Off ? 1 : 0);   // the guard takes a second set per estimate
         int batch = std::min(bench, (int)(framegen::Interpolator::kSetRing - 1) / setsPer);
+        if (setA.uiProtection != framegen::UiProtection::Off && (setA.debugView == framegen::DebugView::UiMask || setA.debugView == framegen::DebugView::UiClean)) {   // the UI views take up to 2 more sets of the kUiSets ring per synthesis
+            const int uiPer = (setA.uiProtection == framegen::UiProtection::WholeScreen ? 2 : 1) + 2 + 2 + (setA.uiProtection == framegen::UiProtection::CrosshairV2 && setA.uiEstimateFill ? 2 : 0);
+            batch = std::max(1, std::min(batch, (int)(framegen::Interpolator::kUiSets - 2) / uiPer));
+        }
         std::vector<double> per1;
         for (int rep = 0; rep < 5; rep++) {
             begin();

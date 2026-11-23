@@ -1000,6 +1000,54 @@ static int check(int W, int H) {
 #endif
 }
 
+
+#ifndef BLURTEST_NO_BLUR
+// Settings::debugView on a motion-blurred output (task 136): the view is drawn ONCE over the average, after the UI patch. Run-time toggle on one estimate:
+// Off, Motion, UiMask, UiClean, Off again: the two Off pictures are identical; Motion tints (the scene pans, so most of the frame moves), UiMask / UiClean
+// change the pixels around the crosshair only (protection Crosshair), a window of real frames only (t0 = t1 = 1) is not tinted.
+static int debugViewCheck(int W, int H) {
+    Settings s = algo(Settings{});
+    s.blurSamples = 4;
+    s.uiProtection = UiProtection::Crosshair;
+    s.uiBoxHeightFrac = 43.0f / H;
+    printf("debugview (blur) %dx%d %s\n", W, H, bgra ? "BGRA8" : "RGBA8");
+    Ctx c(W, H, s);
+    auto blurTo = [&](int i, DebugView v, float t0, float t1) {
+        Settings sv = s; sv.debugView = v;
+        if (!c.fg.setSettings(sv)) { fprintf(stderr, "setSettings(debugView) failed\n"); exit(1); }
+        blurOut(c, i, t0, t1);
+    };
+    blurTo(0, DebugView::Off, 0.25f, 0.75f);
+    blurTo(1, DebugView::Motion, 0.25f, 0.75f);
+    blurTo(2, DebugView::UiMask, 0.25f, 0.75f);
+    blurTo(3, DebugView::UiClean, 0.25f, 0.75f);
+    blurTo(4, DebugView::Off, 0.25f, 0.75f);
+    blurTo(5, DebugView::Motion, 1.0f, 1.0f);   // a real frame (the window [1, 1]): nothing is drawn
+    blurTo(6, DebugView::Off, 1.0f, 1.0f);
+    const auto o0 = c.get(0), o1 = c.get(1), o2 = c.get(2), o3 = c.get(3), o4 = c.get(4), o5 = c.get(5), o6 = c.get(6);
+    int32_t bx[4], wr[4];
+    Interpolator::boxRect(s, W, H, bx);
+    Interpolator::workRect(s, W, H, wr);
+    size_t nMot = 0, nMask = 0, nMaskOut = 0, nClean = 0, nCleanOut = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            const size_t i = ((size_t)y * W + x) * 4;
+            const bool in = x >= wr[0] && y >= wr[1] && x < wr[0] + wr[2] && y < wr[1] + wr[3];
+            nMot += memcmp(&o0[i], &o1[i], 4) != 0;
+            const bool dm = memcmp(&o0[i], &o2[i], 4) != 0, dc = memcmp(&o0[i], &o3[i], 4) != 0;
+            nMask += dm; nMaskOut += dm && !in;
+            nClean += dc; nCleanOut += dc && !in;
+        }
+    printf("   Motion tints %zu px of %d; UiMask changes %zu px (%zu outside the work rectangle); UiClean %zu (%zu outside)\n", nMot, W * H, nMask, nMaskOut, nClean, nCleanOut);
+    expect(o4 == o0, "blur window: Off after Motion / UiMask / UiClean equals Off before (the view is a run-time switch, nothing sticks)");
+    expect(nMot > (size_t)W * H / 4, "blur window, Motion: the moving picture is tinted");
+    expect(nMask > 100 && nMaskOut == 0, "blur window, UiMask: the crosshair and the box outline change, nothing outside the work rectangle");
+    expect(nClean > 100 && nCleanOut == 0, "blur window, UiClean: the work rectangle shows the clean copy, nothing outside it changes");
+    expect(o5 == o6, "window of a real frame only: Motion draws nothing");
+    return fails;
+}
+#endif
+
 int main(int argc, char** argv) {
     std::vector<std::string> pos;
     for (int i = 1; i < argc; i++) {
@@ -1034,7 +1082,7 @@ int main(int argc, char** argv) {
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2|learned|v3] [--mode quality|performance] [--colour-window] [--detail-split] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "debugview")) { fprintf(stderr, "usage: blurtest check|bench|debugview [--bgra] [--algo v1|v2|learned|v3] [--mode quality|performance] [--colour-window] [--detail-split] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -1078,6 +1126,16 @@ int main(int argc, char** argv) {
         if (pos.size() >= 3) sizes = {{atoi(pos[1].c_str()), atoi(pos[2].c_str())}};
         for (auto [w, h] : sizes)
             for (uint32_t fs : {2u, 4u}) benchOne(w, h, fs, Settings{});
+    }
+    if (pos[0] == "debugview") {
+#ifdef BLURTEST_NO_BLUR
+        fprintf(stderr, "debugview needs the blur API\n");
+        return 2;
+#else
+        int W = pos.size() >= 3 ? atoi(pos[1].c_str()) : 1280, H = pos.size() >= 3 ? atoi(pos[2].c_str()) : 720;
+        rc = debugViewCheck(W, H);
+        printf(rc ? "RESULT: FAIL (%d)\n" : "RESULT: PASS\n", fails);
+#endif
     }
     if (pos[0] == "check") {
         int W = pos.size() >= 3 ? atoi(pos[1].c_str()) : 1280, H = pos.size() >= 3 ? atoi(pos[2].c_str()) : 720;
