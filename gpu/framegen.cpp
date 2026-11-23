@@ -2950,7 +2950,8 @@ void Interpolator::Impl::debugDraw(VkCommandBuffer cb, VkDescriptorSet synth, Fr
     // UiMask / UiClean: only where the pair was observed under a protection mode (estUi), as the patch
     if (!estUi || !dbgPipes[D_UI]) return;
     const UiEntry& E = uiE[estEnt[1]];
-    const bool clean = set.debugView == DebugView::UiClean && !E.v2;   // CrosshairV2 keeps no clean copy: it shows the mask
+    const bool clean = set.debugView == DebugView::UiClean && !E.v2;
+    const bool fill = set.debugView == DebugView::UiClean && E.v2;   // CrosshairV2 keeps no clean copy: its pixels are filled from their surroundings in `out`
     const Frame src = clean ? E.frame() : curr;
     UiPC pc{};
     pc.W = (int)W; pc.H = (int)H;
@@ -2969,7 +2970,8 @@ void Interpolator::Impl::debugDraw(VkCommandBuffer cb, VkDescriptorSet synth, Fr
         pc.maskX = E.wr.x; pc.maskY = E.wr.y; pc.maskW = E.wr.w; pc.maskH = E.wr.h;
         pc.maskStride = (E.wr.w + 3) / 4; pc.maskOff = 4; pc.gate = 0;
         pc.binary = E.v2;
-        pc.dbg = clean ? 2 : (1 | 16);
+        pc.dbg = clean ? 2 : fill ? 3 : (1 | 16);
+        pc.reach = (int)set.uiInpaintReach;
         uiDispatchP(*this, cb, dbgPipes[D_UI], takeUiSet(src, out, uiBoxState, E.box), pc, divUp(pc.maskStride, 8), divUp(E.wr.h, 8));
     }
 }

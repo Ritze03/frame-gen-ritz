@@ -2112,7 +2112,54 @@ static int debugViewCheck(int W, int H) {
             const auto& off = rOff.out[0];
             const auto& cl = rC.out[0];
             if (md.v2) {
-                expect(cl == rM.out[0] && rC.out[1] == rM.out[1], "UiClean under CrosshairV2 (no clean copy) is the UiMask picture, t = 0.5 and 0.25");
+                // CrosshairV2: no colours, no outline; the pixels the mask holds (non-zero: what UiMask tints, outline excluded) are filled from the unmasked ones around them
+                const int reach = (int)md.s.uiInpaintReach;
+                for (int k = 0; k < 2; k++) {
+                    const auto& o = rOff.out[k];
+                    const auto& m = rM.out[k];
+                    const auto& c = rC.out[k];
+                    std::vector<uint8_t> M((size_t)W * H, 0);
+                    for (int y = 0; y < H; y++)
+                        for (int x = 0; x < W; x++) {
+                            const size_t i = (size_t)y * W + x;
+                            M[i] = !onOutline(x, y) && memcmp(&o[i * 4], &m[i * 4], 4) != 0;
+                        }
+                    size_t nChanged = 0, nOutsideMask = 0, nEdgeChanged = 0, nCpuBad = 0, nCpuChecked = 0, nMask = 0, nEdge = 0;
+                    for (int y = 0; y < H; y++)
+                        for (int x = 0; x < W; x++) {
+                            const size_t i = (size_t)y * W + x;
+                            const bool ch = memcmp(&o[i * 4], &c[i * 4], 4) != 0;
+                            nMask += M[i];
+                            if (onOutline(x, y) && !M[i]) { nEdge++; nEdgeChanged += ch; }
+                            if (!ch) continue;
+                            nChanged++;
+                            if (!M[i]) { nOutsideMask++; continue; }
+                            // the same walk and weights on the CPU, from the Off picture and the mask
+                            static const int dx[8] = {1, -1, 0, 0, 1, -1, 1, -1}, dy[8] = {0, 0, 1, -1, 1, 1, -1, -1};
+                            double acc[3] = {0, 0, 0}, ws = 0;
+                            for (int d = 0; d < 8; d++)
+                                for (int st = 1; st <= reach; st++) {
+                                    const int qx = x + dx[d] * st, qy = y + dy[d] * st;
+                                    if (qx < 0 || qy < 0 || qx >= W || qy >= H) break;
+                                    const size_t qi = (size_t)qy * W + qx;
+                                    if (M[qi]) continue;
+                                    const double w = 1.0 / ((double)st * st * (d < 4 ? 1.0 : 2.0));
+                                    for (int ch2 = 0; ch2 < 3; ch2++) acc[ch2] += o[qi * 4 + ch2] * w;
+                                    ws += w;
+                                    break;
+                                }
+                            nCpuChecked++;
+                            bool ok = ws > 0;
+                            for (int ch2 = 0; ch2 < 3 && ok; ch2++) ok = std::fabs(acc[ch2] / ws - (double)c[i * 4 + ch2]) <= 1.01;
+                            nCpuBad += !ok;
+                            if (o[i * 4 + 3] != c[i * 4 + 3]) nCpuBad++;   // alpha kept
+                        }
+                    printf("   UiClean (V2) t=%s: %zu mask px, %zu changed (%zu outside the mask), %zu/%zu mask-free outline px changed; %zu changed px checked against the CPU average, %zu off\n", k ? "0.25" : "0.5", nMask, nChanged, nOutsideMask, nEdgeChanged, nEdge, nCpuChecked, nCpuBad);
+                    expect(nOutsideMask == 0, "UiClean (CrosshairV2): every pixel the mask does not hold is byte-identical to Off (no highlight)");
+                    expect(nEdgeChanged == 0, "UiClean (CrosshairV2): no outline (the box edge pixels with mask byte 0 are unchanged)");
+                    expect(nChanged > 0, "UiClean (CrosshairV2): at least one masked pixel is filled");
+                    expect(nCpuBad == 0, "UiClean (CrosshairV2): each filled pixel is the 8-direction 1/d^2 average of the first unmasked pixels of the Off picture (+-1 level, alpha kept)");
+                }
             } else {
                 size_t nFarBad = 0, nUiLeft = 0, nUi = 0, nOutsideChanged = 0, nInpaintDiff = 0;
                 for (int y = 0; y < H; y++)

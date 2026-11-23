@@ -135,7 +135,7 @@ enum class DebugView : uint8_t {
     Off = 0,       // the default: exactly the library without the setting (byte-identical output, nothing recorded, created or allocated)
     Motion = 1,    // tint the pixels that move: hue = direction, strength = magnitude of this frame's motion field (see Settings::debugView)
     UiMask = 2,    // tint what static UI protection treats as UI in this frame, plus a 1 px outline of the box
-    UiClean = 3,   // show the library's clean copy of the frame (the UI inpainted out: what the motion estimate works on)
+    UiClean = 3,   // the generated frame with the UI taken out: the clean copy of curr (Crosshair / WholeScreen), or CrosshairV2's masked pixels filled from nearby pixels; never any colour or outline
 };
 
 // Image formats (README.md / INTEGRATION.md "Formats"). Chosen at init() by InitInfo::viewFormat, which maps to exactly one:
@@ -381,7 +381,7 @@ struct Settings {
     //             frame's. Nothing is drawn where the output is a real frame (V3 scene cut, a window of real frames only).
     //   UiMask  : the pixels UI protection treats as UI in this frame: pasted pixels in one colour, CrosshairV2's confirmed-but-changed pixels (not pasted) in a second, the feathered ring of Crosshair
     //             / WholeScreen weaker, plus a 1 px outline of the box. Nothing with protection Off or a pair that was not observed.
-    //   UiClean : the clean copy of curr replaces the generated picture over the work rectangle (Crosshair) / the whole frame (WholeScreen). CrosshairV2 keeps no clean copy: it shows UiMask.
+    //   UiClean : the clean copy of curr replaces the generated picture over the work rectangle (Crosshair) / the whole frame (WholeScreen). CrosshairV2 keeps no clean copy: there the pixels of its mask (bytes 255 and 64) are filled in the generated frame from the nearest unmasked pixels (the ui_inpaint average, uiInpaintReach; made only for this view, the motion search never sees it). UiClean draws no colour and no outline in any mode.
     // HDR (Rgb10, RgbaF16): the tint colours stay at code values of about 0.6 at most. Each UI view takes up to 2 descriptor sets of the kUiSets ring per synthesis, besides the patch's 2.
     DebugView debugView = DebugView::Off;
     // v3Guard (see V3Guard): V2 Quality's motion estimate also runs on each pair and corrects (Guard) or replaces (V2Motion) V3's dense motion field

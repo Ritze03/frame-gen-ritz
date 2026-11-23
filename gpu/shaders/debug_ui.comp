@@ -7,6 +7,8 @@
 //     64 (confirmed, changed in this pair, not pasted) -> colour 2; the other bytes (Crosshair / WholeScreen feather, 128) -> colour 1 weighted by byte / 255.
 //     dbg & 16: the 1 px outline of the box (boxX..boxH), in colour 3. Whole screen keeps the patch's gate (tile flag, "mostly still" suppression).
 //   dbg & 15 == 2 (UiClean): out = the library's clean copy of curr (binding 0: sampled) over the dispatched rectangle (mask rectangle; no mask is read).
+//   dbg & 15 == 3 (UiClean under CrosshairV2): no colours, no outline. Every pixel whose mask byte is non-zero (255 and 64) is replaced by the ui_inpaint.comp
+//     average of its first unmasked pixel along 8 directions within pc.reach (weights 1/(steps^2 len^2)), read from out itself; none within reach: untouched.
 // A pasted pixel is tinted from the real frame (binding 0), not from out, so the pass is idempotent where the whole-screen and the box masks overlap.
 // Alpha is kept. The colours are scaled by CS: 0.6 in the HDR formats (Rgb10 / RgbaF16: the stored values are PQ codes, 1.0 is peak brightness), 0.9 in Rgba8.
 #include "format.glsl"
@@ -37,6 +39,12 @@ layout(push_constant) uniform PC {
 layout(local_size_x = 8, local_size_y = 8) in;
 
 const int TILE = 32;
+// mask byte at a position relative to the mask rectangle (the box mask: no gate, maskOff words in)
+// ponytail: the mode 3 walks read the mask buffer directly (up to 8 x reach reads per masked pixel); stage it per tile like ui_inpaint.comp if the cost matters
+uint maskByte(ivec2 rel) {
+    const uint w = mk[pc.maskOff + rel.y * pc.maskStride + (rel.x >> 2)];
+    return (w >> uint(8 * (rel.x & 3))) & 255u;
+}
 bool tileLive(ivec2 tile) {
     return mk[0] <= uint(pc.stillLimit) && mk[4 + tile.y * pc.tilesX + tile.x] != 0u;
 }
@@ -65,6 +73,29 @@ void main() {
         const vec4 o = imageLoad(img, p);
         if (mode == 2) {
             imageStore(img, p, vec4(texelFetch(src, p, 0).rgb, o.a));
+            continue;
+        }
+        if (mode == 3) {
+            // only masked pixels are written and only unmasked ones are read, so the in-place walks do not race
+            if (maskByte(rel) == 0u) continue;
+            const ivec2 dirs[8] = ivec2[8](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1),
+                                           ivec2(1, 1), ivec2(-1, 1), ivec2(1, -1), ivec2(-1, -1));
+            vec3 acc = vec3(0.0);
+            float wsum = 0.0;
+            for (int d = 0; d < 8; d++) {
+                for (int s = 1; s <= pc.reach; s++) {
+                    const ivec2 q = p + dirs[d] * s;
+                    if (q.x < 0 || q.y < 0 || q.x >= pc.W || q.y >= pc.H) break;   // the frame edge stops a walk
+                    const ivec2 qr = q - ivec2(pc.maskX, pc.maskY);
+                    const bool inMask = qr.x >= 0 && qr.y >= 0 && qr.x < pc.maskW && qr.y < pc.maskH;
+                    if (inMask && maskByte(qr) != 0u) continue;
+                    const float w = 1.0 / (float(s * s) * (d < 4 ? 1.0 : 2.0));
+                    acc += imageLoad(img, q).rgb * w;
+                    wsum += w;
+                    break;
+                }
+            }
+            if (wsum > 0.0) imageStore(img, p, vec4(acc / wsum, o.a));
             continue;
         }
         const uint a = (word >> uint(8 * k)) & 255u;
