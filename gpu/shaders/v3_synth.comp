@@ -24,7 +24,7 @@
 //   8. quantise exactly as the store does (V3_QUANT), accumulate with the blur weights; store.
 // Mode bits (V3PC.mode): 1 Gaussian blur weights, 2 hook (l) detail split (host: selects the -DV3L=1 build, which does not read the bit), 8 debug dump: the 28-float record of the weight stage
 // per output pixel (V3.md 3.16), every pc.lw-th pixel of the raster, the first pc.lh of them, into the T-field slot after the interior ones.
-// Settings::v3Blend (-DV3B=1 build, P_V3_SYNTH_B, Rgba8 / Bgra8 only): mode bits 4, 5 = the variant 1..3 (host: V3M_BLEND_SHIFT); the plain build does not read them.
+// Settings::v3Blend (-DV3B=1 build, P_V3_SYNTH_B, Rgba8 / Bgra8 only): mode bits 4, 5, 6 = the variant 1..6 (host: V3M_BLEND_SHIFT); the plain build does not read them.
 // The per-format variants (step F) go through the V3_* macros of v3_format.glsl (YUV also writes its CbCr plane once per 2x2 block, as v2_morph.glsl).
 #include "common.glsl"
 #include "v3_common.glsl"
@@ -282,11 +282,11 @@ void main() {
             V3WOut wo;
             v3Weights(wi, wo);
 #if defined(V3B)
-            // Settings::v3Blend (the -DV3B=1 build, V3.md 3.16 "As built (learned blend)"): the net's weights replace the rule's (mode bits 4, 5: the variant 1..3); the
-            // smear amount wo.s stays the rule's. Variant 3: wo.w is renormalised over the four taps and runs the path below unchanged; w4, w5 mix e0, e1 in after the smear.
+            // Settings::v3Blend (the -DV3B=1 build, V3.md 3.16 "As built (learned blend)"): the net's weights replace the rule's (mode bits 4, 5, 6: the variant 1..6; 4, 5, 6 = the second weight set's nets A, B, C); the
+            // smear amount wo.s stays the rule's. Variants 3, 6: wo.w is renormalised over the four taps and runs the path below unchanged; w4, w5 mix e0, e1 in after the smear.
             float bw4 = 0.0, bw5 = 0.0;
             float dw[4] = float[4](wo.w[0], wo.w[1], wo.w[2], wo.w[3]);
-            const int bvar = (pc.mode >> 4) & 3;
+            const int bvar = (pc.mode >> 4) & 7;
             if (bvar != 0) v3BlendNet(wi, V3_LEVELS(s0.rgb), V3_LEVELS(s1.rgb), bvar, wo, bw4, bw5, dw);
 #endif
             vec3 C = wo.w[0] * wi.CAp + wo.w[1] * wi.CAc + wo.w[2] * wi.CBp + wo.w[3] * wi.CBc;
@@ -373,7 +373,7 @@ void main() {
                 if (farW > 0.0) C = mix(C, blend0, farW);
             }
 #if defined(V3B)
-            if (bvar == 3) C = (1.0 - bw4 - bw5) * C + bw4 * V3_LEVELS(s0.rgb) + bw5 * V3_LEVELS(s1.rgb);   // the six-choice net's two extra choices: prev(x), curr(x)
+            if (bvar == 3 || bvar == 6) C = (1.0 - bw4 - bw5) * C + bw4 * V3_LEVELS(s0.rgb) + bw5 * V3_LEVELS(s1.rgb);   // the six-choice net's two extra choices: prev(x), curr(x)
 #endif
             // step 7: the static mask
             float wst = 0.0;

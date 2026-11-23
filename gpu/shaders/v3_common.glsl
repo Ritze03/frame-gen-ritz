@@ -19,7 +19,7 @@ layout(push_constant) uniform V3PC {
     float hp[5];                             // task 105: the ramps of the bonus (v3_est.glsl)
 } pc;
 // mode bits, per pass (a pass never reads another's meaning): search: bit 0 = hook (j) colour window; dense: bit 0 = (j), bit 2 = inject
-// (tests); synth: bit 0 = Gaussian blur weights, bit 1 = hook (l) detail split, bits 4, 5 = Settings::v3Blend's variant (the -DV3B=1 build only), bit 3 = debug dump (then lw = the stride of the dumped pixels in the
+// (tests); synth: bit 0 = Gaussian blur weights, bit 1 = hook (l) detail split, bits 4, 5, 6 = Settings::v3Blend's variant 1..6 (the -DV3B=1 build only), bit 3 = debug dump (then lw = the stride of the dumped pixels in the
 // raster, lh = their number).
 const int V3M_GAUSS = 1, V3M_DETAIL = 2, V3M_DUMP = 8;
 // (Y1) occl: bit 2 = inject (tests, BLK is stale: amb = 0); fill, project: none.

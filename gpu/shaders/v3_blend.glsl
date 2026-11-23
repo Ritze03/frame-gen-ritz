@@ -6,10 +6,11 @@
 // weights, v3Weights unchanged), p_4 = p_5 = -5. The weights are in v3_blend_weights.glsl (generated: gpu/ml/blend/export_glsl.py).
 #include "v3_blend_weights.glsl"
 float v3bM(vec3 v) { return (4.0 / 3.0) * (abs(v.r) + abs(v.g) + abs(v.b)); }
-// var 1, 2: four choices (w[0..3] of o replaced, w4 = w5 = 0); var 3: six choices (o.w is renormalised over the four taps, w4, w5 the shares of e0, e1; dw = the four
+// var 1, 2 (4, 5): four choices (w[0..3] of o replaced, w4 = w5 = 0); var 3 (6): six choices (o.w is renormalised over the four taps, w4, w5 the shares of e0, e1; dw = the four
 // weights before the renormalisation, for the debug dump). e0 / e1: the working values of prev / curr at the pixel (levels).
 void v3BlendNet(in V3WIn i, vec3 e0, vec3 e1, int var, inout V3WOut o, out float w4, out float w5, out float dw[4]) {
-    const int v = var - 1;
+    const int v = var - 1;            // the weight index: 0..2 = the first weight set's nets A, B, C, 3..5 = the second's
+    const int nv = (var - 1) % 3 + 1;  // the net structure: 1, 2 = four choices, 3 = six choices
     const float k255 = 1.0 / 255.0;
     const vec3 c0 = i.CAp * k255, c1 = i.CAc * k255, c2 = i.CBp * k255, c3 = i.CBc * k255;
     float x[25];
@@ -27,7 +28,7 @@ void v3BlendNet(in V3WIn i, vec3 e0, vec3 e1, int var, inout V3WOut o, out float
     for (int j = 0; j < 8; j++) {
         float z = V3B_B1[v * 8 + j];
         for (int n = 0; n < 25; n++) z += V3B_W1[(v * 8 + j) * 34 + n] * x[n];
-        if (var == 3) for (int n = 0; n < 9; n++) z += V3B_W1[(v * 8 + j) * 34 + 25 + n] * xe[n];
+        if (nv == 3) for (int n = 0; n < 9; n++) z += V3B_W1[(v * 8 + j) * 34 + 25 + n] * xe[n];
         h[j] = max(z, 0.1 * z);
     }
     float l[6];
@@ -38,18 +39,18 @@ void v3BlendNet(in V3WIn i, vec3 e0, vec3 e1, int var, inout V3WOut o, out float
         l[k] = z + (k < 4 ? log(max(r[k], 1e-3)) : -5.0);
     }
     float mx = max(max(l[0], l[1]), max(l[2], l[3]));
-    if (var == 3) mx = max(mx, max(l[4], l[5]));
+    if (nv == 3) mx = max(mx, max(l[4], l[5]));
     float e[6];
     float sum = 0.0;
     for (int k = 0; k < 6; k++) {
-        e[k] = (k < 4 || var == 3) ? exp(l[k] - mx) : 0.0;
+        e[k] = (k < 4 || nv == 3) ? exp(l[k] - mx) : 0.0;
         sum += e[k];
     }
     const float inv = 1.0 / sum;
     for (int k = 0; k < 4; k++) dw[k] = e[k] * inv;
     w4 = e[4] * inv;
     w5 = e[5] * inv;
-    if (var == 3) {
+    if (nv == 3) {
         const float s4 = 1.0 / max(dw[0] + dw[1] + dw[2] + dw[3], 1e-12);
         for (int k = 0; k < 4; k++) o.w[k] = dw[k] * s4;
     } else {

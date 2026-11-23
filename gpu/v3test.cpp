@@ -2,10 +2,10 @@
 // rendered on the CPU (the two real frames, and the true in-between frame R_t for any t); V3's estimated flows (recordDebugV3) and its
 // in-between frames (recordSynth) are measured against them, once with V3's own estimate and once with the exact flows injected
 // (recordDebugV3Inject).
-//   v3test [--size WxH] [--fs 1|2|4] [--scene NAME|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--colour-window] [--detail-split] [--blend 0..3] [--guard off|guard|v2motion] [--list]
+//   v3test [--size WxH] [--fs 1|2|4] [--scene NAME|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--colour-window] [--detail-split] [--blend 0..6] [--guard off|guard|v2motion] [--list]
 //     --colour-window   Settings::v3ColourWindow on (hook (j)); the pass marks stay the same (information with the hook on)
 //     --detail-split    Settings::v3DetailSplit on (hook (l)); the marks stay the same (information with the hook on)
-//     --blend N         Settings::v3Blend 0..3 (learned blend, experimental; the committed weights are zeros); the marks stay the same (information)
+//     --blend N         Settings::v3Blend 0..6 (learned blend, experimental; 4..6 = the second weight set); the marks stay the same (information)
 //     --guard MODE      Settings::v3Guard off (default) | guard | v2motion (task 104); the marks stay the same (information with it on)
 //     --size   frame size (default 1920x1080). The scenes' lengths (shifts, layer sizes) are those of 1080p scaled by min(W/1920, H/1080);
 //              the texture (wavelengths 4..128 px) is not.

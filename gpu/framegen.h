@@ -353,9 +353,9 @@ struct Settings {
     float v3SceneCut = 0.0f;
     bool v3ColourWindow = false;
     bool v3DetailSplit = false;
-    // v3Blend (0..3, EXPERIMENTAL, default 0): the synthesis' blend weights come from one of three small per-pixel nets instead of the hand-written rule: 1 / 2 = four
-    // choices (the four taps), 3 = six choices (also the two real frames' own pixel). The weights are baked in at build time (gpu/shaders/v3_blend_weights.glsl, written by
-    // gpu/ml/blend/export_glsl.py; the committed header is all zeros = every variant equals the rule up to a 1e-3 floor in the prior). 0 = the rule, byte-identical to V3
+    // v3Blend (0..6, EXPERIMENTAL, default 0): the synthesis' blend weights come from one of three small per-pixel nets instead of the hand-written rule: 1 / 2 = four
+    // choices (the four taps), 3 = six choices (also the two real frames' own pixel); 4, 5, 6 = the same three nets (A, B, C) with a second set of trained weights (blend/weights/forza-rx9070xt).
+    // The weights are baked in at build time (gpu/shaders/v3_blend_weights.glsl, written by gpu/ml/blend/export_glsl.py). 0 = the rule, byte-identical to V3
     // without the setting. Only the Rgba8 / Bgra8 and Rgb10 builds have the nets (v3BlendActive() says whether they run): with another Format, or with v3DetailSplit on, a non-zero value falls back to the rule (gpu/V3.md
     // 3.16 "As built (learned blend)"). Acts in the synthesis (from the next recordSynth, no re-estimate), selects a third build of it (P_V3_SYNTH_B).
     uint8_t v3Blend = 0;
