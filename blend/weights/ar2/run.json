@@ -1,5 +1,5 @@
 {
- "commit": "bfaade79b3f1c98ff9731acd7849b2f3c28acc92",
+ "commit": "93b500dad817821feb6e92b2a44693e2b1534859",
  "tracked_files_changed": true,
  "options": {
   "steps": 4000,
@@ -10,15 +10,16 @@
   "batch": 65536,
   "init": "base",
   "mix": "owner_rows.npz",
-  "teacher": false
+  "teacher": false,
+  "keep": "last"
  },
  "steps": 4000,
  "best_step": {
-  "A": 0,
-  "B": 0,
-  "C": 500
+  "A": 4000,
+  "B": 4000,
+  "C": 4000
  },
- "train_seconds": 1082.5,
+ "train_seconds": 303.1,
  "rows_local_train": {
   "minecraft120": 2326740,
   "battlefield": 187772
@@ -296,5 +297,7 @@
    "anchors_kept": 24,
    "anchors_dropped_repeated": 0
   }
- }
+ },
+ "keep": "last",
+ "keep_note": "Last step (4000) kept with --last. The best-step rule (mean of local and mix validation loss) had picked step 0 for A and B and step 500 for C in the first run (out_ar2) because the validation loss is flat; that made A and B identical to base. The other person's run also ended on step 4000."
 }

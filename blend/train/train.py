@@ -1,5 +1,6 @@
 """Trains the three learned-blend nets A, B, C together (same batches, one gather per step).
-usage: train.py OUTDIR [--teacher] [--steps N] [--seed S] [--threads T] [--lr X] [--lr-end X] [--init DIR] [--mix FILE] [--base DIR] [--case CASE]
+usage: train.py OUTDIR [--teacher] [--steps N] [--seed S] [--threads T] [--lr X] [--lr-end X] [--init DIR] [--mix FILE] [--base DIR] [--case CASE] [--last]
+  --last saves the weights of the last step (per net) instead of the best step; log.json / run.json record keep = last (nothing is recorded without --last).
   --case CASE keeps only the local rows (training and validation) of samples whose manifest case is CASE, e.g. 60to120.
   OUTDIR gets A.npz B.npz C.npz (+ log.json). --teacher adds the cached teacher training rows (weight 0.5 per row).
 Net = gpu/ml/blend/ref.py: 8 hidden units (max(z, 0.1 z)), softmax(log(max(rule, 1e-3)) [+ -5, -5] + z2), W2 = b2 = 0 at the start.
@@ -31,6 +32,7 @@ def opt(name):
 
 
 INIT, MIX, CASE = opt("--init"), opt("--mix"), opt("--case")
+LAST = "--last" in args   # save the weights of the last step instead of the best step (per net)
 VARS = {"A": (25, 4, "O4"), "B": (25, 4, "Y"), "C": (34, 6, "O6")}
 
 
@@ -190,13 +192,15 @@ def main():
         optim.zero_grad()
         loss.backward()
         optim.step()
+    if LAST:
+        best = {v: (sel[v], [t.detach().clone() for t in P[v]], steps) for v in VARS}
     os.makedirs(out, exist_ok=True)
     for v in VARS:
         W1, b1, W2, b2 = (t.numpy().astype(np.float32) for t in best[v][1])
         np.savez(f"{out}/{v}.npz", W1=W1, b1=b1, W2=W2, b2=b2)
     json.dump(dict(log=log, best={v: [best[v][0], best[v][2]] for v in VARS}, rows={f"{a}/{t}": r for (a, t), r in rows.items()},
                    steps=steps, seconds=time.time() - t0, teacher=use_teacher, batch_counts={GROUPS[g]: c for g, c in cnt.items()},
-                   init=bool(INIT), mix_rows=mrows, **({"batch_counts_mix": {GROUPS[g]: c for g, c in cnt_m.items()}} if MIX else {})),
+                   init=bool(INIT), mix_rows=mrows, **({"keep": "last"} if LAST else {}), **({"batch_counts_mix": {GROUPS[g]: c for g, c in cnt_m.items()}} if MIX else {})),
               open(f"{out}/log.json", "w"), indent=1)
     print("best", {v: (round(best[v][0], 5), best[v][2]) for v in VARS})
     if INIT:
@@ -205,7 +209,7 @@ def main():
         finetune_report.write(out, INIT, opt("--base"), va, mva if MIX else None, rows, mrows, cnt_l if MIX else cnt, cnt_m if MIX else None,
                               {v: best[v][2] for v in VARS}, steps, time.time() - t0, dict(
                                   steps=steps, seed=seed, lr=LR0, lr_end=LR1, threads=torch.get_num_threads(), batch=BATCH,
-                                  init=os.path.basename(INIT.rstrip("/")), mix=os.path.basename(MIX) if MIX else None, teacher=use_teacher))
+                                  init=os.path.basename(INIT.rstrip("/")), mix=os.path.basename(MIX) if MIX else None, teacher=use_teacher, **({"keep": "last"} if LAST else {})))
 
 
 if __name__ == "__main__":
