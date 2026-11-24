@@ -1,0 +1,26 @@
+{
+ "commit": "e2fbeacd9cfb568f4205307531e45248ddb91db5",
+ "task": 146,
+ "start_weights": "blend/weights/forza-rx9070xt (A, B, C)",
+ "data": "dense dumps of the 56 training pairs of blend/probe/pairs.json (32 forza 30->60, 8 cs2, 8 minecraft120, 8 battlefield 60->120); scored on the 23 held-out pairs",
+ "steps": 2000,
+ "lr": 0.0002,
+ "lr_end": 1e-05,
+ "lr_schedule": "cosine",
+ "optimizer": "Adam",
+ "seed": 0,
+ "batch": 16,
+ "crop": 128,
+ "loss": "Charbonnier mean(sqrt((out - real)^2 + 1e-6)) + lam * mean(relu(G(out) - G(real))); colours 0..1, G = Sobel magnitude of luma (0.299 R + 0.587 G + 0.114 B) on the crop interior, sqrt(gx^2 + gy^2 + 1e-8) while training; output = sum of weights x candidates",
+ "lam": 1.0,
+ "lam_start_share": "about 46 % of the start loss (start terms: Charbonnier 0.014705, penalty 0.012512)",
+ "sweep_lam_C": [
+  0,
+  0.1306,
+  0.5037,
+  1.0,
+  1.763
+ ],
+ "choice_rule": "strongest lam with all-pairs whole PSNR at most 0.10 dB and every group at most 0.25 dB below forza-rx9070xt C",
+ "scripts": "blend/edge/ (train_edge.py, score_edge.py, report_edge.py, finalize.py)"
+}
