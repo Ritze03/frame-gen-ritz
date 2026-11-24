@@ -546,7 +546,7 @@ static_assert(sizeof(V3PC) == sizeof(PC), "V3PC is pushed over PC's range");
 // task 105: hudBonus in V3 (gpu/V3.md "As built (HUD bonus, task 105)"): K converts V1's levels (5x5 mean abs luma error) to V3's cost units; P = the ramps
 const float kV3HudK = 0.7f;
 const float kV3HudP[5] = {1.0f, 3.0f, 1.5f, 4.0f, 10.0f};
-enum V3Mode : int { V3M_GAUSS = 1, V3M_DETAIL = 2, V3M_DUMP = 8, V3M_BLEND_SHIFT = 4 };   // (bits 4, 5, 6: Settings::v3Blend)   // synth mode bits (shaders/v3_common.glsl)
+enum V3Mode : int { V3M_GAUSS = 1, V3M_DETAIL = 2, V3M_DUMP = 8, V3M_BLEND_SHIFT = 4 };   // (bits 4..7: Settings::v3Blend, <= kV3BlendMax <= 15)   // synth mode bits (shaders/v3_common.glsl)
 // MotionVersion::Learned's duplicate test: FGR's own, proto/harness.py DUP_DIFF (and gpu/compare.py): a pair whose mean over the
 // pixels of the channel-mean |a - c| is at most this many 8-bit levels is a duplicate ("re-encoded duplicate frames differ by up to
 // ~0.5"). The net is skipped there and the field is zero (shaders/ml_dup.comp).
@@ -1748,7 +1748,7 @@ bool Interpolator::validate(const Settings& s) {
            s.searchRadius >= 1 && s.searchRadius <= 12 && s.searchRadiusTop >= 1 && s.searchRadiusTop <= 12 &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) && s.pyramidMinSide >= 16 && s.pyramidMinSide <= 256 &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V3 &&
-           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.v3Guard <= (uint32_t)V3Guard::V2Motion && s.v3Blend <= 6 && (uint32_t)s.debugView <= (uint32_t)DebugView::UiClean && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
+           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.v3Guard <= (uint32_t)V3Guard::V2Motion && s.v3Blend <= kV3BlendMax && (uint32_t)s.debugView <= (uint32_t)DebugView::UiClean && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
            in(s.v3Smear, 0.0f, 1.0f) && in(s.v3OcclSoft, 0.25f, 4.0f) && in(s.v3Unsure, 0.25f, 4.0f) && in(s.v3SceneCut, 0.0f, 4.0f) &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
@@ -3599,7 +3599,7 @@ bool Interpolator::Impl::v3Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     }
     // synth mode: bit 0 Gaussian blur weights, bit 1 hook (l) v3DetailSplit (also selects the -DV3L=1 build P_V3_SYNTH_L, which does not read it), bit 3 the weights dump
     // (lw = the stride of the dumped pixels in the raster, lh = their number)
-    // Settings::v3Blend >= 1 selects the -DV3B=1 build (P_V3_SYNTH_B; bits 4, 5, 6 = the variant 1..6), unless the detail split is on or this format has no such build (then the rule)
+    // Settings::v3Blend >= 1 selects the -DV3B=1 build (P_V3_SYNTH_B; bits 4..7 = the variant 1..kV3BlendMax), unless the detail split is on or this format has no such build (then the rule)
     const bool blend = set.v3Blend != 0 && !set.v3DetailSplit && mo[(int)MotionVersion::V3].pipes[P_V3_SYNTH_B];
     v.mode = (gauss ? V3M_GAUSS : 0) | (set.v3DetailSplit ? V3M_DETAIL : 0) | (dumpCount ? V3M_DUMP : 0) | (blend ? (int)set.v3Blend << V3M_BLEND_SHIFT : 0);
     v.lw = (int)dumpStride;

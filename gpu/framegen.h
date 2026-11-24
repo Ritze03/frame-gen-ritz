@@ -168,6 +168,11 @@ struct Frame {
     Frame(VkImageView v, VkImageView c = VK_NULL_HANDLE) : view(v), chroma(c) {}
 };
 
+// The highest Settings::v3Blend value this build accepts (the learned-blend nets of V3). value = 1 + 3 * weight set + net (net 0, 1, 2 = A, B, C), so it is 3 * the number of weight
+// sets; it must equal V3B_NETS of the committed gpu/shaders/v3_blend_weights.glsl (gpu/meson.build stops the configure otherwise); at most 15 (the synth's variant field is 4 bits).
+// Values above it are refused by settingsError / validate. A host reads it to know how many variants the build has (today 6: the sets base and forza-rx9070xt).
+constexpr uint8_t kV3BlendMax = 6;
+
 // Tuning knobs. The defaults are the tuned values of proto/interp.py (the approved look); with them the
 // output is byte-identical to the library without settings (this includes searchRadius, searchRadiusTop and
 // pyramidMinSide: at 2 / 6 / 48 the search is the one the library always had). Costs and mismatches are in 8-bit luma/RGB
@@ -363,8 +368,8 @@ struct Settings {
     float v3SceneCut = 0.0f;
     bool v3ColourWindow = false;
     bool v3DetailSplit = false;
-    // v3Blend (0..6, EXPERIMENTAL, default 0): the synthesis' blend weights come from one of three small per-pixel nets instead of the hand-written rule: 1 / 2 = four
-    // choices (the four taps), 3 = six choices (also the two real frames' own pixel); 4, 5, 6 = the same three nets (A, B, C) with a second set of trained weights (blend/weights/forza-rx9070xt).
+    // v3Blend (0..kV3BlendMax, EXPERIMENTAL, default 0): the synthesis' blend weights come from one of the small per-pixel nets instead of the hand-written rule. value = 1 + 3 * weight set
+    // + net, net 0, 1, 2 = A, B, C: A, B = four choices (the four taps), C = six choices (also the two real frames' own pixel). Today 1..3 = set 0 (blend/weights/base), 4..6 = set 1 (blend/weights/forza-rx9070xt).
     // The weights are baked in at build time (gpu/shaders/v3_blend_weights.glsl, written by gpu/ml/blend/export_glsl.py). 0 = the rule, byte-identical to V3
     // without the setting. Only the Rgba8 / Bgra8 and Rgb10 builds have the nets (v3BlendActive() says whether they run): with another Format, or with v3DetailSplit on, a non-zero value falls back to the rule (gpu/V3.md
     // 3.16 "As built (learned blend)"). Acts in the synthesis (from the next recordSynth, no re-estimate), selects a third build of it (P_V3_SYNTH_B).

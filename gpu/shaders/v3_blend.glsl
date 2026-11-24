@@ -6,10 +6,10 @@
 // weights, v3Weights unchanged), p_4 = p_5 = -5. The weights are in v3_blend_weights.glsl (generated: gpu/ml/blend/export_glsl.py).
 #include "v3_blend_weights.glsl"
 float v3bM(vec3 v) { return (4.0 / 3.0) * (abs(v.r) + abs(v.g) + abs(v.b)); }
-// var 1, 2 (4, 5): four choices (w[0..3] of o replaced, w4 = w5 = 0); var 3 (6): six choices (o.w is renormalised over the four taps, w4, w5 the shares of e0, e1; dw = the four
+// var = 1 + 3 * weight set + net: net 0, 1 (var 1, 2, 4, 5, 7, ..): four choices (w[0..3] of o replaced, w4 = w5 = 0); net 2 (var 3, 6, 9, ..): six choices (o.w is renormalised over the four taps, w4, w5 the shares of e0, e1; dw = the four
 // weights before the renormalisation, for the debug dump). e0 / e1: the working values of prev / curr at the pixel (levels).
 void v3BlendNet(in V3WIn i, vec3 e0, vec3 e1, int var, inout V3WOut o, out float w4, out float w5, out float dw[4]) {
-    const int v = var - 1;            // the weight index: 0..2 = the first weight set's nets A, B, C, 3..5 = the second's
+    const int v = var - 1;            // the weight index (< V3B_NETS): 3 * weight set + net, net 0, 1, 2 = A, B, C
     const int nv = (var - 1) % 3 + 1;  // the net structure: 1, 2 = four choices, 3 = six choices
     const float k255 = 1.0 / 255.0;
     const vec3 c0 = i.CAp * k255, c1 = i.CAc * k255, c2 = i.CBp * k255, c3 = i.CBc * k255;
