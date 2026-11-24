@@ -168,10 +168,12 @@ struct Frame {
     Frame(VkImageView v, VkImageView c = VK_NULL_HANDLE) : view(v), chroma(c) {}
 };
 
-// The highest Settings::v3Blend value this build accepts (the learned-blend nets of V3). value = 1 + 3 * weight set + net (net 0, 1, 2 = A, B, C), so it is 3 * the number of weight
-// sets; it must equal V3B_NETS of the committed gpu/shaders/v3_blend_weights.glsl (gpu/meson.build stops the configure otherwise); at most 15 (the synth's variant field is 4 bits).
-// Values above it are refused by settingsError / validate. A host reads it to know how many variants the build has (today 15: the five sets base, forza-rx9070xt, ar, ar3, ar4).
-constexpr uint8_t kV3BlendMax = 15;
+// The highest Settings::v3Blend value this build accepts (the learned-blend nets of V3): 1 = Fluidity, 2 = Consistency (0 = the rule). It must equal V3B_NETS of the committed
+// gpu/shaders/v3_blend_weights.glsl (gpu/meson.build stops the configure otherwise); at most 15 (the synth's variant field is 4 bits). Values above it are refused by settingsError / validate.
+// These values replaced the earlier 1..15 (old 6 is now 1, old 15 is now 2).
+constexpr uint8_t kV3BlendMax = 2;
+constexpr uint8_t kV3BlendFluidity = 1;      // blend/weights/forza-rx9070xt/C.npz: smoother in-between motion
+constexpr uint8_t kV3BlendConsistency = 2;   // blend/weights/ar4/C.npz: fewest ghost edges, the most stable picture; softer edges, motion closer to repeated frames
 
 // Tuning knobs. The defaults are the tuned values of proto/interp.py (the approved look); with them the
 // output is byte-identical to the library without settings (this includes searchRadius, searchRadiusTop and
@@ -368,9 +370,8 @@ struct Settings {
     float v3SceneCut = 0.0f;
     bool v3ColourWindow = false;
     bool v3DetailSplit = false;
-    // v3Blend (0..kV3BlendMax, EXPERIMENTAL, default 0): the synthesis' blend weights come from one of the small per-pixel nets instead of the hand-written rule. value = 1 + 3 * weight set
-    // + net, net 0, 1, 2 = A, B, C: A, B = four choices (the four taps), C = six choices (also the two real frames' own pixel). Today 1..3 = set 0 (blend/weights/base), 4..6 = set 1 (forza-rx9070xt), 7..9 = set 2 (ar), 10..12 = set 3 (ar3), 13..15 = set 4 (ar4); sets 2 to 4 are an experiment
-    // for comparison by eye (held-out scores within 0.02 dB of set 0; blend/weights/README.md).
+    // v3Blend (0..kV3BlendMax, EXPERIMENTAL, default 0): the synthesis' blend weights come from one of two small per-pixel nets instead of the hand-written rule. 1 = kV3BlendFluidity
+    // (smoother in-between motion), 2 = kV3BlendConsistency (fewest ghost edges, the most stable picture, softer edges). Both are six-choice nets (the four taps and the two real frames' own pixel).
     // The weights are baked in at build time (gpu/shaders/v3_blend_weights.glsl, written by gpu/ml/blend/export_glsl.py). 0 = the rule, byte-identical to V3
     // without the setting. Only the Rgba8 / Bgra8 and Rgb10 builds have the nets (v3BlendActive() says whether they run): with another Format, or with v3DetailSplit on, a non-zero value falls back to the rule (gpu/V3.md
     // 3.16 "As built (learned blend)"). Acts in the synthesis (from the next recordSynth, no re-estimate), selects a third build of it (P_V3_SYNTH_B).

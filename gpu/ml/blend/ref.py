@@ -4,7 +4,7 @@
     blend_weights(rec, npz, e0=None, e1=None) -> (w [n, 4], w45 [n])
     rec: float32 [n, >=28] records of `fgtest --v3weights` (columns CAp CAc CBp CBc (levels), oA holeA uA oB holeB uB t lenA lenB sigma, w0..w3 s pad); the rule's
          weights r (columns 22..25) must come from a dump at v3Blend 0 (a dump at v3Blend >= 1 holds the net's weights there; its inputs are the same).
-    npz: W1 [8][NI], b1 [8], W2 [K][8], b2 [K] (NI 25, K 4: four choices; NI 34, K 6: six choices, then e0 / e1 [n, 3] (levels) = prev(x) / curr(x) are needed).
+    npz: W1 [8][NI], b1 [8], W2 [K][8], b2 [K] (NI 34, K 6: six choices, e0 / e1 [n, 3] (levels) = prev(x) / curr(x) are needed; the two nets in the build are of this shape. NI 25, K 4, the old nets A and B, still work here as training history).
     Returns the four tap weights (before any renormalisation) and, for six choices, w4 + w5 (zeros otherwise).
 CLI: ref.py RULE_DUMP.bin NET_DUMP.bin WEIGHTS.npz W H prev.rgba curr.rgba STRIDE [rgb10]  -> prints the max |difference| of w0..w3 and w4 + w5 (NET_DUMP = the shader's).
     The optional last argument rgb10: the dump came from `fgtest --format rgb10`, whose upload turns each 8-bit value v into the PQ code of 1000 * (v/255)^2.4 nits

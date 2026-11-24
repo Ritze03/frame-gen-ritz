@@ -5,7 +5,7 @@
 //   v3test [--size WxH] [--fs 1|2|4] [--scene NAME|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--colour-window] [--detail-split] [--blend 0..kV3BlendMax] [--guard off|guard|v2motion] [--list]
 //     --colour-window   Settings::v3ColourWindow on (hook (j)); the pass marks stay the same (information with the hook on)
 //     --detail-split    Settings::v3DetailSplit on (hook (l)); the marks stay the same (information with the hook on)
-//     --blend N         Settings::v3Blend 0..kV3BlendMax (learned blend, experimental; 1 + 3 * weight set + net); the marks stay the same (information)
+//     --blend N         Settings::v3Blend 0..kV3BlendMax (learned blend, experimental; 1 Fluidity, 2 Consistency); the marks stay the same (information)
 //     --guard MODE      Settings::v3Guard off (default) | guard | v2motion (task 104); the marks stay the same (information with it on)
 //     --size   frame size (default 1920x1080). The scenes' lengths (shifts, layer sizes) are those of 1080p scaled by min(W/1920, H/1080);
 //              the texture (wavelengths 4..128 px) is not.

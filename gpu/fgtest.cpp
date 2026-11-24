@@ -100,7 +100,7 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         else if (k == "v3SceneCut") s.v3SceneCut = (float)v;
         else if (k == "v3ColourWindow") s.v3ColourWindow = v != 0;
         else if (k == "v3DetailSplit") s.v3DetailSplit = v != 0;
-        else if (k == "v3Blend") s.v3Blend = (uint8_t)std::min(std::max(v, 0.0), 255.0);   // learned blend (experimental): 0 = the rule, 1 + 3 * weight set + net = the nets (> kV3BlendMax is refused by settingsError)
+        else if (k == "v3Blend") s.v3Blend = (uint8_t)std::min(std::max(v, 0.0), 255.0);   // learned blend (experimental): 0 = the rule, 1 Fluidity, 2 Consistency = the nets (> kV3BlendMax is refused by settingsError)
         else if (k == "debugView") {   // Settings::debugView: off | motion | uimask | uiclean (or 0..3; a value above is refused by validate)
             std::string a = eq + 1;
             if (a == "off") s.debugView = framegen::DebugView::Off;

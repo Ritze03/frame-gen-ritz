@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comparison clips and scores of the V3 blend versions: rule = v3Blend 0, then value = 1 + 3 * set + net, names A B C (set 0), A-A A-B A-C, AR-A .., AR2-A .., AR3-A ..
+"""Comparison clips and scores of the V3 blend versions: rule = v3Blend 0, Fluidity = 1, Consistency = 2
 (whole picture, hard 10 % blocks, and edge-only: edge PSNR / MAE / share > 30 and the edge sharpness ratio).
 
 Options anywhere on the command line: --vers rule,C,A-C (default: all 16), --out ROOT (default $BLEND/render; raw frames, json, videos, scores.md go below it),
@@ -44,7 +44,8 @@ FGTEST = _fg or os.environ.get("FGTEST", os.path.join(HERE, "..", "..", "gpu", "
 LOCK = os.path.expanduser("~/tmp/fg-handoff/gpu.lock")
 R = _out or os.path.join(BLEND, "render")
 RAW = os.path.join(R, "raw")
-ALL = [("rule", 0)] + [((c if st == 0 else f"{('A', 'AR', 'AR2', 'AR3')[st - 1]}-{c}"), 1 + 3 * st + k) for st in range(5) for k, c in enumerate("ABC")]
+# the build has v3Blend 0 (rule), 1 (Fluidity), 2 (Consistency) since task 153; output folders rendered before that (keyed by the old values 0..15) are not comparable by folder name
+ALL = [("rule", 0), ("Fluidity", 1), ("Consistency", 2)]
 VERS = ALL if not _vers else [(n, dict(ALL)[n]) for n in _vers.split(",")]
 CLIPS = ["racing_forza6_a", "racing_forza6_b", "racing_forza6_c", "fps_cs2_a", "minecraft_rtx_a", "indie_schedule1_a", "realworld_portland_walk_a"]
 N = 240
@@ -326,7 +327,7 @@ def report():
     json.dump(J, open(f"{R}/scores.json", "w"), indent=1)
     order = [n for n, _ in ALL]
     L = ["# Learned blend: V3 blend versions, whole-picture, hard-block and edge scores", "",
-         "rule = v3Blend 0, then value = 1 + 3 * set + net (A, B, C, A-A, A-B, A-C, AR-A .. AR3-C; `blend/weights/README.md`); otherwise default V3 settings (`--set algo=v3,v3Blend=N`). Test 30 -> 60: inputs the even frames of 240 consecutive source frames, t = 0.5, compared with the real odd frame;",
+         "rule = v3Blend 0, Fluidity = 1, Consistency = 2 (`blend/weights/README.md`); otherwise default V3 settings (`--set algo=v3,v3Blend=N`). Test 30 -> 60: inputs the even frames of 240 consecutive source frames, t = 0.5, compared with the real odd frame;",
          "one continuous fgtest stream per version (chunks of 40 pairs, each started 2 pairs early, those outputs discarded). PSNR pooled over RGB and all frames (levels 0..255); MAE in levels;",
          "'>30' = share of pixels with any channel error above 30 levels. 'Hard 10 %' = the 10 % of 16x16 blocks (per frame) where the rule's error is largest, the same blocks for all versions.",
          "'Edge' = pixels of an edge mask of the REAL frame: luma L = 0.299 R + 0.587 G + 0.114 B, Sobel magnitude G of L, mask = pixels where the maximum of G over the 5x5 window around the pixel is >= the 90th percentile of G in that frame;",
