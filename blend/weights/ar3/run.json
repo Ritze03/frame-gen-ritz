@@ -1,0 +1,288 @@
+{
+ "commit": "bfaade79b3f1c98ff9731acd7849b2f3c28acc92",
+ "tracked_files_changed": true,
+ "options": {
+  "steps": 4000,
+  "seed": 0,
+  "lr": 0.0002,
+  "lr_end": 1e-05,
+  "threads": 6,
+  "batch": 65536,
+  "init": "forza-rx9070xt",
+  "mix": null,
+  "teacher": false
+ },
+ "steps": 4000,
+ "best_step": {
+  "A": 2000,
+  "B": 2000,
+  "C": 2000
+ },
+ "train_seconds": 335.5,
+ "rows_local_train": {
+  "forza": 933888,
+  "cs2": 718432,
+  "schedule1": 228592,
+  "minecraft_rtx": 334724,
+  "minecraft_vanilla": 359216,
+  "portland": 179608,
+  "minecraft120": 9306960,
+  "battlefield": 751088
+ },
+ "rows_local_val": {
+  "forza": 704512,
+  "cs2": 65312,
+  "schedule1": 24492,
+  "minecraft_rtx": 32656,
+  "minecraft_vanilla": 32656,
+  "portland": 16328,
+  "minecraft120": 881712,
+  "battlefield": 97968
+ },
+ "rows_mix": {},
+ "batch_local": {
+  "cs2": 5617,
+  "schedule1": 5617,
+  "minecraft_rtx": 5617,
+  "minecraft_vanilla": 5617,
+  "portland": 5617,
+  "minecraft120": 5617,
+  "battlefield": 5617,
+  "forza": 26217
+ },
+ "batch_mix": null,
+ "clips": {
+  "minecraft120_01": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 17,
+   "anchors_dropped_repeated": 7
+  },
+  "minecraft120_02": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "minecraft120_03": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 11,
+   "anchors_dropped_repeated": 13
+  },
+  "minecraft120_04": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "minecraft120_05": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "minecraft120_06": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "minecraft120_07": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 23,
+   "anchors_dropped_repeated": 1
+  },
+  "minecraft120_08": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "minecraft120_09": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "minecraft120_10": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 23,
+   "anchors_dropped_repeated": 1
+  },
+  "minecraft120_11": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 22,
+   "anchors_dropped_repeated": 2
+  },
+  "minecraft120_12": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "minecraft120_13": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "minecraft120_14": {
+   "fps": 120,
+   "frames": 3000,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "battlefield": {
+   "fps": 120,
+   "frames": 3436,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 26,
+   "anchors_dropped_repeated": 2
+  },
+  "racing_forza6_a": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 64,
+   "anchors_dropped_repeated": 10
+  },
+  "racing_forza6_b": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 62,
+   "anchors_dropped_repeated": 12
+  },
+  "racing_forza6_c": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 74,
+   "anchors_dropped_repeated": 0
+  },
+  "fps_cs2_a": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "fps_cs2_b": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "fps_cs2_c": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "fps_cs2_d": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "indie_schedule1_a": {
+   "fps": 60,
+   "frames": 900,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 14,
+   "anchors_dropped_repeated": 0
+  },
+  "indie_schedule1_b": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 17,
+   "anchors_dropped_repeated": 7
+  },
+  "minecraft_rtx_a": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 22,
+   "anchors_dropped_repeated": 2
+  },
+  "minecraft_rtx_b": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 23,
+   "anchors_dropped_repeated": 1
+  },
+  "minecraft_vanilla_a": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "minecraft_vanilla_b": {
+   "fps": 60,
+   "frames": 1500,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  },
+  "realworld_portland_walk_a": {
+   "fps": 60,
+   "frames": 1499,
+   "frames_from": null,
+   "anchors_every_s": null,
+   "anchors_kept": 24,
+   "anchors_dropped_repeated": 0
+  }
+ }
+}

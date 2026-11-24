@@ -1,5 +1,6 @@
 """Trains the three learned-blend nets A, B, C together (same batches, one gather per step).
-usage: train.py OUTDIR [--teacher] [--steps N] [--seed S] [--threads T] [--lr X] [--lr-end X] [--init DIR] [--mix FILE] [--base DIR]
+usage: train.py OUTDIR [--teacher] [--steps N] [--seed S] [--threads T] [--lr X] [--lr-end X] [--init DIR] [--mix FILE] [--base DIR] [--case CASE]
+  --case CASE keeps only the local rows (training and validation) of samples whose manifest case is CASE, e.g. 60to120.
   OUTDIR gets A.npz B.npz C.npz (+ log.json). --teacher adds the cached teacher training rows (weight 0.5 per row).
 Net = gpu/ml/blend/ref.py: 8 hidden units (max(z, 0.1 z)), softmax(log(max(rule, 1e-3)) [+ -5, -5] + z2), W2 = b2 = 0 at the start.
 A: Charbonnier distance of the colour to the four-choice oracle colour; B: to the target; C: six choices, to the six-choice oracle colour.
@@ -29,7 +30,7 @@ def opt(name):
     return args[args.index(name) + 1] if name in args else None
 
 
-INIT, MIX = opt("--init"), opt("--mix")
+INIT, MIX, CASE = opt("--init"), opt("--mix"), opt("--case")
 VARS = {"A": (25, 4, "O4"), "B": (25, 4, "Y"), "C": (34, 6, "O6")}
 
 
@@ -109,6 +110,10 @@ def main():
     split_of = np.array([s["split"] == "val" for s in man])
     assert not split_of[tr["S"]].any(), "validation row in the training set"
     assert split_of[va["S"]].all()
+    if CASE:   # --case: only rows of samples with this manifest case (training and validation alike); pools / counts below follow from G
+        keep = np.array([s["case"] == CASE for s in man])
+        tr, va = ({k: v[keep[d["S"]]] for k, v in d.items()} for d in (tr, va))
+        assert len(tr["G"]) and len(va["G"]), f"--case {CASE}: no rows"
     rows = {}
     for nm, d in (("train", tr), ("val", va)):
         for t in (0, 1):
