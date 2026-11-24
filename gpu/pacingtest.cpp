@@ -73,6 +73,7 @@ namespace
 		int blurSamples = 4;
 		double blurAmount = 0.5;
 		BlurRelative blurRelative = BlurRelative::ShownFrame;
+		bool lowFps = false;           // Inputs::lowFpsCompensation
 		uint64_t focusKey = 1;
 		FrameFormat layer{ 1920, 1080, 87 };
 
@@ -111,6 +112,7 @@ namespace
 			in.blurSamples = blurSamples;
 			in.blurAmount = blurAmount;
 			in.blurRelative = blurRelative;
+			in.lowFpsCompensation = lowFps;
 			return in;
 		}
 
@@ -4621,4 +4623,457 @@ TEST_CASE( "pacing: the extra timer's band does not flap for o a hair under a ti
 	CHECK( ExtraAtTarget( drv, 101 ) );
 	CHECK_FALSE( ExtraAtTarget( drv, 100 ) );
 	CHECK_FALSE( ExtraAtTarget( drv, 101 ) );    // and a hair under does not re-enter
+}
+
+// ---------------------------------------------------------------------------
+//  Low FPS compensation (task 149, 2026-11-24)
+// ---------------------------------------------------------------------------
+//
+// The switch must give the picture and the timing of a 60 fps stream in which every
+// frame of a 30 fps game is fed twice, without the duplicates. These tests drive the
+// Driver with explicit arrival lists on a 240 Hz display (Target = the refresh).
+
+namespace
+{
+	constexpr Ns kLowFpsTick60 = 16666667;     // one 60 fps interval, ns
+
+	std::vector<Ns> SteadyArrivals( Ns first, Ns intervalNs, Ns tEnd )
+	{
+		std::vector<Ns> v;
+		for ( Ns t = first; t < tEnd; t += intervalNs )
+			v.push_back( t );
+		return v;
+	}
+
+	// The same frames at 60 fps, each followed by a copy of itself (its own id, the same image).
+	std::vector<Ns> DoubledArrivals( const std::vector<Ns> &arr )
+	{
+		std::vector<Ns> v;
+		for ( Ns t : arr )
+		{
+			v.push_back( t );
+			v.push_back( t + kLowFpsTick60 );
+		}
+		return v;
+	}
+
+	Driver LowFpsDriver( double hz, Priority prio, bool lowFps )
+	{
+		Driver drv;
+		drv.refreshHz = hz;
+		drv.mode = Mode::Target;
+		drv.targetFps = 0;
+		drv.priority = prio;
+		drv.lowFps = lowFps;
+		return drv;
+	}
+
+	// Where an output sits on the line of distinct images: image index + t between two
+	// different images, the image itself for a real frame or a synth between two copies.
+	template<class F>
+	double PosOf( const Pacer::Decision &d, F img )
+	{
+		if ( d.prevId == 0 )
+			return img( d.showId );
+		const double a = img( d.prevId ), b = img( d.currId );
+		return a == b ? a : a + double( d.t );
+	}
+
+	// What the screen shows at the tick V: the last paint at or before it.
+	template<class F>
+	double ShownAt( const Driver &drv, Ns v, F img )
+	{
+		double pos = -1.0;
+		for ( const Painted &p : drv.log )
+		{
+			if ( p.t > v )
+				break;
+			pos = PosOf( p.d, img );
+		}
+		return pos;
+	}
+
+	// The invariants every Low FPS run has to keep: the content time never goes back and
+	// no generated output leaves [kTMin, 1] (the blur window stays inside [0, 1]).
+	void CheckLowFpsInvariants( const Driver &drv )
+	{
+		int64_t tauLast = 0;
+		for ( const Painted &p : drv.log )
+		{
+			if ( p.tau != 0 )
+			{
+				REQUIRE( p.tau >= tauLast );
+				tauLast = p.tau;
+			}
+			const Pacer::Decision &d = p.d;
+			if ( d.prevId != 0 )
+			{
+				REQUIRE( d.t >= float( kTMin ) - 1e-6f );
+				REQUIRE( d.t <= 1.0f );
+				REQUIRE( d.t0 >= 0.0f );
+				REQUIRE( d.t1 <= 1.0f );
+				REQUIRE( d.t0 <= d.t1 );
+			}
+		}
+	}
+
+	// Every field of two logs equal.
+	bool SameLog( const Driver &a, const Driver &b )
+	{
+		if ( a.log.size() != b.log.size() )
+			return false;
+		for ( size_t i = 0; i < a.log.size(); i++ )
+		{
+			const Pacer::Decision &x = a.log[ i ].d, &y = b.log[ i ].d;
+			if ( a.log[ i ].t != b.log[ i ].t || x.newestId != y.newestId || x.prevId != y.prevId || x.currId != y.currId ||
+				x.outId != y.outId || x.t != y.t || x.t0 != y.t0 || x.t1 != y.t1 || x.showId != y.showId || x.inert != y.inert ||
+				x.reset != y.reset || x.repaintNext != y.repaintNext || x.newOutput != y.newOutput || x.skip != y.skip ||
+				a.log[ i ].delayMs != b.log[ i ].delayMs )
+				return false;
+		}
+		return true;
+	}
+
+	// The shown position never steps back, and no gap between new images is longer than maxGapNs.
+	void CheckForwardAndNotStuck( const Driver &d, Ns maxGapNs, Ns fromNs = 0 )
+	{
+		double last = -1.0;
+		Ns lastNew = 0, maxGap = 0;
+		int nBack = 0;
+		for ( const Painted &p : d.log )
+		{
+			if ( p.t < fromNs )
+				continue;
+			const double pos = PosOf( p.d, []( uint64_t id ) { return double( id ); } );
+			if ( pos < last - 1e-6 )
+				nBack++;
+			last = std::max( last, pos );
+			if ( p.d.newOutput )
+			{
+				if ( lastNew != 0 )
+					maxGap = std::max( maxGap, p.t - lastNew );
+				lastNew = p.t;
+			}
+		}
+		INFO( "backward steps " << nBack << ", longest gap between new images " << double( maxGap ) / 1e6 << " ms" );
+		CHECK( nBack == 0 );
+		CHECK( maxGap <= maxGapNs );
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation on is bit-identical to off at 60 fps and above", "[pacing][lowfps]" )
+{
+	// Steady games at or above 60 fps (the transition cannot get longer than the pair), both
+	// priorities, both modes, with and without blur, on two refresh rates. The same scenario
+	// with the switch off was also compared with the unmodified header (task 149 report).
+	int nCases = 0;
+	for ( double fps : { 60.0, 90.0, 120.0, 144.0 } )
+	for ( double hz : { 240.0, 144.0 } )
+	for ( int prio = 0; prio < 2; prio++ )
+	for ( int mode = 0; mode < 2; mode++ )
+	for ( int blur = 0; blur < 2; blur++ )
+	{
+		Driver off = LowFpsDriver( hz, prio ? Priority::Smoothness : Priority::LowLatency, false );
+		off.mode = mode ? Mode::Target : Mode::Fixed;
+		off.multiplier = 3;
+		off.blur = blur != 0;
+		Driver on = off;
+		on.lowFps = true;
+		const Ns tEnd = 1500 * MS;
+		const std::vector<Ns> arr = SteadyArrivals( 3 * MS, Ns( 1e9 / fps ), tEnd );
+		off.RunArrivals( arr, tEnd );
+		on.RunArrivals( arr, tEnd );
+		INFO( "fps " << fps << " hz " << hz << " prio " << prio << " mode " << mode << " blur " << blur );
+		CHECK( off.log.size() > 100 );
+		CHECK( SameLog( off, on ) );
+		nCases++;
+	}
+	CHECK( nCases == 64 );
+}
+
+TEST_CASE( "pacing: low fps compensation barely changes a 60 fps game that jitters", "[pacing][lowfps]" )
+{
+	// A real 60 fps game's intervals scatter around 16.67 ms; the ones above the transition are
+	// only a little above it, so the result may differ only by that little.
+	Driver off = LowFpsDriver( 240.0, Priority::Smoothness, false );
+	Driver on = off;
+	on.lowFps = true;
+	std::vector<Ns> arr;
+	Ns t = 3 * MS;
+	for ( int i = 0; i < 90; i++ )
+	{
+		arr.push_back( t );
+		t += kLowFpsTick60 + Ns( ( ( i * 7919 ) % 11 - 5 ) * 100000 );   // +-0.5 ms
+	}
+	off.RunArrivals( arr, t );
+	on.RunArrivals( arr, t );
+	CheckLowFpsInvariants( on );
+	auto img = []( uint64_t id ) { return double( id ); };
+	int nTicks = 0, nBad = 0;
+	for ( Ns v = 500 * MS; v < t - 100 * MS; v += 1000000000 / 240 )
+	{
+		nTicks++;
+		nBad += std::fabs( ShownAt( off, v, img ) - ShownAt( on, v, img ) ) < 0.15 ? 0 : 1;
+	}
+	INFO( "ticks differing by more than 0.15 of a frame: " << nBad << " of " << nTicks );
+	CHECK( nBad <= nTicks / 20 );
+}
+
+TEST_CASE( "pacing: low fps compensation at 30 fps shows what a doubled 60 fps stream shows", "[pacing][lowfps]" )
+{
+	// A: 30 fps, switch on. B: the same frames at 60 fps, every second one a duplicate (its own
+	// id, the same image), switch off. 240 Hz, Target = the refresh. The ticks compared are those
+	// of seconds 1..3; "shown" is the image position (image index + t, a synth between two
+	// copies of one image is that image).
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		const Priority pr = prio ? Priority::Smoothness : Priority::LowLatency;
+		const Ns tEnd = 3500 * MS;
+		Driver a = LowFpsDriver( 240.0, pr, true );
+		Driver b = LowFpsDriver( 240.0, pr, false );
+		const std::vector<Ns> arrA = SteadyArrivals( 3 * MS, 2 * kLowFpsTick60, tEnd );
+		a.RunArrivals( arrA, tEnd );
+		b.RunArrivals( DoubledArrivals( arrA ), tEnd );
+		CheckLowFpsInvariants( a );
+		CheckLowFpsInvariants( b );
+
+		auto imgA = []( uint64_t id ) { return double( id - 1 ); };
+		auto imgB = []( uint64_t id ) { return double( ( id - 1 ) / 2 ); };
+		int nTicks = 0, nBad = 0;
+		for ( Ns v = 1000 * MS; v < 3000 * MS; v += 1000000000 / 240 )
+		{
+			const double pa = ShownAt( a, v, imgA ), pb = ShownAt( b, v, imgB );
+			nTicks++;
+			if ( std::fabs( pa - pb ) >= 0.03 )
+			{
+				nBad++;
+				INFO( "prio " << prio << " tick at " << double( v ) / 1e6 << " ms: A " << pa << " B " << pb );
+				CHECK( std::fabs( pa - pb ) < 0.03 );
+			}
+		}
+		INFO( "prio " << prio << ": " << nBad << " of " << nTicks << " ticks differ" );
+		CHECK( nBad == 0 );
+		// the delay follows the 16.7 ms interval, not the 33.3 ms one
+		CHECK( std::fabs( a.log.back().delayMs - b.log.back().delayMs ) < 0.01 );
+		const Pacer::Report r = a.Status();
+		CHECK( r.lowFpsActive );
+		CHECK( std::fabs( r.transitionMs - 16.6667f ) < 0.01f );
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation counts distinct images and says when it acts", "[pacing][lowfps]" )
+{
+	Driver a = LowFpsDriver( 240.0, Priority::LowLatency, true );
+	const Ns tEnd = 3000 * MS;
+	a.RunArrivals( SteadyArrivals( 3 * MS, 33333334, tEnd ), tEnd );
+	// 30 fps at 240 Hz: per real frame 3 synths + 1 real = 4 distinct images, 120 a second.
+	const int nDistinct = a.CountDistinct( 1000 * MS, 2000 * MS );
+	CHECK( nDistinct >= 118 );
+	CHECK( nDistinct <= 122 );
+	Driver off = LowFpsDriver( 240.0, Priority::LowLatency, false );
+	off.RunArrivals( SteadyArrivals( 3 * MS, 33333334, tEnd ), tEnd );
+	CHECK( off.CountDistinct( 1000 * MS, 2000 * MS ) >= 236 );   // 1 real + 7 synths per real frame
+	CHECK_FALSE( off.Status().lowFpsActive );
+	CHECK( off.Status().transitionMs == 0.0f );
+	// 120 fps with the switch on: not acting
+	Driver fast = LowFpsDriver( 240.0, Priority::LowLatency, true );
+	fast.RunArrivals( SteadyArrivals( 3 * MS, 8333333, tEnd ), tEnd );
+	CHECK_FALSE( fast.Status().lowFpsActive );
+	CHECK( fast.Status().transitionMs == 0.0f );
+}
+
+TEST_CASE( "pacing: low fps compensation changes smoothly with the game's rate", "[pacing][lowfps]" )
+{
+	const Ns tick = 1000000000 / 240;
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		int nPrev = -1;
+		for ( double fps : { 30.0, 40.0, 45.0, 50.0, 55.0, 59.0 } )
+		{
+			Driver d = LowFpsDriver( 240.0, prio ? Priority::Smoothness : Priority::LowLatency, true );
+			const Ns tEnd = 3000 * MS;
+			const Ns span = Ns( 1e9 / fps );
+			d.RunArrivals( SteadyArrivals( 3 * MS, span, tEnd ), tEnd );
+			CheckLowFpsInvariants( d );
+			// Per pair (keyed by currId): the first generated output, the real frame, the synths.
+			// The transition ends with the first new output after its last synth: the real frame, or (in
+			// Smoothness near 60 fps, where the pair played is an older one and its real frame is never
+			// shown on its own) the next pair's first synth.
+			std::map<uint64_t, Ns> firstSynth, realAt;
+			std::map<uint64_t, double> firstT;
+			std::map<uint64_t, int> nSynth;
+			uint64_t lastPair = 0;
+			for ( const Painted &p : d.log )
+			{
+				if ( p.t < 1000 * MS || !p.d.newOutput )
+					continue;
+				if ( lastPair != 0 && !( p.d.prevId != 0 && p.d.currId == lastPair && p.d.t < 1.0f ) )
+				{
+					realAt[ lastPair ] = p.t;
+					lastPair = 0;
+				}
+				if ( p.d.prevId != 0 && p.d.t < 1.0f )
+				{
+					if ( !firstSynth.count( p.d.currId ) )
+					{
+						firstSynth[ p.d.currId ] = p.t;
+						firstT[ p.d.currId ] = p.d.t;
+					}
+					nSynth[ p.d.currId ]++;
+					lastPair = p.d.currId;
+				}
+			}
+			int nPairs = 0, nMin = 1000, nMax = 0;
+			const uint64_t idFirst = firstSynth.empty() ? 0 : firstSynth.begin()->first;
+			for ( const auto &kv : firstSynth )
+			{
+				if ( !realAt.count( kv.first ) || kv.first + 2 > d.newestId || kv.first == idFirst )
+					continue;
+				// The transition's length: from where its window starts (the first synth's own time
+				// minus its position t * 16.7 ms: the first paint after an arrival lands anywhere in a tick)
+				// to the real frame.
+				const Ns durPlain = realAt[ kv.first ] - kv.second;
+				const Ns dur = durPlain + Ns( firstT[ kv.first ] * 16666667.0 );
+				INFO( "prio " << prio << " fps " << fps << " pair " << kv.first << " transition " << double( dur ) / 1e6 << " ms" );
+				// Within one tick of 16.7 ms measured from where the window starts; the time between the
+				// first paint of the pair and the real frame is shorter by what the first paint's phase
+				// in its tick (and, in Low latency, the output interval) takes, never longer than the pair.
+				CHECK( dur <= 16666667 + tick );
+				CHECK( dur >= 16666667 - tick );
+				CHECK( durPlain <= 16666667 );
+				CHECK( durPlain < span );
+				nMin = std::min( nMin, nSynth[ kv.first ] );
+				nMax = std::max( nMax, nSynth[ kv.first ] );
+				nPairs++;
+			}
+			INFO( "prio " << prio << " fps " << fps << " synths per pair " << nMin << ".." << nMax );
+			CHECK( nPairs > 20 );
+			CHECK( nMax - nMin <= 1 );
+			if ( nPrev >= 0 )
+				CHECK( std::abs( nMax - nPrev ) <= 1 );
+			nPrev = nMax;
+		}
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation follows a game that goes 30 -> 60 -> 30 fps", "[pacing][lowfps]" )
+{
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		Driver d = LowFpsDriver( 240.0, prio ? Priority::Smoothness : Priority::LowLatency, true );
+		std::vector<Ns> arr;
+		Ns t = 3 * MS;
+		const Ns seg[ 3 ] = { 33333333, 16666667, 33333333 };
+		for ( int s = 0; s < 3; s++ )
+		{
+			const Ns end = t + 1500 * MS;
+			for ( ; t < end; t += seg[ s ] )
+				arr.push_back( t );
+		}
+		d.RunArrivals( arr, t );
+		CheckLowFpsInvariants( d );
+		INFO( "prio " << prio );
+		CheckForwardAndNotStuck( d, 33333333 + 2 * ( 1000000000 / 240 ) );
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation survives a 100 ms hitch", "[pacing][lowfps]" )
+{
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		Driver d = LowFpsDriver( 240.0, prio ? Priority::Smoothness : Priority::LowLatency, true );
+		std::vector<Ns> arr;
+		Ns t = 3 * MS;
+		for ( int i = 0; i < 90; i++ )
+		{
+			arr.push_back( t );
+			t += ( i == 60 ) ? 100 * MS : 33333333;
+		}
+		d.RunArrivals( arr, t );
+		CheckLowFpsInvariants( d );
+		INFO( "prio " << prio );
+		// never stuck for longer than the hitch itself (the held frame covers the gap)
+		CheckForwardAndNotStuck( d, 100 * MS + 2 * ( 1000000000 / 240 ) );
+		// and the picture keeps moving after it
+		CHECK( d.CountDistinct( t - 500 * MS, t ) > 40 );
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation with blur keeps the window in the transition", "[pacing][lowfps]" )
+{
+	for ( int rel = 0; rel < 2; rel++ )
+	{
+		Driver d = LowFpsDriver( 240.0, Priority::Smoothness, true );
+		d.blur = true;
+		d.blurRelative = rel ? BlurRelative::GameFrame : BlurRelative::ShownFrame;
+		Driver ref = d;      // the doubled stream, switch off
+		ref.lowFps = false;
+		const Ns tEnd = 3000 * MS;
+		const std::vector<Ns> arr = SteadyArrivals( 3 * MS, 33333334, tEnd );
+		d.RunArrivals( arr, tEnd );
+		ref.RunArrivals( DoubledArrivals( arr ), tEnd );
+		CheckLowFpsInvariants( d );
+		int nWin = 0;
+		for ( const Painted &p : d.log )
+			if ( p.t > 1000 * MS && p.d.prevId != 0 && p.d.t0 < p.d.t1 )
+			{
+				nWin++;
+				// ShownFrame: a window of s * o / g' with g' the 16.7 ms transition: 0.5 * 4.17 / 16.7
+				if ( rel == 0 )
+					CHECK( p.d.t1 - p.d.t0 <= 0.126f );
+			}
+		CHECK( nWin > 100 );
+		// the picture is the doubled stream's (the window ends where the output's t is)
+		auto imgA = []( uint64_t id ) { return double( id - 1 ); };
+		auto imgB = []( uint64_t id ) { return double( ( id - 1 ) / 2 ); };
+		int nCmp = 0, nBad = 0;
+		for ( Ns v = 1000 * MS; v < 2900 * MS; v += 1000000000 / 240 )
+		{
+			nCmp++;
+			nBad += std::fabs( ShownAt( d, v, imgA ) - ShownAt( ref, v, imgB ) ) < 0.03 ? 0 : 1;
+		}
+		INFO( "blur rel " << rel << ": " << nBad << " of " << nCmp << " ticks differ from the doubled stream" );
+		CHECK( nBad <= nCmp / 20 );
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation with the lag buffer's extra delay plays older pairs forwards", "[pacing][lowfps]" )
+{
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		Driver d = LowFpsDriver( 240.0, prio ? Priority::Smoothness : Priority::LowLatency, true );
+		d.extraDelayNs = 60 * MS;
+		const Ns tEnd = 3000 * MS;
+		d.RunArrivals( SteadyArrivals( 3 * MS, 33333334, tEnd ), tEnd );
+		CheckLowFpsInvariants( d );
+		INFO( "prio " << prio );
+		// (from 1 s on: the step at which the delay first appears is the buffer's, not this switch's)
+		CheckForwardAndNotStuck( d, 33333334 + 2 * ( 1000000000 / 240 ), 1000 * MS );
+		CHECK( d.CountDistinct( 1000 * MS, 2000 * MS ) >= 100 );
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation counts no held tick as a synth for the cost guard", "[pacing][lowfps]" )
+{
+	// Fixed 8x with a measured cost that allows 7 synths per 33.3 ms pair: the synths of a pair
+	// are spread over the 16.7 ms transition, so the guard must neither exceed 7 per pair nor
+	// raise the output interval beyond what 7 synths in 16.7 ms need (o >= 16.7 / 8 = 2.1 ms).
+	Driver d = LowFpsDriver( 240.0, Priority::LowLatency, true );
+	d.mode = Mode::Fixed;
+	d.multiplier = 8;
+	d.estimateMs = 1.0f;
+	d.synthMs = 1.0f;
+	const Ns tEnd = 3000 * MS;
+	d.RunArrivals( SteadyArrivals( 3 * MS, 33333334, tEnd ), tEnd );
+	CheckLowFpsInvariants( d );
+	std::map<uint64_t, int> n;
+	for ( const Painted &p : d.log )
+		if ( p.t > 1000 * MS && p.d.newOutput && p.d.prevId != 0 && p.d.t < 1.0f )
+			n[ p.d.currId ]++;
+	int nMax = 0;
+	for ( const auto &kv : n )
+		nMax = std::max( nMax, kv.second );
+	INFO( "most synths in a pair " << nMax << ", output interval " << d.pacer.OutputMs() << " ms" );
+	CHECK( nMax <= 7 );
+	CHECK( nMax >= 3 );
 }

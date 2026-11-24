@@ -111,6 +111,28 @@
 // passes through. A probe retries every 10 s. No timestamps, no guard.
 // Inputs::costGuard false turns all of it off (costs are still read).
 //
+// LOW FPS COMPENSATION (Inputs::lowFpsCompensation, default off; 2026-11-24). A user found a 30 fps
+// game bad at 30 -> 240 but "amazing" when every frame was fed twice (a 60 fps input with duplicates)
+// and then generated to 240. Doubling leaves the motion estimate of the pair that holds the motion
+// as it was; it changes the SCHEDULE: per real frame the screen shows the real frame five times and
+// three generated frames (t = 0.25, 0.5, 0.75) instead of one real and seven generated, the
+// transition takes 16.7 ms instead of 33.3 ms, and the delay follows a 16.7 ms interval. Generated
+// frames across a 33 ms gap are much worse than across 16.7 ms, so they are shown for less time.
+// With the switch on, a pair of span s is played as the 60 fps game would have played it:
+//   * the transition is the LAST min(s, 1000/60 ms) of the pair, t = (tau - (A1 - w)) / w with
+//     w = min(s, 1000/60 ms) (A1 the pair's later arrival); before it (t <= 0) the previous real
+//     frame is shown as it is (no synth; a repeat, newOutput false, when it is already on screen);
+//   * the delay rule (DelayBaseFor) uses min(interval, 1000/60 ms) wherever it used the interval, so
+//     the real frame is fully shown D(16.7 ms) after its arrival, as in the doubled stream;
+//   * blur windows are measured against w, so a blurred output never reaches back into the hold
+//     further than at a 60 fps game.
+// It is the same picture at the same times as the doubling (tested tick by tick, both priorities)
+// without duplicate frames, generated hold frames or a second estimate. No threshold: at 45 fps the
+// transition is 16.7 of 22.2 ms, at 59 fps 16.7 of 16.9 ms, from 60 fps up (within 1 us) nothing
+// changes, bit for bit. Output interval o is unchanged (Fixed N and Target keep their cadence); the
+// cost guard spreads one pair's synths over w. Report::lowFpsActive / transitionMs say it is acting.
+// Not affected: video / timestamps mode, frame generation off (real-rate planning).
+//
 // LATENCY. A newer real frame is seen by the very next paint: nothing is ever
 // queued except by Smoothness's deliberate delay.
 //
@@ -411,6 +433,14 @@ namespace framegen::pacing
 	// t above kRealSnapT shows the real frame itself.
 	constexpr double kTMin            = 0.02;
 	constexpr double kRealSnapT       = 0.98;
+	// Low FPS compensation (Inputs::lowFpsCompensation, 2026-11-24): the longest a transition
+	// between two real frames takes, 1000/60 ms. Fixed, no setting: it is "what a 60 fps game
+	// does".
+	constexpr double  kLowFpsTransitionMs = 1000.0 / 60.0;
+	constexpr int64_t kLowFpsTransitionNs = int64_t( kLowFpsTransitionMs * 1e6 );
+	// A game interval within this of the transition counts as "not longer" (a 60 fps game's
+	// intervals are 16666666 or 16666667 ns): the switch then changes nothing, bit for bit.
+	constexpr int64_t kLowFpsSlackNs = 1000;
 	// Real frames kept for pair selection (the renderer's ring is the same size).
 	constexpr int    kHistory         = 3;
 	// With a delay (the lag-spike buffer, Inputs::extraDelayNs) the number of real frames kept
@@ -895,6 +925,12 @@ namespace framegen::pacing
 			double blurAmount = 0.5;   // 0..1, the shutter (see BlurWindow)
 			BlurRelative blurRelative = BlurRelative::ShownFrame;
 
+			// Low FPS compensation (default off; see the header comment): below 60 fps the
+			// transition between two real frames takes at most kLowFpsTransitionMs and the
+			// previous real frame is held for the rest of the game interval. No effect at
+			// 60 fps and above, in video mode, or with frame generation off.
+			bool   lowFpsCompensation = false;
+
 			// --- video / timestamps mode (only read after OnFrame; see the header) ---
 			// The media clock: PTS p is to be shown at V = mediaOffsetNs + p / playbackRate.
 			// Read fresh at each paint (a rate change or an A/V trim takes effect at once).
@@ -967,6 +1003,11 @@ namespace framegen::pacing
 			//                       Informational: it does not gate `generating`.
 			float  steadyMultiplier = 0.0f;
 			bool   generating = false;
+			// Low FPS compensation is acting right now: the switch is on, frame generation is
+			// generating and the game interval is above kLowFpsTransitionMs. transitionMs is then
+			// the transition's length (kLowFpsTransitionMs), else 0.
+			bool   lowFpsActive = false;
+			float  transitionMs = 0.0f;
 		};
 
 		// Is the output capped at the refresh rate under these inputs?
@@ -1268,6 +1309,11 @@ namespace framegen::pacing
 						if ( s.gameFps > 0.0f )
 							s.activeN = std::max( 2, int( std::lround( s.effectiveMultiplier ) ) );
 						s.generating = m_bHaveSynth && ulNow >= m_ulLastSynthAt && ulNow - m_ulLastSynthAt <= kGeneratingRecentNs;
+							if ( !m_bPts && in.lowFpsCompensation && m_Est.IntervalMs() > kLowFpsTransitionMs + double( kLowFpsSlackNs ) / 1e6 )
+							{
+								s.lowFpsActive = true;
+								s.transitionMs = float( kLowFpsTransitionMs );
+							}
 					}
 				}
 			}
@@ -1742,6 +1788,11 @@ namespace framegen::pacing
 
 			double flOutMs = flBaseMs;
 			Reason eReason = Reason::Normal;
+			// The time the synths of one pair are spread over: the game interval, but with Low FPS
+			// compensation only the transition (the held ticks are no synths), so the same GPU
+			// budget buys the same synths in a shorter window (2026-11-24). The budget itself
+			// (25% of the real interval, one estimate per pair) is unchanged.
+			const double flGenMs = CapInterval( in, flInterval );
 
 			const bool bTimed = in.estimateMs >= 0.0f && in.synthMs >= 0.0f;
 			if ( !bTimed || !in.costGuard )
@@ -1787,7 +1838,7 @@ namespace framegen::pacing
 						return;
 					}
 					// The probe: one generated frame per real frame.
-					flOutMs = std::max( flOutMs, flInterval * 0.5 );
+					flOutMs = std::max( flOutMs, flGenMs * 0.5 );
 					eReason = Reason::CostGuard;
 				}
 				else
@@ -1803,7 +1854,7 @@ namespace framegen::pacing
 						m_Plan = p;
 						return;
 					}
-					const double flCostMs = flInterval / double( nMax + 1 );
+					const double flCostMs = flGenMs / double( nMax + 1 );
 					if ( !bRealRate && flCostMs > flOutMs + 1e-9 )
 					{
 						flOutMs = flCostMs;
@@ -1843,12 +1894,20 @@ namespace framegen::pacing
 			return DelayBaseFor( in ) + flExtraMs;
 		}
 
+		// The interval the delay rule works on: the game's, but with Low FPS compensation never
+		// longer than the transition (2026-11-24): the real frame is then fully shown D(16.7 ms)
+		// after its arrival, exactly as when a 60 fps stream carried every frame twice.
+		static double CapInterval( const Inputs &in, double flIntervalMs )
+		{
+			return ( in.lowFpsCompensation && flIntervalMs > kLowFpsTransitionMs + double( kLowFpsSlackNs ) / 1e6 ) ? kLowFpsTransitionMs : flIntervalMs;
+		}
+
 		double DelayBaseFor( const Inputs &in ) const
 		{
-			const double flInterval = m_Est.IntervalMs();
+			const double flInterval = CapInterval( in, m_Est.IntervalMs() );
 			if ( in.priority == Priority::Smoothness )
 				return SmoothnessDelayMs( flInterval, m_Est.SpreadMs() );
-			const double flI = LowLatencyIntervalMs( flInterval, m_flLastIntervalMs );
+			const double flI = CapInterval( in, LowLatencyIntervalMs( m_Est.IntervalMs(), m_flLastIntervalMs ) );
 			const double flBase = LowLatencyDelayMs( flI, m_Plan.oMs );
 			// i - o plus the typical jitter. No floor of one o and no paint lead: minimal
 			// delay is the point (see LowLatencyMarginMs). Zero stays zero (game at the output rate).
@@ -1962,12 +2021,47 @@ namespace framegen::pacing
 			bool bReal = tau >= newest.arrival;
 			int j = m_nHist - 2;
 			double t = 1.0;
+			bool bHold = false;
 			if ( !bReal )
 			{
 				while ( j > jMin && m_Hist[ j ].arrival > tau )
 					j--;
 				const int64_t nSpan = std::max<int64_t>( m_Hist[ j + 1 ].arrival - m_Hist[ j ].arrival, 1 );
-				t = double( tau - m_Hist[ j ].arrival ) / double( nSpan );
+				if ( in.lowFpsCompensation && nSpan > kLowFpsTransitionNs + kLowFpsSlackNs )
+				{
+					// Low FPS compensation: the transition is the LAST kLowFpsTransitionNs of the pair
+					// (t is then the position in the transition, which is what the renderer
+					// interpolates at); before it the previous real frame is held.
+					t = double( tau - ( m_Hist[ j + 1 ].arrival - kLowFpsTransitionNs ) ) / double( kLowFpsTransitionNs );
+					bHold = t <= 0.0;
+				}
+				else
+				{
+					t = double( tau - m_Hist[ j ].arrival ) / double( nSpan );
+				}
+				if ( bHold )
+				{
+					// The real frame j again: nothing to generate; no new output when it is
+					// already on screen (the same image, so it is not counted as presented).
+					const uint64_t ulHoldId = m_Hist[ j ].id;
+					const bool bOnScreen = m_Last.outId != 0 && m_Last.t >= 1.0f && m_Last.showId == ulHoldId && m_Last.prevId == 0;
+					if ( bOnScreen )
+					{
+						Repeat( d, m_Last, true );
+						d.showId = ulHoldId;
+					}
+					else
+					{
+						d.t = d.t0 = d.t1 = 1.0f;
+						d.prevId = d.currId = 0;
+						d.showId = ulHoldId;
+						d.outId = ++m_ulOutSeq;
+						m_flBlurMs = 0.0;
+					}
+					d.repaintNext = true;
+					m_bExpectPaint = true;
+					return;
+				}
 				if ( j + 1 == m_nHist - 1 && t >= kRealSnapT )
 					bReal = true;
 				else
@@ -1977,14 +2071,14 @@ namespace framegen::pacing
 			if ( bReal )
 			{
 				// The real frame itself: nothing more is due until a newer one arrives.
-				FinishReal( in, d, m_nHist - 1 );
+				FinishReal( in, d, m_nHist - 1, true );
 				d.repaintNext = false;
 				m_bExpectPaint = false;
 				m_bHavePair = false;
 				return;
 			}
 
-			FinishSynth( in, d, j, t, bLastSynth );
+			FinishSynth( in, d, j, t, bLastSynth, true );
 			d.repaintNext = true;
 			m_bExpectPaint = true;
 		}
@@ -2113,6 +2207,15 @@ namespace framegen::pacing
 
 		// ---- the shared end of every output: which pair, which window, which image ----
 
+		// The game interval a blur window is measured against, ns: the pair's span, but with Low FPS
+		// compensation (bCap: the paths that remap the position) the transition's length at most, so
+		// a blurred output reaches back into the hold no further than it does at a 60 fps game
+		// (2026-11-24). t is already in the transition's own time, so only the span changes.
+		static double BlurSpanNs( const Inputs &in, int64_t nSpanNs, bool bCap )
+		{
+			return double( bCap && in.lowFpsCompensation && nSpanNs > kLowFpsTransitionNs + kLowFpsSlackNs ? kLowFpsTransitionNs : nSpanNs );
+		}
+
 		// The output interval ShownFrame blur is measured in, ns.
 		double BlurOutputNs() const
 		{
@@ -2121,7 +2224,7 @@ namespace framegen::pacing
 
 		// A real frame hist[jShown] is the output. With blur its window is cut from the
 		// pair (jShown - 1, jShown), ending at the frame itself.
-		void FinishReal( const Inputs &in, Decision &d, int jShown )
+		void FinishReal( const Inputs &in, Decision &d, int jShown, bool bCapSpan = false )
 		{
 			d.t = d.t0 = d.t1 = 1.0f;
 			d.prevId = d.currId = 0;
@@ -2130,7 +2233,7 @@ namespace framegen::pacing
 			m_flBlurMs = 0.0;
 			if ( BlurActive( in ) && jShown >= 1 )
 			{
-				const double flSpan = double( m_Hist[ jShown ].arrival - m_Hist[ jShown - 1 ].arrival );
+				const double flSpan = BlurSpanNs( in, m_Hist[ jShown ].arrival - m_Hist[ jShown - 1 ].arrival, bCapSpan );
 				const BlurSpan w = BlurWindow( 1.0, BlurOutputNs(), flSpan, in.blurAmount, in.blurRelative );
 				if ( w.t0 < w.t1 )
 				{
@@ -2144,7 +2247,7 @@ namespace framegen::pacing
 		}
 
 		// A synth at t between hist[j] and hist[j + 1], with its blur window.
-		void FinishSynth( const Inputs &in, Decision &d, int j, double t, bool bLastSynth )
+		void FinishSynth( const Inputs &in, Decision &d, int j, double t, bool bLastSynth, bool bCapSpan = false )
 		{
 			d.prevId = m_Hist[ j ].id;
 			d.currId = m_Hist[ j + 1 ].id;
@@ -2180,7 +2283,7 @@ namespace framegen::pacing
 			m_flBlurMs = 0.0;
 			if ( BlurActive( in ) )
 			{
-				const double flSpan = double( m_Hist[ j + 1 ].arrival - m_Hist[ j ].arrival );
+				const double flSpan = BlurSpanNs( in, m_Hist[ j + 1 ].arrival - m_Hist[ j ].arrival, bCapSpan );
 				const BlurSpan w = BlurWindow( d.t, BlurOutputNs(), flSpan, in.blurAmount, in.blurRelative );
 				d.t0 = w.t0;
 				d.t1 = w.t1;
