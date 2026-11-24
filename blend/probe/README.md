@@ -66,3 +66,30 @@ Where the gain sits (squared-error reduction vs the rule; edge pixels are 25.8 %
 
 `n5-all-o6` was not trained (budget; dropped first as agreed).
 **Part 3: seed noise.** px8 seed 0 vs seed 1 (torch init and crop order): 31.14 / 26.59 vs 31.15 / 26.61, differences 0.01 / 0.02 dB (largest per-group difference 0.04 dB, forza whole 30.51 vs 30.53).
+
+## Probe 3 (task 147): can the best 8x8 block mix be predicted by a block-level net?
+Scripts: `block3_build.py` (block table), `block3_check.py`, `block3_rulepix.py`, `block3_base.py`, `block3_lib.py`, `block3_train.py`, `block3_all.sh` / `block3_reg.sh` (runs), `block3_report.py` -> `tables3.md` (all tables incl. per group, edge, training set). Data: `$BLEND/probe/block3/` (`NN.npz` block tables, `base.json`, `rule_pix.json`, `res_TAG.json`, `net_TAG.pt`). The pixel data was read once (table build, rule scores); training and scoring use only the block table.
+
+Method. B = 8 (135 x 240 blocks per pair). Per block: Gram data G (6x6), b, yy over 64 px x RGB for the six candidates (0..1 units), the same restricted to edge-mask pixels, mean / std / min / max of the 34 features (136), block-mean rule weights. Error of a block-constant mix w = w^T G w - 2 b^T w + yy (exact). Checks: block oracle from the table equals `block_oracle/NN.json` "6_8" on pairs 56 and 70 (relative difference <= 3e-7 in se and se_e, same edge counts); rule per pixel over the 23 held-out pairs 31.243 / 26.753; block oracle 34.18 / 29.37. Nets: hidden width 64, leaky ReLU 0.1, softmax over logits log(max(block-mean rule, 1e-3)) (taps) and -5 (prev, curr) plus the net output, last layer zero at the start; MLPs are 1x1 convs (2 hidden layers); b-ctx adds the feature means over the 3x3 / 7x7 / 15x15 blocks around (edge-replicated), b-ctx-frame also the frame-wide mean and std of the 34 features, b-conv 3 x (3x3) (receptive field 7x7), b-conv-big 4 x (3x3, dilation 1,2,4,8) (31x31) + frame-wide statistics channels. Inputs standardised with training statistics. Loss: exact mean squared error per pixel from the Gram form (mse); Adam 2e-3 -> 1e-4 cosine, 2,500 steps, 8 random 64x64 block crops (of the 56 training pairs) per step, 3 threads; 1 to 12 minutes per net.
+
+Result (PSNR dB whole / edge; rule held-out 31.24 / 26.75; "train gain" = gain over the per-pixel rule on the 56 training pairs, whole / edge):
+
+| method | held-out all | held-out gain | train gain |
+|---|---|---|---|
+| (a) rule block-averaged | 31.34 / 26.85 | +0.10 / +0.10 | +0.06 / +0.06 |
+| (b) fixed mix, all | 31.36 / 26.83 | +0.12 / +0.07 | +0.34 / +0.28 |
+| (c) fixed mix per group | 31.39 / 26.93 | +0.15 / +0.18 | +0.54 / +0.57 |
+| (d) block oracle | 34.18 / 29.37 | +2.93 / +2.61 | +4.52 / +3.73 |
+| b-mean | 30.94 / 26.43 | -0.30 / -0.32 | +0.64 / +0.49 |
+| b-stats | 31.02 / 26.58 | -0.22 / -0.17 | +0.75 / +0.56 |
+| b-ctx | 30.46 / 25.91 | -0.78 / -0.85 | +0.81 / +0.58 |
+| b-ctx-frame | 30.94 / 26.61 | -0.31 / -0.14 | +1.61 / +1.31 |
+| b-conv | 30.25 / 25.88 | -1.00 / -0.87 | +1.02 / +0.71 |
+| b-conv-big | 30.17 / 26.19 | -1.07 / -0.57 | +1.37 / +1.17 |
+| b-stats, wd 1e-4 + dropout 0.1 | 31.09 / 26.65 | -0.15 / -0.10 | +0.75 / +0.56 |
+| b-ctx, wd + dropout | 30.52 / 25.99 | -0.72 / -0.77 | +0.82 / +0.61 |
+| b-conv, wd + dropout | 30.68 / 26.17 | -0.57 / -0.59 | +0.90 / +0.65 |
+| b-stats, Charbonnier loss | 31.15 / 26.63 | -0.10 / -0.12 | +0.54 / +0.35 |
+| b-stats, seed 1 | 31.22 / 26.75 | -0.02 / -0.01 | +0.78 / +0.57 |
+
+Answer: no block net beats the rule on held-out pairs (best -0.02 dB, b-stats seed 1; seed 0 gives -0.22, so the seed noise of this net is about 0.2 dB, far larger than the 0.01 dB of the per-pixel nets). The best net reaches about 0 % of the oracle's +2.93 dB (range -37 % to -1 %). The nets do fit the training pairs (+0.6 to +1.6 dB, more with more context or capacity; the oracle on the training pairs is +4.5 dB) and that does not carry over: held-out forza loses 0.3 to 1.8 dB (held-out forza is another clip, racing_forza6_c, than the training clips _a/_b), minecraft120 gains 0.5 to 0.6 for the 1x1 and context nets, cs2 up to +0.7 for some nets, battlefield about 0. Wider context raises the training gain and lowers the held-out gain (b-stats, b-ctx, b-conv, b-conv-big: held-out -0.22, -0.78, -1.00, -1.07). Frame-wide statistics give the largest training gain (+1.61) and a better held-out figure than the same net without them (b-ctx -0.78, b-ctx-frame -0.31), but still below the rule. Weight decay 1e-4 + dropout 0.1 helps the over-fitting nets a little (b-conv -1.00 -> -0.57, b-ctx -0.78 -> -0.72, b-stats -0.22 -> -0.15), none turns positive. The Charbonnier loss does not change the picture (b-stats -0.10 vs -0.22, inside seed noise). Fixed mixes: the single six-weight mix fitted on the training pairs (0.176 0.217 0.225 0.282 0.033 0.068) gains +0.12 / +0.07 held-out, one per group +0.15 / +0.18, with per-group swings from -0.11 (minecraft120, (c)) to +0.52 (minecraft120, (b)); (a) block constancy alone costs the rule nothing (+0.10). Not done: block size 16, and a second seed of the other nets (only b-stats has seed 1). Training loss values are noisy (random crops); last-100-step means are in `tables3.md`.
