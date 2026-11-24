@@ -29,3 +29,40 @@ Whole picture / edge pixels (edge mask: luma of the real frame, Sobel magnitude,
 Answer: no network that sees neighbours beats the per-pixel one on held-out pairs in this setup: every gain over px8 is between -0.12 and +0.04 dB (whole and edge), i.e. 0 % of the px8 -> O6 gap closed (between -1.6 % and +0.5 %). In-sample (160 training crops, `check_train_loss.py`) the nets do improve slightly: rule-start 29.38 dB, px8 29.57, px32 29.67, n3-all 29.74. So the neighbourhood buys a little on training crops and nothing on held-out pairs. Caveat: even px8 is not better than the rule on held-out pairs (31.14 vs 31.24 dB), so this training recipe (real-frame target, 6,000 steps, 56 pairs) extracts almost nothing beyond the rule at all; the null result may be a property of the recipe as much as of the information content. See the report for details.
 
 Sanity: rule on the 12 forza held-out pairs is 30.86 dB (stride 1), 30.52 dB on the same pairs at the cache's sparse pixels (stride 64, n=32400 per pair); the stored arrays equal the sparse records at the sampled pixels (taps within f16 rounding 0.0625, rule weights 2.4e-4, target exactly), so the stride-1 path is the cache path; the 29.9 figure is the whole forza val set (74 pairs, 2.79 M sparse rows, `records/measure.md`), and per-pair differences between sparse and stride-1 reach 1.1 dB (sampling noise). O6 <= O4 <= every net (in squared error) holds on all 23 pairs.
+
+## Follow-up (task 144): block-constant ceiling, O6 target, seed noise
+Scripts: `block_oracle.py` (Part 1), `make_o6crops.py` + `train_probe2.py` + `score2.py` (Parts 2, 3), `report2.py` -> `tables2.md` (all tables incl. four-candidate rows, per-group, checkerboard, edge shares). New data under `$BLEND/probe/`: `block_oracle/NN.json`, `o6crops/` (crops.json, 56 x [20,128,128,3] f16), `nets/{px8-o6,n3-all-o6,px8-fix,n3-all-fix,px8-s1}.pt`, `scores2.json`. Numbers below: all 23 pairs pooled, whole picture / edge pixels, PSNR dB.
+
+**Part 1: block-constant oracle.** Solver = oracle.py's subset enumeration on the block's Gram data (G = sum c c^T, b = sum c y, yy). Check at B = 1 on pair 56, rows 400..520 (230,400 pixels): colour after float16 rounding equals the stored `o6.npy` and `o4.npy` exactly (max difference 0.0000 levels, MSE 3.7390 = 3.7390 and 5.5799 = 5.5799).
+
+| method (six candidates) | all | gain over rule |
+|---|---|---|
+| rule | 31.24 / 26.75 | |
+| px8 (task 143) | 31.14 / 26.59 | -0.10 / -0.16 |
+| whole frame, 1 weight vector | 31.79 / 27.26 | +0.55 / +0.51 |
+| block 32 | 32.85 / 28.16 | +1.61 / +1.41 |
+| block 16 | 33.41 / 28.65 | +2.17 / +1.90 |
+| block 8 | 34.18 / 29.37 | +2.94 / +2.62 |
+| block 4 | 35.13 / 30.37 | +3.89 / +3.62 |
+| block 2 | 36.32 / 31.74 | +5.08 / +4.99 |
+| per-pixel O6 | 37.65 / 33.41 | +6.41 / +6.66 |
+| four taps: whole / 32 / 16 / 8 / 4 / 2 | 31.63 / 32.25 / 32.59 / 33.02 / 33.52 / 34.09 (edges 27.07 / 27.51 / 27.80 / 28.19 / 28.70 / 29.33) | +0.39 / +1.01 / +1.35 / +1.78 / +2.28 / +2.85 whole |
+| per-pixel O4 | 34.69 / 30.02 | +3.45 / +3.27 |
+
+Checkerboard (fit on even pixels of each block, score on the odd pixels; rule on odd pixels 31.24 / 26.75): B = 16 33.37 / 28.60 (plain fit 33.41 / 28.65), B = 8 34.06 / 29.23 (plain 34.18 / 29.37, i.e. +2.82 / +2.48 over the rule survives), B = 4 34.73 / 29.89 (plain 35.13 / 30.37, +3.49 / +3.14 survives). Four candidates, B = 8: 32.95 / 28.10 (plain 33.02 / 28.19).
+Where the gain sits (squared-error reduction vs the rule; edge pixels are 25.8 % of pixels): B = 8 removes 49.1 % of the rule's squared error, 66.8 % of that reduction is at edge pixels and 33.2 % elsewhere; B = 4 removes 59.1 %, 69.4 % at edges / 30.6 % elsewhere; O6 77.1 %, 73.8 % / 26.2 %. Per region B = 8 removes 45.2 % of the squared error inside the edge mask and 59.4 % outside it.
+
+**Part 2: training toward the O6 colour** (fixed crops: 20 random 128x128 per training pair, rng seed 144, 1,120 crops; their O6 colour by the same solver; loss Charbonnier(mix colour, O6 colour), everything else as `train_probe.py`; `-fix` = same crops, real-frame target; scored against the real frame):
+
+| net | all | forza | cs2 | minecraft120 | battlefield |
+|---|---|---|---|---|---|
+| rule | 31.24 / 26.75 | 30.86 / 26.23 | 28.79 / 25.23 | 40.05 / 35.26 | 32.36 / 25.93 |
+| px8 (143) | 31.14 / 26.59 | 30.51 / 25.88 | 29.06 / 25.33 | 40.75 / 36.02 | 32.41 / 25.88 |
+| px8-fix | 31.28 / 26.70 | 30.69 / 26.02 | 29.13 / 25.40 | 40.64 / 35.89 | 32.52 / 25.94 |
+| px8-o6 | 31.26 / 26.68 | 30.65 / 25.98 | 29.15 / 25.41 | 40.66 / 35.91 | 32.52 / 25.95 |
+| n3-all-fix | 31.21 / 26.58 | 30.63 / 25.87 | 29.05 / 25.33 | 40.55 / 35.78 | 32.41 / 25.87 |
+| n3-all-o6 | 31.16 / 26.54 | 30.55 / 25.79 | 29.07 / 25.35 | 40.61 / 35.85 | 32.40 / 25.85 |
+| px8-s1 (seed 1, 143 recipe) | 31.15 / 26.61 | 30.53 / 25.92 | 29.04 / 25.32 | 40.74 / 36.00 | 32.42 / 25.88 |
+
+`n5-all-o6` was not trained (budget; dropped first as agreed).
+**Part 3: seed noise.** px8 seed 0 vs seed 1 (torch init and crop order): 31.14 / 26.59 vs 31.15 / 26.61, differences 0.01 / 0.02 dB (largest per-group difference 0.04 dB, forza whole 30.51 vs 30.53).
