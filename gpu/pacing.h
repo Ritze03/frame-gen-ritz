@@ -118,17 +118,23 @@
 // three generated frames (t = 0.25, 0.5, 0.75) instead of one real and seven generated, the
 // transition takes 16.7 ms instead of 33.3 ms, and the delay follows a 16.7 ms interval. Generated
 // frames across a 33 ms gap are much worse than across 16.7 ms, so they are shown for less time.
-// With the switch on, a pair of span s is played as the 60 fps game would have played it:
-//   * the transition is the LAST min(s, 1000/60 ms) of the pair, t = (tau - (A1 - w)) / w with
-//     w = min(s, 1000/60 ms) (A1 the pair's later arrival); before it (t <= 0) the previous real
+// The length is a setting, Inputs::lowFpsTransitionMs (default 1000/60 = the 60 fps game, range
+// 4..50 ms, clamped; NaN / <= 0 = default), so the owner can trade the stop-and-go of a short
+// transition against the artefacts of a long one: at a 30 fps game 16.7 ms gives a 16.7 ms pause,
+// 25 ms an 8.3 ms pause, 33.3 ms or more none (= the switch off for that game), 8.3 ms a 25 ms
+// pause (2026-11-24). Below, "L" is that setting. A setting at or above the game's interval
+// changes nothing for that game, bit for bit. With the switch on, a pair of span s is played
+// as a game at 1000/L fps would have played it:
+//   * the transition is the LAST min(s, L) of the pair, t = (tau - (A1 - w)) / w with
+//     w = min(s, L) (A1 the pair's later arrival); before it (t <= 0) the previous real
 //     frame is shown as it is (no synth; a repeat, newOutput false, when it is already on screen);
-//   * the delay rule (DelayBaseFor) uses min(interval, 1000/60 ms) wherever it used the interval, so
-//     the real frame is fully shown D(16.7 ms) after its arrival, as in the doubled stream;
+//   * the delay rule (DelayBaseFor) uses min(interval, L) wherever it used the interval, so
+//     the real frame is fully shown D(L) after its arrival, as in the doubled stream;
 //   * blur windows are measured against w, so a blurred output never reaches back into the hold
 //     further than at a 60 fps game.
 // It is the same picture at the same times as the doubling (tested tick by tick, both priorities)
 // without duplicate frames, generated hold frames or a second estimate. No threshold: at 45 fps the
-// transition is 16.7 of 22.2 ms, at 59 fps 16.7 of 16.9 ms, from 60 fps up (within 1 us) nothing
+// transition (at the default L) is 16.7 of 22.2 ms, at 59 fps 16.7 of 16.9 ms, from 60 fps up (within 1 us) nothing
 // changes, bit for bit. Output interval o is unchanged (Fixed N and Target keep their cadence); the
 // cost guard spreads one pair's synths over w. Report::lowFpsActive / transitionMs say it is acting.
 // Not affected: video / timestamps mode, frame generation off (real-rate planning).
@@ -434,10 +440,14 @@ namespace framegen::pacing
 	constexpr double kTMin            = 0.02;
 	constexpr double kRealSnapT       = 0.98;
 	// Low FPS compensation (Inputs::lowFpsCompensation, 2026-11-24): the longest a transition
-	// between two real frames takes, 1000/60 ms. Fixed, no setting: it is "what a 60 fps game
-	// does".
-	constexpr double  kLowFpsTransitionMs = 1000.0 / 60.0;
-	constexpr int64_t kLowFpsTransitionNs = int64_t( kLowFpsTransitionMs * 1e6 );
+	// between two real frames takes is the setting Inputs::lowFpsTransitionMs (task 151,
+	// 2026-11-24). Default 1000/60 ms ("what a 60 fps game does"); the pacer clamps the setting
+	// to [Min, Max]. Max is kMaxIntervalMs (50): a longer transition than the longest game
+	// interval the pacer plans for would never be reached. Min 4 ms keeps the hold from becoming
+	// a slideshow of pauses; a NaN or non-positive setting falls back to the default.
+	constexpr double  kLowFpsTransitionMs    = 1000.0 / 60.0;
+	constexpr double  kLowFpsTransitionMinMs = 4.0;
+	constexpr double  kLowFpsTransitionMaxMs = 50.0;
 	// A game interval within this of the transition counts as "not longer" (a 60 fps game's
 	// intervals are 16666666 or 16666667 ns): the switch then changes nothing, bit for bit.
 	constexpr int64_t kLowFpsSlackNs = 1000;
@@ -930,6 +940,13 @@ namespace framegen::pacing
 			// previous real frame is held for the rest of the game interval. No effect at
 			// 60 fps and above, in video mode, or with frame generation off.
 			bool   lowFpsCompensation = false;
+			// The transition's length, ms (default kLowFpsTransitionMs = 1000/60; clamped to
+			// [kLowFpsTransitionMinMs, kLowFpsTransitionMaxMs] = [4, 50]; NaN or <= 0 gives the
+			// default). Only read while lowFpsCompensation is true. A game interval at or below
+			// it is untouched, so a value at or above the game's frame time is "off" for that
+			// game; below it the pause is interval - value (30 fps: 16.7 -> 16.7 ms pause,
+			// 25 -> 8.3, 33.3 -> none, 8.3 -> 25). May change while running.
+			double lowFpsTransitionMs = kLowFpsTransitionMs;
 
 			// --- video / timestamps mode (only read after OnFrame; see the header) ---
 			// The media clock: PTS p is to be shown at V = mediaOffsetNs + p / playbackRate.
@@ -1004,8 +1021,8 @@ namespace framegen::pacing
 			float  steadyMultiplier = 0.0f;
 			bool   generating = false;
 			// Low FPS compensation is acting right now: the switch is on, frame generation is
-			// generating and the game interval is above kLowFpsTransitionMs. transitionMs is then
-			// the transition's length (kLowFpsTransitionMs), else 0.
+			// generating and the game interval is above the (clamped) lowFpsTransitionMs.
+			// transitionMs is then that length, else 0.
 			bool   lowFpsActive = false;
 			float  transitionMs = 0.0f;
 		};
@@ -1309,10 +1326,10 @@ namespace framegen::pacing
 						if ( s.gameFps > 0.0f )
 							s.activeN = std::max( 2, int( std::lround( s.effectiveMultiplier ) ) );
 						s.generating = m_bHaveSynth && ulNow >= m_ulLastSynthAt && ulNow - m_ulLastSynthAt <= kGeneratingRecentNs;
-							if ( !m_bPts && in.lowFpsCompensation && m_Est.IntervalMs() > kLowFpsTransitionMs + double( kLowFpsSlackNs ) / 1e6 )
+							if ( !m_bPts && in.lowFpsCompensation && m_Est.IntervalMs() > TransitionMs( in ) + double( kLowFpsSlackNs ) / 1e6 )
 							{
 								s.lowFpsActive = true;
-								s.transitionMs = float( kLowFpsTransitionMs );
+								s.transitionMs = float( TransitionMs( in ) );
 							}
 					}
 				}
@@ -1899,7 +1916,23 @@ namespace framegen::pacing
 		// after its arrival, exactly as when a 60 fps stream carried every frame twice.
 		static double CapInterval( const Inputs &in, double flIntervalMs )
 		{
-			return ( in.lowFpsCompensation && flIntervalMs > kLowFpsTransitionMs + double( kLowFpsSlackNs ) / 1e6 ) ? kLowFpsTransitionMs : flIntervalMs;
+			const double flTr = TransitionMs( in );
+			return ( in.lowFpsCompensation && flIntervalMs > flTr + double( kLowFpsSlackNs ) / 1e6 ) ? flTr : flIntervalMs;
+		}
+
+		// The transition's length, ms: Inputs::lowFpsTransitionMs clamped (NaN / <= 0: the default).
+		// Read per call, so a slider may move it while running. ponytail: no smoothing of the
+		// setting itself; the content time's own forward-only rule absorbs the jump.
+		static double TransitionMs( const Inputs &in )
+		{
+			const double f = in.lowFpsTransitionMs;
+			if ( !( f > 0.0 ) )
+				return kLowFpsTransitionMs;
+			return std::min( std::max( f, kLowFpsTransitionMinMs ), kLowFpsTransitionMaxMs );
+		}
+		static int64_t TransitionNs( const Inputs &in )
+		{
+			return int64_t( TransitionMs( in ) * 1e6 );
 		}
 
 		double DelayBaseFor( const Inputs &in ) const
@@ -2027,12 +2060,13 @@ namespace framegen::pacing
 				while ( j > jMin && m_Hist[ j ].arrival > tau )
 					j--;
 				const int64_t nSpan = std::max<int64_t>( m_Hist[ j + 1 ].arrival - m_Hist[ j ].arrival, 1 );
-				if ( in.lowFpsCompensation && nSpan > kLowFpsTransitionNs + kLowFpsSlackNs )
+				const int64_t nTr = TransitionNs( in );
+				if ( in.lowFpsCompensation && nSpan > nTr + kLowFpsSlackNs )
 				{
-					// Low FPS compensation: the transition is the LAST kLowFpsTransitionNs of the pair
+					// Low FPS compensation: the transition is the LAST nTr of the pair
 					// (t is then the position in the transition, which is what the renderer
 					// interpolates at); before it the previous real frame is held.
-					t = double( tau - ( m_Hist[ j + 1 ].arrival - kLowFpsTransitionNs ) ) / double( kLowFpsTransitionNs );
+					t = double( tau - ( m_Hist[ j + 1 ].arrival - nTr ) ) / double( nTr );
 					bHold = t <= 0.0;
 				}
 				else
@@ -2213,7 +2247,8 @@ namespace framegen::pacing
 		// (2026-11-24). t is already in the transition's own time, so only the span changes.
 		static double BlurSpanNs( const Inputs &in, int64_t nSpanNs, bool bCap )
 		{
-			return double( bCap && in.lowFpsCompensation && nSpanNs > kLowFpsTransitionNs + kLowFpsSlackNs ? kLowFpsTransitionNs : nSpanNs );
+			const int64_t nTr = TransitionNs( in );
+			return double( bCap && in.lowFpsCompensation && nSpanNs > nTr + kLowFpsSlackNs ? nTr : nSpanNs );
 		}
 
 		// The output interval ShownFrame blur is measured in, ns.

@@ -74,6 +74,7 @@ namespace
 		double blurAmount = 0.5;
 		BlurRelative blurRelative = BlurRelative::ShownFrame;
 		bool lowFps = false;           // Inputs::lowFpsCompensation
+		double lowFpsTransitionMs = kLowFpsTransitionMs;   // Inputs::lowFpsTransitionMs
 		uint64_t focusKey = 1;
 		FrameFormat layer{ 1920, 1080, 87 };
 
@@ -113,6 +114,7 @@ namespace
 			in.blurAmount = blurAmount;
 			in.blurRelative = blurRelative;
 			in.lowFpsCompensation = lowFps;
+			in.lowFpsTransitionMs = lowFpsTransitionMs;
 			return in;
 		}
 
@@ -5076,4 +5078,223 @@ TEST_CASE( "pacing: low fps compensation counts no held tick as a synth for the 
 	INFO( "most synths in a pair " << nMax << ", output interval " << d.pacer.OutputMs() << " ms" );
 	CHECK( nMax <= 7 );
 	CHECK( nMax >= 3 );
+}
+
+// ---------------------------------------------------------------------------
+//  Low FPS compensation: the transition's length is a setting (task 151, 2026-11-24)
+// ---------------------------------------------------------------------------
+
+namespace
+{
+	// A 30 fps game on 240 Hz, Target = the refresh, run for 3.5 s with the given setting.
+	Driver LowFpsSetDriver( Priority prio, bool lowFps, double ms, Ns span = 33333334, Ns tEnd = 3500 * MS )
+	{
+		Driver d = LowFpsDriver( 240.0, prio, lowFps );
+		d.lowFpsTransitionMs = ms;
+		d.RunArrivals( SteadyArrivals( 3 * MS, span, tEnd ), tEnd );
+		return d;
+	}
+
+	// Every 4th image of a stream fed as copies of one real frame at 120 fps.
+	std::vector<Ns> QuadArrivals( const std::vector<Ns> &arr )
+	{
+		std::vector<Ns> v;
+		for ( Ns t : arr )
+			for ( int k = 0; k < 4; k++ )
+				v.push_back( t + Ns( k ) * 8333333 );
+		return v;
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation's default setting equals an explicit 1000/60", "[pacing][lowfps]" )
+{
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		const Priority pr = prio ? Priority::Smoothness : Priority::LowLatency;
+		Driver a = LowFpsSetDriver( pr, true, kLowFpsTransitionMs );
+		Driver b = LowFpsDriver( 240.0, pr, true );
+		b.RunArrivals( SteadyArrivals( 3 * MS, 33333334, 3500 * MS ), 3500 * MS );
+		Driver c = LowFpsSetDriver( pr, true, 1000.0 / 60.0 );
+		CHECK( a.log.size() > 300 );
+		CHECK( SameLog( a, b ) );
+		CHECK( SameLog( a, c ) );
+		CHECK( a.Status().lowFpsActive );
+		CHECK( std::fabs( a.Status().transitionMs - 16.6667f ) < 0.01f );
+		// the setting is not read with the switch off
+		Driver off = LowFpsSetDriver( pr, false, 1000.0 / 60.0 );
+		Driver off2 = LowFpsSetDriver( pr, false, 9.0 );
+		CHECK( SameLog( off, off2 ) );
+		CHECK_FALSE( off2.Status().lowFpsActive );
+		CHECK( off2.Status().transitionMs == 0.0f );
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation at 8.333 ms equals a 120 fps stream with every image fed four times", "[pacing][lowfps]" )
+{
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		const Priority pr = prio ? Priority::Smoothness : Priority::LowLatency;
+		const Ns tEnd = 3500 * MS;
+		Driver a = LowFpsDriver( 240.0, pr, true );
+		a.lowFpsTransitionMs = 1000.0 / 120.0;
+		Driver b = LowFpsDriver( 240.0, pr, false );
+		const std::vector<Ns> arrA = SteadyArrivals( 3 * MS, 4 * 8333333, tEnd );
+		a.RunArrivals( arrA, tEnd );
+		b.RunArrivals( QuadArrivals( arrA ), tEnd );
+		CheckLowFpsInvariants( a );
+		CheckLowFpsInvariants( b );
+		auto imgA = []( uint64_t id ) { return double( id - 1 ); };
+		auto imgB = []( uint64_t id ) { return double( ( id - 1 ) / 4 ); };
+		int nTicks = 0, nBad = 0;
+		for ( Ns v = 1000 * MS; v < 3000 * MS; v += 1000000000 / 240 )
+		{
+			const double pa = ShownAt( a, v, imgA ), pb = ShownAt( b, v, imgB );
+			nTicks++;
+			if ( std::fabs( pa - pb ) >= 0.03 )
+			{
+				nBad++;
+				INFO( "prio " << prio << " tick at " << double( v ) / 1e6 << " ms: A " << pa << " B " << pb );
+				CHECK( std::fabs( pa - pb ) < 0.03 );
+			}
+		}
+		INFO( "prio " << prio << ": " << nBad << " of " << nTicks << " ticks differ" );
+		CHECK( nBad == 0 );
+		CHECK( std::fabs( a.log.back().delayMs - b.log.back().delayMs ) < 0.01 );
+		const Pacer::Report r = a.Status();
+		CHECK( r.lowFpsActive );
+		CHECK( std::fabs( r.transitionMs - 8.3333f ) < 0.01f );
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation at or above the game's interval equals the switch off", "[pacing][lowfps]" )
+{
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		const Priority pr = prio ? Priority::Smoothness : Priority::LowLatency;
+		Driver off = LowFpsSetDriver( pr, false, kLowFpsTransitionMs );
+		for ( double ms : { 33.4, 50.0 } )
+		{
+			Driver on = LowFpsSetDriver( pr, true, ms );
+			INFO( "prio " << prio << " setting " << ms );
+			CHECK( SameLog( off, on ) );
+			CHECK_FALSE( on.Status().lowFpsActive );
+			CHECK( on.Status().transitionMs == 0.0f );
+		}
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation at 25 ms at a 30 fps game", "[pacing][lowfps]" )
+{
+	const Ns tick = 1000000000 / 240;
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		const Priority pr = prio ? Priority::Smoothness : Priority::LowLatency;
+		Driver d = LowFpsSetDriver( pr, true, 25.0, 33333334, 3000 * MS );
+		CheckLowFpsInvariants( d );
+		// the window as in "changes smoothly with the game's rate": first synth (minus its t * 25 ms)
+		// to the real frame
+		std::map<uint64_t, Ns> firstSynth, realAt;
+		std::map<uint64_t, double> firstT;
+		uint64_t lastPair = 0;
+		for ( const Painted &p : d.log )
+		{
+			if ( p.t < 1000 * MS || !p.d.newOutput )
+				continue;
+			if ( lastPair != 0 && !( p.d.prevId != 0 && p.d.currId == lastPair && p.d.t < 1.0f ) )
+			{
+				realAt[ lastPair ] = p.t;
+				lastPair = 0;
+			}
+			if ( p.d.prevId != 0 && p.d.t < 1.0f )
+			{
+				if ( !firstSynth.count( p.d.currId ) )
+				{
+					firstSynth[ p.d.currId ] = p.t;
+					firstT[ p.d.currId ] = p.d.t;
+				}
+				lastPair = p.d.currId;
+			}
+		}
+		int nPairs = 0;
+		const uint64_t idFirst = firstSynth.empty() ? 0 : firstSynth.begin()->first;
+		for ( const auto &kv : firstSynth )
+		{
+			if ( !realAt.count( kv.first ) || kv.first + 2 > d.newestId || kv.first == idFirst )
+				continue;
+			const Ns dur = realAt[ kv.first ] - kv.second + Ns( firstT[ kv.first ] * 25e6 );
+			INFO( "prio " << prio << " pair " << kv.first << " transition " << double( dur ) / 1e6 << " ms" );
+			CHECK( dur <= 25 * MS + tick );
+			CHECK( dur >= 25 * MS - tick );
+			nPairs++;
+		}
+		CHECK( nPairs > 20 );
+		// the delay is the rule at a 25 ms interval: a 40 fps game with the switch off
+		Driver ref = LowFpsDriver( 240.0, pr, false );
+		ref.RunArrivals( SteadyArrivals( 3 * MS, 25 * MS, 3000 * MS ), 3000 * MS );
+		INFO( "prio " << prio << " delay " << d.log.back().delayMs << " vs " << ref.log.back().delayMs );
+		CHECK( std::fabs( d.log.back().delayMs - ref.log.back().delayMs ) < 0.01 );
+		CHECK( std::fabs( d.Status().transitionMs - 25.0f ) < 0.01f );
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation clamps its transition setting", "[pacing][lowfps]" )
+{
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		const Priority pr = prio ? Priority::Smoothness : Priority::LowLatency;
+		INFO( "prio " << prio );
+		Driver four = LowFpsSetDriver( pr, true, 4.0 );
+		Driver one = LowFpsSetDriver( pr, true, 1.0 );
+		Driver tiny = LowFpsSetDriver( pr, true, 1e-9 );
+		CHECK( SameLog( four, one ) );
+		CHECK( SameLog( four, tiny ) );
+		CHECK( std::fabs( one.Status().transitionMs - 4.0f ) < 1e-4f );
+		CHECK_FALSE( SameLog( four, LowFpsSetDriver( pr, true, 8.0 ) ) );
+		// 15 fps (66.7 ms): 50 and 80 are the same, and not the default
+		Driver fifty = LowFpsSetDriver( pr, true, 50.0, 66666667 );
+		Driver eighty = LowFpsSetDriver( pr, true, 80.0, 66666667 );
+		CHECK( SameLog( fifty, eighty ) );
+		CHECK_FALSE( SameLog( fifty, LowFpsSetDriver( pr, true, kLowFpsTransitionMs, 66666667 ) ) );
+		// 0, negative, NaN, inf-free: the default
+		Driver def = LowFpsSetDriver( pr, true, kLowFpsTransitionMs );
+		for ( double bad : { 0.0, -5.0, std::nan( "" ) } )
+		{
+			Driver b = LowFpsSetDriver( pr, true, bad );
+			CHECK( SameLog( def, b ) );
+			CHECK( std::fabs( b.Status().transitionMs - 16.6667f ) < 0.01f );
+		}
+	}
+}
+
+TEST_CASE( "pacing: low fps compensation survives the slider being dragged while running", "[pacing][lowfps]" )
+{
+	// 16.7 -> 33.3 -> 8.3 -> 16.7 ms, every 0.5 s, a 30 fps game.
+	const double steps[ 4 ] = { 1000.0 / 60.0, 1000.0 / 30.0, 1000.0 / 120.0, 1000.0 / 60.0 };
+	for ( int prio = 0; prio < 2; prio++ )
+	{
+		Driver d = LowFpsDriver( 240.0, prio ? Priority::Smoothness : Priority::LowLatency, true );
+		const std::vector<Ns> arr = SteadyArrivals( 3 * MS, 33333334, 9000 * MS );
+		Ns t0 = 0;
+		for ( int seg = 0; seg < 18; seg++ )
+		{
+			const Ns t1 = t0 + 500 * MS;
+			// the setting changes at 2 s, every 0.5 s from there; before it the first value
+			d.lowFpsTransitionMs = steps[ std::max( 0, seg - 4 ) % 4 ];
+			std::vector<Ns> part;
+			for ( Ns a : arr )
+				if ( a >= t0 && a < t1 )
+					part.push_back( a );
+			d.RunArrivals( part, t1 );
+			t0 = t1;
+		}
+		CheckLowFpsInvariants( d );
+		INFO( "prio " << prio );
+		CheckForwardAndNotStuck( d, 33333334 + 2 * ( 1000000000 / 240 ), 1000 * MS );
+		for ( const Painted &p : d.log )
+			if ( p.d.prevId != 0 )
+			{
+				REQUIRE( p.d.t >= float( kTMin ) - 1e-6f );
+				REQUIRE( p.d.t <= 1.0f );
+			}
+	}
 }
