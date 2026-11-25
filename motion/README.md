@@ -286,3 +286,75 @@ Why tp_7753 (and most of the new `tp_n*` pairs) give identical output: V3's last
 Numbers (72 synthetic + 23 held-out real; V3 -> V3.5, round 1 in brackets): EPE 3.86 -> 0.97 (1.27), p95 14.95 -> 3.43 (5.28), textured EPE 2.06 -> 0.82 (0.97), above 4 px 23.0% -> 3.9%, falsely still 5.3% -> 0.1%, blk16 0.124 -> 0.058, PSNR 38.81 -> 39.59 (39.33), edge 34.01 -> 34.65. All 24 rows lower; chase l 10.15 -> 4.80 (5.90). Real PSNR whole / edge: battlefield 32.26/25.79 -> 32.90/26.38, cs2 29.18/25.61 -> 29.19/25.61, forza 30.71/25.97 -> 30.80/26.04, minecraft120 40.41/35.69 -> 40.49/35.74; blk16 forza 0.171 -> 0.155 (round 1: 0.216; the rise was model-vote kinks, now smoothed). Cost on the RX 7900 XTX (1080p, back-to-back per pair, 3 runs): 2x V3 0.96 -> V3.5 1.41 ms, 4x 1.43 -> 1.86 ms. First use: the 3 lazily created pipelines add 0.26 s to the first output with an empty shader cache (1.15 -> 1.41 s from process start); warm runs identical (0.048 s).
 
 Known losses of round 2: the rim of a still foreground object (error inside a 16 px band of the cut-out outline, V3 -> V3.5, forza_chase l 0.8 -> 7, forza_orbit l 8.5 -> 13: the straddling blocks of the coarse levels 1 and 2 take the background's vector; skipping the regularisation there restores the rim but undoes most of the gain outside), thin near objects (the lamp post in forza_b600_30fps takes the background's vector: the 0.14 dB loss there), a fast first-person weapon (fps_cs2c_960) partly smoothed into the background.
+
+## V3.5 (round 3)
+
+Round 3 is the last round. Numbers are from the final code (the same V3 reference build and the same pairs as before; `Settings::v3Motion = 1`).
+
+### What changed
+
+- **Level 0 keeps V3's own vectors (slot 0).** The regularisation at level 0 is now one step that reads slot 0 (V3's search result) and writes only the vector of slot 1. It keeps slot 1's z, which holds the still-part evidence of the zero-vector bonus (round 2 overwrote it, so the bonus never saw its evidence under V3.5). The dense pass reads the regularised vectors from slot 1; where a block's regularised and own vector differ by more than 1 flow px it offers both (8 candidates, the per-pixel pick), and a tile with evidence for the zero-vector bonus takes the unchanged code, not the smooth interpolation (the HUD protection works as in V3).
+- **Replacement test.** A vote that moves a block is kept only if the window cost at the new vector is at least 3% lower than at the block's own (`REJ = (0, -0.03)`; before: 0.05 higher allowed). Where the image has no evidence for the change the block keeps its own vector. -10% was better for the rims and cost the fast weapon in `fps_cs2c_960` 0.5 dB, so -3% it is.
+- **Aperture strips.** At levels 2 and up, an edge-only block (strong structure along one direction only) takes the camera model's vector along the edge and keeps its measured across-edge part, if its window cost does not rise by more than 5% + 0.05. It happens before the vote, so the block does not vote its wrong along-edge part into the flat surface beside it. Cost +0.07 ms (levels 1 and 0 cost +0.04 more and were left out).
+- **Beyond-reach whips.** A pair on which V3's own match weights give the camera fit fewer than 10% inliers while the fit's translation is above 90 flow px has no valid dominant motion and no camera in V3.5 (`G_VALID = 0` from `v35_stats`, as V3 would have it for such a pair). Before, V3.5 found a "camera" among the textured blocks (a stone wall's repeated wrong vector), and V3's own later passes (occlusion, fill, project fall-back) then applied it to the flat sky.
+
+### Numbers
+
+Synthetic (72 pairs): mean EPE 3.86 -> 0.95, p95 14.95 -> 3.62, textured 2.06 -> 0.83, above 4 px 23.0% -> 4.2%, false still 5.3% -> 0.2%, blk16 0.124 -> 0.076, PSNR 38.81 -> 39.55, edge 34.01 -> 34.62. chase l EPE 10.15 -> 4.62, zoom_o l 7.53 -> 1.1. Every one of the 24 rows has a lower EPE. Real pairs (23): all +0.11 dB (edge +0.10); forza +0.11 / +0.09, battlefield +0.38, minecraft120 +0.09 / +0.04, cs2 +0.00 (blk16 .182 -> .193). No group loses.
+
+Cost on the forza real pair, 1080p, back-to-back, 3 runs each: 2x V3 0.95 ms, V3.5 1.47 ms (+0.52); 3x 1.18 / 1.69; 4x 1.42 / 1.90.
+
+### Rims of still foreground objects (the known loss)
+
+Band table (16 px bands outside / inside the still cut-out's outline), flow EPE and picture error (mean absolute error of the generated t = 0.5 frame against the true middle frame, levels), V3 -> V3.5:
+
+| pair | EPE outside | EPE inside | picture outside | picture inside |
+|---|---|---|---|---|
+| forza_chase_m | 10.36 -> 3.60 | 0.39 -> 1.71 | 1.91 -> 1.67 | 0.12 -> 0.21 |
+| forza_chase_l | 33.58 -> 14.59 | 0.78 -> 4.78 | 5.32 -> 5.01 | 0.14 -> 0.28 |
+| forza_orbit_m | 6.58 -> 1.68 | 0.98 -> 3.25 | 3.53 -> 3.35 | 0.24 -> 0.35 |
+| forza_orbit_l | 10.80 -> 3.73 | 8.52 -> 10.55 | 9.36 -> 9.31 | 0.78 -> 0.82 |
+| cs2_chase_m | 4.95 -> 1.52 | 0.22 -> 0.59 | 2.05 -> 1.75 | 0.15 -> 0.27 |
+| cs2_chase_l | 17.07 -> 5.66 | 0.83 -> 1.93 | 5.10 -> 4.50 | 0.53 -> 0.74 |
+| cs2_orbit_m | 2.43 -> 1.13 | 1.04 -> 1.37 | 4.54 -> 4.38 | 0.68 -> 0.78 |
+| cs2_orbit_l | 8.61 -> 7.83 | 5.89 -> 6.01 | 8.34 -> 8.16 | 1.68 -> 1.71 |
+| mc_chase_m | 10.12 -> 6.30 | 0.13 -> 0.64 | 1.52 -> 1.32 | 0.04 -> 0.10 |
+| mc_chase_l | 35.79 -> 29.97 | 0.47 -> 0.63 | 2.96 -> 2.90 | 0.10 -> 0.17 |
+| mc_orbit_m | 6.17 -> 0.94 | 1.30 -> 2.77 | 4.50 -> 4.21 | 0.23 -> 0.47 |
+| mc_orbit_l | 15.86 -> 7.59 | 16.46 -> 16.99 | 5.75 -> 5.66 | 0.78 -> 1.17 |
+
+The inside-band gate (V3 + 0.3 px, or not above V3 where V3 is above 5 px) is NOT met: 10 of 12 pairs fail (round 2: 9 of 12 at 2.8 to 13 px; the worst inside errors are now about half). The picture side shows why it matters little: the picture error inside the band stays within 0.1 to 0.4 levels of V3's, and the outside band's picture gets better in every pair. The rim's vector error is mostly absorbed (the rim pixels' two candidates match about equally well in the image). What was tried, and what it did (all measured with this table): a keep-own rule for blocks whose same-coloured neighbours share their vector (inside 6.6 -> 3.9 on chase l, but the outside gain falls from 62% to 37%); colour weight made stricter across vector disagreements (no change); own-evidence test against the model before any vote (no change: the rim blocks are flat, both vectors match equally); switching a level's regularisation off (restores the rim, but each level's loss adds up, and all four levels off undo the whole outside gain). The reason is in the flat blocks: a flat still object and a flat road look the same to every test that uses only the image, and the model's pull is exactly what repairs the road.
+
+### Third-person turning (`tp_m*`, new)
+
+Ten moments of the 240 fps recording (`2026-10-26 10-55-24.mkv`), chosen by DIS flow on 1/4-size frames 4 apart (one 60 fps pair), scanned every 0.25 s, median displacement 15 to 117 px per 60 fps pair (the scan's 150 px upper bound was not reached with sideways-dominant flow and the avatar in view), sideways flow dominant, avatar in view (checked on a contact sheet). Pairs `tp_mNN_60fps` (frames +0 / +2 / +4) and `tp_mNN_30fps` (+0 / +4 / +8); cut by `/home/mo/tmp/fg-v35/round3/cut_m.py`. PSNR whole V3 -> V3.5 (a "fall-back" is failMix above 0.5 on either side):
+
+| pair | median px | 60 fps | 30 fps |
+|---|---|---|---|
+| m01 | 15 | 24.08 -> 24.05 | 23.63 -> 23.60 |
+| m02 | 20 | 34.58 -> 34.65 | 36.39 -> 36.38 |
+| m03 | 25 | 25.55 -> 25.70 (fall-back) | 23.99 -> 23.87 (fall-back) |
+| m04 | 33 | 30.15 -> 31.19 | 22.39 -> 22.36 (fall-back) |
+| m05 | 42 | 26.84 -> 26.84 | 25.76 -> 25.77 |
+| m06 | 54 | 19.89 -> 19.81 | 21.77 -> 21.79 (fall-back) |
+| m07 | 69 | 21.42 -> 21.27 | 21.25 -> 20.35 (fall-back) |
+| m08 | 90 | 21.41 -> 21.29 | 21.91 -> 21.86 (fall-back) |
+| m09 | 107 | 22.65 -> 22.59 (fall-back) | 22.16 -> 21.94 (fall-back) |
+| m10 | 117 | 19.87 -> 20.04 (fall-back) | 20.65 -> 20.45 (fall-back) |
+
+Group means over the pairs where neither version fell back: 60 fps (7 pairs) 25.48 -> 25.59, edge 21.54 -> 21.65, blk16 .194 -> .199; 30 fps (3 pairs) 28.59 -> 28.58, edge 23.02 -> 23.03, blk16 .314 -> .305. The 60 fps gain is m04 (+1.04); the other six are within 0.15 dB, and from 54 px up V3.5 is a little behind (-0.06 to -0.15 dB, blk16 up): both fields are about equally wrong in the high-frequency grass and wall texture there and V3.5's has a few more block steps (m07 sheet). This is information, not a fix. The hard-cut rule `(uAll > 0.5 && D > 4.5)` never tripped on any tp_m pair, for either version: D stays below 0.75 (the unsure share reaches 0.91 on m10 at 117 px, D is 0.34). It trips on the real whips (D 2.5 to 4.8; tp_7753 at 4.79). The whip group (tp_7753, tp_7278, tp_n043, 082, 127, 139, 153, 182, 206, 264): no pair loses more than 0.08 dB (tp_n153_60 -0.08, tp_n182_30 -0.05), tp_n153_30 +1.51, the rest within 0.03.
+
+### HUD and thin objects
+
+`forza_a1060_30fps`: V3.5 +0.13 dB over V3 (29.07 -> 29.20). The speedometer's digits are unchanged from V3's (crop of the tile at x 1600 to 1920, y 768 to 1008); the tile that loses most against V3 (bottom right, MAE 18 -> 23) is the fast road surface behind it, which both versions smear and V3.5 a little more. `forza_b600_30fps` (lamp post) -0.16 dB, `fps_cs2c_960` (weapon) -0.06, `mc120_10_1080` -0.04, `faroe_8s_15fps` +0.08.
+
+## V3.5 as it stands (final summary, pass by pass)
+
+`Settings::v3Motion = 1`, valid with `MotionVersion::V3` only; four lazily created pipelines on top of V3's own (`v35_stats`, `v35_rgn`, `v35_reg`, `v3_dense_35`).
+
+1. **Search** (unchanged V3 passes, per level n-1 down to 0). Level n-2 down to 1 then run the V3.5 passes below after the wide step.
+2. **`v35_stats`** (levels LH = max(1, n-3) down to 1): the dominant motions (V3's weights) and a 6-parameter affine camera from the blocks' vectors, weighted by match and by texture (flat blocks do not count). A pair with fewer than 10% V3-weight inliers and a translation above 90 flow px has no camera.
+3. **`v35_rgn`** (same levels): 4 x 3 regional affine models, ridge-regularised toward the camera, with a reliability from their residual.
+4. **`v35_reg`** (levels n-2 down to 0; two Jacobi steps per level, one at level 0; the top level is skipped): per block, the aperture step (levels 2 and up), then the vote of the neighbours (colour weighted, confidence and aperture aware) together with the regional (else global) model, weighted medoid plus two mean-shift steps; replacement kept only where the window cost is at least 3% lower; the model decides for confident blocks no neighbour supports (R2). Only the vector changes.
+5. **`v3_dense_35`**: Catmull-Rom interpolation of the regularised level-0 field where it is smooth; otherwise V3's per-pixel pick, with V3's own level-0 vector as a second candidate where it differs by more than 1 flow px; the zero-vector bonus as in V3.
+6. V3's occlusion, fill, decide, project, synth, and the hard-cut / unsure rules are unchanged.
