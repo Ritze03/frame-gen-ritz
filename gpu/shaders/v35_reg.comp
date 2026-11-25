@@ -20,9 +20,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 const vec2 G01 = vec2(0.6, 2.5);      // sqrt(eigenvalue / pixels) of the structure tensor (feature levels per px): confidence ramp
 const vec2 CR = vec2(1.0, 2.5);       // cost / (texture + 2): a block matching worse than this ratio proves less
-const vec2 REJ = vec2(0.15, 0.05);      // a replacement is rejected when its window cost exceeds the old vector's by this much + this share
+const vec2 REJ = vec2(0.05, 0.0);       // a replacement is rejected when its window cost exceeds the old vector's by this much + this share
 const vec2 REJ2 = vec2(0.05, 0.02);     // the same for the outlier rule (R2): the model's vector must match nearly as well as the block's
-const float COLS = 30.0;              // colour distance (L1 over Y Cb Cr) at which the vote weight is 1/e
+const float COLS = 12.0;              // colour distance (L1 over Y Cb Cr) at which the vote weight is 1/e
 const float WCAM = 0.6;               // the camera model's vote when there are no confident neighbours (fades out as their weight grows to 1.5)
 const float MODEL_SUP = 0.3;          // a block whose vector fewer than this share of the neighbour weight supports takes the model's (when the window agrees)
 const float MMIN = 0.15;              // the summed weight below which a block keeps its vector
