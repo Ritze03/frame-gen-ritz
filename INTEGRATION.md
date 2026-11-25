@@ -119,7 +119,7 @@ A plain struct whose in-class defaults are the tuned values of `proto/interp.py`
 | `uiHistory` | 3 | 3-`kUiFramesMax` (65) | runtime | Observed real frames that keep their clean copy + mask (LRU). 3 = the newest pair and the one before it. A host that synthesises from an older pair (the lag-spike buffer plays pairs several frames back) sets it to `Pacer::HistoryDepth()`. Memory: 4 B/px per kept frame (4.9 MB at 1280x960, 14.7 MB at 1440p; WholeScreen +1 B/px). See "Static UI protection". |
 | `blurSamples` | 0 | 0, 1 (off), 2-16 | runtime | Interpolation-based motion blur: sub-frames averaged by `recordSynthBlur()` (see "Motion blur"). Off = byte-identical. |
 | `blurWeights` | Gaussian | Even, Gaussian | runtime | Weights of the sub-frames: 1/N each, or a Gaussian with the window ends at 2 sigma (weights at the slice centres). |
-| `learnedNet`, `learnedHalf` | E2v5, false | E2v5 / E1v5 (the small net) / E2v4 / E1v4 / E2v3 / E1v3 / G2v2 / M2v2 (colour) / G2v3 / M2v3 (features); bool | runtime | `MotionVersion::Learned` only: the net and fp16 activation storage (see "Learned motion estimate"). The next estimate uses them. `learnedNetFromName()` maps the names `e2v5`, `e1v5`, `e2v4`, `e1v4`, `e2v3`, `e1v3`, `g2v2`, `g2v3`, `m2v2`, `m2v3`. |
+| `learnedNet`, `learnedHalf` | E2v5, false | E2v5 (= 4, the only net); bool | runtime | `MotionVersion::Learned` only: the net and fp16 activation storage (see "Learned motion estimate"). Any other `learnedNet` value is refused by `validate` / `settingsError`. The next estimate uses them. `learnedNetFromName()` maps the name `e2v5`. |
 | `learnedZeroTest`, `learnedStaticGuard` | true, false | bool; bool | runtime | `MotionVersion::Learned` only: ml-fg's zero-motion test on the net's field (from the next estimate; off = the net's raw field, byte-identical to round 1), and the opt-in static guard on every generated frame (from the next synth; off = byte-identical). Expose both for A/B testing. |
 | `motionVersion` | V1 | V1, V2, Learned (`flowScale` 2 only), V3 | runtime | The motion algorithm (see "Motion version 2", "Motion version 3", "Learned motion estimate"). V1 = byte-identical to before. All run every `Format`. A switch **drops** the current estimate: `recordSynth` / `recordSynthBlur` return false (show the real frame) until the next `recordEstimate`. The first switch to a version creates its pipelines at once (no GPU wait); `releaseUnusedMotion()` frees the unused version's resources (retire rule of `resize()`). |
 | `v2Mode` | Quality | Quality, Performance | runtime | V2's mode; V1 ignores it. A switch keeps the current estimate (no hitch). |
@@ -366,13 +366,11 @@ Totals: 20 mandatory V3 headers beside the per-format ones (14 plain, 3 hook (j)
 
 ## Learned motion estimate (`MotionVersion::Learned`, testing branch `ml-fg-testing`)
 Opt-in: V1 with its motion search replaced by ml-fg's learned estimator, then ml-fg's zero-motion test. The settings:
-- `Settings::learnedNet`: `E2v5` (= 4, the default), `E1v5` (= 5, the small net, the fallback when E2v5 costs too much), and
-  the older `E2v4`, `E1v4`, `E2v3`, `E1v3` for A/B.
-- Net variants (opt-in, defaults unchanged): `G2v2` (= 6, colour game net), `G2v3` (= 7, learned-features game net), `M2v2` (= 8,
-  colour allrounder), `M2v3` (= 9, features allrounder), `kLearnedNets` = 10. Each net has one input variant (luma 14, colour 25,
-  features 27 first-conv inputs), fixed by its manifest; a net built into the wrong pipeline is a compile error. They replace
-  round 4's stand-ins `c2smoke` / `c2feat`, which no longer exist: a host that referenced them must switch to the real names.
-  More nets of these variants are added with no code change (steps in `ML-FG-TESTING.md`).
+- `Settings::learnedNet`: `E2v5` (= 4, the default and the only value; the field keeps its place and size in `Settings`, `sizeof(Settings)` is still
+  164). Every other value is refused. `kLearnedNets` = 5 (one past the highest value); `learnedNetName()` is null for 0-3 and for every
+  other value but 4, so a host loop `for n < kLearnedNets` must skip null names. **The other nine nets were removed from the build and
+  the repository in task 154** (`E2v3` = 0, `E1v3` = 1, `E2v4` = 2, `E1v4` = 3, `E1v5` = 5, and the colour / learned-features variants `G2v2` = 6,
+  `G2v3` = 7, `M2v2` = 8, `M2v3` = 9) to reduce the library's footprint; their values stay unused and their weights are in the git history.
 - `learnedZeroTest`: default on.
 - `learnedStaticGuard`: default off.
 - `learnedHalf`: fp16 activations.
@@ -381,32 +379,28 @@ It writes V1's per-pixel field (`fieldPF`) and scene-cut sum (`u[1]`, from the f
 protection are unchanged. A duplicate pair (mean |a - c| ≤ 0.6 levels) skips the net and gets a zero field. It needs `flowScale`
 2 and runs every `Format`. The full QC record is `ML-FG-TESTING.md`: parity with ml-fg's test vectors, cost, memory, the HUD
 finding, known issues, and what changed in each round. What the host has to do:
-- **Shader build:** add `ml_dup`, `ml_reduce`, `ml_pyr`, `ml_match`, `ml_conv`, `ml_out`, `ml_zero`, `ml_guard`, and, for the round-4 variants, `ml_planes` and `ml_feat`
-  (`ml_common.glsl` is included) to the shader list. Also add `ml_dup`, `ml_guard` and `ml_planes` per non-RGBA8 format
-  (`-DFG_FORMAT_<FMT>=1`).
-- **Weights:** generate `ml_weights.h` with `gpu/ml/embed_weights.py` from `gpu/ml/<net>/` for all ten nets in `LearnedNet`
-  order (`gpu/meson.build` `ml_nets = ['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5', 'g2v2', 'g2v3', 'm2v2', 'm2v3']`; round 4b
-  added `gpu/ml/g2v2/`, `g2v3/`, `m2v2/` and `m2v3/` (a host drops `c2smoke/` / `c2feat/`) and must embed all four, or the `kMlNet`
-  static_assert fails). Round 3 added `gpu/ml/e2v5/` and
-  `gpu/ml/e1v5/`: a host such as gamescope must embed these two new weight sets, because the default net is now E2v5.
+- **Shader build:** add `ml_dup`, `ml_reduce`, `ml_pyr`, `ml_match`, `ml_conv`, `ml_out`, `ml_zero` and `ml_guard`
+  (`ml_common.glsl` is included) to the shader list. Also add `ml_dup` and `ml_guard` per non-RGBA8 format
+  (`-DFG_FORMAT_<FMT>=1`). `ml_planes` (with its per-format variants) and `ml_feat` are gone (task 154): a host must drop them from its list.
+- **Weights:** generate `ml_weights.h` with `gpu/ml/embed_weights.py` from `gpu/ml/e2v5/` (`gpu/meson.build` `ml_nets = ['e2v5']`).
+  The command line and the output's shape are unchanged for one net (`embed_weights.py OUT.h e2v5 MANIFEST WEIGHTS`; names `kMlWidth_e2v5`,
+  `kMlTable_e2v5`, `kMlInCh_e2v5`, `kMlVariant_e2v5`, `kMlExtr_e2v5` (zeros), `kMlWeights_e2v5`); the e2v5 section is byte-identical to the old header's.
+  It now refuses a manifest of a colour or features variant. A host that still embeds the other nets' folders must drop them: `framegen.cpp`
+  accepts exactly the list `ML_NET(e2v5)`.
 - **Missing pieces:** without any of these, `__has_include` leaves Learned out as a whole. `init()` / `setSettings()` refuse it
   with a reason, and V1/V2 are unaffected. A host that only re-vendors round 1's shader list loses Learned.
-- **Descriptors:** Learned's sets add storage buffers at bindings 13 (state), 14 (activations) and 15 (weights, all ten nets,
-  3.23 MB = 3,226,288 bytes), all in the library's own layout.
+- **Descriptors:** Learned's sets add storage buffers at bindings 13 (state), 14 (activations) and 15 (weights, the one net,
+  399,440 bytes), all in the library's own layout.
 - **Weights upload:** `vkCmdUpdateBuffer` in the first Learned estimate's command buffer (again after `releaseUnusedMotion()`
   freed them). That command buffer must be submitted; the existing rule "every record is submitted" already says so. The first
-  switch creates about 122 pipelines (22 + 10 per net; 102 with the eight round-4 nets; the 122 is the formula, not re-counted at runtime).
-- **Cost** (RX 7900 XTX, 2x, back-to-back per pair, QC 2026-10-27; e2v5 / e1v5 cost what e2v4 / e1v4 do):
-  - 1080p: e2v5 1.35–1.66 ms (half 1.02–1.28) and e1v5 0.53–0.54 ms (half 0.49), against V1's 0.30 ms;
-  - 1440p: e2v5 from 2.70 ms (half 1.75–1.98) and e1v5 0.90 ms (half 0.80–1.01), against V1's 0.45 ms;
+  switch creates 26 pipelines (`uitest check` counts them).
+- **Cost** (RX 7900 XTX, 2x, back-to-back per pair):
+  - 1080p: e2v5 1.30-1.66 ms (half 1.00-1.28), against V1's 0.30 ms;
+  - 1440p: e2v5 from 2.70 ms (half 1.75-1.98), against V1's 0.45 ms;
   - the zero test adds ~0.005 ms, and the static guard ~0.05 ms per generated frame.
 
-  Round 4b (real nets, 1080p, min per pair, fp32 / half): e2v5 1.31 / 1.02 ms, G2v2 1.74 / 1.25 and M2v2 1.73 / 1.24
-  (+32 % / +22 %), G2v3 and M2v3 1.89 / 1.40 (+45 % / +37 %), above the spec's +12 %; untuned. M2v3 is the best on PSNR
-  (see `ML-FG-TESTING.md`).
-
-  This is well above the 0.33 / 0.47 ms budget of the V1 pipeline. Memory on top of V1: 1080p e2v5 100 + 11 MB (half 50 + 11),
-  e1v5 58 + 11 MB; 1440p about 1.76x that.
+  This is well above the 0.33 / 0.47 ms budget of the V1 pipeline. Memory on top of V1: 1080p 100 + 11 MB (half 50 + 11);
+  1440p about 1.76x that.
 - **Known limits:**
   - Static HUD over moving content is no longer smeared with the zero test, but its glyph edges are not as clean as with V1. (V3 honours `hudBonus` since task 105, on evidence only: see "Static HUD protection under V3".)
   - CrosshairV2 leaves more pixels around the crosshair than with V1 (`uitest --algo learned` fails V1/V2-tuned thresholds).

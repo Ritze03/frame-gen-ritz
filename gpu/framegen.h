@@ -33,7 +33,7 @@ enum class MotionVersion : uint32_t {
               // (its synthesis has a variant per Format, its thresholds are in the same 8-bit levels as V1's). Settings::v2Mode picks
               // between its two modes. Its motion estimate computes V1's block field with faster passes (shared by both modes).
     Learned = 2,  // opt-in: V1 with its motion search replaced by a small learned estimator (ml-fg: a 5-level coarse-to-fine conv net
-                  // on the flow-res luma, Settings::learnedNet picks the weights, all embedded in the library), followed by ml-fg's
+                  // on the flow-res luma, the weights, LearnedNet::E2v5, are embedded in the library), followed by ml-fg's
                   // zero-motion test (Settings::learnedZeroTest, on by default) and optionally its static guard on the generated
                   // frames (Settings::learnedStaticGuard, off by default). It writes what V1's
                   // search writes (the per-pixel half-vector field, the scene-cut SAD sum); V1's synthesis, trust, fallbacks, motion
@@ -42,13 +42,11 @@ enum class MotionVersion : uint32_t {
                   // still pair, a zero field (a small cursor moving on a still desktop counts as a duplicate too). Float32
                   // throughout (Settings::learnedHalf: half activations). flowScale 2 only (the nets were trained at 2). Every
                   // Format. Costs more GPU time and memory than V1; V1 stays the default. RX 7900 XTX, 2x, whole pair (estimate +
-                  // synth), back-to-back, ms, float32 / learnedHalf: 1080p E2v3 1.29 / 1.00, E1v3 0.53 / 0.48 (V1 0.31); 1440p E2v3
-                  // 2.70 / 1.66, E1v3 0.88 / 0.78 (V1 0.47); E2v4 / E2v5 cost what E2v3 does, E1v4 / E1v5 what E1v3 does. The
+                  // synth), back-to-back, ms, float32 / learnedHalf: 1080p E2v5 1.29 / 1.00 (V1 0.31); 1440p 2.70 / 1.66 (V1 0.47). The
                   // synth part is V1's (~0.07 ms at 1080p, ~0.12 at 1440p). (Measured without the zero test; that test adds ~0.006 ms per pair at
                   // 1080p: the net's output pass is 0.011-0.016 ms without it, 0.017-0.022 with it; the static guard adds 0.047-0.050
-                  // ms per generated frame at 1080p, per-pass GPU profile.) Memory on top of V1 (activations + state): 1080p E2v3 / E2v4 /
-                  // E2v5 100 + 11 MB, E1v3 / E1v4 / E1v5 58 + 11 MB; 1440p E2v3 / E2v4 / E2v5 177 + 20 MB, E1v3 / E1v4 / E1v5 103 + 20 MB
-                  // (learnedHalf: half the activations); the zero test and the static guard need none; the weights of all eight nets 2.3 MB.
+                  // ms per generated frame at 1080p, per-pass GPU profile.) Memory on top of V1 (activations + state): 1080p 100 + 11 MB, 1440p
+                  // 177 + 20 MB (learnedHalf: half the activations); the zero test and the static guard need none; the weights 0.4 MB.
     V3 = 3,   // the third algorithm (design: gpu/V3.md): a gather-based, two-flow, occlusion-aware interpolator, built for the best picture
               // (about 0.9 ms per real pair at 1080p, flowScale 2, 2x on a 7900 XTX, 1.1 / 1.3 ms at 3x / 4x; INTEGRATION.md "Motion version 3").
               // Both flow directions, occlusion, a vector fill in hidden strips, smear along the motion where unsure (it never holds a patch of a
@@ -58,38 +56,17 @@ enum class MotionVersion : uint32_t {
               // subpixel, trustLow / trustHigh, sceneCutSad, smoothBonus, searchPenalty, learned* and v2Mode are ignored. hudBonus applies (below).
 };
 
-// The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. All nets are the same
-// architecture (ml-fg export/SPEC.md); only the width (channels per hidden layer) and the weights differ.
+// The weights of MotionVersion::Learned (Settings::learnedNet). Values are never renumbered (hosts and recorded captures store the number).
+// The library embeds one net; the nine others it had (values 0-3 and 5-9) were removed from the build and the repository in task 154
+// and are in the git history. Their values stay unused.
 enum class LearnedNet : uint32_t {
-    E2v3 = 0,   // width 24, 95,530 weights, 13.2 GMAC per 1080p pair. Better than V1 on average over ml-fg's 7 clips (+0.23 dB, much
-                // better on hard footage), 0.1-0.5 dB worse on FGR's own three. (The default before E2v4.)
-    E1v3 = 1,   // width 12, 28,330 weights, 3.9 GMAC (3.4x cheaper), 0.24 dB below E2v3 on average (on par with V1).
-    E2v4 = 2,   // E2v3 fine-tuned by ml-fg, the same architecture, size and cost (width 24, 95,530 weights, 13.2 GMAC). With the zero
-                // test (Settings::learnedZeroTest): +0.27 dB over V1 ("final") on ml-fg's 14 clips. (The default before E2v5.)
-    E1v4 = 3,   // E1v3 fine-tuned by ml-fg, the same architecture, size and cost as E1v3 (width 12, 28,330 weights, 3.9 GMAC). With the
-                // zero test: +0.05 dB over E1v3, better on 13 of ml-fg's 14 clips. (The small net before E1v5.)
-    E2v5 = 4,   // the default: E2v4 fine-tuned further by ml-fg on more varied footage, the same architecture, size and cost (width 24,
-                // 95,530 weights, 13.2 GMAC). With the zero test: +0.31 dB over V1 ("final") on ml-fg's 14 clips, +0.04 dB over E2v4,
-                // no clip worse.
-    E1v5 = 5,   // THE SMALL NET, the recommended fallback when E2v5 costs too much (a host that drops to a cheaper net at high resolution or
-                // refresh rate picks this one): E1v4 fine-tuned further, the same architecture, size and cost as E1v3 (width 12, 28,330
-                // weights, 3.9 GMAC, ~0.5 ms per 1080p pair). With the zero test: +0.12 dB over V1 on ml-fg's 14 clips, +0.06 dB over E1v4.
-    G2v2 = 6,   // the colour variant, a game net (ml-fg export/g2v2): width 24, 107,410 weights, 14.9 GMAC
-                // (+12.5 % over E2v5). A colour net (SPEC.md section 10) also matches the frames' chroma (Cb, Cr): 25 conv inputs
-                // instead of 14, two more planes per frame. The allrounder m2v2 will be
-                // appended after it. Opt-in; the default stays E2v5.
-    G2v3 = 7,   // the learned-features variant, a game net (ml-fg export/g2v3, SPEC.md section 11): width
-                // 24, 110,086 weights, 15.5 GMAC per pair (+17.5 % over E2v5; 27 conv inputs: the luma's 14 plus 4 learned maps' differences
-                // and a 9-channel map cost, from a 3 -> 8 -> 4 extractor run on every pooled RGB level of both frames).
-    M2v2 = 8,   // the colour variant, the allrounder (ml-fg export/m2v2): the same architecture, size and cost as G2v2 (width 24, 107,410
-                // weights, 14.9 GMAC), trained on the broad mix instead of game footage.
-    M2v3 = 9,   // the learned-features variant, the allrounder (ml-fg export/m2v3): the same architecture, size and cost as G2v3 (width 24,
-                // 27 conv inputs), trained on the broad mix instead of game footage.
+    E2v5 = 4,   // the only net (ml-fg export/SPEC.md architecture): width 24, 95,530 weights, 13.2 GMAC per 1080p pair. With the zero
+                // test (Settings::learnedZeroTest): +0.31 dB over V1 ("final") on ml-fg's 14 clips.
 };
-// The number of LearnedNet values (every net is built into the library), and their names as ml-fg's export calls them ("e2v3", "e1v3",
-// "e2v4", "e1v4", "e2v5", "e1v5", "g2v2", "g2v3", "m2v2", "m2v3"), for a host's or a test's settings parser: learnedNetName() is null for a value out of range, learnedNetFromName() false
-// (out untouched) for an unknown name.
-constexpr uint32_t kLearnedNets = 10;
+// One past the highest LearnedNet value (4 + 1), the bound of a loop over the values: learnedNetName() is null for every value that is not a net
+// (0-3), so a host's or a test's `for n < kLearnedNets` loop must skip null names. The name is ml-fg's export run, "e2v5": learnedNetName()
+// is null for any other value, learnedNetFromName() false (out untouched) for any other name.
+constexpr uint32_t kLearnedNets = 5;
 const char* learnedNetName(LearnedNet n);
 bool learnedNetFromName(const char* name, LearnedNet* out);
 
@@ -400,11 +377,8 @@ struct Settings {
     // it Off) or a resize / destroy frees them. Cost on top of V3 (RX 7900 XTX, 1080p flowScale 2, 2x, per real pair): about +0.34 ms (Guard) / +0.31 ms (V2Motion), 14.06 MiB of buffers; see INTEGRATION.md "Motion guard".
     // Other versions ignore it. Does not drop the current estimate.
     V3Guard v3Guard = V3Guard::Off;
-    // MotionVersion::Learned: the net (see LearnedNet). E2v5 = the default (E2v4, E2v3 before it); E1v5 = the small net, the recommended
-    // fallback when E2v5 is too expensive (~2.4x cheaper at 1080p). Other versions ignore it (any valid value,
-    // no effect). Runtime: setSettings() at any time, no GPU wait; the next recordEstimate runs the new net (the current estimate is
-    // kept). Every net's weights are uploaded with the version's first estimate; a switch to a wider net grows the activation buffer (it
-    // only ever allocates; false from setSettings if that fails, nothing changed).
+    // MotionVersion::Learned: the net (see LearnedNet): E2v5, the only one; every other value is refused (validate / settingsError). Other versions
+    // ignore it. The net's weights are uploaded with the version's first estimate.
     LearnedNet learnedNet = LearnedNet::E2v5;
     // MotionVersion::Learned: store the net's activations (its 14-channel input and the four hidden layers' outputs) as IEEE half
     // instead of float32; the arithmetic, the field and the pyramid stay float32 (ml-fg SPEC.md section 7, the tested fp16 storage).
@@ -843,10 +817,6 @@ public:
         uint32_t fw, fh, pw, ph, width;    // flow size, the net's padded level 0, the selected net's width
         bool half;                         // Settings::learnedHalf: a channel group is 4 IEEE half (8 bytes) instead of a vec4
         VkDeviceSize pyrOff[5], hOff[5], actOff[2], size;
-        // the net variant's extra planes (colour: Cb, Cr; 0 for a luma net): ext planes, and per level l at xOff[l] the pyramid of plane p
-        // (0 = Cb, 1 = Cr): a then c, n(l) float32 each (/255, signed), a at xOff[l] + 2 * p * n(l) * 4 bytes
-        uint32_t ext, scr;
-        VkDeviceSize xOff[5], sOff[5];   // scr (features nets, else 0) RGB planes: plane c (R, G, B) a then c at sOff[l] + 2 c n(l) * 4 bytes (/255)
     };
     bool debugLearnedLayout(DebugLearnedLayout& l) const;
     bool recordDebugLearned(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);

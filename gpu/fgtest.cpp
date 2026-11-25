@@ -11,7 +11,7 @@
 // --seq "S0;S1;..": live-toggle test: before pair i, setSettings(--set + state min(i, n-1)) and releaseUnusedMotion() (settingsError / setSettings failures end the run).
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
 // smoothBonus searchPenalty searchRadius searchRadiusTop subpixel flowScale pyramidMinSide v2StaticMask v3Smear v3OcclSoft v3Unsure v3SceneCut v3ColourWindow v3DetailSplit v3Blend v3Guard=off|guard|v2motion (or 0|1|2); debugView=off|motion|uimask|uiclean (or 0..3); algo=v1|v2|learned|v3 = motionVersion; v2Mode=quality|performance;
-// learnedNet=e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3 (MotionVersion::Learned's net), learnedHalf, learnedZeroTest, learnedStaticGuard (0|1); ui=off|crosshair|wholescreen|crosshairv2 =
+// learnedNet=e2v5 (MotionVersion::Learned's net), learnedHalf, learnedZeroTest, learnedStaticGuard (0|1); ui=off|crosshair|wholescreen|crosshairv2 =
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill), passed to init.
 // Also every field by its own name with a number (motionVersion uiProtection blurSamples blurWeights v2Mode learnedNet v3Guard: the enum's
@@ -68,11 +68,12 @@ static bool parseSettings(char* str, framegen::Settings& s) {
             else if (a == "v3") s.motionVersion = framegen::MotionVersion::V3;
             else { fprintf(stderr, "algo=v1|v2|learned|v3, not %s\n", eq + 1); return false; }
         }
-        else if (k == "learnedNet") {   // MotionVersion::Learned's net by its name (framegen::learnedNetName: e2v3 | e1v3 | e2v4 | e1v4 | e2v5 | e1v5 | g2v2|g2v3|m2v2|m2v3)
+        else if (k == "learnedNet") {   // MotionVersion::Learned's net by its name (framegen::learnedNetName: e2v5)
             if (eq[1] >= '0' && eq[1] <= '9') s.learnedNet = (framegen::LearnedNet)(uint32_t)v;   // a capture's number
             else if (!framegen::learnedNetFromName(eq + 1, &s.learnedNet)) {
                 fprintf(stderr, "learnedNet=");
-                for (uint32_t n = 0; n < framegen::kLearnedNets; n++) fprintf(stderr, "%s%s", n ? "|" : "", framegen::learnedNetName((framegen::LearnedNet)n));
+                for (uint32_t n = 0, k = 0; n < framegen::kLearnedNets; n++)
+                    if (const char* nm = framegen::learnedNetName((framegen::LearnedNet)n)) fprintf(stderr, "%s%s", k++ ? "|" : "", nm);
                 fprintf(stderr, ", not %s\n", eq + 1);
                 return false;
             }

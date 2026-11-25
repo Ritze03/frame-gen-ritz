@@ -10,6 +10,9 @@ Output per net, the layout shaders/ml_conv.comp reads (binding 15, vec4 units): 
 re-laid out as W'[ky][kx][i][o] with the input channels padded to a multiple of 4 (14 -> 16, colour 25 -> 28) and the output channels padded to a
 multiple of 4 (2 -> 4), zeros in the padding, then the bias b'[o] (padded likewise). One table entry per (level, layer): the vec4
 offset of the weights and of the bias. All values are the float32 bits of weights.bin, unchanged.
+
+Only the luma net (manifest variant absent or 'luma', 14 -> w -> w -> w -> w -> 2) is accepted: the colour and features variants (and their
+kMlExtr_ extractor offsets, which stay in the output as zeros) were removed from the library with the nets that used them (task 154).
 """
 import hashlib
 import json
@@ -17,10 +20,8 @@ import struct
 import sys
 
 LEVELS, LAYERS = 5, 5
-# The input variants of the net (SPEC.md section 10.7), in framegen.cpp MlVariant order: the manifest's `variant` (absent = luma) and
-# its first-layer input channels. A new variant: one entry here, one in framegen.cpp kMlVariants (+ its extra-plane pass).
-VARIANTS = [('luma', 14), ('colour', 25), ('features', 27)]
-FEATURES = 4   # the features variant's maps per frame (config.features): ml_feat.comp and ml_match.comp are written for 4
+# The input variant of the net: the manifest's `variant` (absent = luma) and its first-layer input channels.
+VARIANTS = [('luma', 14)]
 
 
 def ceil4(n):
@@ -38,11 +39,8 @@ def load(manifest, weights):
     vi = [v for v, _ in VARIANTS].index(vname)   # an unknown variant fails the build
     IN_CH = VARIANTS[vi][1]
     assert cfg['levels'] == LEVELS and cfg['depth'] == LAYERS - 1 and man['in_channels'] == IN_CH and man['flow_scale'] == 2
-    assert bool(man.get('colour', 0)) == bool(cfg.get('colour', 0)) == (vname == 'colour'), f'{manifest}: variant {vname} vs its colour flags'
-    assert bool(man.get('needs_chroma', False)) == (vname == 'colour')
-    assert (man.get('features', 0) == cfg.get('features', 0)) and (cfg.get('features', 0) == FEATURES) == (vname == 'features') \
-        and bool(man.get('needs_rgb', False)) == (vname == 'features') and ('extractor' in man) == (vname == 'features'), \
-        f'{manifest}: variant {vname} vs its features flags'
+    assert not man.get('colour', 0) and not cfg.get('colour', 0) and not man.get('needs_chroma', False)
+    assert not man.get('features', 0) and not cfg.get('features', 0) and not man.get('needs_rgb', False) and 'extractor' not in man
     assert man['pad_multiple'] == 1 << (LEVELS - 1) and cfg['cost'] == 1
     vals = struct.unpack(f'<{len(raw) // 4}I', raw)   # float32 bits
     t, pos = {}, 0
@@ -71,14 +69,6 @@ def load(manifest, weights):
             layers.append((ci, co, w, b))
         levels.append(layers)
     extr = None
-    if vname == 'features':   # the per-frame extractor (SPEC.md section 11.3): 3 -> 8 -> 4, clamp01 both, zero padding
-        ly = man['extractor']['layers']
-        assert [(l['c_in'], l['c_out'], l['act'], l['padding']) for l in ly] == [(3, 8, 'clamp01', 'zero'), (8, FEATURES, 'clamp01', 'zero')]
-        extr = []
-        for l in ly:
-            (ws, w), (bs, b) = t[l['weight']], t[l['bias']]
-            assert ws == [l['c_out'], l['c_in'], 3, 3] and bs == [l['c_out']]
-            extr.append((l['c_in'], l['c_out'], w, b))
     return man, width, levels, vi, extr
 
 

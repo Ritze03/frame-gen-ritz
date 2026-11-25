@@ -30,16 +30,16 @@ shaders = shader_gen.process(
   'shaders/v2_qfield.comp', 'shaders/v2_qown.comp', 'shaders/v2_qcov.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_static.comp', 'shaders/v2_enclose.comp',
   'shaders/v2_morph_s.comp', 'shaders/v2_qmorph_s.comp',
   'shaders/ml_dup.comp', 'shaders/ml_reduce.comp', 'shaders/ml_pyr.comp', 'shaders/ml_match.comp', 'shaders/ml_conv.comp', 'shaders/ml_out.comp',
-  'shaders/ml_zero.comp', 'shaders/ml_guard.comp', 'shaders/ml_planes.comp', 'shaders/ml_feat.comp',
+  'shaders/ml_zero.comp', 'shaders/ml_guard.comp',
   'shaders/v3_synth.comp', 'shaders/v3_planes.comp', 'shaders/v3_pyr.comp', 'shaders/v3_hist.comp', 'shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp', 'shaders/v3_wide.comp', 'shaders/v3_stats.comp',
   'shaders/v3_occl.comp', 'shaders/v3_fill.comp', 'shaders/v3_project.comp', 'shaders/v3_enclose.comp', 'shaders/v3_decide.comp',
   'shaders/v3_anchor.comp', 'shaders/v3_guard.comp',
   'shaders/debug_motion.comp', 'shaders/debug_ui.comp')   # task 136: Settings::debugView (the motion tint for V1 / Learned, the UI views); task 104: Settings::v3Guard, V2 Quality's vectors correct V3's dense field
 
 # MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked
-# against the manifest (sha256, shapes, offsets) and re-laid out for shaders/ml_conv.comp. Order = LearnedNet (E2v3, E1v3, E2v4, E1v4,
-# E2v5, E1v5, G2v2, G2v3, M2v2, M2v3): a new net is appended here and in framegen.cpp kMlNetInfo / kMlNet.
-ml_nets = ['e2v3', 'e1v3', 'e2v4', 'e1v4', 'e2v5', 'e1v5', 'g2v2', 'g2v3', 'm2v2', 'm2v3']
+# against the manifest (sha256, shapes, offsets) and re-laid out for shaders/ml_conv.comp. The build keeps one net, LearnedNet::E2v5 (the others were removed in task 154):
+# a new net is appended here and in framegen.cpp kMlNetInfo / kMlNet.
+ml_nets = ['e2v5']
 python = find_program('python3')
 ml_inputs = ['ml/embed_weights.py']
 ml_args = [python, '-I', '@INPUT0@', '@OUTPUT@']
@@ -114,8 +114,8 @@ wide2_shaders = wide2_gen.process('shaders/medhist.comp', 'shaders/v2_medhist.co
 # MotionVersion::V2: only its synthesis reads and writes colour (both modes, with and without the static-overlay tests; YUV: both
 # planes); its other passes read the luma, which luma.comp already gives per format
 v2_colour_srcs = ['shaders/v2_morph.comp', 'shaders/v2_morph_s.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_qmorph_s.comp']
-# MotionVersion::Learned: only its duplicate test, its static guard and the colour variant's chroma planes read colour; the net and the zero test read the luma
-ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp', 'shaders/ml_planes.comp']
+# MotionVersion::Learned: only its duplicate test and its static guard read colour; the net and the zero test read the luma
+ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp']
 # MotionVersion::V3: its raw planes (the colour of both frames -> its level-0 planes) and its synthesis read colour (YUV: both planes); its other
 # passes work on those planes and the luma. The static-structure mask (v2_static.comp) is V2's plain build: it reads the luma only.
 v3_colour_srcs = ['shaders/v3_planes.comp', 'shaders/v3_synth.comp']

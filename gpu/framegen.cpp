@@ -78,7 +78,7 @@
 // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
 // generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
 // have format variants (probed per format below).
-#if __has_include("ml_conv_spv.h") && __has_include("ml_zero_spv.h") && __has_include("ml_guard_spv.h") && __has_include("ml_planes_spv.h") && __has_include("ml_feat_spv.h") && __has_include("ml_weights.h")
+#if __has_include("ml_conv_spv.h") && __has_include("ml_zero_spv.h") && __has_include("ml_guard_spv.h") && __has_include("ml_weights.h")
 #define FG_HAVE_ML 1
 #include "ml_dup_spv.h"
 #include "ml_reduce_spv.h"
@@ -88,8 +88,6 @@
 #include "ml_out_spv.h"
 #include "ml_zero_spv.h"
 #include "ml_guard_spv.h"
-#include "ml_planes_spv.h"
-#include "ml_feat_spv.h"
 #include "ml_weights.h"
 #endif
 
@@ -120,11 +118,10 @@
 #include "v2_qmorph_s_rgb10_spv.h"
 #endif
 // ... and MotionVersion::Learned's colour passes of rgb10, its duplicate test and static guard (probed on their own, like V2's synthesis)
-#if __has_include("ml_dup_rgb10_spv.h") && __has_include("ml_guard_rgb10_spv.h") && __has_include("ml_planes_rgb10_spv.h") && defined(FG_HAVE_RGB10) && defined(FG_HAVE_ML)
+#if __has_include("ml_dup_rgb10_spv.h") && __has_include("ml_guard_rgb10_spv.h") && defined(FG_HAVE_RGB10) && defined(FG_HAVE_ML)
 #define FG_HAVE_ML_RGB10 1
 #include "ml_dup_rgb10_spv.h"
 #include "ml_guard_rgb10_spv.h"
-#include "ml_planes_rgb10_spv.h"
 #endif
 // ... and MotionVersion::V3's colour passes of rgb10, its raw planes and its synthesis (probed on their own, like V2's synthesis)
 #if __has_include("v3_synth_rgb10_spv.h") && __has_include("v3_synth_l_rgb10_spv.h") && __has_include("v3_planes_rgb10_spv.h") && defined(FG_HAVE_RGB10)
@@ -162,11 +159,10 @@
 #include "v2_qmorph_f16_spv.h"
 #include "v2_qmorph_s_f16_spv.h"
 #endif
-#if __has_include("ml_dup_f16_spv.h") && __has_include("ml_guard_f16_spv.h") && __has_include("ml_planes_f16_spv.h") && defined(FG_HAVE_F16) && defined(FG_HAVE_ML)
+#if __has_include("ml_dup_f16_spv.h") && __has_include("ml_guard_f16_spv.h") && defined(FG_HAVE_F16) && defined(FG_HAVE_ML)
 #define FG_HAVE_ML_F16 1
 #include "ml_dup_f16_spv.h"
 #include "ml_guard_f16_spv.h"
-#include "ml_planes_f16_spv.h"
 #endif
 // ... and MotionVersion::V3's colour passes of f16, its raw planes and its synthesis (probed on their own, like V2's synthesis)
 #if __has_include("v3_synth_f16_spv.h") && __has_include("v3_synth_l_f16_spv.h") && __has_include("v3_planes_f16_spv.h") && defined(FG_HAVE_F16)
@@ -202,11 +198,10 @@
 #include "v2_qmorph_nv12_spv.h"
 #include "v2_qmorph_s_nv12_spv.h"
 #endif
-#if __has_include("ml_dup_nv12_spv.h") && __has_include("ml_guard_nv12_spv.h") && __has_include("ml_planes_nv12_spv.h") && defined(FG_HAVE_NV12) && defined(FG_HAVE_ML)
+#if __has_include("ml_dup_nv12_spv.h") && __has_include("ml_guard_nv12_spv.h") && defined(FG_HAVE_NV12) && defined(FG_HAVE_ML)
 #define FG_HAVE_ML_NV12 1
 #include "ml_dup_nv12_spv.h"
 #include "ml_guard_nv12_spv.h"
-#include "ml_planes_nv12_spv.h"
 #endif
 // ... and MotionVersion::V3's colour passes of nv12, its raw planes and its synthesis (probed on their own, like V2's synthesis)
 #if __has_include("v3_synth_nv12_spv.h") && __has_include("v3_synth_l_nv12_spv.h") && __has_include("v3_planes_nv12_spv.h") && defined(FG_HAVE_NV12)
@@ -242,11 +237,10 @@
 #include "v2_qmorph_p010_spv.h"
 #include "v2_qmorph_s_p010_spv.h"
 #endif
-#if __has_include("ml_dup_p010_spv.h") && __has_include("ml_guard_p010_spv.h") && __has_include("ml_planes_p010_spv.h") && defined(FG_HAVE_P010) && defined(FG_HAVE_ML)
+#if __has_include("ml_dup_p010_spv.h") && __has_include("ml_guard_p010_spv.h") && defined(FG_HAVE_P010) && defined(FG_HAVE_ML)
 #define FG_HAVE_ML_P010 1
 #include "ml_dup_p010_spv.h"
 #include "ml_guard_p010_spv.h"
-#include "ml_planes_p010_spv.h"
 #endif
 // ... and MotionVersion::V3's colour passes of p010, its raw planes and its synthesis (probed on their own, like V2's synthesis)
 #if __has_include("v3_synth_p010_spv.h") && __has_include("v3_synth_l_p010_spv.h") && __has_include("v3_planes_p010_spv.h") && defined(FG_HAVE_P010)
@@ -300,14 +294,14 @@ struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
 struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill,
-    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, mlPlanes, v3Synth, v3Planes, v3SynthL, v3SynthB,
+    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, v3Synth, v3Planes, v3SynthL, v3SynthB,
     dbgMotion, dbgMotionV2, dbgMotionV3, dbgUi; };   // (Settings::debugView: the motion tint of V1 / Learned, V2, V3 and the UI views; empty = this build has none)
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
     SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
     SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f), Spv{}, Spv{}, Spv{}, Spv{}}
 #define V2_SET(c, f) (c.v2Morph = SPV(v2_morph##f), c.v2MorphS = SPV(v2_morph_s##f), c.v2QMorph = SPV(v2_qmorph##f), c.v2QMorphS = SPV(v2_qmorph_s##f))
 #define V3_SET(c, f) (c.v3Synth = SPV(v3_synth##f), c.v3Planes = SPV(v3_planes##f), c.v3SynthL = SPV(v3_synth_l##f))   // (V3's two colour passes: the raw planes and the synthesis)
-#define ML_SET(c, f) (c.mlDup = SPV(ml_dup##f), c.mlGuard = SPV(ml_guard##f), c.mlPlanes = SPV(ml_planes##f))
+#define ML_SET(c, f) (c.mlDup = SPV(ml_dup##f), c.mlGuard = SPV(ml_guard##f))
 #define DBG_SET(c, f) (c.dbgMotion = SPV(debug_motion##f), c.dbgMotionV2 = SPV(debug_motion_v2##f), c.dbgMotionV3 = SPV(debug_motion_v3##f), c.dbgUi = SPV(debug_ui##f))
 // false = this format's variants were not built into the library (meson option `formats`)
 bool colourSpv(Format f, ColourSpv& c) {
@@ -393,43 +387,23 @@ inline bool isYuv(Format f) { return f == Format::Nv12 || f == Format::P010; }
 const char* const kDbgNotBuilt = "the Settings::debugView shader variants of this format (debug_motion, debug_motion_v2, debug_motion_v3, debug_ui) are not built into the library";
 const char* const kV2NotBuilt = "the MotionVersion::V2 shader variants of this format (v2_morph, v2_morph_s, v2_qmorph, v2_qmorph_s) are not built into the library";
 const char* const kV3NotBuilt = "the MotionVersion::V3 shader variants of this format (v3_planes, v3_synth, v3_synth_l) are not built into the library";
-const char* const kMlNotBuilt = "the MotionVersion::Learned shaders of this format (ml_dup, ml_reduce, ml_pyr, ml_match, ml_conv, ml_out, ml_zero, ml_guard, ml_planes) or its weights (ml_weights.h, gpu/ml/embed_weights.py) are not built into the library";
+const char* const kMlNotBuilt = "the MotionVersion::Learned shaders of this format (ml_dup, ml_reduce, ml_pyr, ml_match, ml_conv, ml_out, ml_zero, ml_guard) or its weights (ml_weights.h, gpu/ml/embed_weights.py) are not built into the library";
 const char* const kMlFlowScale = "MotionVersion::Learned needs flowScale 2 (its nets were trained at 2)";
-// The input variants of the learned nets (ml-fg export/SPEC.md sections 10.7, 11; the manifest's `variant`, read by gpu/ml/embed_weights.py,
-// whose VARIANTS list this one mirrors): what the first conv layer of every level reads, and the per-frame planes it needs beyond
-// P_LUMA's luma. A variant's per-frame flow-res planes (nin, made by ml_planes.comp, pyramided by ml_pyr.comp) are either matched as
-// they are (colour: Cb, Cr) or, with `feat`, are RGB that ml_feat.comp's extractor turns into `ext` learned maps per pyramid level;
-// ml_match.comp matches the `ext` planes next to the luma (inCh = 14 + ext + 9 channels).
-// ADDING A VARIANT: append to the enum and here and to embed_weights.py VARIANTS; if it needs other planes, extend ml_planes.comp /
-// ml_pyr.comp / ml_feat.comp (the push constants ext, nin, feat in ml_common.glsl); a new match layout is a branch in ml_match.comp.
-enum MlVariant : int { MLV_LUMA, MLV_COLOUR, MLV_FEATURES, MLV_COUNT };
-struct MlVariantInfo { int inCh, ext, nin, feat; };   // first-conv input channels, matched extra planes, flow-res planes per frame, extractor
-constexpr MlVariantInfo kMlVariants[MLV_COUNT] = {{14, 0, 0, 0}, {25, 2, 2, 0}, {27, 4, 3, 1}};   // luma; colour (Cb, Cr); features (RGB -> 4 maps)
 constexpr int groups4(int c) { return (c + 3) / 4; }
-// The nets of MotionVersion::Learned, in LearnedNet order: their name (ml-fg's export run, learnedNetName()), width (channels per
-// hidden layer; the layout and the pipelines depend on it) and input variant. ADDING A NET: append its LearnedNet value and bump
-// kLearnedNets (framegen.h), append its name + width + variant here and its ML_NET entry to kMlNet below, copy ml-fg's
-// export/<run>/manifest.json + weights.bin into gpu/ml/<run>/ and append <run> to gpu/meson.build's ml_nets (the same order); the
-// variant is checked against the manifest's at build time (kMlVariant_<run>). Tests: mltest's TEST_CASEs, the --net help strings.
-struct MlNetInfo { const char* name; int width; MlVariant variant; };
-constexpr MlNetInfo kMlNetInfo[] = {{"e2v3", 24, MLV_LUMA}, {"e1v3", 12, MLV_LUMA}, {"e2v4", 24, MLV_LUMA}, {"e1v4", 12, MLV_LUMA},
-                                    {"e2v5", 24, MLV_LUMA}, {"e1v5", 12, MLV_LUMA}, {"g2v2", 24, MLV_COLOUR}, {"g2v3", 24, MLV_FEATURES}, {"m2v2", 24, MLV_COLOUR}, {"m2v3", 24, MLV_FEATURES}};
+// The one net of MotionVersion::Learned (LearnedNet::E2v5, ml-fg's export run "e2v5"; the other nine were removed from the library in task 154, they are in the
+// git history): its width (channels per hidden layer; the layout and the pipelines depend on it) and its first-conv input channels (14: the luma net).
+struct MlNetInfo { const char* name; int width, inCh; };
+constexpr MlNetInfo kMlNetInfo[] = {{"e2v5", 24, 14}};
 constexpr int kMlNets = (int)(sizeof(kMlNetInfo) / sizeof(kMlNetInfo[0]));
-static_assert(kMlNets == (int)kLearnedNets, "a name and width per LearnedNet");
+static_assert(kMlNets == 1, "one embedded net");
 #ifdef FG_HAVE_ML
-// The embedded nets, in LearnedNet order (gpu/ml/embed_weights.py): weights in shaders/ml_conv.comp's layout, the table of each
+// The embedded net (gpu/ml/embed_weights.py): weights in shaders/ml_conv.comp's layout, the table of each
 // (level, layer)'s weight / bias offsets (vec4 units, relative to the net's start in the weights buffer)
-struct MlNet { const uint32_t* w; size_t words; uint32_t width; uint32_t variant, inCh; const uint32_t* extr; const uint32_t (*table)[5][2]; };
-#define ML_NET(n) MlNet{kMlWeights_##n, sizeof(kMlWeights_##n) / 4, kMlWidth_##n, kMlVariant_##n, kMlInCh_##n, kMlExtr_##n, kMlTable_##n}
-constexpr MlNet kMlNet[] = {ML_NET(e2v3), ML_NET(e1v3), ML_NET(e2v4), ML_NET(e1v4), ML_NET(e2v5), ML_NET(e1v5), ML_NET(g2v2), ML_NET(g2v3), ML_NET(m2v2), ML_NET(m2v3)};
-static_assert(sizeof(kMlNet) / sizeof(kMlNet[0]) == kMlNets, "an embedded net per LearnedNet");
-constexpr bool mlWidthsMatch() {
-    for (int i = 0; i < kMlNets; i++)
-        if ((int)kMlNet[i].width != kMlNetInfo[i].width || (int)kMlNet[i].variant != (int)kMlNetInfo[i].variant ||
-            (int)kMlNet[i].inCh != kMlVariants[kMlNetInfo[i].variant].inCh) return false;   // (a manifest's variant / input channels vs this table: build error)
-    return true;
-}
-static_assert(mlWidthsMatch(), "kMlNetInfo's widths, variants and input channels are those of ml_weights.h (a net loaded into the wrong pipeline fails the build)");
+struct MlNet { const uint32_t* w; size_t words; uint32_t width; uint32_t inCh; const uint32_t (*table)[5][2]; };
+#define ML_NET(n) MlNet{kMlWeights_##n, sizeof(kMlWeights_##n) / 4, kMlWidth_##n, kMlInCh_##n, kMlTable_##n}
+constexpr MlNet kMlNet[] = {ML_NET(e2v5)};
+static_assert(kMlNet[0].width == (uint32_t)kMlNetInfo[0].width && kMlNet[0].inCh == (uint32_t)kMlNetInfo[0].inCh && kMlVariant_e2v5 == 0,
+              "kMlNetInfo's width and input channels are those of ml_weights.h (a net loaded into the wrong pipeline fails the build)");
 // (every net's weights are a whole number of vec4: embed_weights.py pads each layer to 4 channels, so each net starts on a vec4)
 #endif
 // the view / clean-copy formats of a Format: the library's own clean copies are in the source's own format, in logical channel order
@@ -637,10 +611,10 @@ struct UiEntry {
 
 // P_V2_*: MotionVersion::V2's own passes (empty in V1's group; V2's group leaves V1's P_MEDHIST / P_SEARCH / P_SUBPIX empty instead).
 // P_ML_*: MotionVersion::Learned's (its group has V1's luma and synthesis, none of V1's search); the convs are one pipeline per layer
-// shape (first / hidden / last) and net (LearnedNet), shaders/ml_conv.comp specialised. P_ML_PLANES / P_ML_FEAT: the colour and features variants' per-frame planes and the features extractor.
+// shape (first / hidden / last), shaders/ml_conv.comp specialised.
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
             P_V2_MEDHIST, P_V2_MEDHIST_WIDE, P_V2_SEARCH, P_V2_SEARCH_WIDE, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QOWN_WIDE, P_V2_QCOV, P_V2_QCOV_WIDE, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
-            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_PLANES, P_ML_FEAT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2 * MLV_COUNT, P_ML_ZERO = P_ML_CONV + 10 * kMlNets, P_ML_GUARD,
+            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2, P_ML_ZERO = P_ML_CONV + 10, P_ML_GUARD,
             // MotionVersion::V3 (gpu/V3.md section 7; the skeleton fills P_LUMA and P_V3_SYNTH only, the others are reserved for the steps E1..Y2)
             P_V3_PLANES, P_V3_PYR, P_V3_HIST, P_V3_SEARCH, P_V3_WIDE, P_V3_STATS, P_V3_DENSE, P_V3_OCCL, P_V3_FILL, P_V3_ENCLOSE, P_V3_DECIDE, P_V3_PROJECT, P_V3_SYNTH,
             P_V3_SYNTH_L,   // (hook (l) v3DetailSplit: the synthesis built with -DV3L=1)
@@ -649,13 +623,12 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, 
             P_V3_SEARCH_TOP,   // (E1: the top level's exhaustive search, its own pipeline: its shared patch must not cost the other levels' occupancy)
             P_V3_ANCHOR, P_V3_GUARD,   // (task 104, Settings::v3Guard: created with the V2 estimate passes P_DOWN / P_V2_MEDHIST* / P_V2_SEARCH* / P_V2_REPICK / P_V2_CLEAN / P_V2_QFIELD in V3's group)
             P_COUNT };
-// The match pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF) and per net
-// variant (ML_EXT); the conv pipelines per activation storage too; convs per
-// net and shape (0 = first, 14 -> w; 1 = hidden, w -> w; 2 = last, w -> 2) and, but the last, whole or split (one output group per
+// The match and conv pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF); convs per
+// shape (0 = first, 14 -> w; 1 = hidden, w -> w; 2 = last, w -> 2) and, but the last, whole or split (one output group per
 // workgroup: the small levels)
-inline Pipe mlMatchPipe(bool half, int variant) { return (Pipe)(P_ML_MATCH + MLV_COUNT * half + variant); }
-inline Pipe mlConvPipe(bool half, int net, int shape, bool split) {
-    return (Pipe)(P_ML_CONV + 5 * (kMlNets * half + net) + (shape == 2 ? 4 : 2 * shape + split));
+inline Pipe mlMatchPipe(bool half) { return (Pipe)(P_ML_MATCH + half); }
+inline Pipe mlConvPipe(bool half, int shape, bool split) {
+    return (Pipe)(P_ML_CONV + 5 * half + (shape == 2 ? 4 : 2 * shape + split));
 }
 
 struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
@@ -739,18 +712,15 @@ static SizeLayout sizeLayout(uint32_t W, uint32_t H, uint32_t flowScale, uint32_
 // MotionVersion::Learned's layout of a size (shaders/ml_common.glsl): the net's padded level 0 (fw, fh rounded up to a multiple of
 // 16), the sum S of its 5 level sizes, the partial sums of its two reductions, and per net the activation regions: R0 holds the
 // input (14 channels, 4 groups; colour 25, 7) and two hidden layers (width / 4 groups each), R1 the other two.
-inline int mlWidth(LearnedNet n) { return kMlNetInfo[(int)n].width; }
-inline int mlVariantOf(int net) { return kMlNetInfo[net].variant; }
-inline const MlVariantInfo& mlVariant(LearnedNet n) { return kMlVariants[kMlNetInfo[(int)n].variant]; }
+inline int mlWidth() { return kMlNetInfo[0].width; }
 struct MlLayout {
     int pw = 0, ph = 0, n0 = 0, S = 0, nDup = 0, nOut = 0;
-    int ext = 0, nin = 0, scr = 0, gi = 4;   // the net variant's matched planes, flow-res planes, RGB scratch pyramids (kMlVariants) and the channel groups of its first-layer input
+    int gi = 4;   // the channel groups of the first-layer input
     VkDeviceSize stateBytes = 0;
     int g = 0, r0 = 0, groups = 0;   // the net's groups per hidden layer, R0's groups, R0 + R1
     VkDeviceSize elem = 0, actBytes = 0;   // bytes per group of 4 channels (16 float32, 8 half), the activations
 };
 static MlLayout mlLayout(uint32_t W, uint32_t H, int fw, int fh, const Settings& s) {
-    const LearnedNet net = s.learnedNet;
     MlLayout L;
     L.pw = (fw + 15) & ~15;
     L.ph = (fh + 15) & ~15;
@@ -758,14 +728,10 @@ static MlLayout mlLayout(uint32_t W, uint32_t H, int fw, int fh, const Settings&
     for (int l = 0; l < kMlLevels; l++) L.S += (L.pw >> l) * (L.ph >> l);
     L.nDup = (int)(((W + 31) / 32) * ((H + 31) / 32));   // ml_dup.comp: 32x32 pixels per workgroup
     L.nOut = ((fw + 15) / 16) * ((fh + 15) / 16);       // ml_out.comp: 16x16 flow pixels per workgroup
-    L.ext = mlVariant(net).ext;
-    L.nin = mlVariant(net).nin;
-    L.scr = mlVariant(net).feat ? L.nin : 0;
-    L.gi = groups4(mlVariant(net).inCh);
-    // ml_common.glsl's state: pyramid + h (4S), the matched planes' pyramids (2 ext S), a features net's RGB pyramids (2 scr S), the flow-res
-    // planes (2 nin fw fh), partial sums
-    L.stateBytes = ((VkDeviceSize)4 * L.S + (VkDeviceSize)2 * (L.ext + L.scr) * L.S + (VkDeviceSize)2 * L.nin * fw * fh + std::max(L.nDup, L.nOut)) * 4;
-    L.g = mlWidth(net) / 4;
+    L.gi = groups4(kMlNetInfo[0].inCh);
+    // ml_common.glsl's state: pyramid + h (4S), partial sums
+    L.stateBytes = ((VkDeviceSize)4 * L.S + std::max(L.nDup, L.nOut)) * 4;
+    L.g = mlWidth() / 4;
     L.r0 = std::max(L.gi, L.g);
     L.groups = L.r0 + L.g;
     L.elem = s.learnedHalf ? 8 : 16;
@@ -906,7 +872,7 @@ struct Interpolator::Impl {
     void v2ResetClaims(VkCommandBuffer cb);
     void v2Tail(VkCommandBuffer cb);
     // MotionVersion::Learned: both nets' weights (binding 15; created with the version's pipelines, uploaded by its first estimate:
-    // mlWeightsUp), the activation buffer's size (it grows for a wider net or float32 storage, the old one waits in mlGrave until the
+    // mlWeightsUp), the activation buffer's size (it grows for float32 storage after half, the old one waits in mlGrave until the
     // size is freed), and the test hooks (setDebugLearned)
     UiBuf mlWeights;
     bool mlWeightsUp = false;
@@ -1729,14 +1695,11 @@ bool Interpolator::Impl::rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool forc
     return true;
 }
 
-const char* learnedNetName(LearnedNet n) { return (uint32_t)n < kLearnedNets ? kMlNetInfo[(int)n].name : nullptr; }
+const char* learnedNetName(LearnedNet n) { return n == LearnedNet::E2v5 ? kMlNetInfo[0].name : nullptr; }
 bool learnedNetFromName(const char* name, LearnedNet* out) {
-    for (int i = 0; name && i < kMlNets; i++)
-        if (!strcmp(name, kMlNetInfo[i].name)) {
-            if (out) *out = (LearnedNet)i;
-            return true;
-        }
-    return false;
+    if (!name || strcmp(name, kMlNetInfo[0].name)) return false;
+    if (out) *out = LearnedNet::E2v5;
+    return true;
 }
 
 bool Interpolator::validate(const Settings& s) {
@@ -1748,7 +1711,7 @@ bool Interpolator::validate(const Settings& s) {
            s.searchRadius >= 1 && s.searchRadius <= 12 && s.searchRadiusTop >= 1 && s.searchRadiusTop <= 12 &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) && s.pyramidMinSide >= 16 && s.pyramidMinSide <= 256 &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V3 &&
-           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.v3Guard <= (uint32_t)V3Guard::V2Motion && s.v3Blend <= kV3BlendMax && (uint32_t)s.debugView <= (uint32_t)DebugView::UiClean && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
+           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.v3Guard <= (uint32_t)V3Guard::V2Motion && s.v3Blend <= kV3BlendMax && (uint32_t)s.debugView <= (uint32_t)DebugView::UiClean && s.learnedNet == LearnedNet::E2v5 &&
            in(s.v3Smear, 0.0f, 1.0f) && in(s.v3OcclSoft, 0.25f, 4.0f) && in(s.v3Unsure, 0.25f, 4.0f) && in(s.v3SceneCut, 0.0f, 4.0f) &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
@@ -1843,7 +1806,7 @@ bool Interpolator::Impl::motionEnsure() {
     MotionGroup& g = mg();
     if (g.live) {
         if (mv3() && set.v3Guard != V3Guard::Off && !guardEnsure()) return false;   // (Settings::v3Guard turned on: V2's estimate passes and buffers)
-        return !W || !mlearned() || mlSized();   // (Learned: a wider net than before grows the activations)
+        return !W || !mlearned() || mlSized();   // (Learned: float32 activations after half ones grow the activation buffer)
     }
     // V1: the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's,
     // as are the two colour passes of the blur. V2: both modes' pipelines (see MotionGroup), the format's luma and synthesis; empty
@@ -1900,9 +1863,9 @@ bool Interpolator::Impl::motionEnsure() {
     }
     // Learned: V1's luma, synthesis and blur, its own passes instead of V1's search; the convs specialised per layer shape and net
     // (shaders/ml_conv.comp: GI, GO, LINEAR), and the weights buffer
-    struct MlSpec { int32_t gi, go, linear, got, half, ext; } mlSpec[2 * kMlNets * 5 + 2 * MLV_COUNT]{};
+    struct MlSpec { int32_t gi, go, linear, got, half, ext; } mlSpec[2 * 5 + 2]{};
     VkSpecializationMapEntry mlEnt[6] = {{20, 0, 4}, {21, 4, 4}, {22, 8, 4}, {23, 12, 4}, {24, 16, 4}, {25, 20, 4}};   // (25 = ML_EXT: ml_match only)
-    VkSpecializationInfo mlSi[2 * kMlNets * 5 + 2 * MLV_COUNT]{};
+    VkSpecializationInfo mlSi[2 * 5 + 2]{};
     if (mlearned()) {
 #ifdef FG_HAVE_ML
         for (int i = P_DOWN; i <= P_PIXFIELD; i++) spv[i].sp = Spv{};
@@ -1910,28 +1873,21 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_ML_REDUCE].sp = SPV(ml_reduce);
         spv[P_ML_PYR].sp = SPV(ml_pyr);
         spv[P_ML_OUT].sp = SPV(ml_out);
-        spv[P_ML_PLANES] = {cs.mlPlanes, spec};   // the variants' flow-res planes (read colour: the format's own variant)
-        spv[P_ML_FEAT].sp = SPV(ml_feat);         // the features variant's extractor
         spv[P_ML_ZERO].sp = SPV(ml_zero);         // Settings::learnedZeroTest (ml_out's pass with the zero-motion test)
         spv[P_ML_GUARD] = {cs.mlGuard, spec};     // Settings::learnedStaticGuard (reads and writes colour: the format's variant)
         for (int half = 0; half < 2; half++) {
-            for (int v = 0; v < MLV_COUNT; v++) {
-                const int jm = 2 * kMlNets * 5 + MLV_COUNT * half + v;
-                mlSpec[jm].half = half;
-                mlSpec[jm].ext = kMlVariants[v].ext;
-                mlSi[jm] = {6, mlEnt, sizeof(MlSpec), &mlSpec[jm]};
-                spv[mlMatchPipe(half, v)] = {SPV(ml_match), &mlSi[jm]};
-            }
-            for (int net = 0; net < kMlNets; net++) {
-                const int gw = mlWidth((LearnedNet)net) / 4, gi = groups4(mlVariant((LearnedNet)net).inCh);
-                // the variant's input channels (14 padded to 16, colour 25 to 28) -> w, w -> w (each whole and split), w -> 2 (padded to 4)
-                const MlSpec shapes[5] = {{gi, gw, 0, gw, half, 0}, {gi, gw, 0, 1, half, 0}, {gw, gw, 0, gw, half, 0}, {gw, gw, 0, 1, half, 0}, {gw, 1, 1, 1, half, 0}};
-                for (int k = 0; k < 5; k++) {
-                    const int j = 5 * (kMlNets * half + net) + k;
-                    mlSpec[j] = shapes[k];
-                    mlSi[j] = {6, mlEnt, sizeof(MlSpec), &mlSpec[j]};
-                    spv[P_ML_CONV + j] = {SPV(ml_conv), &mlSi[j]};
-                }
+            const int jm = 2 * 5 + half;
+            mlSpec[jm].half = half;
+            mlSi[jm] = {6, mlEnt, sizeof(MlSpec), &mlSpec[jm]};
+            spv[mlMatchPipe(half)] = {SPV(ml_match), &mlSi[jm]};
+            const int gw = mlWidth() / 4, gi = groups4(kMlNetInfo[0].inCh);
+            // the input channels (14 padded to 16) -> w, w -> w (each whole and split), w -> 2 (padded to 4)
+            const MlSpec shapes[5] = {{gi, gw, 0, gw, half, 0}, {gi, gw, 0, 1, half, 0}, {gw, gw, 0, gw, half, 0}, {gw, gw, 0, 1, half, 0}, {gw, 1, 1, 1, half, 0}};
+            for (int k = 0; k < 5; k++) {
+                const int j = 5 * half + k;
+                mlSpec[j] = shapes[k];
+                mlSi[j] = {6, mlEnt, sizeof(MlSpec), &mlSpec[j]};
+                spv[P_ML_CONV + j] = {SPV(ml_conv), &mlSi[j]};
             }
         }
         size_t words = 0;
@@ -2011,8 +1967,8 @@ bool Interpolator::Impl::motionSized(MotionGroup& g) {
     return false;
 }
 
-// Learned's size-dependent buffers (MLB_*) for the selected net: the state once per size (grown for a net variant with extra planes), the
-// activations grown whenever the net needs more groups than they hold (the outgrown buffer may still be in a pending record: mlGrave, freed with the size). False = an
+// Learned's size-dependent buffers (MLB_*): the state once per size, the
+// activations grown whenever the storage needs more bytes than they hold (the outgrown buffer may still be in a pending record: mlGrave, freed with the size). False = an
 // allocation failed (what this call allocated is freed; an existing smaller activation buffer stays).
 bool Interpolator::Impl::mlSized() {
     MotionGroup& g = mo[(int)MotionVersion::Learned];
@@ -2021,12 +1977,6 @@ bool Interpolator::Impl::mlSized() {
         g.bufs.resize(MLB_COUNT);
         mlActBytes = 0;
         if (!allocBuf(g.bufs[MLB_STATE], L.stateBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) { g.bufs.clear(); return false; }
-        mlStateBytes = L.stateBytes;
-    } else if (mlStateBytes < L.stateBytes) {   // a net variant with extra planes (colour) after one without: the state grows (nothing in it lives across estimates)
-        UiBuf ns;
-        if (!allocBuf(ns, L.stateBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return false;
-        mlGrave.push_back(g.bufs[MLB_STATE]);
-        g.bufs[MLB_STATE] = ns;
         mlStateBytes = L.stateBytes;
     }
     if (mlActBytes >= L.actBytes) return true;
@@ -2041,7 +1991,7 @@ bool Interpolator::Impl::mlSized() {
     return true;
 }
 
-// Learned: the weights of both nets into mlWeights, once after it was created (CmdUpdateBuffer, at most 64 KiB per command).
+// Learned: the weights of the net into mlWeights, once after it was created (CmdUpdateBuffer, at most 64 KiB per command).
 // Recorded between the barriers of a counter clear (Rec::clearCounters: a transfer write ordered after every earlier record and before
 // this one's passes). No-op unless pending.
 void Interpolator::Impl::mlUpload(VkCommandBuffer cb) {
@@ -2331,15 +2281,11 @@ bool Interpolator::debugLearnedLayout(DebugLearnedLayout& l) const {
     const Impl& I = *m;
     const MlLayout L = mlLayout(I.W, I.H, I.fw, I.fh, I.set);
     l.half = I.set.learnedHalf;
-    l.fw = (uint32_t)I.fw; l.fh = (uint32_t)I.fh; l.pw = (uint32_t)L.pw; l.ph = (uint32_t)L.ph; l.width = (uint32_t)mlWidth(I.set.learnedNet);
+    l.fw = (uint32_t)I.fw; l.fh = (uint32_t)I.fh; l.pw = (uint32_t)L.pw; l.ph = (uint32_t)L.ph; l.width = (uint32_t)mlWidth();
     const VkDeviceSize st = 0;   // the state copy (shaders/ml_common.glsl), then the activations
     VkDeviceSize o = 0;
     for (int k = 0; k < kMlLevels; k++) { l.pyrOff[k] = st + o * 4; o += 2 * (VkDeviceSize)(L.pw >> k) * (L.ph >> k); }
     for (int k = 0; k < kMlLevels; k++) { l.hOff[k] = st + o * 4; o += 2 * (VkDeviceSize)(L.pw >> k) * (L.ph >> k); }
-    l.ext = (uint32_t)L.ext;
-    for (int k = 0; k < kMlLevels; k++) { l.xOff[k] = st + o * 4; o += 2 * (VkDeviceSize)L.ext * (L.pw >> k) * (L.ph >> k); }
-    l.scr = (uint32_t)L.scr;
-    for (int k = 0; k < kMlLevels; k++) { l.sOff[k] = st + o * 4; o += 2 * (VkDeviceSize)L.scr * (L.pw >> k) * (L.ph >> k); }
     l.actOff[0] = (st + L.stateBytes + 15) & ~(VkDeviceSize)15;
     l.actOff[1] = l.actOff[0] + (VkDeviceSize)L.r0 * L.n0 * L.elem;
     l.size = l.actOff[0] + L.actBytes;
@@ -3310,15 +3256,12 @@ void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
 #ifdef FG_HAVE_ML
     Rec r(*this, cb);
     const MlLayout L = mlLayout(W, H, fw, fh, set);
-    const int net = (int)set.learnedNet;
     const bool half = set.learnedHalf;
-    uint32_t base = 0;   // the net's start in mlWeights (vec4 units): the nets are uploaded back to back in LearnedNet order
-    for (int k = 0; k < net; k++) base += (uint32_t)(kMlNet[k].words / 4);
     const int r1 = L.r0 * L.n0;                                             // activation region R1 (vec4 offset)
     const Level& l0 = lv[0];
     MLPC m{};
     m.W = (int)W; m.H = (int)H; m.fw = fw; m.fh = fh; m.pw = L.pw; m.ph = L.ph;
-    m.offYa = l0.offA; m.offYc = l0.offC; m.bw = l0.bw; m.bh = l0.bh; m.pf = fieldPF; m.dupDiff = kMlDupDiff; m.ext = L.ext; m.nin = L.nin; m.feat = L.scr != 0;
+    m.offYa = l0.offA; m.offYc = l0.offC; m.bw = l0.bw; m.bh = l0.bh; m.pf = fieldPF; m.dupDiff = kMlDupDiff;
     auto run = [&](Pipe p, uint32_t gx, uint32_t gy, uint32_t gz = 1) {
         CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, mg().pipes[p]);
         CmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MLPC), &m);
@@ -3340,41 +3283,25 @@ void Interpolator::Impl::mlEstimate(VkCommandBuffer cb) {
     run(P_ML_REDUCE, 1, 1);
     r.cbar();
     r.stamp("duplicate test");
-    if (L.nin) {   // the net variant's flow-res planes of both frames (colour: Cb, Cr; features: R, G, B), before the pyramid pads and scales them
-        run(P_ML_PLANES, divUp(fw, 8), divUp(fh, 8));
-        r.cbar();
-        r.stamp("net variant planes");
-    }
     run(P_ML_PYR, (uint32_t)L.pw / 16, (uint32_t)L.ph / 16);
     r.cbar();
     r.stamp("net pyramid");
-    if (L.scr) {   // features: the extractor on every pooled RGB level of both frames (not cached across pairs: a pair's c is the next pair's a, but a
-                   // view handle does not say the content is the same)
-        for (int lvl = 0; lvl < kMlLevels; lvl++) {
-            m.lvl = lvl;
-            m.wOff = (int)(base + kMlNet[net].extr[0]); m.bOff = (int)(base + kMlNet[net].extr[1]);
-            m.xwOff = (int)(base + kMlNet[net].extr[2]); m.xbOff = (int)(base + kMlNet[net].extr[3]);
-            run(P_ML_FEAT, divUp(L.pw >> lvl, 16), divUp(L.ph >> lvl, 16), 2);
-        }
-        r.cbar();
-        r.stamp("net feature extractor");
-    }
     static const char* lvNames[kMlLevels] = {"net level 0", "net level 1", "net level 2", "net level 3", "net level 4"};
     for (int lvl = kMlLevels - 1; lvl >= 0; lvl--) {
         const uint32_t gx = divUp(L.pw >> lvl, 16), gy = divUp(L.ph >> lvl, 16);
         const bool split = gx * gy < kMlSplitTiles;   // a small level: one output group per workgroup (ml_conv.comp)
         m.lvl = lvl;
-        m.actOut = 0;   // the net's input (14 channels, colour 25) -> R0
-        run(mlMatchPipe(half, mlVariantOf(net)), gx, gy);
+        m.actOut = 0;   // the net's input (14 channels) -> R0
+        run(mlMatchPipe(half), gx, gy);
         r.cbar();
         if (stop(lvl, 0)) return;
         for (int k = 0; k < kMlLayers; k++) {   // R0 -> R1 -> R0 -> R1 -> R0 -> the field
-            m.wOff = (int)(base + kMlNet[net].table[lvl][k][0]);
-            m.bOff = (int)(base + kMlNet[net].table[lvl][k][1]);
+            m.wOff = (int)kMlNet[0].table[lvl][k][0];
+            m.bOff = (int)kMlNet[0].table[lvl][k][1];
             m.actIn = k % 2 ? r1 : 0;
             m.actOut = k % 2 ? 0 : r1;
             const int shape = k == 0 ? 0 : k == kMlLayers - 1 ? 2 : 1;
-            run(mlConvPipe(half, net, shape, split), gx, gy, shape == 2 || !split ? 1 : (uint32_t)L.g);
+            run(mlConvPipe(half, shape, split), gx, gy, shape == 2 || !split ? 1 : (uint32_t)L.g);
             r.cbar();
             if (stop(lvl, k + 1)) return;
         }
