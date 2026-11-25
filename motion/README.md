@@ -302,7 +302,7 @@ Round 3 is the last round. Numbers are from the final code (the same V3 referenc
 
 Synthetic (72 pairs): mean EPE 3.86 -> 0.95, p95 14.95 -> 3.62, textured 2.06 -> 0.83, above 4 px 23.0% -> 4.2%, false still 5.3% -> 0.2%, blk16 0.124 -> 0.076, PSNR 38.81 -> 39.55, edge 34.01 -> 34.62. chase l EPE 10.15 -> 4.62, zoom_o l 7.53 -> 1.1. Every one of the 24 rows has a lower EPE. Real pairs (23): all +0.11 dB (edge +0.10); forza +0.11 / +0.09, battlefield +0.38, minecraft120 +0.09 / +0.04, cs2 +0.00 (blk16 .182 -> .193). No group loses.
 
-Cost on the forza real pair, 1080p, back-to-back, 3 runs each: 2x V3 0.95 ms, V3.5 1.47 ms (+0.52); 3x 1.18 / 1.69; 4x 1.42 / 1.90.
+Cost before the cheaper schedule (task 169, see "V3.5 cheaper"), on the forza real pair, 1080p, back-to-back, 3 runs each: 2x V3 0.95 ms, V3.5 1.47 ms (+0.52); 3x 1.18 / 1.69; 4x 1.42 / 1.90.
 
 ### Rims of still foreground objects (the known loss)
 
@@ -388,7 +388,7 @@ Verdict: V3.5 gains about +0.09 dB over V3 under either learned blend on the hel
 
 Seven formats (Rgba8, Bgra8, Rgb10, F16, F16Lin, Nv12, P010) x 2x / 3x / 4x x six sizes (1920x1080, 2560x1440, 1440x1080, 1280x720, 1366x768, 1367x769): 252 runs, none failed; Bgra8 equals Rgba8 byte for byte at both values; the float formats produce no non-finite, negative or over-range value. The PSNR of a format against Rgba8 moves by more than 0.3 dB in 113 of 324 comparisons (87 up, 26 down by 0.3 to 0.67 dB, mostly Nv12), because the estimate changed where the formats' own tone and chroma paths disagree most (on `tp_m04` Rgb10 / F16 against Rgba8 rise from 33.6 to 37.3 dB: the formats agree better with V3.5). This is a shift of what the different formats do with a different field, not a defect of one format.
 
-Cost (`fgtest --bench 200`, RX 7900 XTX, median of 3): V3.5 adds 0.48 to 0.52 ms per pair at 1080p and 0.62 to 0.65 ms at 1440p. 1080p 2x rule blend: Rgba8 1.470 ms, Rgb10 1.496, Nv12 1.502 (a hair above the 1.5 ms limit). First use with an empty shader cache: 1.16 s (V3) -> 1.43 s; the first `setSettings` 0 -> 1 stalls 275 ms with an empty cache and 0.33 ms with a warm one.
+Cost before task 169 (`fgtest --bench 200`, RX 7900 XTX, median of 3; now +0.30 to +0.33 ms at Quality, see "V3.5 cheaper"): V3.5 adds 0.48 to 0.52 ms per pair at 1080p and 0.62 to 0.65 ms at 1440p. 1080p 2x rule blend: Rgba8 1.470 ms, Rgb10 1.496, Nv12 1.502 (a hair above the 1.5 ms limit). First use with an empty shader cache: 1.16 s (V3) -> 1.43 s; the first `setSettings` 0 -> 1 stalls 275 ms with an empty cache and 0.33 ms with a warm one.
 
 ### Weak points (stated, not fixed)
 
@@ -501,3 +501,51 @@ python motion/ground.py --pairs pairs.json --truth TRUTHDIR --out OUT \
 python motion/maps.py --ground OUT --truth TRUTHDIR --fgtest NEW --ref-fgtest TODAY --out SHEETS --pairs pairs.json --only name,name,...   # sheets 1800 px wide: prev | V3 | today; new | truth arrows (green: within 4 px) of new | of today; real | generated-vs-real error of today | of new
 python motion/study_match.py --list pairs.json --truth TRUTHDIR --out study.pkl [--light up|down]; python motion/study_table.py study.pkl --md table.md
 ```
+
+## V3.5 cheaper (task 169)
+
+V3.5's added GPU time over V3 at flowScale 2 / subpixel on (Quality) was +0.43 ms at 1440x1080 and +0.46 ms at 1080p, at flowScale 4 / subpixel off (Performance) +0.24 / +0.28 ms. The goal was +0.25 / +0.15 ms. Reached: **+0.30 / +0.33 ms Quality, +0.15 / +0.20 ms Performance** (`fgtest --bench 200`, Rgba8 2x, median of 3 alternating runs, noise +-0.03 ms). The target is met only for Performance at 1440x1080; the schedule below is the cheapest one that passes the quality gates.
+
+What was changed (`gpu/V3.md` section 3.18 "Cheaper" has the schedule as built and the cost table for 1440x1080, 1080p and 1440p at 2x / 3x / 4x): `v35_reg` runs one Jacobi step at every level except the one below the top (two), 12 instead of 15 added dispatches (Performance 9 instead of 11); the regularised records of a one-step level stay in slot 0, so `v3_search` is compiled once more with `-DV35=1` (`v3_search_35`) to read its parent from there; `v35_reg` itself got a cache for the blocks' static data, a branch-free window cost and one window cost less, with a bit-identical output (0.32 -> 0.26 ms for the old schedule). The two passes that remain expensive are the single-workgroup `v35_stats` (0.09 ms at Quality) and `v35_rgn` (0.05 ms): latency-bound, and each level of them carries a group (minecraft120 / forza / cs2) of the quality gates. The pass list grows by one compile variant of an existing source (five pipelines instead of four). The debug dump of the level stages L1..L3 shows the field before the regularisation for the one-step levels.
+
+Every variant (cost over V3 at 2x; quality at the preset's own flowScale on the quick set: 72 known-motion pairs for the EPE, 23 held-out + scenes_all pairs for the dB, the blobs of the non-driving real pairs; "gates" = no game group below V3, no non-driving pair more than 0.10 dB below V3, at least 70 % of today's gain per group with a gain of 0.05 dB or more, EPE lower than V3 in all 24 rows, blobs at most today +3 % and no pair above V3's count where today is below it):
+
+### Quality preset (flowScale 2, subpixel on): added cost over V3 and the quality quick-set
+| variant | steps per level 0.. / stats levels / rgn levels | dispatches | +ms 1440x1080 | +ms 1080p | EPE mean | battlefield / cs2 / forza / minecraft120 / scene (dB vs V3) | pairs < -0.10 | blobs vs today | blob pairs over V3 | gates |
+|---|---|---|---|---|---|---|---|---|---|---|
+| today: today: 2 steps at levels 1..4, 1 at 0; stats + rgn at 3, 2, 1 | 122220; 123; 123 | 15 | +0.421 | +0.468 | 0.963 | +0.496 / -0.004 / +0.100 / +0.092 / +0.068 | 0 | 1.000 | 0 | ok |
+| v_opt: today's schedule, shaders only optimised (static data cache, branch-free window cost, one window cost less): output bytes identical | 122220; 123; 123 | 15 | +0.357 | +0.386 | same bytes as today |  |  |  |  |  |
+| a1: 1 step at every level | 111110; 123; 123 | 11 | +0.291 | +0.303 | 0.988 | +0.409 / +0.006 / +0.087 / +0.077 / +0.066 | 1 | 1.034 | 1 | FAIL |
+| a2: no reg at level 4 | 122200; 123; 123 | 13 | +0.354 | +0.397 | 0.999 | +0.422 / -0.002 / +0.096 / +0.034 / +0.065 | 1 | 1.023 | 1 | FAIL |
+| a3: no reg at levels 4, 3 | 122000; 123; 123 | 11 | +0.280 | +0.339 | 1.150 | +0.347 / +0.009 / +0.078 / +0.009 / +0.065 | 1 | 1.040 | 2 | FAIL |
+| a4: stats + rgn at 2, 1 only | 122220; 12; 12 | 13 | +0.337 | +0.374 | 1.039 | +0.570 / +0.041 / +0.117 / +0.110 / +0.062 | 2 | 0.947 | 2 | FAIL |
+| a5: stats + rgn at 1 only | 122220; 1; 1 | 11 | +0.273 | +0.257 | 1.213 | +0.491 / -0.064 / +0.115 / +0.127 / +0.064 | 2 | 0.945 | 3 | FAIL |
+| a7: 1 step at levels 1, 2; 2 steps at 3, 4 | 111220; 123; 123 | 13 | +0.294 | +0.334 | 0.980 | +0.492 / +0.002 / +0.088 / +0.087 / +0.068 | 0 | 1.004 | 0 | ok |
+| a8: 2 steps at 1, 2; 1 step at 3, 4 | 122110; 123; 123 | 13 | +0.336 | +0.390 | 0.971 | +0.400 / +0.006 / +0.100 / +0.081 / +0.066 | 1 | 1.031 | 1 | FAIL |
+| a9: a7 + stats + rgn at 2, 1 only | 111220; 12; 12 | 11 | +0.293 | +0.328 | 1.062 | +0.571 / +0.036 / +0.117 / +0.106 / +0.062 | 2 | 0.950 | 1 | FAIL |
+| a10: a7 without the level-0 step | 011220; 123; 123 | 12 | +0.334 | +0.375 | 4.562 | +0.231 / +0.067 / -0.333 / +0.064 / -0.060 | 6 | 1.276 | 17 | FAIL |
+| a11: a7 + stats + rgn at 1 only | 111220; 1; 1 | 9 | +0.238 | +0.253 | 1.243 | +0.485 / -0.059 / +0.114 / +0.126 / +0.064 | 2 | 0.948 | 4 | FAIL |
+| r1: a7, rgn at 2, 1 only (stats at 3, 2, 1) | 111220; 123; 12 | 12 | +0.304 | +0.344 | 0.963 | +0.590 / -0.007 / +0.071 / +0.033 / +0.068 | 0 | 1.014 | 2 | FAIL |
+| r2: a7, rgn at 1 only | 111220; 123; 1 | 11 | +0.302 | +0.306 | 0.965 | +0.532 / +0.008 / +0.043 / +0.031 / +0.068 | 0 | 1.034 | 4 | FAIL |
+| z1: a7, rgn at 3 and 1 only | 111220; 123; 13 | 12 | +0.302 | +0.357 | 0.995 | +0.496 / +0.006 / +0.085 / +0.089 / +0.068 | 0 | 1.015 | 1 | ok |
+| z2: a7, stats + rgn at 3 and 1 only | 111220; 13; 13 | 11 | +0.256 | +0.311 | 1.031 | +0.434 / +0.006 / +0.061 / +0.089 / +0.068 | 0 | 1.013 | 1 | FAIL |
+| m1: 1 step at 1, 2, 3; 2 steps at 4 is replaced by 1 (1 step at 4) | 111210; 123; 123 | 12 | +0.308 | +0.351 | 0.981 | +0.492 / +0.001 / +0.088 / +0.087 / +0.066 | 1 | 1.032 | 1 | FAIL |
+| m2: 1 step at 1, 2, 3; 2 steps at level 4 only = THE COMMITTED SCHEDULE | 111120; 123; 123 | 12 | +0.309 | +0.338 | 0.986 | +0.409 / +0.007 / +0.087 / +0.077 / +0.068 | 0 | 1.006 | 0 | ok |
+| final: committed build (m2 as built, no knobs) | 111120; 123; 123 | 12 | +0.304 | +0.318 | 0.986 | +0.409 / +0.007 / +0.087 / +0.077 / +0.068 | 0 | 1.006 | 0 | ok |
+
+### Performance preset (flowScale 4, subpixel off)
+| variant | steps per level 0.. / stats levels / rgn levels | dispatches | +ms 1440x1080 | +ms 1080p | EPE mean | battlefield / cs2 / forza / minecraft120 / scene (dB vs V3) | pairs < -0.10 | blobs vs today | blob pairs over V3 | gates |
+|---|---|---|---|---|---|---|---|---|---|---|
+| today: today: 2 steps at levels 1..3, 1 at 0; stats + rgn at 2, 1 | 12220; 12; 12 | 11 | +0.254 | +0.253 | 1.352 | +0.336 / +0.039 / +0.079 / +0.076 / -0.016 | 3 | 1.000 | 0 | FAIL |
+| v_opt: today's schedule, optimised shaders only | 12220; 12; 12 | 11 | +0.211 | +0.248 | same bytes as today |  |  |  |  |  |
+| p0: same with the env knobs (control) | 12220; 12; 12 | 11 | +0.233 | +0.218 | same bytes as today |  |  |  |  |  |
+| p1: 1 step at 1, 2; 2 steps at 3 (committed) | 11120; 12; 12 | 9 | +0.176 | +0.197 | 1.381 | +0.328 / +0.035 / +0.084 / +0.069 / -0.016 | 3 | 1.003 | 1 | FAIL |
+| p2: p1 + stats + rgn at 1 only | 11120; 1; 1 | 7 | +0.125 | +0.163 | 1.521 | +0.342 / -0.008 / +0.128 / +0.081 / -0.049 | 4 | 0.991 | 2 | FAIL |
+| p3: 1 step at 3 as well | 11110; 12; 12 | 8 | +0.166 | +0.183 | 1.384 | +0.328 / +0.035 / +0.084 / +0.069 / -0.015 | 3 | 1.004 | 1 | FAIL |
+| final: committed build | 11120; 12; 12 | 9 | +0.179 | +0.174 | 1.381 | +0.328 / +0.035 / +0.084 / +0.069 / -0.016 | 3 | 1.003 | 1 | FAIL |
+
+Quality-preset gates, committed schedule against today and V3: EPE lower than V3 in 24 / 24 rows, mean 0.986 px (today 0.963; limit 1.20); battlefield +0.41 dB (today +0.50, 82 %), forza +0.087 (+0.100, 87 %), minecraft120 +0.077 (+0.092, 84 %), cs2 +0.007 (-0.004), scene +0.068 (+0.068); no pair more than 0.10 dB below V3; blobs 50554 against today's 50241 (+0.6 %) and V3's 51985, no pair above V3 where today is below. Performance preset: the same as today's Performance within the noise of the gates; today's Performance already has three pairs 0.2 to 0.3 dB below V3 (`battlefield_003240_60t`, `tp_n153_30fps`, `tp_n153_60fps`), and one battlefield pair has 3 blobs more than V3 where today's has not.
+
+What the next 0.1 ms would cost: see the last paragraph of section 3.18 "Cheaper" in `gpu/V3.md`: removing `v35_stats` + `v35_rgn` at level 3 (-0.05 ms) already leaves two pairs 0.10 dB below V3; at levels 3 and 2 (-0.1 ms) cs2 goes to -0.06 dB; dropping the second step at the level below the top loses `fps_cs2c_960` 0.5 dB; dropping the level-0 step breaks every pair.
+
+The census candidate of the previous section (`census_candidate/census_candidate.patch`, not applied) names its search compile variant `v3_search_35` and its pipeline `P_V35_SEARCH` as well: both now exist in the library for the schedule above, so the patch needs these two hunks adapted (its search shader changes would go into the `-DV35` branch of `v3_search.comp` that now exists) before it applies.

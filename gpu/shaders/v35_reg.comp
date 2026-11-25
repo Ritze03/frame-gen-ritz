@@ -1,7 +1,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 // MotionVersion::V3, Settings::v3Motion = 1 (V3.5, round 1): confidence-weighted regularisation of one level's block field. One Jacobi step: reads the block records of
-// slot pc.iter (a) of level pc.lvl and writes slot 1 - a (the callers run it twice, a -> b and b -> a, so the result ends in a). Dispatch: tiles of 8x8 blocks,
+// slot pc.iter (a) of level pc.lvl and writes slot 1 - a (the level below the top runs it twice, a -> b and b -> a; every other level once, its result then stays in slot 1 - a and
+// the search below reads its parent's records from there: v3_search_35 with mode bit 1). The mode bits M35_CW / M35_CR (below) pass the blocks' static data from a level's first step to its second. Dispatch: tiles of 8x8 blocks,
 // ceil(gw / 8) x ceil(gh / 8) x 2 (z = direction), workgroup 64, one block per thread; the tile and a 2-block apron are staged in shared memory.
 // What a block's own search proves: its texture, from the structure tensor of the high-pass features over the block (sqrt of its two eigenvalues: r1 along the
 // dominant gradient n, r2 along the other direction t), times how well it matched (cost relative to the texture) and the level's ambiguity measure. A flat road or sky
@@ -25,7 +26,9 @@ const vec2 REJ2 = vec2(0.05, 0.02);     // the same for the outlier rule (R2): t
 const float COLS = 12.0;              // colour distance (L1 over Y Cb Cr) at which the vote weight is 1/e
 const float WCAM = 0.6;               // the camera model's vote when there are no confident neighbours (fades out as their weight grows to 1.5)
 const float MODEL_SUP = 0.3;          // a block whose vector fewer than this share of the neighbour weight supports takes the model's (when the window agrees)
-const int M35_L0 = 1 << 20;           // level 0's single pass: reads slot 0, writes only the vector of slot 1
+const int M35_CW = 1 << 21;           // the first of a level's two steps: also writes the blocks' static data for the second
+const int M35_CR = 1 << 22;           // the second step: reads that data instead of computing it again
+const int M35_L0 = 1 << 20;          // level 0's single pass: reads slot 0, writes only the vector of slot 1
 const float AP_R1 = 0.6, AP_R2 = 0.15;   // an edge-only block: strong structure along one direction only
 const float HUD_EN = 2.0;             // the HUD hold (below): a block with at least this much detail (mean v3Detail; a flat block matches every vector and proves nothing)
 const float MMIN = 0.15;              // the summed weight below which a block keeps its vector
@@ -54,11 +57,12 @@ float winCost(const V3Lv L, int fOff, int dir, ivec2 b, vec2 v) {
     const vec2 mx = vec2(float(L.w - 1), float(L.h - 1));
     for (int k = 0; k < 16; k++) {   // every second pixel of the window (a flat or textured block alike: the comparison between vectors is what counts)
         const ivec2 x = wo + ivec2(2 * (k & 3), 2 * (k >> 2));
-        if (x.x < 0 || x.y < 0 || x.x >= L.w || x.y >= L.h) continue;
         const vec2 q = vec2(x) + v;
-        if (q.x < 0.0 || q.y < 0.0 || q.x > mx.x || q.y > mx.y) continue;
-        s += v3Term(v3FeatAt(L, fOff, dir, x), v3FeatBil(L, fOff, 1 - dir, q), dMu);
-        n += 1.0;
+        // (branch-free: every sample's loads are issued together, the invalid ones add exactly 0)
+        const bool ok = x.x >= 0 && x.y >= 0 && x.x < L.w && x.y < L.h && q.x >= 0.0 && q.y >= 0.0 && q.x <= mx.x && q.y <= mx.y;
+        const float t = v3Term(v3FeatC(L, fOff, dir, x), v3FeatBil(L, fOff, 1 - dir, q), dMu);
+        s += ok ? t : 0.0;
+        n += ok ? 1.0 : 0.0;
     }
     return n >= 8.0 ? s / n : 255.0;
 }
@@ -82,10 +86,24 @@ void main() {
         const int o = v3BlkIdx(L, dir, sa, b);
         const vec4 r = vec4(fl[o], fl[o + 1], fl[o + 2], fl[o + 3]);
         srec[idx] = r;
+        float r1, r2, en;
+        vec2 nv;
+        // the block's static data (12 floats, independent of the vectors) in the FD region of V3B_FLOW (free until v3_dense): the first step of a level writes it for its own tile, the second reads it
+        const int so = pc.fdOff + (L.blk * 3) / 2 + (dir * L.gw * L.gh + b.y * L.gw + b.x) * 12;
+        if ((pc.mode & M35_CR) != 0) {
+            scol[idx] = vec4(fl[so], fl[so + 1], fl[so + 2], fl[so + 3]);
+            nv = vec2(fl[so + 4], fl[so + 5]);
+            r1 = fl[so + 6]; r2 = fl[so + 7];
+            sax[idx] = vec4(nv, fl[so + 8], fl[so + 9]);
+            en = fl[so + 10];
+            sr1[idx] = r1;
+            sen[idx] = en;
+        } else {
         // the block's pixels (4 x 4 samples at stride bs / 4): colour, detail, structure tensor of the weighted channels
         const ivec2 x0 = b * bs;
         const int st = bs / 4;
-        float en = 0.0, n = 0.0, gxx = 0.0, gxy = 0.0, gyy = 0.0;
+        float n = 0.0, gxx = 0.0, gxy = 0.0, gyy = 0.0;
+        en = 0.0;
         vec3 col = vec3(0.0);
         for (int j = 0; j < 4; j++)
             for (int i = 0; i < 4; i++) {
@@ -107,13 +125,22 @@ void main() {
         const float tr = gxx + gyy, df = sqrt(max(0.25 * (gxx - gyy) * (gxx - gyy) + gxy * gxy, 0.0));
         const float l1 = 0.5 * tr + df, l2 = max(0.5 * tr - df, 0.0);
         // principal direction (the larger eigenvalue's eigenvector)
-        vec2 nv = abs(gxy) > 1e-9 ? normalize(vec2(l1 - gyy, gxy)) : (gxx >= gyy ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
-        const float r1 = smoothstep(G01.x, G01.y, sqrt(l1)), r2 = smoothstep(G01.x, G01.y, sqrt(l2));
+        nv = abs(gxy) > 1e-9 ? normalize(vec2(l1 - gyy, gxy)) : (gxx >= gyy ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
+        r1 = smoothstep(G01.x, G01.y, sqrt(l1)); r2 = smoothstep(G01.x, G01.y, sqrt(l2));
         const float bconf = (1.0 - smoothstep(CR.x, CR.y, r.z / (en + 2.0))) * (1.0 - 0.7 * r.w);
         scol[idx] = vec4(col, bconf * max(r2, 0.15 * r1));
         sr1[idx] = r1;
         sen[idx] = en;
         sax[idx] = vec4(nv, smoothstep(0.05, 0.45, r1), smoothstep(0.05, 0.45, r2));
+        if ((pc.mode & M35_CW) != 0) {
+            const ivec2 lq = ivec2(idx % 12, idx / 12);
+            if (all(greaterThanEqual(lq, ivec2(2))) && all(lessThan(lq, ivec2(10)))) {   // (the tile's own blocks)
+                fl[so] = col.x; fl[so + 1] = col.y; fl[so + 2] = col.z; fl[so + 3] = scol[idx].w;
+                fl[so + 4] = nv.x; fl[so + 5] = nv.y; fl[so + 6] = r1; fl[so + 7] = r2;
+                fl[so + 8] = sax[idx].z; fl[so + 9] = sax[idx].w; fl[so + 10] = en;
+            }
+        }
+        }
         if (l > 1 && r1 > AP_R1 && r2 < AP_R2) {
             // the aperture problem: an edge-only block measured its motion across the edge only; along the edge its vector is whatever the search propagated. Along the edge it takes
             // the camera model's vector (the across-edge part stays), where the window agrees (a still object's outline, parallax: it keeps its own). Before the vote, so
@@ -180,6 +207,7 @@ void main() {
     }
     mass += w[25];
     vec2 res = own.xy;
+    float cRes = -1.0;   // the window cost at res when it is known (the check below computed it)
 #ifdef V35_DIAG
     vec2 vRes = own.xy;
     bool r2Eval = false, r2Sup = false, r2Cost = false;
@@ -219,7 +247,7 @@ void main() {
         // textured block whose own vector is right, a thin or fast object, parallax: clearly worse, it keeps its own)
         if (dot(res - own.xy, res - own.xy) > 1e-6) {
             const float c0 = winCost(L, fOff, dir, b, own.xy), c1 = winCost(L, fOff, dir, b, res);
-            if (c1 > c0 + REJ.x + REJ.y * c0) res = own.xy;
+            if (c1 > c0 + REJ.x + REJ.y * c0) { res = own.xy; cRes = c0; } else cRes = c1;
         }
     }
     if (hasM && mq > 0.5 && length(res - v[25]) > 0.5 && !(holdOwn && length(v[25]) * exp2(float(l)) * float(pc.fscale) >= pc.hp[3])) {
@@ -234,7 +262,7 @@ void main() {
         r2Eval = true; r2Sup = !r2;
 #endif
         if (r2) {
-            const float cr = winCost(L, fOff, dir, b, res), cm = winCost(L, fOff, dir, b, v[25]);
+            const float cr = cRes >= 0.0 ? cRes : winCost(L, fOff, dir, b, res), cm = winCost(L, fOff, dir, b, v[25]);
             if (cm <= cr + REJ2.x + REJ2.y * cr) res = v[25];
 #ifdef V35_DIAG
             else r2Cost = true;

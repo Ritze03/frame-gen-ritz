@@ -76,6 +76,7 @@
 #include "v3_anchor_spv.h"
 #include "v3_guard_spv.h"
 #include "v3_dense_35_spv.h"
+#include "v3_search_35_spv.h"   // (V3.5: the block search reading its parent level's regularised records from slot 0 or 1, v3_search.comp with -DV35=1)
 #include "v35_reg_spv.h"
 #include "v35_stats_spv.h"
 #include "v35_rgn_spv.h"      // Settings::v3Motion = 1 (V3.5): the block field regularisation
@@ -626,7 +627,7 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, 
             P_V3_SEARCH_J, P_V3_SEARCH_TOP_J, P_V3_DENSE_J,   // (hook (j) v3ColourWindow: the search and dense passes built with the colour-window weights; the plain ones stay as they are)
             P_V3_SEARCH_TOP,   // (E1: the top level's exhaustive search, its own pipeline: its shared patch must not cost the other levels' occupancy)
             P_V3_ANCHOR, P_V3_GUARD,   // (task 104, Settings::v3Guard: created with the V2 estimate passes P_DOWN / P_V2_MEDHIST* / P_V2_SEARCH* / P_V2_REPICK / P_V2_CLEAN / P_V2_QFIELD in V3's group)
-            P_V35_REG, P_V35_DENSE, P_V35_STATS, P_V35_RGN,   // (Settings::v3Motion = 1, V3.5: created only while it is on, v35Ensure)
+            P_V35_REG, P_V35_DENSE, P_V35_STATS, P_V35_RGN, P_V35_SEARCH,   // (Settings::v3Motion = 1, V3.5: created only while it is on, v35Ensure)
             P_COUNT };
 // The match and conv pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF); convs per
 // shape (0 = first, 14 -> w; 1 = hidden, w -> w; 2 = last, w -> 2) and, but the last, whole or split (one output group per
@@ -1923,7 +1924,7 @@ bool Interpolator::Impl::motionEnsure() {
 // group is freed. False: a creation failed (what exists stays; nothing is half-used: the estimate checks every pipe it needs).
 bool Interpolator::Impl::v35Ensure() {
     MotionGroup& g = mo[(int)MotionVersion::V3];
-    const struct { Pipe p; Spv sp; } list[] = {{P_V35_REG, SPV(v35_reg)}, {P_V35_DENSE, SPV(v3_dense_35)}, {P_V35_STATS, SPV(v35_stats)}, {P_V35_RGN, SPV(v35_rgn)}};
+    const struct { Pipe p; Spv sp; } list[] = {{P_V35_REG, SPV(v35_reg)}, {P_V35_DENSE, SPV(v3_dense_35)}, {P_V35_STATS, SPV(v35_stats)}, {P_V35_RGN, SPV(v35_rgn)}, {P_V35_SEARCH, SPV(v3_search_35)}};
     for (const auto& e : list)
         if (!g.pipes[e.p] && !makePipe(e.sp, layout, g.pipes[e.p], nullptr)) return false;
     return true;
@@ -3122,6 +3123,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
             static const char* const lvNames[] = {"level 0 (finest)", "level 1", "level 2", "level 3", "level 4", "level 5", "level 6", "level 7", "level 8", "level 9",
                                                   "level 10", "level 11", "level 12", "level 13", "level 14", "level 15"};
             static const char* const topName = "level (top)";
+            int v35Fin[16] = {};   // V3.5: the slot that holds each level's final block records (the search's own: 1 on the levels in between, else 0)
             for (int l = V.n - 1; l >= 0; l--) {
                 V3PC sv = v;
                 sv.lvl = l; sv.lw = V.w[l]; sv.lh = V.h[l]; sv.gw = V.gw[l]; sv.gh = V.gh[l];
@@ -3129,7 +3131,9 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
                 const int its = (l >= 1 && l < V.n - 1) ? 2 : 1;
                 for (int it = 0; it < its; it++) {
                     sv.iter = it;
-                    r.runV3(l == V.n - 1 ? (hookJ ? P_V3_SEARCH_TOP_J : P_V3_SEARCH_TOP) : (hookJ ? P_V3_SEARCH_J : P_V3_SEARCH), sv, V.gw[l], V.gh[l], 2);   // (the top level: exhaustive, its own pipeline)
+                    V3PC sq = sv;
+                    if (v35 && l + 1 < V.n) sq.mode = (l + 1 < V.n - 1 && v35Fin[l + 1] == 0) ? 2 : 0;   // the parent level's regularised slot (V3.5's search variant)
+                    r.runV3(l == V.n - 1 ? (hookJ ? P_V3_SEARCH_TOP_J : P_V3_SEARCH_TOP) : v35 ? P_V35_SEARCH : (hookJ ? P_V3_SEARCH_J : P_V3_SEARCH), sq, V.gw[l], V.gh[l], 2);   // (the top level: exhaustive, its own pipeline)
                     r.cbar();
                 }
                 r.stamp(l == V.n - 1 && V.n > 1 ? topName : lvNames[l]);
@@ -3151,14 +3155,20 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
                         r.cbar();
                         r.stamp("stats");
                     }
-                    // the level's block field regularised (two Jacobi steps: its final slot -> the other -> back; level 0: one step, slot 0 (V3's result) -> slot 1, the dense pass offers both)
-                    for (int k = 0; k < ((l + 1 == V.n && V.n > 3) ? 0 : l == 0 ? 1 : 2); k++) {   // the top level: a handful of blocks, a dispatch costs more than it gains
+                    // the level's block field regularised, one Jacobi step per dispatch: level 0 (slot 0, V3's result -> slot 1, the dense pass offers both) and every level but the one
+                    // below the top make one step (the level's final slot -> the other; the search below is told which slot holds the result, v35Fin), the level below the top two
+                    // (final slot -> the other -> back, the second step reads the blocks' static data the first one wrote); the top level (a handful of blocks) none
+                    const int nReg = (l + 1 == V.n && V.n > 3) ? 0 : l == 0 ? 1 : (V.n <= 3 || l + 2 == V.n) ? 2 : 1;
+                    int cur = fin;
+                    for (int k = 0; k < nReg; k++) {
                         V3PC rv = sv;
-                        rv.mode = l == 0 ? (1 << 20) : 0;
-                        rv.iter = k == 0 ? fin : 1 - fin;
+                        rv.mode = l == 0 ? (1 << 20) : nReg >= 2 ? (k == 0 ? (1 << 21) : (1 << 22)) : 0;
+                        rv.iter = cur;
+                        cur = 1 - cur;
                         r.runV3(P_V35_REG, rv, divUp(V.gw[l], 8), divUp(V.gh[l], 8), 2);
                         r.cbar();
                     }
+                    v35Fin[l] = cur;
                     r.stamp("reg");
                 } else if (V.n >= 3 && l == std::max(1, V.n - 3)) {   // the dominant motions and the camera from level LH (section 3.7)
                     r.runV3(P_V3_STATS, sv, 1, 1, 1);

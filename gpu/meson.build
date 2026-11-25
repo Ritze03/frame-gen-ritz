@@ -73,13 +73,13 @@ v3j_gen = generator(glslang,
   arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                '-DV3J=1', '--vn', '@BASENAME@_j_spv', '-o', '@OUTPUT@', '@INPUT@'])
 v3j_shaders = v3j_gen.process('shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp')
-# MotionVersion::V3 Settings::v3Motion = 1 (V3.5): the dense pass with -DV35=1, into <name>_35_spv (v3_dense_35). The plain builds keep their SPIR-V.
+# MotionVersion::V3 Settings::v3Motion = 1 (V3.5): the dense pass and the block search with -DV35=1, into <name>_35_spv (v3_dense_35, v3_search_35). The plain builds keep their SPIR-V.
 v35_gen = generator(glslang,
   output : '@BASENAME@_35_spv.h',
   depfile : '@BASENAME@_35_spv.h.d',
   arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                '-DV35=1', '--vn', '@BASENAME@_35_spv', '-o', '@OUTPUT@', '@INPUT@'])
-v35_shaders = v35_gen.process('shaders/v3_dense.comp')
+v35_shaders = v35_gen.process('shaders/v3_dense.comp', 'shaders/v3_search.comp')
 # MotionVersion::V3 hook (l) (Settings::v3DetailSplit): the synthesis with the detail split, -DV3L=1, into v3_synth_l_spv (Rgba8 / Bgra8; the other formats'
 # variants are built below as v3_synth_l_<fmt>_spv). The plain v3_synth builds keep their SPIR-V (the switch off costs nothing).
 v3l_gen = generator(glslang,

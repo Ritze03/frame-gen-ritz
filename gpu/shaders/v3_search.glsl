@@ -354,7 +354,11 @@ void main() {
 #else
     if (l >= 1 && pc.iter == 0) {
         const V3Lv Lp = v3Lv(l + 1);
+#ifdef V35
+        const int pfin = (l + 1 == nLev - 1) ? 0 : (pc.mode & 2) != 0 ? 0 : 1;   // V3.5: bit 1 of the mode = the parent level's regularisation ended in slot 0
+#else
         const int pfin = (l + 1 == nLev - 1) ? 0 : 1;
+#endif
         const ivec2 pb = clamp(blk >> 1, ivec2(0), ivec2(Lp.gw - 1, Lp.gh - 1));
         const ivec2 sg = ivec2((blk.x & 1) != 0 ? 1 : -1, (blk.y & 1) != 0 ? 1 : -1);
         if (tid == 0) refV = parentVec(Lp, pfin, pb);
@@ -431,7 +435,11 @@ void main() {
         }
     } else {   // level 0 below a coarser level
         const V3Lv Lp = v3Lv(1);
+#ifdef V35
+        const int pfin = nLev == 2 ? 0 : (pc.mode & 2) != 0 ? 0 : 1;
+#else
         const int pfin = nLev == 2 ? 0 : 1;
+#endif
         const ivec2 pb = clamp(blk, ivec2(0), ivec2(Lp.gw - 1, Lp.gh - 1));
         if (tid == 0) refV = parentVec(Lp, pfin, pb);
         if (tid < 16) {

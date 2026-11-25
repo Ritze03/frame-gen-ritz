@@ -2,7 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 // MotionVersion::V3, build step E1 (gpu/V3.md section 3.5): the candidate-driven coarse-to-fine block search, both directions (z = 0: F01, 1: F10),
 // one workgroup (64 threads) per block, dispatch gw_l x gh_l x 2 per level and iteration. Push: lvl = the level, iter = the iteration (0 / 1),
-// mode bit 0 = hook (j) colour window (wired, a no-op: the wgt = 1 path). This is the pipeline of levels n-2 .. 0 (P_V3_SEARCH); the top level's
+// mode bit 0 = hook (j) colour window (wired, a no-op: the wgt = 1 path); with -DV35=1 (v3_search_35, V3.5) mode bit 1 = the parent level's regularised records are in slot 0 (not 1). This is the pipeline of levels n-2 .. 0 (P_V3_SEARCH); the top level's
 // exhaustive search is v3_search_top.comp (P_V3_SEARCH_TOP). The cost is section 2's (high-pass Y, Cb, Cr + the offset-corrected raw Y, 4 weights,
 // mean over the window pixels whose target is inside the level; invalid below half). A "round" evaluates up to 16 candidates at once, 4 threads each
 // (a quarter of the 64-pixel window per thread), the quarters summed through shared memory; the ring is a round of the 8 integer neighbours of the best.
