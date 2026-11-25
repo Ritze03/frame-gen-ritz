@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Motion maps and contact sheets of a motion estimate (see motion/README.md).
+
+  maps.py --fgtest PATH --set 'algo=v3' --out DIR --pairs pairs.json [--pairs more.json] [--only substr,...] [--label TEXT]
+
+Per pair writes DIR/sheets/<name>.png (one contact sheet, 1800 px wide, same layout every time) and DIR/png/<name>_{motion,truth,error,steps}.png
+at the flow grid's resolution.  Colours: motion = hue is the direction, saturation the magnitude (white = no motion), full saturation at the
+pair's fixed scale (its `scale` in the list: 8 / 24 / 64 px for the synthetic strengths), the wheel in the corner; error = end-point error against
+the truth in px, inferno, 0 .. scale/8, dark grey = not valid (hidden in a frame / invented border / cut-out outline); steps = magnitude of the
+estimated field's Jacobian, grey = (g / 2 px per flow px)^0.6, black = smooth, white = a step of 2 px or more between neighbours.
+Layout, synthetic pairs: row 1 true middle frame | true motion | estimated motion, row 2 steps of the estimate | error | steps of the truth.
+Real pairs: row 1 prev frame | estimated motion | steps, row 2 real in-between frame (or curr) | generated t = 0.5 frame | |generated - real| x 4.
+"""
+import argparse
+import os
+import sys
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import common as C  # noqa: E402
+import mkpairs  # noqa: E402
+
+PW, PH = 600, 338   # panel size: 3 x 600 = 1800 px wide
+TITLE = 64
+
+
+def sheet(r, setstr, label, outdir):
+    p = r["pair"]
+    name, scale = p["name"], float(p["scale"])
+    fl = C.fields(r, setstr)
+    if "main" not in fl:
+        raise RuntimeError("%s: this estimator's dump holds no field (set: %s)" % (name, setstr))
+    f = fl[fl["main"]]
+    F, fs = f["F"], f["fs"]
+    size = (PW, PH)
+    os.makedirs(os.path.join(outdir, "png"), exist_ok=True)
+    os.makedirs(os.path.join(outdir, "sheets"), exist_ok=True)
+    est = C.motion_panel(F, scale, size, "estimated motion (%s)" % fl["main"])
+    stp = C.steps_panel(F, size, "steps of the estimate")
+    png = lambda s, img: cv2.imwrite(os.path.join(outdir, "png", "%s_%s.png" % (name, s)), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    stats = ""
+    if p["truth"]:
+        import json
+        spec = json.load(open(os.path.join(p["dir"], "spec.json")))
+        ft, valid = mkpairs.truth(spec, p["dir"], fs, f["grid"])
+        e, ok = C.epe(F, ft, valid)
+        vmax = max(scale / 8, 1.0)
+        m = C.pair_metrics(r, setstr)
+        fm = m["fields"][fl["main"]]
+        stats = "EPE mean %.2f p95 %.2f px | blk16 %.3f (truth %.3f, block-const truth %.3f)" % (
+            fm["epe_mean"], fm["epe_p95"], fm["blk16"], m["truth_blk16"], m["truthbc_blk16"])
+        if "psnr" in m:
+            stats += " | PSNR %.2f / edge %.2f dB" % (m["psnr"], m["psnr_edge"])
+        panels = [
+            [C.image_panel(C.read_rgba(p["mid"], p["W"], p["H"]), size, "true middle frame"),
+             C.motion_panel(ft, scale, size, "true motion"), est],
+            [stp, C.heat_panel(e, ok, vmax, size, "error 0..%g px (grey: not valid)" % vmax),
+             C.steps_panel(ft, size, "steps of the truth")]]
+        png("truth", C.motion_panel(ft, scale, (ft.shape[1], ft.shape[0]), "true motion", legend=False))
+        png("error", C.heat_panel(e, ok, vmax, (ft.shape[1], ft.shape[0]), "error 0..%g px" % vmax))
+    else:
+        m = C.pair_metrics(r, setstr)
+        fm = m["fields"][fl["main"]]
+        stats = "blk16 %.3f" % fm["blk16"]
+        prev = C.read_rgba(p["prev"], p["W"], p["H"])
+        gen = r["out"]
+        if p.get("mid"):
+            real = C.read_rgba(p["mid"], p["W"], p["H"])
+            d = np.clip(np.abs(gen.astype(np.int16) - real.astype(np.int16)) * 4, 0, 255).astype(np.uint8)
+            c3 = C.image_panel(d, size, "|generated - real| x 4")
+            stats += " | PSNR %.2f / edge %.2f dB" % (m["psnr"], m["psnr_edge"])
+            second = C.image_panel(real, size, "real in-between frame")
+        else:
+            c3 = np.full((PH, PW, 3), 30, np.uint8)
+            C.put(c3, "no real in-between frame", (8, 22), 0.6)
+            second = C.image_panel(C.read_rgba(p["curr"], p["W"], p["H"]), size, "curr frame")
+        panels = [[C.image_panel(prev, size, "prev frame"), est, stp],
+                  [second, C.image_panel(gen, size, "generated t = 0.5"), c3]]
+    png("motion", C.motion_panel(F, scale, (F.shape[1], F.shape[0]), "", legend=False)[:, :])
+    png("steps", C.steps_panel(F, (F.shape[1], F.shape[0]), ""))
+    body = np.concatenate([np.concatenate(row, 1) for row in panels], 0)
+    head = np.full((TITLE, body.shape[1], 3), 24, np.uint8)
+    cv2.putText(head, "%s    [%s]" % (name, label), (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(head, stats, (10, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+    img = np.concatenate([head, body], 0)
+    path = os.path.join(outdir, "sheets", name + ".png")
+    cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    return path
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--fgtest", required=True)
+    ap.add_argument("--set", default="", dest="setstr", help="fgtest --set string")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--pairs", action="append", required=True)
+    ap.add_argument("--only")
+    ap.add_argument("--label", help="text on the sheet (default: the --set string)")
+    a = ap.parse_args()
+    pairs = []
+    for p in a.pairs:
+        pairs += C.load_pairs(p, a.only)
+    label = a.label or a.setstr or "defaults"
+    for i, r in enumerate(C.run_fgtest(a.fgtest, a.setstr, pairs, os.path.join(a.out, "work"))):
+        print("%3d/%d" % (i + 1, len(pairs)), sheet(r, a.setstr, label, a.out), flush=True)
+
+
+if __name__ == "__main__":
+    main()
