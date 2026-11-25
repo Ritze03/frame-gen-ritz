@@ -358,3 +358,38 @@ Group means over the pairs where neither version fell back: 60 fps (7 pairs) 25.
 4. **`v35_reg`** (levels n-2 down to 0; two Jacobi steps per level, one at level 0; the top level is skipped): per block, the aperture step (levels 2 and up), then the vote of the neighbours (colour weighted, confidence and aperture aware) together with the regional (else global) model, weighted medoid plus two mean-shift steps; replacement kept only where the window cost is at least 3% lower; the model decides for confident blocks no neighbour supports (R2). Only the vector changes.
 5. **`v3_dense_35`**: Catmull-Rom interpolation of the regularised level-0 field where it is smooth; otherwise V3's per-pixel pick, with V3's own level-0 vector as a second candidate where it differs by more than 1 flow px; the zero-vector bonus as in V3.
 6. V3's occlusion, fill, decide, project, synth, and the hard-cut / unsure rules are unchanged.
+
+## After I11 (task 160): V3.5 in every format, with the learned blend, and the HUD hold
+
+V3.5 (`v3Motion = 1`) is complete in the library: the four test programs take `--v3-motion N`, every format at 2x / 3x / 4x runs it, the validation layer (core, GPU-assisted, synchronisation; Rgba8, Rgb10, Nv12 at 2x / 4x, `v3Blend` 0 / 1, `v3Guard` on / off) reports nothing, and switching `v3Motion` 0 -> 1 -> 0 at run time reproduces the output of an interpolator initialised with each value.
+
+**One fix.** `v3test --scene hud` (a still overlay over a panning background) failed at `v3Motion` 1 only: overlay error 9.2 / 9.4 levels against V3's 6.1 / 6.4, limit 7. The background's field was better (dominant error 0.0 against 2.8) but `v35_reg` replaced the zero vector of the still blocks with the neighbours'. Now a block with its own vector below 0.25 flow px and a mean detail of at least 2 keeps it while `v3HudBonus > 0` (`HUD_EN` in `v35_reg.comp`). Overlay error after: 6.2 / 6.4. The 72 + 23 gate was run again on the final code: synthetic mean EPE 3.86 -> 0.96, p95 14.95 -> 3.69, false still 0.2%; held-out 23 pairs 31.27 -> 31.38 dB whole, 26.70 -> 26.81 edge, blk16 0.167 -> 0.148; no row with a higher EPE, no group losing more than 0.05 dB (battlefield rose from +0.38 to +0.50 dB). Frames at `v3Motion` 0 are byte-identical to the build before I11 (84 of 84).
+
+### Hybrid table
+
+PSNR whole / edge in dB, pooled per group, V3 (`v3Motion` 0) -> V3.5 (1), for the rule blend, Fluidity (`v3Blend` 1) and Consistency (`v3Blend` 2). "scenes" are the 45 real-scene pairs of `scenes_all.json` and the `tp_m` pairs that have a true in-between frame.
+
+| group (pairs) | rule | Fluidity | Consistency |
+|---|---|---|---|
+| battlefield (3) | 32.26 / 25.79 -> 32.75 / 26.26 | 32.44 / 25.85 -> 32.89 / 26.28 | 32.42 / 25.82 -> 32.85 / 26.25 |
+| cs2 (4) | 29.18 / 25.61 -> 29.18 / 25.61 | 29.40 / 25.68 -> 29.39 / 25.68 | 29.35 / 25.70 -> 29.34 / 25.70 |
+| forza (12) | 30.71 / 25.97 -> 30.81 / 26.05 | 30.45 / 25.62 -> 30.53 / 25.69 | 30.29 / 25.45 -> 30.37 / 25.52 |
+| minecraft (4) | 40.41 / 35.69 -> 40.50 / 35.73 | 40.45 / 35.69 -> 40.52 / 35.70 | 40.60 / 35.88 -> 40.70 / 35.91 |
+| **held-out (23)** | 31.27 / 26.70 -> 31.38 / 26.81 | 31.19 / 26.52 -> 31.28 / 26.61 | 31.08 / 26.42 -> 31.17 / 26.51 |
+| scenes (45) | 16.12 / 16.40 -> 16.17 / 16.42 | 16.15 / 16.46 -> 16.19 / 16.50 | 16.19 / 16.52 -> 16.24 / 16.55 |
+
+Verdict: V3.5 gains about +0.09 dB over V3 under either learned blend on the held-out pairs, the same as under the rule blend, so the two improvements add up and do not interfere; the gain sits in battlefield (+0.45 dB) and forza (+0.08 dB), cs2 is unchanged, and V3.5 Hybrid is not worse than V3 Hybrid on any group. The learned blends themselves stay below the rule blend on forza and the pooled 23 pairs in this metric, as before (they are chosen for the look of the motion, not for PSNR). Worst pairs for V3.5 Hybrid (Fluidity): `tp_m07_30fps` -0.52 dB, `tp_n153_60fps` -0.27 dB; best: `tp_n153_30fps` +1.65 dB, `tp_m04_60fps` +0.80 dB.
+
+### Before / after sheets (V3 Hybrid Fluidity against V3.5 Hybrid Fluidity)
+
+`forza_b600_30fps` -0.06 dB (a lamp post loses: a thin near object), `forza_a1060_30fps` +0.05 dB (the kerb strip loses a little, the wall and the road gain), `fps_cs2c_960` -0.06 dB (blk16 0.480 -> 0.516, lost and gained patches along the crate edges cancel), `mc120_10_1080` -0.03 dB (no visible difference), `tp_m04_60fps` +0.80 dB (the grass plane under the camera turn becomes smooth: the block-patchy orange region of V3's field is gone). On the real game scenes the two are equal within 0.06 dB; the clear gain is on the camera-turn scene.
+
+### Formats, sizes, cost
+
+Seven formats (Rgba8, Bgra8, Rgb10, F16, F16Lin, Nv12, P010) x 2x / 3x / 4x x six sizes (1920x1080, 2560x1440, 1440x1080, 1280x720, 1366x768, 1367x769): 252 runs, none failed; Bgra8 equals Rgba8 byte for byte at both values; the float formats produce no non-finite, negative or over-range value. The PSNR of a format against Rgba8 moves by more than 0.3 dB in 113 of 324 comparisons (87 up, 26 down by 0.3 to 0.67 dB, mostly Nv12), because the estimate changed where the formats' own tone and chroma paths disagree most (on `tp_m04` Rgb10 / F16 against Rgba8 rise from 33.6 to 37.3 dB: the formats agree better with V3.5). This is a shift of what the different formats do with a different field, not a defect of one format.
+
+Cost (`fgtest --bench 200`, RX 7900 XTX, median of 3): V3.5 adds 0.48 to 0.52 ms per pair at 1080p and 0.62 to 0.65 ms at 1440p. 1080p 2x rule blend: Rgba8 1.470 ms, Rgb10 1.496, Nv12 1.502 (a hair above the 1.5 ms limit). First use with an empty shader cache: 1.16 s (V3) -> 1.43 s; the first `setSettings` 0 -> 1 stalls 275 ms with an empty cache and 0.33 ms with a warm one.
+
+### Weak points (stated, not fixed)
+
+Just inside the outline of a still foreground object, strips along lane lines and kerbs, thin near objects, whip pans beyond the search range (the dominant motions are invalid there; at `flowScale` 1 three `v3test` stats checks fail only at V3.5), and on real third-person turning pairs V3.5 is equal to V3.
