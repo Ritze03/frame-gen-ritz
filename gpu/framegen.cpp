@@ -3144,9 +3144,10 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
                         r.cbar();
                         r.stamp("stats");
                     }
-                    // the level's block field regularised (two Jacobi steps: its final slot -> the other -> back)
-                    for (int k = 0; k < (l + 1 == V.n && V.n > 3 ? 0 : 2); k++) {   // the top level: a handful of blocks, a dispatch costs more than it gains
+                    // the level's block field regularised (two Jacobi steps: its final slot -> the other -> back; level 0: one step, slot 0 (V3's result) -> slot 1, the dense pass offers both)
+                    for (int k = 0; k < ((l + 1 == V.n && V.n > 3) || l == 0 ? 1 : 2); k++) {   // the top level: a handful of blocks, a dispatch costs more than it gains
                         V3PC rv = sv;
+                        rv.mode = l == 0 ? (1 << 20) : 0;
                         rv.iter = k == 0 ? fin : 1 - fin;
                         r.runV3(P_V35_REG, rv, divUp(V.gw[l], 8), divUp(V.gh[l], 8), 2);
                         r.cbar();

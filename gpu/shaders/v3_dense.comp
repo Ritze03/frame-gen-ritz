@@ -19,7 +19,7 @@
 // V35 = 1 (the v3_dense_35 build, Settings::v3Motion = 1, V3.5): where the 4x4 blocks around the tile form one smooth motion (no neighbouring pair differs by more than
 // V35_EDGE flow px) the vector is the Catmull-Rom interpolation of the block vectors (C1: no kink at the block centres, and a locally linear field, rotation or zoom, is
 // reproduced exactly, where the bilinear blend of the 4 nearest has a kink at every centre and the "agree within 0.5" test sends such a field into the soft pick);
-// the cost is the bilinear blend of the blocks' costs as before. Every other tile is the unchanged code. The zero-vector bonus (hudBonus) is not used by V3.5.
+// the cost is the bilinear blend of the blocks' costs as before. Every other tile is the unchanged code. The zero-vector bonus (hudBonus) keeps its place: a tile with evidence for it takes the unchanged code, not the smooth one. Round 3: the block field's regularised vectors are in slot 1 and V3's own search result in slot 0; a block whose two differ by more than V35_DIS offers both to the per-pixel pick (8 candidates).
 #ifndef V35
 #define V35 0
 #endif
@@ -31,6 +31,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 const float TAU = 1.5;
 const float BAD = 255.0;
 const int M_FF = 2, M_INJECT = 4;
+const float V35_DIS = 1.0;    // flow px: a block whose regularised and own vectors differ by more than this offers both to the per-pixel pick
 const float V35_EDGE = 2.0;   // flow px: a neighbouring pair of block vectors further apart than this is a motion edge, not a smooth field
 
 float cr1(float t, int k) {   // Catmull-Rom weight k (0..3) at t
@@ -71,7 +72,12 @@ float winCost(const V3Lv L, int fOff, int dir, vec2 dMu, ivec2 p, vec2 v) {
 
 shared float zmap[144];       // task 105: the zero vector's term of every pixel of the tile with its apron (-1 = outside)
 shared float dmap[144];       // task 105: the detail of the role-0 frame at every pixel of the tile with its apron
-shared float tmap[4 * 144];   // per candidate: the matching term of every pixel of the tile with a 2 px apron (12x12), -1 = no term (outside)
+#if V35
+shared float tmap[8 * 144];
+#else
+shared float tmap[4 * 144];
+#endif
+//    // per candidate: the matching term of every pixel of the tile with a 2 px apron (12x12), -1 = no term (outside)
 #if V3J
 shared vec3 tcol[144];        // the role-0 raw colour of every pixel of the tile with its apron (the weights' source)
 #endif
@@ -101,23 +107,49 @@ void main() {
 
     // the tile's 4 surrounding blocks (uniform over the workgroup): block k covers 8 px from 8 k, centre 8 k + 3.5; this pixel's bilinear weights
     const ivec2 t0 = ivec2(gl_WorkGroupID.xy) - 1;
+#if V35
+    // V3.5: the regularised vectors are in slot 1 (xy), V3's own search result stays in slot 0 (the regularisation's level-0 pass writes slot 1 and keeps its z)
+    vec4 rec[8];
+    float wb[8];
+    bool anyDis = false;
+    for (int k = 0; k < 4; k++) {
+        const int o = v3BlkIdx(L, dir, 0, t0 + ivec2(k & 1, k >> 1));
+        const int o1 = v3BlkIdx(L, dir, 1, t0 + ivec2(k & 1, k >> 1));
+        rec[k] = vec4(fl[o1], fl[o1 + 1], fl[o + 2], 0.0);
+        rec[k + 4] = vec4(fl[o], fl[o + 1], fl[o + 2], 0.0);
+        const bool dis = length(rec[k].xy - rec[k + 4].xy) > V35_DIS;
+        wb[k] = 1.0;
+        wb[k + 4] = dis ? 1.0 : 0.0;
+        anyDis = anyDis || dis;
+    }
+#else
     vec4 rec[4];
     for (int k = 0; k < 4; k++) {
         const int o = v3BlkIdx(L, dir, 0, t0 + ivec2(k & 1, k >> 1));
         rec[k] = vec4(fl[o], fl[o + 1], fl[o + 2], 0.0);
     }
+#endif
     float spread = 0.0, vmax = 0.0;
     for (int i = 0; i < 4; i++) {
         vmax = max(vmax, length(rec[i].xy));
         for (int j = i + 1; j < 4; j++) spread = max(spread, length(rec[i].xy - rec[j].xy));
     }
+#if V35
+    if (anyDis) spread = max(spread, 1.0);   // the blocks' own vectors are candidates there: the per-pixel pick
+    bool needZ = pc.hudB > 0.0 && vmax * float(pc.fscale) >= pc.hp[3];
+    if (needZ && Bw > 0 && nLev > 1) {
+        float zmax = 0.0;
+        for (int k = 0; k < 4; k++) zmax = max(zmax, fl[v3BlkIdx(L, dir, 1, t0 + ivec2(k & 1, k >> 1)) + 2]);
+        needZ = zmax > V3H_BLKE;
+    }
+#endif
     // task 105: the zero vector as a candidate (hudBonus > 0; not where every block vector is nearly zero: it adds nothing there)
 #if V35
     {   // the smooth-field test over the 4x4 blocks around the tile (uniform over the workgroup)
         vec2 g[16];
         bool isSmooth = true;
         for (int k = 0; k < 16; k++) {
-            const int o = v3BlkIdx(L, dir, 0, t0 + ivec2(k & 3, k >> 2) - 1);
+            const int o = v3BlkIdx(L, dir, 1, t0 + ivec2(k & 3, k >> 2) - 1);
             g[k] = vec2(fl[o], fl[o + 1]);
         }
         for (int j = 0; j < 4; j++)
@@ -125,7 +157,7 @@ void main() {
                 if (i < 3 && length(g[j * 4 + i] - g[j * 4 + i + 1]) > V35_EDGE) isSmooth = false;
                 if (j < 3 && length(g[j * 4 + i] - g[(j + 1) * 4 + i]) > V35_EDGE) isSmooth = false;
             }
-        if (isSmooth) {
+        if (isSmooth && !anyDis && !needZ) {
             if (!inFrame) return;
             const vec2 u = (vec2(p) - 3.5) * 0.125;
             const vec2 a = u - vec2(floor(u));
@@ -142,12 +174,14 @@ void main() {
         }
     }
 #endif
+#if !V35
     bool needZ = pc.hudB > 0.0 && vmax * float(pc.fscale) >= pc.hp[3];
     if (needZ && Bw > 0 && nLev > 1) {   // the pre-test: some block of the 4 has evidence of a still part (level 0's slot 1, .z)
         float zmax = 0.0;
         for (int k = 0; k < 4; k++) zmax = max(zmax, fl[v3BlkIdx(L, dir, 1, t0 + ivec2(k & 1, k >> 1)) + 2]);
         needZ = zmax > V3H_BLKE;
     }
+#endif
     //    // (the gate's lower edge: slower motion takes no bonus, and costs nothing)
     const ivec2 zto = ivec2(gl_WorkGroupID.xy) * 8 - 6;   // the apron's corner
     if (needZ) {
@@ -189,16 +223,23 @@ void main() {
     } else {
         // the cost of each distinct vector at each pixel of the tile and its apron, once (a 5x5 box sum of them per pixel afterwards), instead of
         // 25 bilinear windows per pixel; a vector within 0.25 px of an earlier one shares its map
-        int rep[4];
-        for (int k = 0; k < 4; k++) {
+#if V35
+        const int NC = 8;
+#else
+        const int NC = 4;
+        float wb[4] = float[4](1.0, 1.0, 1.0, 1.0);
+#endif
+        int rep[NC];
+        for (int k = 0; k < NC; k++) {
             rep[k] = k;
+            if (wb[k] <= 0.0) continue;
             for (int j = 0; j < k; j++)
-                if (length(rec[j].xy - rec[k].xy) < 0.25) { rep[k] = rep[j]; break; }
+                if (wb[j] > 0.0 && length(rec[j].xy - rec[k].xy) < 0.25) { rep[k] = rep[j]; break; }
         }
         const ivec2 to = ivec2(gl_WorkGroupID.xy) * 8 - 6;   // the apron's corner
-        for (int idx = lid; idx < 4 * 144; idx += 64) {
+        for (int idx = lid; idx < NC * 144; idx += 64) {
             const int k = idx / 144, q = idx - k * 144;
-            if (rep[k] != k) continue;
+            if (rep[k] != k || wb[k] <= 0.0) continue;
             const ivec2 x = to + ivec2(q % 12, q / 12);
             float t = -1.0;
             if (x.x >= 0 && x.y >= 0 && x.x < L.w && x.y < L.h) {
@@ -216,7 +257,7 @@ void main() {
 #endif
         barrier();
         if (!inFrame) return;
-        float c[4], cmin = 1e9;
+        float c[NC], cmin = 1e9;
 #if V3J
         float cw[25];   // the window's colour weights around this pixel (the same for the 4 vectors)
         {
@@ -225,7 +266,8 @@ void main() {
                 for (int i = 0; i < 5; i++) cw[j * 5 + i] = v3ColourWgt(tcol[(lp.y + j) * 12 + lp.x + i], cen);
         }
 #endif
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < NC; k++) {
+            if (wb[k] <= 0.0) { c[k] = BAD; continue; }
             if (rep[k] != k) { c[k] = c[rep[k]]; continue; }
             float s = 0.0, n = 0.0;
 #if V3J
@@ -247,10 +289,11 @@ void main() {
 #endif
             cmin = min(cmin, c[k]);
         }
-        for (int k = 0; k < 4; k++) cmin = min(cmin, c[k]);
+        for (int k = 0; k < NC; k++) if (wb[k] > 0.0) cmin = min(cmin, c[k]);
         float ws = 0.0;
-        for (int k = 0; k < 4; k++) {
-            const float w = bwt[k] * exp(-max(0.0, c[k] - cmin) * (1.0 / TAU));
+        for (int k = 0; k < NC; k++) {
+            if (wb[k] <= 0.0) continue;
+            const float w = bwt[k & 3] * exp(-max(0.0, c[k] - cmin) * (1.0 / TAU));
             v += w * rec[k].xy;
             ws += w;
         }

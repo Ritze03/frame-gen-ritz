@@ -30,15 +30,18 @@ shared int wtot;
 shared int domOk;
 
 int tid;
+const float SHARE_G = 0.1;
+const float BIG = 90.0;   // flow px
 const int NC = 8;   // samples per thread kept in registers (the passes below walk them again and again)
 vec4 cs[NC];          // (x, d) of this thread's samples tid + 256 j, j < NC; w in csw
 float csw[NC];
+float csw0[NC];       // the weight without the texture factor (V3's: the blocks' match only)
 V3Lv L;
 int nSamp, nBlk, nLev, nFull, st;   // nFull all samples (2 per block), nSamp those used: every st-th, with a jitter within the stride (all stay in the registers, none is computed twice)
 float sc;   // 2^LH
 
 // sample i: x (prev position), d (displacement to curr), w (weight); level-0 flow px
-void sampleAt(int is, out vec2 x, out vec2 d, out float w) {
+void sampleAt(int is, out vec2 x, out vec2 d, out float w, out float w0) {
     const int i = st == 1 ? is : min(is * st + int(((uint(is) * 2654435761u) >> 16) % uint(st)), nFull - 1);
     const int dir = i >= nBlk ? 1 : 0;
     const int b = dir == 1 ? i - nBlk : i;
@@ -51,6 +54,7 @@ void sampleAt(int is, out vec2 x, out vec2 d, out float w) {
     if (dir == 0) { x = c; d = v; }
     else { x = c + v; d = -v; }
     w = 1.0 - smoothstep(6.0, 18.0, r.z);
+    w0 = w;
     if (w > 0.0) {   // the block's texture in the role-0 frame (4 x 4 samples of the block)
         int P, Bw, nl;
         v3Totals(P, Bw, nl);
@@ -67,11 +71,11 @@ void sampleAt(int is, out vec2 x, out vec2 d, out float w) {
 }
 
 // sample j of this thread (index tid + 256 j): from the cache for j < NC; weight 0 beyond the last sample
-void mySample(int j, out vec2 x, out vec2 d, out float w) {
-    if (j < NC) { x = cs[j].xy; d = cs[j].zw; w = csw[j]; return; }
+void mySample(int j, out vec2 x, out vec2 d, out float w, out float w0) {
+    if (j < NC) { x = cs[j].xy; d = cs[j].zw; w = csw[j]; w0 = csw0[j]; return; }
     const int i = tid + 256 * j;
-    if (i >= nSamp) { x = d = vec2(0.0); w = 0.0; return; }
-    sampleAt(i, x, d, w);
+    if (i >= nSamp) { x = d = vec2(0.0); w = 0.0; w0 = 0.0; return; }
+    sampleAt(i, x, d, w, w0);
 }
 
 // the sums of 12 values per thread over the 256 threads (the result in every thread); smem holds the products
@@ -109,13 +113,19 @@ void accumulate(int pass, const float aff[6], out float a[12]) {
     for (int k = 0; k < 12; k++) a[k] = 0.0;
     for (int j = 0; tid + 256 * j < nSamp; j++) {
         vec2 x, d;
-        float w;
-        mySample(j, x, d, w);
+        float w, w0;
+        mySample(j, x, d, w, w0);
+        if (pass == 2) {   // the inlier shares of both weightings: a[0], a[1] textured, a[2], a[3] V3's (the match alone)
+            const vec2 XY2 = (x - vec2(pc.cx, pc.cy)) / vec2(pc.cx, pc.cy);
+            const vec2 m2 = vec2(aff[0] + aff[1] * XY2.x + aff[2] * XY2.y, aff[3] + aff[4] * XY2.x + aff[5] * XY2.y);
+            const bool in2 = length(d - m2) < 2.0 * sc;
+            a[0] += in2 ? w : 0.0; a[1] += w; a[2] += in2 ? w0 : 0.0; a[3] += w0;
+            continue;
+        }
         if (w <= 0.0) continue;
         const vec2 XY = (x - vec2(pc.cx, pc.cy)) / vec2(pc.cx, pc.cy);
         const vec2 m = vec2(aff[0] + aff[1] * XY.x + aff[2] * XY.y, aff[3] + aff[4] * XY.x + aff[5] * XY.y);
         const float r = length(d - m);
-        if (pass == 2) { a[0] += r < 2.0 * sc ? w : 0.0; a[1] += w; continue; }
         const float q = r / ((pass == 0 ? 3.0 : 1.5) * sc);
         w /= 1.0 + q * q;
         a[0] += w; a[1] += w * XY.x; a[2] += w * XY.y;
@@ -132,8 +142,8 @@ void meanShift(vec2 c, float r) {
     float sx = 0.0, sy = 0.0, sw = 0.0;
     for (int j = 0; tid + 256 * j < nSamp; j++) {
         vec2 x, d;
-        float w;
-        mySample(j, x, d, w);
+        float w, w0;
+        mySample(j, x, d, w, w0);
         if (w > 0.0 && length(d - c) < r) { sx += w * d.x; sy += w * d.y; sw += w; }
     }
     atomicAdd(msum[0], int(round(sx * 16.0)));
@@ -165,12 +175,12 @@ void main() {
     for (int i = tid; i < 3072; i += 256) smem[i] = 0;
     if (tid == 0) { wtot = 0; domOk = 0; }
     barrier();
-    for (int j = 0; j < NC; j++) { cs[j] = vec4(0.0); csw[j] = 0.0; }
+    for (int j = 0; j < NC; j++) { cs[j] = vec4(0.0); csw[j] = 0.0; csw0[j] = 0.0; }
     for (int j = 0; tid + 256 * j < nSamp; j++) {
         vec2 x, d;
-        float w;
-        sampleAt(tid + 256 * j, x, d, w);
-        if (j < NC) { cs[j] = vec4(x, d); csw[j] = w; }
+        float w, w0;
+        sampleAt(tid + 256 * j, x, d, w, w0);
+        if (j < NC) { cs[j] = vec4(x, d); csw[j] = w; csw0[j] = w0; }
         const int w16 = int(w * 16.0 + 0.5);
         if (w16 <= 0) continue;
         const ivec2 bn = clamp(ivec2(floor((d + RH) * (16.0 / RH))), ivec2(0), ivec2(31));
@@ -262,6 +272,7 @@ void main() {
         }
         for (int k = 0; k < 6; k++) ax[g + G_AFF + k] = floatBitsToUint(affOk ? aff[k] : 0.0);
         if (affOk) valid |= 256u;
+        if (a[2] < SHARE_G * a[3] && length(vec2(aff[0], aff[3])) > BIG) valid = 0u;   // no camera describes what V3 itself matched well: its dominant motions, found among textured blocks only, are not to be trusted either
         ax[g + G_VALID] = valid;
         ax[g + G_CAM_TRANS] = floatBitsToUint(aff[0]);
         ax[g + G_CAM_TRANS + 1] = floatBitsToUint(aff[3]);

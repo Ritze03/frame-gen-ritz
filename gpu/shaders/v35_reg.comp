@@ -20,11 +20,13 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 const vec2 G01 = vec2(0.6, 2.5);      // sqrt(eigenvalue / pixels) of the structure tensor (feature levels per px): confidence ramp
 const vec2 CR = vec2(1.0, 2.5);       // cost / (texture + 2): a block matching worse than this ratio proves less
-const vec2 REJ = vec2(0.05, 0.0);       // a replacement is rejected when its window cost exceeds the old vector's by this much + this share
+const vec2 REJ = vec2(0.0, -0.03);       // a replacement is kept only when its window cost is at least 10% lower than the old vector's: where the image has no evidence for the change (a flat block, a still object's rim) the block keeps its own vector
 const vec2 REJ2 = vec2(0.05, 0.02);     // the same for the outlier rule (R2): the model's vector must match nearly as well as the block's
 const float COLS = 12.0;              // colour distance (L1 over Y Cb Cr) at which the vote weight is 1/e
 const float WCAM = 0.6;               // the camera model's vote when there are no confident neighbours (fades out as their weight grows to 1.5)
 const float MODEL_SUP = 0.3;          // a block whose vector fewer than this share of the neighbour weight supports takes the model's (when the window agrees)
+const int M35_L0 = 1 << 20;           // level 0's single pass: reads slot 0, writes only the vector of slot 1
+const float AP_R1 = 0.6, AP_R2 = 0.15;   // an edge-only block: strong structure along one direction only
 const float MMIN = 0.15;              // the summed weight below which a block keeps its vector
 
 shared vec4 srec[144];      // record (vx, vy, cost, amb) of the tile's blocks with the apron
@@ -109,6 +111,22 @@ void main() {
         scol[idx] = vec4(col, bconf * max(r2, 0.15 * r1));
         sr1[idx] = r1;
         sax[idx] = vec4(nv, smoothstep(0.05, 0.45, r1), smoothstep(0.05, 0.45, r2));
+        if (l > 1 && r1 > AP_R1 && r2 < AP_R2) {
+            // the aperture problem: an edge-only block measured its motion across the edge only; along the edge its vector is whatever the search propagated. Along the edge it takes
+            // the camera model's vector (the across-edge part stays), where the window agrees (a still object's outline, parallax: it keeps its own). Before the vote, so
+            // that the block does not vote its wrong along-edge part into the flat surface beside it.
+            vec2 m; float mq0 = 1.0;
+            bool hm = regVote(L, l, dir, b, m, mq0);
+            if (!hm) { hm = camVote(L, l, dir, b, m); mq0 = 1.0; }
+            if (hm && mq0 > 0.5) {
+                const vec2 tv = vec2(-nv.y, nv.x);
+                const vec2 rr = r.xy + tv * dot(m - r.xy, tv);
+                if (length(rr - r.xy) > 0.5) {
+                    const float c0 = winCost(L, fOff, dir, b, r.xy), c1 = winCost(L, fOff, dir, b, rr);
+                    if (c1 <= c0 + 0.05 + 0.1 * c0) srec[idx].xy = rr;
+                }
+            }
+        }
     }
     barrier();
     const ivec2 lp = ivec2(lid & 7, lid >> 3);
@@ -203,5 +221,6 @@ void main() {
         }
     }
     const int o = v3BlkIdx(L, dir, sb, b);
-    fl[o] = res.x; fl[o + 1] = res.y; fl[o + 2] = own.z; fl[o + 3] = own.w;
+    fl[o] = res.x; fl[o + 1] = res.y;
+    if ((pc.mode & M35_L0) == 0) { fl[o + 2] = own.z; fl[o + 3] = own.w; }   // level 0: slot 1 keeps its z (the still-part evidence of the zero-vector bonus), slot 0 stays V3's own result
 }
