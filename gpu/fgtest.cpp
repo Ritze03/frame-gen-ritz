@@ -42,6 +42,7 @@
 #include "framegen.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -281,6 +282,7 @@ static void encodeFrame(const uint8_t* rgba, uint32_t W, uint32_t H, uint8_t* ds
     }
     }
 }
+static size_t gFloatBad[3] = {0, 0, 0};   // non-finite / negative / above 1.0 (f16: PQ code) or 126 (f16lin: 10,000 nits) values of the float output formats
 // ... and back: plane 0 at src, plane 1 at src + off1 -> RGBA8 (alpha 255)
 static void decodeFrame(const uint8_t* src, size_t off1, uint32_t W, uint32_t H, uint8_t* rgba) {
     const size_t n = (size_t)W * H;
@@ -307,6 +309,10 @@ static void decodeFrame(const uint8_t* src, size_t off1, uint32_t W, uint32_t H,
         for (size_t i = 0; i < n; i++) {
             uint16_t h[4];
             memcpy(h, src + i * 8, 8);
+            for (int c = 0; c < 3; c++) {
+                const float fv = fromHalf(h[c]);   // --format f16 / f16lin: count the output's non-finite, negative and out-of-range values (printed at the end: FLOATCHECK)
+                if (!std::isfinite(fv)) gFloatBad[0]++; else if (fv < 0.0f) gFloatBad[1]++; else if (fv > (gFmt == Fmt::F16 ? 1.0001f : 126.0f)) gFloatBad[2]++;
+            }
             for (int c = 0; c < 3; c++) rgba[i * 4 + c] = lut[h[c]];
             rgba[i * 4 + 3] = 255;
         }
@@ -739,7 +745,11 @@ int main(int argc, char** argv) {
             const framegen::Settings& st = seq[std::min(pairIdx, seq.size() - 1)];
             if (const char* why = fg.settingsError(st)) { fprintf(stderr, "pair %zu: settingsError: %s\n", pairIdx, why); return 1; }
             if (seqReconf[std::min(pairIdx, seq.size() - 1)]) { if (!fg.reconfigure(st)) { fprintf(stderr, "pair %zu: reconfigure failed\n", pairIdx); return 1; } }
-            else if (!fg.setSettings(st)) { fprintf(stderr, "pair %zu: setSettings failed\n", pairIdx); return 1; }
+            else {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!fg.setSettings(st)) { fprintf(stderr, "pair %zu: setSettings failed\n", pairIdx); return 1; }
+                fprintf(stderr, "pair %zu: setSettings took %.2f ms\n", pairIdx, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());   // (the stall a host sees: V3.5's pipelines are created by the first setSettings with v3Motion 1)
+            }
             fg.releaseUnusedMotion();   // frees the resources the state does not use (the guard's two buffers at Off, an unselected version's group); the next state may need them again
             fprintf(stderr, "pair %zu: motionVersion %u v3Guard %u\n", pairIdx, (unsigned)st.motionVersion, (unsigned)st.v3Guard);
         }
@@ -839,6 +849,7 @@ int main(int argc, char** argv) {
         if (stats) {
             printf("STATS %zu %u %u %u %zu\n", pairIdx, dbgMap[0], dbgMap[1], fg.debugSadBlocks(), (size_t)W * H);
             printf("BLEND %zu %d\n", pairIdx, (int)fg.v3BlendActive());   // Interpolator::v3BlendActive(): 1 = the learned-blend build ran under the settings
+            printf("MOTION %zu %d\n", pairIdx, (int)fg.v3MotionActive());   // Interpolator::v3MotionActive(): 1 = V3.5's motion passes ran under the settings
         }
         for (size_t k = 0; k < tcur.size(); k++) {
             begin();
@@ -936,5 +947,6 @@ int main(int argc, char** argv) {
     vkDestroyCommandPool(dev, cpool, nullptr);
     vkDestroyDevice(dev, nullptr);
     vkDestroyInstance(inst, nullptr);
+    if (gFmt == Fmt::F16 || gFmt == Fmt::F16Lin) printf("FLOATCHECK nonfinite %zu negative %zu over %zu\n", gFloatBad[0], gFloatBad[1], gFloatBad[2]);
     return 0;
 }

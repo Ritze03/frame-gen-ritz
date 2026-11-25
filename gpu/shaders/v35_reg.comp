@@ -20,13 +20,14 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 const vec2 G01 = vec2(0.6, 2.5);      // sqrt(eigenvalue / pixels) of the structure tensor (feature levels per px): confidence ramp
 const vec2 CR = vec2(1.0, 2.5);       // cost / (texture + 2): a block matching worse than this ratio proves less
-const vec2 REJ = vec2(0.0, -0.03);       // a replacement is kept only when its window cost is at least 10% lower than the old vector's: where the image has no evidence for the change (a flat block, a still object's rim) the block keeps its own vector
+const vec2 REJ = vec2(0.0, -0.03);       // a replacement is kept only when its window cost is at least 3% lower than the old vector's: where the image has no evidence for the change (a flat block, a still object's rim) the block keeps its own vector
 const vec2 REJ2 = vec2(0.05, 0.02);     // the same for the outlier rule (R2): the model's vector must match nearly as well as the block's
 const float COLS = 12.0;              // colour distance (L1 over Y Cb Cr) at which the vote weight is 1/e
 const float WCAM = 0.6;               // the camera model's vote when there are no confident neighbours (fades out as their weight grows to 1.5)
 const float MODEL_SUP = 0.3;          // a block whose vector fewer than this share of the neighbour weight supports takes the model's (when the window agrees)
 const int M35_L0 = 1 << 20;           // level 0's single pass: reads slot 0, writes only the vector of slot 1
 const float AP_R1 = 0.6, AP_R2 = 0.15;   // an edge-only block: strong structure along one direction only
+const float HUD_EN = 2.0;             // the HUD hold (below): a block with at least this much detail (mean v3Detail; a flat block matches every vector and proves nothing)
 const float MMIN = 0.15;              // the summed weight below which a block keeps its vector
 
 shared vec4 srec[144];      // record (vx, vy, cost, amb) of the tile's blocks with the apron
@@ -34,6 +35,7 @@ shared vec4 scol[144];      // block mean colour (Y, Cb, Cr) and the vote weight
 shared vec4 sax[144];       // n.x, n.y, ra', rb'
 shared int sok[144];
 shared float sr1[144];      // the block's own texture along its dominant gradient (0 = flat)
+shared float sen[144];      // the block's mean detail (v3Detail of the features): the evidence of the HUD hold below
 
 vec3 rawAt(const V3Lv L, int f, ivec2 p) {
     p = clamp(p, ivec2(0), ivec2(L.w - 1, L.h - 1));
@@ -76,7 +78,7 @@ void main() {
         const ivec2 b = org + ivec2(idx % 12, idx / 12);
         const bool ok = all(greaterThanEqual(b, ivec2(0))) && all(lessThan(b, ivec2(L.gw, L.gh)));
         sok[idx] = ok ? 1 : 0;
-        if (!ok) { srec[idx] = vec4(0.0); scol[idx] = vec4(0.0); sax[idx] = vec4(1.0, 0.0, 0.0, 0.0); sr1[idx] = 0.0; continue; }
+        if (!ok) { sen[idx] = 0.0; srec[idx] = vec4(0.0); scol[idx] = vec4(0.0); sax[idx] = vec4(1.0, 0.0, 0.0, 0.0); sr1[idx] = 0.0; continue; }
         const int o = v3BlkIdx(L, dir, sa, b);
         const vec4 r = vec4(fl[o], fl[o + 1], fl[o + 2], fl[o + 3]);
         srec[idx] = r;
@@ -110,6 +112,7 @@ void main() {
         const float bconf = (1.0 - smoothstep(CR.x, CR.y, r.z / (en + 2.0))) * (1.0 - 0.7 * r.w);
         scol[idx] = vec4(col, bconf * max(r2, 0.15 * r1));
         sr1[idx] = r1;
+        sen[idx] = en;
         sax[idx] = vec4(nv, smoothstep(0.05, 0.45, r1), smoothstep(0.05, 0.45, r2));
         if (l > 1 && r1 > AP_R1 && r2 < AP_R2) {
             // the aperture problem: an edge-only block measured its motion across the edge only; along the edge its vector is whatever the search propagated. Along the edge it takes
@@ -134,6 +137,11 @@ void main() {
     if (b.x >= L.gw || b.y >= L.gh) return;
     const int ci = (lp.y + 2) * 12 + lp.x + 2;
     const vec4 own = srec[ci];
+    // the HUD hold (hudBonus > 0, task 160): V3's block search keeps the zero vector of a block that a static overlay explains (the bonus acts on evidence: the zero vector matches, the
+    // window has detail, the moving vector is a real motion); a thin still line (a reticle, a rule) in moving surroundings owns only a few pixels of its block, so the window test
+    // below would still call the background's vector no worse, and the vote, the neighbours and the model would take the line along. A block that has the zero vector and detail keeps it.
+    // (Before: v3test --scene hud overlay error 9.2 / 9.4 levels against V3's 6.1 / 6.4, limit 7; the reticle took the background's vector at level 1.)
+    const bool holdOwn = pc.hudB > 0.0 && length(own.xy) < 0.25 && sen[ci] >= HUD_EN;
     // neighbour votes
     float w[26];
     vec2 v[26];
@@ -172,7 +180,7 @@ void main() {
     }
     mass += w[25];
     vec2 res = own.xy;
-    if (mass >= MMIN) {
+    if (mass >= MMIN && !holdOwn) {
         // the weighted medoid
         int bi = 12;
         float bc = 1e9;
@@ -207,7 +215,7 @@ void main() {
             if (c1 > c0 + REJ.x + REJ.y * c0) res = own.xy;
         }
     }
-    if (hasM && mq > 0.5 && length(res - v[25]) > 0.5) {
+    if (hasM && mq > 0.5 && length(res - v[25]) > 0.5 && !(holdOwn && length(v[25]) * exp2(float(l)) * float(pc.fscale) >= pc.hp[3])) {
         // the model decides where a confident block is not supported by its neighbours (a repeat of the texture matched at the wrong place: window grids, signs): it takes
         // the model's vector when its window matches there nearly as well as at the vector it has now (a textured block whose own vector is right matches clearly worse at the
         // model's: it keeps its own). Flat blocks follow their confident neighbours of their colour in the vote above, not this rule (a still object's flat body).

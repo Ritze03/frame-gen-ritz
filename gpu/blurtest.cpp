@@ -10,6 +10,7 @@
 //                               object's edge against the ideal model, the crosshair pixel-exact under UI protection, the
 //                               descriptor rings, validation of the settings.
 //   option --algo v1|v2|learned the motion version (Settings::motionVersion) every Interpolator is created and set with (default v1)
+//   option --v3-motion 0|1      Settings::v3Motion (0 = V3, default; 1 = V3.5) of every instance (V3 only)
 //   option --zt 0|1, --guard 0|1, --net e2v5  Settings::learnedZeroTest (default 1) / learnedStaticGuard (default 0) / learnedNet (default the library's) of them (Learned only)
 #include "framegen.h"
 #include "blendbench_spv.h"
@@ -248,12 +249,13 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
 static MotionVersion gAlgo = MotionVersion::V1;
 static bool gDetailSplit = false;   // --detail-split: Settings::v3DetailSplit (V3 hook (l)) on in every instance
 static bool gColourWindow = false;   // --colour-window: Settings::v3ColourWindow (V3 hook (j)) on in every instance
+static uint8_t gV3Motion = 0;   // --v3-motion: Settings::v3Motion (0 = V3, 1 = V3.5) in every instance
 static V3Guard gV3Guard = V3Guard::Off;   // --v3-guard: Settings::v3Guard (task 104) in every instance
 static V2Mode gMode = V2Mode::Quality;   // --mode: Settings::v2Mode (V1 ignores it)
 static bool gZt = true, gGuard = false;   // --zt, --guard: Settings::learnedZeroTest / learnedStaticGuard (Learned only)
 static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v5: Settings::learnedNet (Learned only; default: the library's)
 static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
-static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; s.v3ColourWindow = gColourWindow; s.v3DetailSplit = gDetailSplit; s.v3Guard = gV3Guard; return s; }
+static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; s.v3ColourWindow = gColourWindow; s.v3DetailSplit = gDetailSplit; s.v3Guard = gV3Guard; s.v3Motion = gV3Motion; return s; }
 #else
 static Settings algo(Settings s) { return s; }
 #endif
@@ -1069,6 +1071,7 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--colour-window")) gColourWindow = true;
         else if (!strcmp(argv[i], "--detail-split")) gDetailSplit = true;
+        else if (!strcmp(argv[i], "--v3-motion") && i + 1 < argc) gV3Motion = (uint8_t)atoi(argv[++i]);   // Settings::v3Motion: 0 = V3, 1 = V3.5
         else if (!strcmp(argv[i], "--v3-guard") && i + 1 < argc) {   // Settings::v3Guard (task 104): off | guard | v2motion (--guard is the Learned static guard)
             const char* g = argv[++i];
             if (!strcmp(g, "off") || !strcmp(g, "0")) gV3Guard = V3Guard::Off;
@@ -1082,7 +1085,7 @@ int main(int argc, char** argv) {
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "debugview")) { fprintf(stderr, "usage: blurtest check|bench|debugview [--bgra] [--algo v1|v2|learned|v3] [--mode quality|performance] [--colour-window] [--detail-split] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "debugview")) { fprintf(stderr, "usage: blurtest check|bench|debugview [--bgra] [--algo v1|v2|learned|v3] [--v3-motion 0|1] [--v3-guard off|guard|v2motion] [--mode quality|performance] [--colour-window] [--detail-split] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

@@ -2,15 +2,16 @@
 // rendered on the CPU (the two real frames, and the true in-between frame R_t for any t); V3's estimated flows (recordDebugV3) and its
 // in-between frames (recordSynth) are measured against them, once with V3's own estimate and once with the exact flows injected
 // (recordDebugV3Inject).
-//   v3test [--size WxH] [--fs 1|2|4] [--scene NAME|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--colour-window] [--detail-split] [--blend 0..kV3BlendMax] [--guard off|guard|v2motion] [--list]
+//   v3test [--size WxH] [--fs 1|2|4] [--scene NAME|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--colour-window] [--detail-split] [--blend 0..kV3BlendMax] [--guard off|guard|v2motion] [--v3-motion 0|1] [--list]
 //     --colour-window   Settings::v3ColourWindow on (hook (j)); the pass marks stay the same (information with the hook on)
 //     --detail-split    Settings::v3DetailSplit on (hook (l)); the marks stay the same (information with the hook on)
 //     --blend N         Settings::v3Blend 0..kV3BlendMax (learned blend, experimental; 1 Fluidity, 2 Consistency); the marks stay the same (information)
+//     --v3-motion N     Settings::v3Motion 0 (V3, default) | 1 (V3.5: the regularised motion field); the marks stay the same (information with 1)
 //     --guard MODE      Settings::v3Guard off (default) | guard | v2motion (task 104); the marks stay the same (information with it on)
 //     --size   frame size (default 1920x1080). The scenes' lengths (shifts, layer sizes) are those of 1080p scaled by min(W/1920, H/1080);
 //              the texture (wavelengths 4..128 px) is not.
 //     --fs     flowScale (1, 2 or 4; default 2)
-//     --scene  shift | zoom | rotate | layers | fade | stripes | border | all (default all; border = task 109 frame-border injection scenes; stripes = repetitive texture, informational, not in all). shift = 7 shifts, layers = a rectangle and a zooming disc on a background.
+//     --scene  shift | zoom | rotate | layers | fade | stripes | border | motion | all (default all; motion = task 160: Settings::v3Motion switched at run time, v3MotionActive(); border = task 109 frame-border injection scenes; stripes = repetitive texture, informational, not in all). shift = 7 shifts, layers = a rectangle and a zooming disc on a background.
 //     --t      times of the in-between frames measured (default 0.25,0.5)
 //     --report-only   always exit 0 (until the later steps of V3 make the metrics pass)
 //     --selfcheck     verify the tool itself instead of V3: (i) the CPU warp of prev by the exact F10 (and of curr by F01) reproduces curr (prev)
@@ -655,6 +656,7 @@ static std::vector<uint8_t> oracleBlend(const Scene& sc, const std::vector<uint8
 static bool gDiag = false;
 static bool gColourWindow = false;   // --colour-window
 static bool gDetailSplit = false;    // --detail-split
+static int gMotion = 0;              // --v3-motion N: Settings::v3Motion (0 = V3, 1 = V3.5)
 static int gBlend = 0;               // --blend N: Settings::v3Blend (learned blend, experimental)
 static framegen::V3Guard gGuard = framegen::V3Guard::Off;   // --guard
 static float gHud = -1.0f;            // --hud X: Settings::hudBonus (default: the library default)
@@ -918,6 +920,73 @@ static void borderScenes(const framegen::Settings& base, Img& a, Img& b, Img& o,
     destroyHostBuf(fb);
 }
 
+
+// Settings::v3Motion at run time (task 160): one interpolator that runs with v3Motion 0, is switched to 1 by setSettings and back, three times in a row, mid-stream (the same pair:
+// V3 keeps no state across pairs, every pair's estimate starts from its two frames), then an interpolator created with each value. The frames after switching back are byte-identical to
+// the frames of a run that never switched, the frames at 1 to those of a run created with 1; v3MotionActive() follows the setting and the motion version.
+static void motionSwitch(const framegen::InitInfo& info, Img& a, Img& b, Img& o, int W, int H) {
+    using namespace framegen;
+    const double k = std::min(W / 1920.0, H / 1080.0);
+    Scene sc; sc.W = W; sc.H = H;
+    Layer bg = plane(1, 0.5 * W, 0.5 * H); bg.shx = -60 * k; bg.shy = 10 * k; bg.rotDeg = 1.0;
+    Layer fg; fg.seed = 2; fg.kind = 1; fg.mhw = 200 * k; fg.mhh = 150 * k; fg.mcx = fg.px = 0.38 * W; fg.mcy = fg.py = 0.52 * H; fg.shx = 180 * k; fg.shy = -40 * k;
+    sc.layers = {bg, fg};
+    upload(renderFrame(sc, 0.0), a, W, H);
+    upload(renderFrame(sc, 1.0), b, W, H);
+    const std::vector<double> ts = {0.5};
+    auto settings = [&](int m, V3Guard g) { Settings s = info.settings; s.v3Motion = (uint8_t)m; s.v3Guard = g; return s; };
+    auto run = [&](std::vector<uint8_t>& out) { Run r; const bool ok = runV3(a, b, o, ts, nullptr, r); if (ok) out = r.out[0]; return ok; };
+    auto check = [&](bool pass, const char* what) { printf("%-20s v3Motion switching: %s   %s\n", "motion", what, pass ? "PASS" : "FAIL"); verdict(pass, true); };
+    auto nDiff = [](const std::vector<uint8_t>& x, const std::vector<uint8_t>& y) { size_t n = 0; for (size_t i = 0; i < x.size() && i < y.size(); i++) n += x[i] != y[i]; return n; };
+    const V3Guard g0 = info.settings.v3Guard;
+    std::vector<uint8_t> A0, A1, out;
+    bool ok = gFg.setSettings(settings(0, g0)) && run(A0);
+    check(ok && !gFg.v3MotionActive(), "v3Motion 0: runs, v3MotionActive() false");
+    ok = gFg.setSettings(settings(1, g0)) && run(A1);
+    check(ok && gFg.v3MotionActive(), "setSettings(v3Motion 1): runs, v3MotionActive() true");
+    printf("%-20s v3Motion switching: information: %zu of %zu output bytes differ between v3Motion 0 and 1\n", "motion", nDiff(A0, A1), A0.size());
+    size_t bad0 = 0, bad1 = 0;
+    bool allOk = true;
+    for (int cycle = 0; cycle < 3; cycle++) {
+        allOk = allOk && gFg.setSettings(settings(0, g0)) && run(out) && !gFg.v3MotionActive();
+        bad0 += nDiff(out, A0);
+        allOk = allOk && gFg.setSettings(settings(1, g0)) && run(out);
+        bad1 += nDiff(out, A1);
+    }
+    check(allOk && bad0 == 0, "back at 0 (3 switches): every frame byte-identical to the run that never switched");
+    check(allOk && bad1 == 0, "at 1 again (3 switches): every frame byte-identical to the first one at 1");
+    // an interpolator created with each value
+    for (int m = 0; m < 2; m++) {
+        gFg.destroy();
+        InitInfo i2 = info;
+        i2.settings = settings(m, g0);
+        const bool inited = gFg.init(i2);
+        out.clear();
+        const bool rok = inited && run(out);
+        const size_t d = nDiff(out, m ? A1 : A0);
+        char nm[128];
+        snprintf(nm, sizeof nm, "created with v3Motion %d: byte-identical to the switched run (%zu bytes differ)", m, d);
+        check(rok && d == 0, nm);
+    }
+    // the guard modes: V3.5 runs under both (V2Motion: V2's field replaces the dense field, only the statistics of V3.5 show); another motion version ignores v3Motion
+    {
+        std::vector<uint8_t> G0, G1;
+        const bool gok = gFg.setSettings(settings(0, V3Guard::V2Motion)) && run(G0) && gFg.setSettings(settings(1, V3Guard::V2Motion)) && run(G1);
+        check(gok && gFg.v3MotionActive(), "v3Guard V2Motion with v3Motion 1: runs, v3MotionActive() true");
+        printf("%-20s v3Motion switching: information: v3Guard V2Motion, %zu output bytes differ between v3Motion 0 and 1\n", "motion", nDiff(G0, G1));
+        const bool g2 = gFg.setSettings(settings(1, V3Guard::Guard)) && run(out);
+        check(g2 && gFg.v3MotionActive(), "v3Guard Guard with v3Motion 1: v3MotionActive() true");
+        gFg.destroy();
+        InitInfo i3 = info;
+        i3.settings = settings(1, g0);
+        i3.settings.motionVersion = MotionVersion::V1;
+        const bool v1ok = gFg.init(i3);
+        check(v1ok && !gFg.v3MotionActive(), "motionVersion V1 with v3Motion 1: v3MotionActive() false");
+    }
+    gFg.destroy();
+    if (!gFg.init(info)) { fprintf(stderr, "init failed after the switching test\n"); exit(1); }
+}
+
 int main(int argc, char** argv) {
     int W = 1920, H = 1080, fs = 2;
     std::string which = "all";
@@ -940,6 +1009,7 @@ int main(int argc, char** argv) {
         else if (a == "--profile") gProfile = true;
         else if (a == "--colour-window") gColourWindow = true;
         else if (a == "--detail-split") gDetailSplit = true;
+        else if (a == "--v3-motion" && i + 1 < argc) gMotion = atoi(argv[++i]);
         else if (a == "--blend" && i + 1 < argc) gBlend = atoi(argv[++i]);
         else if (a == "--guard" && i + 1 < argc) {
             const std::string g = argv[++i];
@@ -950,12 +1020,12 @@ int main(int argc, char** argv) {
         }
         else if (a == "--hud" && i + 1 < argc) gHud = (float)atof(argv[++i]);
         else if (a == "--list") list = true;
-        else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|stripes|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
+        else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|stripes|border|decide|motion|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--colour-window] [--detail-split] [--blend N] [--guard off|guard|v2motion] [--v3-motion 0|1] [--list]\n"); return 2; }
     }
     if ((fs != 1 && fs != 2 && fs != 4) || W < 16 || H < 16) { fprintf(stderr, "--fs 1|2|4, --size at least 16x16\n"); return 2; }
     for (double t : ts) if (!(t > 0.0 && t < 1.0)) { fprintf(stderr, "--t: times in (0, 1)\n"); return 2; }
     std::vector<Scene> scenes = makeScenes(which, W, H);
-    if (scenes.empty() && which != "decide" && which != "border") { fprintf(stderr, "unknown scene %s (shift zoom rotate layers fade all)\n", which.c_str()); return 2; }
+    if (scenes.empty() && which != "decide" && which != "border" && which != "motion") { fprintf(stderr, "unknown scene %s (shift zoom rotate layers fade all)\n", which.c_str()); return 2; }
     if (list) { for (auto& s : scenes) printf("%s\n", s.name.c_str()); return 0; }
 
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -1010,6 +1080,7 @@ int main(int argc, char** argv) {
     info.settings.v3ColourWindow = gColourWindow;
     info.settings.v3DetailSplit = gDetailSplit;
     info.settings.v3Blend = (uint8_t)gBlend;
+    info.settings.v3Motion = (uint8_t)gMotion;
     info.settings.v3Guard = gGuard;
     if (gHud >= 0.0f) info.settings.hudBonus = gHud;
     if (!gFg.init(info)) { fprintf(stderr, "init failed: %s\n", gFg.initError() ? gFg.initError() : "?"); return 1; }
@@ -1078,6 +1149,7 @@ int main(int argc, char** argv) {
         gFg.setSettings(info.settings);
     }
     if (which == "all" || which == "border") borderScenes(info.settings, a, b, o, W, H);
+    if (which == "all" || which == "motion") motionSwitch(info, a, b, o, W, H);
     for (const Scene& sc : scenes) {
         const Flows F = exactFlows(sc, fs);
         const std::vector<uint8_t> prev = renderFrame(sc, 0.0), curr = renderFrame(sc, 1.0);

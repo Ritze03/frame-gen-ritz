@@ -413,7 +413,10 @@ struct Settings {
     // v3Motion (0..kV3MotionMax, default 0): V3's motion detection. 0 = V3's own, exactly as without the setting (byte-identical output); 1 = V3.5, the block search with
     // confidence-weighted regularisation of the block fields and the dense field blended against a locally linear field. Only MotionVersion::V3 reads it (others ignore it).
     // Runtime: setSettings() at any time, from the next recordEstimate; the first time it is 1, setSettings creates V3.5's pipelines (no GPU wait).
-    // The field sits in the padding byte before flowScale: sizeof(Settings) stays 164.
+    // The field sits in the padding byte before flowScale: sizeof(Settings) stays 164. A value above kV3MotionMax is refused. v3MotionActive() says whether V3.5 runs.
+    // Combined with: v3Blend (the nets were trained on V3's field and read V3.5's; Rgba8 / Bgra8 / Rgb10 only, else the rule blend with V3.5's motion), v3Guard (Guard corrects
+    // V3.5's dense field; V2Motion replaces it by V2's), blur, UI protection and debugView = Motion (they follow the field V3.5 produces) and every flowScale. v3ColourWindow is
+    // ignored while v3Motion is 1 (V3.5 has its own colour weights; the hook (j) pipelines are not combined with V3.5's). gpu/V3.md 3.18.
     uint8_t v3Motion = 0;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
@@ -528,6 +531,12 @@ public:
     // True if the next V3 synthesis would run the learned-blend build under the active settings: motionVersion V3, v3Blend != 0, v3DetailSplit off and a blend build for
     // this Format (Rgba8 / Bgra8, Rgb10). False if not initialised. For a host's status line (a non-zero v3Blend alone does not mean the nets run).
     bool v3BlendActive() const;
+    // True if the next V3 estimate would run V3.5's motion passes (gpu/V3.md 3.18): motionVersion V3, v3Motion != 0 and V3.5's pipelines created. False if not initialised.
+    // For a host's status line (a non-zero v3Motion alone does not mean V3.5 runs: every other motion version ignores it). Every Format, flowScale, size and v3Blend /
+    // v3DetailSplit / blur / UI protection / debugView setting runs it; v3Guard V2Motion runs it too, but V2's field then replaces V3's dense field, so V3.5 only shows
+    // through the pair's statistics there (a few per cent of the output bytes); with v3ColourWindow on, V3.5 runs and the colour-window variants of the search and dense passes
+    // are not used (V3.5 has its own colour weights).
+    bool v3MotionActive() const;
 
     // Call once per command buffer / submission, before its first record*() call: resets the
     // per-submission counts of both descriptor rings (see "Descriptor rings" below).

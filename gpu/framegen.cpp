@@ -2053,6 +2053,10 @@ bool Interpolator::v3BlendActive() const {
     return m && m->mv3() && m->set.v3Blend != 0 && !m->set.v3DetailSplit && colourSpv(m->fmt, c) && c.v3SynthB.code;
 }
 
+bool Interpolator::v3MotionActive() const {
+    return m && m->mv3() && m->set.v3Motion != 0 && m->mo[(int)MotionVersion::V3].pipes[P_V35_REG] != VK_NULL_HANDLE;
+}
+
 Settings Interpolator::settings() const {
     return m ? m->set : Settings{};
 }

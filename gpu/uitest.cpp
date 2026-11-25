@@ -1,6 +1,7 @@
 // uitest: validation + benchmark of framegen's static-UI protection (Settings::uiProtection).
 //   uitest check [--bgra] [--hash] [W H]     default 1280 720
 //   option --algo v1|v2|learned (every mode): the motion version (Settings::motionVersion) every run starts with (default v1)
+//   option --v3-motion 0|1 (every mode): Settings::v3Motion of every instance (0 = V3, default; 1 = V3.5; V3 only)
 //   option --mode quality|performance (every mode): Settings::v2Mode of every run (default quality; V1 ignores it)
 //   option --zt 0|1, --guard 0|1, --net e2v5 (every mode): Settings::learnedZeroTest (default 1) / learnedStaticGuard (default 0) / learnedNet (default the library's) of every run
 //                                            (only MotionVersion::Learned reads them)
@@ -267,7 +268,8 @@ static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v5: Settings::learn
 static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
 static bool gDetailSplit = false;   // --detail-split: Settings::v3DetailSplit (V3 hook (l)) on in every instance
 static V3Guard gV3Guard = V3Guard::Off;   // --v3-guard: Settings::v3Guard (task 104) in every instance
-static Settings algo(Settings s) { s.v3DetailSplit = gDetailSplit; s.v3Guard = gV3Guard; s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
+static uint8_t gV3Motion = 0;   // --v3-motion: Settings::v3Motion (0 = V3, 1 = V3.5) in every instance
+static Settings algo(Settings s) { s.v3Motion = gV3Motion; s.v3DetailSplit = gDetailSplit; s.v3Guard = gV3Guard; s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
 static bool algoV2() { return gAlgo == MotionVersion::V2; }
 static bool algoV2Quality() { return algoV2() && gMode == V2Mode::Quality; }
 static bool algoV3() { return gAlgo == MotionVersion::V3; }   // the skeleton of V3 (gpu/V3.md step S): a plain time-weighted blend, no motion
@@ -2210,6 +2212,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--bgra")) bgra = true;
 #ifndef UITEST_NO_MOTION
         else if (!strcmp(argv[i], "--detail-split")) gDetailSplit = true;
+        else if (!strcmp(argv[i], "--v3-motion") && i + 1 < argc) gV3Motion = (uint8_t)atoi(argv[++i]);   // Settings::v3Motion: 0 = V3, 1 = V3.5
         else if (!strcmp(argv[i], "--v3-guard") && i + 1 < argc) {   // Settings::v3Guard (task 104): off | guard | v2motion (--guard is the Learned static guard)
             const char* g = argv[++i];
             if (!strcmp(g, "off") || !strcmp(g, "0")) gV3Guard = V3Guard::Off;
@@ -2239,7 +2242,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench" && pos[0] != "stale" && pos[0] != "debugview")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench|stale|debugview [--bgra] [--hash] [--algo v1|v2|learned|v3] [--mode quality|performance] [--detail-split] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench" && pos[0] != "stale" && pos[0] != "debugview")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench|stale|debugview [--bgra] [--hash] [--algo v1|v2|learned|v3] [--v3-motion 0|1] [--v3-guard off|guard|v2motion] [--mode quality|performance] [--detail-split] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
