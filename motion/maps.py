@@ -21,6 +21,11 @@ panels show the warp residual |prev - curr warped back by the field| x 4 instead
 Road sheets (task 161): `maps.py --road DIR --out OUT --pairs road.json [--only ...] [--new-label TEXT]` draws one sheet per pair from the fields measure.py --road wrote (DIR/fields/<pair>.npz;
 no GPU run), 1800 px wide, 3 x 3 panels: prev frame | V3 field | V3.5 today; V3.5 new | model of today | model of new; "still against the model" of today | of new | the prev frame with the
 sparse truth of the ground (arrows from the real in-between frame, green = the V3.5 field of today is within 4 px, red = not) .
+
+Ground sheets (task 162): `maps.py --ground DIR --fgtest NEW --ref-fgtest TODAY --out OUT --pairs list.json [--only ...]` draws one sheet per pair from the fields `ground.py` wrote (DIR/fields/<pair>_<tag>.npz,
+tags v3 / today / new) and the truth of DIR's `--truth` files (default DIR/../truth), 1800 px wide, 3 x 3 panels: prev | V3 | V3.5 today; V3.5 new | truth arrows coloured by whether the new field
+is within 4 px (green) or not (red) | the same for today; real in-between frame | |generated - real| x 4 of today | of new.  The generated frames come from a run of both builds (t = 0.5, `--set algo=v3,v3Motion=1`); the numbers in the
+head are the share of the ground patches within 4 px and the mean absolute picture error against the real frame.
 """
 import argparse
 import os
@@ -253,6 +258,65 @@ def road_sheet(p, npz, new_label):
     return np.vstack([head, img])
 
 
+def ground_sheet(p, npz, truth, gen, real):
+    """one ground sheet (see the module docstring); npz = {tag: field} (F full-res px, flow grid), truth [n, 4], gen = {tag: generated frame}, real = the in-between frame"""
+    size = (PW, PH)
+    sc = 32.0
+    prev = C.read_rgba(p["prev"], p["W"], p["H"])
+    fs = p["W"] // npz["v3"].shape[1]
+
+    def read(F, x, y):
+        return F[max(int(y) // fs - 2, 0):int(y) // fs + 3, max(int(x) // fs - 2, 0):int(x) // fs + 3].reshape(-1, 2).mean(0)
+
+    def arrows(tag):
+        img = np.ascontiguousarray(prev.copy())
+        good = 0
+        for x, y, vx, vy in truth:
+            f = read(npz[tag], x, y)
+            ok = np.hypot(f[0] - vx, f[1] - vy) < 4
+            good += ok
+            cv2.arrowedLine(img, (int(x), int(y)), (int(x + vx), int(y + vy)), (0, 255, 0) if ok else (255, 0, 0), 3, tipLength=0.3)
+            cv2.circle(img, (int(x), int(y)), 6, (255, 255, 0), -1)
+        return img, good / max(len(truth), 1)
+
+    def err(tag):
+        return np.abs(gen[tag].astype(np.int16) - real.astype(np.int16)).mean()
+
+    at, gt = arrows("today")
+    an, gn = arrows("new")
+    et, en = err("today"), err("new")
+    d = lambda tag: np.clip(np.abs(gen[tag].astype(np.int16) - real.astype(np.int16)) * 4, 0, 255).astype(np.uint8)
+    pan = [C.image_panel(prev, size, "prev"), C.motion_panel(npz["v3"], sc, size, "V3"), C.motion_panel(npz["today"], sc, size, "V3.5 today"),
+           C.motion_panel(npz["new"], sc, size, "V3.5 new"), C.image_panel(an, size, "truth arrows: new within 4 px green (%.0f%% of patches)" % (100 * gn)),
+           C.image_panel(at, size, "truth arrows: today within 4 px green (%.0f%%)" % (100 * gt)),
+           C.image_panel(real, size, "real in-between frame"), C.image_panel(d("today"), size, "today |generated - real| x4: mean %.2f" % et),
+           C.image_panel(d("new"), size, "new |generated - real| x4: mean %.2f" % en)]
+    img = np.vstack([np.hstack(pan[i:i + 3]) for i in range(0, 9, 3)])
+    head = np.full((TITLE, img.shape[1], 3), 20, np.uint8)
+    C.put(head, "%s   within 4 px of the truth: today %.0f%% -> new %.0f%%   picture error: today %.2f -> new %.2f" % (p["name"], 100 * gt, 100 * gn, et, en), (10, 40), 0.8)
+    return np.vstack([head, img])
+
+
+def ground_main(a):
+    pairs = []
+    for q in a.pairs:
+        pairs += C.load_pairs(q, a.only)
+    pairs = [q for q in pairs if q.get("mid")]
+    tdir = a.truth or os.path.join(a.ground, "..", "truth")
+    os.makedirs(os.path.join(a.out, "ground"), exist_ok=True)
+    pairs = [q for q in pairs if os.path.exists(os.path.join(tdir, q["name"] + ".npy")) and all(os.path.exists(os.path.join(a.ground, "fields", "%s_%s.npz" % (q["name"], t))) for t in ("v3", "today", "new"))]
+    gens = {}
+    for tag, exe in (("today", a.ref_fgtest), ("new", a.fgtest)):
+        for r in C.run_fgtest(exe, "algo=v3,v3Motion=1", pairs, os.path.join(a.out, "work_" + tag), dump=False):
+            gens[(r["pair"]["name"], tag)] = r["out"]
+    for q in pairs:
+        n = q["name"]
+        npz = {t: np.load(os.path.join(a.ground, "fields", "%s_%s.npz" % (n, t)))["F"].astype(np.float32) for t in ("v3", "today", "new")}
+        img = ground_sheet(q, npz, np.load(os.path.join(tdir, n + ".npy")), {t: gens[(n, t)] for t in ("today", "new")}, C.read_rgba(q["mid"], q["W"], q["H"]))
+        cv2.imwrite(os.path.join(a.out, "ground", n + ".png"), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        print(n, flush=True)
+
+
 def road_main(a):
     pairs = []
     for q in a.pairs:
@@ -270,6 +334,8 @@ def road_main(a):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--road", help="road sheets from the DIR of measure.py --road (no GPU run)")
+    ap.add_argument("--ground", help="ground sheets from the DIR of ground.py (needs --fgtest, --ref-fgtest; runs both builds for the generated frames)")
+    ap.add_argument("--truth", help="ground sheets: the truth files' directory (default DIR/../truth)")
     ap.add_argument("--new-label", default="V3.5 new")
     ap.add_argument("--fgtest", required=False)
     ap.add_argument("--set", default="", dest="setstr", help="fgtest --set string")
@@ -283,6 +349,8 @@ def main():
     a = ap.parse_args()
     if a.road:
         return road_main(a)
+    if a.ground:
+        return ground_main(a)
     if not a.fgtest:
         ap.error("--fgtest is required")
     pairs = []

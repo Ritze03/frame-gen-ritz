@@ -1,0 +1,165 @@
+diff --git a/gpu/framegen.cpp b/gpu/framegen.cpp
+index 5a31cd2..259b4b8 100644
+--- a/gpu/framegen.cpp
++++ b/gpu/framegen.cpp
+@@ -5,6 +5,8 @@
+ #include <cstring>
+ #include <algorithm>
+ #include <cassert>
++#include <cstdio>
++#include <cstdlib>
+ 
+ #include "luma_spv.h"
+ #include "down_spv.h"
+@@ -79,6 +81,8 @@
+ #include "v35_reg_spv.h"
+ #include "v35_stats_spv.h"
+ #include "v35_rgn_spv.h"      // Settings::v3Motion = 1 (V3.5): the block field regularisation
++#include "v35_gsearch_spv.h"  // (task 162) the wide census search of the ground
++#include "v3_search_35_spv.h"
+ // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
+ // generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
+ // have format variants (probed per format below).
+@@ -626,7 +630,7 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE,
+             P_V3_SEARCH_J, P_V3_SEARCH_TOP_J, P_V3_DENSE_J,   // (hook (j) v3ColourWindow: the search and dense passes built with the colour-window weights; the plain ones stay as they are)
+             P_V3_SEARCH_TOP,   // (E1: the top level's exhaustive search, its own pipeline: its shared patch must not cost the other levels' occupancy)
+             P_V3_ANCHOR, P_V3_GUARD,   // (task 104, Settings::v3Guard: created with the V2 estimate passes P_DOWN / P_V2_MEDHIST* / P_V2_SEARCH* / P_V2_REPICK / P_V2_CLEAN / P_V2_QFIELD in V3's group)
+-            P_V35_REG, P_V35_DENSE, P_V35_STATS, P_V35_RGN,   // (Settings::v3Motion = 1, V3.5: created only while it is on, v35Ensure)
++            P_V35_REG, P_V35_DENSE, P_V35_STATS, P_V35_RGN, P_V35_GSEARCH, P_V35_SEARCH,   // (Settings::v3Motion = 1, V3.5: created only while it is on, v35Ensure)
+             P_COUNT };
+ // The match and conv pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF); convs per
+ // shape (0 = first, 14 -> w; 1 = hidden, w -> w; 2 = last, w -> 2) and, but the last, whole or split (one output group per
+@@ -1923,7 +1927,8 @@ bool Interpolator::Impl::motionEnsure() {
+ // group is freed. False: a creation failed (what exists stays; nothing is half-used: the estimate checks every pipe it needs).
+ bool Interpolator::Impl::v35Ensure() {
+     MotionGroup& g = mo[(int)MotionVersion::V3];
+-    const struct { Pipe p; Spv sp; } list[] = {{P_V35_REG, SPV(v35_reg)}, {P_V35_DENSE, SPV(v3_dense_35)}, {P_V35_STATS, SPV(v35_stats)}, {P_V35_RGN, SPV(v35_rgn)}};
++    const struct { Pipe p; Spv sp; } list[] = {{P_V35_REG, SPV(v35_reg)}, {P_V35_DENSE, SPV(v3_dense_35)}, {P_V35_STATS, SPV(v35_stats)}, {P_V35_RGN, SPV(v35_rgn)},
++                                               {P_V35_GSEARCH, SPV(v35_gsearch)}, {P_V35_SEARCH, SPV(v3_search_35)}};
+     for (const auto& e : list)
+         if (!g.pipes[e.p] && !makePipe(e.sp, layout, g.pipes[e.p], nullptr)) return false;
+     return true;
+@@ -3127,11 +3132,25 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
+                 sv.lvl = l; sv.lw = V.w[l]; sv.lh = V.h[l]; sv.gw = V.gw[l]; sv.gh = V.gh[l];
+                 sv.mode = hookJ;   // search: bit 0 hook (j)
+                 const int its = (l >= 1 && l < V.n - 1) ? 2 : 1;
++                // task 162 (V3.5): the census search (v35_gsearch) of the two levels gl + 1 and gl (8 and 4 px per level px below the 16-px level: +-6 level px around the parent block vector x2)
++                // runs before the level's first iteration, which takes its vector as a candidate (mode bit 8, the census vector with its confidence); gl is the level of 8 px per level px (flowScale 2: level 2)
++                const int gl = I.set.flowScale == 1 ? 3 : I.set.flowScale == 2 ? 2 : 1;
++                if (v35) { sv.t0 = 0.03f; sv.t1 = 0.06f; sv.smear = 0.04f; sv.unsure = 0.6f; }   // (the census confidence ramps, the zero-vector ramp, the candidate's bonus in levels; v35_gsearch / v3_search)
++                const bool gs = v35 && l >= 1 && l <= V.n - 2 && (l == gl || l == gl + 1);   // the two levels of 8 and 16 px per level px: +-6 level px around the parent's vector
++                if (gs) {
++                    V3PC gv = sv;
++                    gv.n = 6;
++                    gv.mode = 512;
++                    r.runV3(P_V35_GSEARCH, gv, V.gw[l], V.gh[l], 2);
++                    r.cbar();
++                }
+                 for (int it = 0; it < its; it++) {
+                     sv.iter = it;
+-                    r.runV3(l == V.n - 1 ? (hookJ ? P_V3_SEARCH_TOP_J : P_V3_SEARCH_TOP) : (hookJ ? P_V3_SEARCH_J : P_V3_SEARCH), sv, V.gw[l], V.gh[l], 2);   // (the top level: exhaustive, its own pipeline)
++                    sv.mode = hookJ | (gs && it == 0 ? 256 : 0);
++                    r.runV3(l == V.n - 1 ? (hookJ ? P_V3_SEARCH_TOP_J : P_V3_SEARCH_TOP) : v35 ? P_V35_SEARCH : (hookJ ? P_V3_SEARCH_J : P_V3_SEARCH), sv, V.gw[l], V.gh[l], 2);   // (the top level: exhaustive, its own pipeline)
+                     r.cbar();
+                 }
++                sv.mode = hookJ;
+                 r.stamp(l == V.n - 1 && V.n > 1 ? topName : lvNames[l]);
+                 if (V.n >= 4 && l == V.n - 2) {   // the wide search on the blocks where level L_wide's result is unsure (section 3.6)
+                     r.runV3(P_V3_WIDE, sv, V.gw[l], V.gh[l], 2);
+@@ -3142,7 +3161,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
+                     // V3.5: from level LH down to 1 the camera / dominant-motion fit is redone on this level's (not yet regularised) blocks, texture-weighted (v35_stats): the
+                     // coarse level's integer vectors (8 flow px apart at LH) give only a crude model, the finer levels' a precise one; the model is what the search below takes as candidates
+                     const int fin = (l >= 1 && l < V.n - 1) ? 1 : 0;
+-                    if (V.n >= 3 && l >= 1 && l <= std::max(1, V.n - 3)) {
++                    if (V.n >= 3 && (l == 1 || l == std::max(1, V.n - 3))) {   // (level LH, which finds the dominant motions, and level 1; not between: the census chain is the evidence there and the pass costs more than the fit adds)
+                         r.runV3(P_V35_STATS, sv, 1, 1, 1);
+                         r.cbar();
+                         V3PC gv = sv;
+@@ -3152,7 +3171,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
+                         r.stamp("stats");
+                     }
+                     // the level's block field regularised (two Jacobi steps: its final slot -> the other -> back; level 0: one step, slot 0 (V3's result) -> slot 1, the dense pass offers both)
+-                    for (int k = 0; k < ((l + 1 == V.n && V.n > 3) ? 0 : l == 0 ? 1 : 2); k++) {   // the top level: a handful of blocks, a dispatch costs more than it gains
++                    for (int k = 0; k < ((l + 1 == V.n && V.n > 3) ? 0 : l == 0 ? 1 : (l >= 2 && l <= std::max(1, V.n - 3)) ? 0 : 2); k++) {   // the top level: a handful of blocks, a dispatch costs more than it gains
+                         V3PC rv = sv;
+                         rv.mode = l == 0 ? (1 << 20) : 0;
+                         rv.iter = k == 0 ? fin : 1 - fin;
+diff --git a/gpu/meson.build b/gpu/meson.build
+index 4a1b6d2..6891604 100644
+--- a/gpu/meson.build
++++ b/gpu/meson.build
+@@ -33,7 +33,7 @@ shaders = shader_gen.process(
+   'shaders/ml_zero.comp', 'shaders/ml_guard.comp',
+   'shaders/v3_synth.comp', 'shaders/v3_planes.comp', 'shaders/v3_pyr.comp', 'shaders/v3_hist.comp', 'shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp', 'shaders/v3_wide.comp', 'shaders/v3_stats.comp',
+   'shaders/v3_occl.comp', 'shaders/v3_fill.comp', 'shaders/v3_project.comp', 'shaders/v3_enclose.comp', 'shaders/v3_decide.comp',
+-  'shaders/v3_anchor.comp', 'shaders/v3_guard.comp', 'shaders/v35_reg.comp', 'shaders/v35_stats.comp', 'shaders/v35_rgn.comp',
++  'shaders/v3_anchor.comp', 'shaders/v3_guard.comp', 'shaders/v35_reg.comp', 'shaders/v35_stats.comp', 'shaders/v35_rgn.comp', 'shaders/v35_gsearch.comp',
+   'shaders/debug_motion.comp', 'shaders/debug_ui.comp')   # task 136: Settings::debugView (the motion tint for V1 / Learned, the UI views); task 104: Settings::v3Guard, V2 Quality's vectors correct V3's dense field
+ 
+ # MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked
+@@ -73,13 +73,13 @@ v3j_gen = generator(glslang,
+   arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+                '-DV3J=1', '--vn', '@BASENAME@_j_spv', '-o', '@OUTPUT@', '@INPUT@'])
+ v3j_shaders = v3j_gen.process('shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp')
+-# MotionVersion::V3 Settings::v3Motion = 1 (V3.5): the dense pass with -DV35=1, into <name>_35_spv (v3_dense_35). The plain builds keep their SPIR-V.
++# MotionVersion::V3 Settings::v3Motion = 1 (V3.5): the dense pass and the search with -DV35=1, into <name>_35_spv (v3_dense_35, v3_search_35). The plain builds keep their SPIR-V.
+ v35_gen = generator(glslang,
+   output : '@BASENAME@_35_spv.h',
+   depfile : '@BASENAME@_35_spv.h.d',
+   arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+                '-DV35=1', '--vn', '@BASENAME@_35_spv', '-o', '@OUTPUT@', '@INPUT@'])
+-v35_shaders = v35_gen.process('shaders/v3_dense.comp')
++v35_shaders = v35_gen.process('shaders/v3_dense.comp', 'shaders/v3_search.comp')
+ # MotionVersion::V3 hook (l) (Settings::v3DetailSplit): the synthesis with the detail split, -DV3L=1, into v3_synth_l_spv (Rgba8 / Bgra8; the other formats'
+ # variants are built below as v3_synth_l_<fmt>_spv). The plain v3_synth builds keep their SPIR-V (the switch off costs nothing).
+ v3l_gen = generator(glslang,
+diff --git a/gpu/shaders/v3_search.glsl b/gpu/shaders/v3_search.glsl
+index 78e346b..4875d66 100644
+--- a/gpu/shaders/v3_search.glsl
++++ b/gpu/shaders/v3_search.glsl
+@@ -6,6 +6,11 @@
+ #ifndef V3J
+ #define V3J 0
+ #endif
++// V35 = 1 (the v3_search_35 build, Settings::v3Motion = 1, task 162): candidate 11 of iteration 0 where the host set mode bit 8 is the census search's vector (v35_gsearch.comp), with no
++// distance penalty and a bonus of V35_GB x its confidence (levels). V35 = 0 is the unchanged V3 build.
++#ifndef V35
++#define V35 0
++#endif
+ #include "common.glsl"
+ #include "v3_common.glsl"
+ #include "v3_est.glsl"
+@@ -31,6 +36,10 @@ shared float sw[64];       // hook (j): the window pixel's colour weight (0 outs
+ shared float pWgt[64];
+ #endif
+ shared float red[5 * 64];
++#if V35
++shared float gconfS;       // the census candidate's confidence (cflag bit 4 marks the candidate)
++#define V35_GB pc.unsure
++#endif
+ shared uint blkDetU;       // task 105: the window's summed detail x 256 (hudB > 0 only; integer atomics, no extra barrier)
+ #if V3S_TOP
+ shared float topc[289];
+@@ -95,6 +104,9 @@ void evalRound() {
+             const float ev = v3HudEv(float(blkDetU) * (1.0 / 256.0) / float(max(nWin, 1)));
+             bon = pc.hudB * ev * v3HudAbs(cost) * v3HudGate(length(vec2(refV)) * float((1 << pc.lvl) * pc.fscale));
+         }
++#if V35
++        if ((cflag[tid] & 16) != 0) bon += V35_GB * gconfS;
++#endif
+         cres[tid] = (cflag[tid] & 8) != 0 ? 1e9 : cost + ((cflag[tid] & 2) != 0 ? 0.0 : min(V3_LAMBDA * float(d.x + d.y), (cflag[tid] & 4) != 0 ? V3_DOMCAP : 1e9)) - bon;
+     }
+     barrier();
+@@ -373,6 +385,12 @@ void main() {
+                 const ivec2 tb = ivec2(floor(target * 0.25));
+                 v = ivec2(roundEven(-2.0 * recXY(v3BlkIdx(Lp, 1 - dir, pfin, tb)))); fg = 1;
+             }
++#if V35
++            else if (tid == 11 && (pc.mode & 256) != 0) {   // the census search's vector of this block (slot 1 of this level holds it until iteration 1 writes it)
++                const vec4 g = vec4(fl[v3BlkIdx(L, dir, 1, blk)], fl[v3BlkIdx(L, dir, 1, blk) + 1], fl[v3BlkIdx(L, dir, 1, blk) + 2], 0.0);
++                if (g.z > 0.0) { v = ivec2(roundEven(g.xy)); fg = 19; gconfS = g.z; }
++            }
++#endif
+             cv[tid] = v;
+             cflag[tid] = fg;
+         }

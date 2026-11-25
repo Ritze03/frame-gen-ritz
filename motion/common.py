@@ -435,3 +435,22 @@ def road_truth(prev, mid, curr, h=32, step=96, R=96, y_from=0.4):
             if ok:
                 out.append((x, y, a[0] + b[0], a[1] + b[1]))
     return np.array(out, np.float32).reshape(-1, 4)
+
+
+def frame_truth(prev, mid, curr, h=32, step=64, R=96):
+    """The sparse truth of `road_truth` over the whole frame (task 162): patches of 2h x 2h px on a `step` grid from the frame's edge (a margin of h), same acceptance
+    (prev -> mid and mid -> curr agree within 3 px, distinct match, texture).  Returns [n, 4] (x, y, vx, vy), full-resolution prev -> curr displacements at the centres."""
+    A, M, B = (luma(a.astype(np.float32)) for a in (prev, mid, curr))
+    H, W = A.shape
+    out = []
+    for y in range(h, H - h + 1, step):
+        for x in range(h, W - h + 1, step):
+            if A[y - h:y + h, x - h:x + h].std() < 2.0:
+                continue
+            a = _best_shift(A, M, x, y, h, R)
+            b = _best_shift(M, B, x, y, h, R)
+            if np.hypot(a[0] - b[0], a[1] - b[1]) > 3.0:
+                continue
+            if all(t[2] < 0.6 * t[4] and (np.isnan(t[3]) or t[2] < 0.8 * t[3]) for t in (a, b)):
+                out.append((x, y, a[0] + b[0], a[1] + b[1]))
+    return np.array(out, np.float32).reshape(-1, 4)

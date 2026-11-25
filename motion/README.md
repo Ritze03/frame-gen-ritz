@@ -429,3 +429,61 @@ The aperture problem is total on the road: lane lines run along the motion, so a
 Rule: a block may refuse the vote or the model only where the image positively prefers its own vector (per-pixel evidence: at least 3 of the 16 window samples clearly better at its own vector by 1.5 + 0.3 detail levels and not fewer than a fifth of those that prefer the other); indifferent blocks neither vote, nor hold their vector, nor refuse the model; the model fits of a region with a substantial still part (a quarter of the weight and at least 60 moving sample weights) are redone on the moving samples only; the dense pass puts a 2.5-level handicap on V3's own vectors. Result: "still against the model" 6.6 % -> 4.2 % (3.1 % against today's model), the sheets show the field following the model, and the model is still the one above. Against the sparse truth: V3.5 median EPE 13.0 -> 16.3 px, patches within 4 px 36.3 % -> 32.3 % (model 27.5 -> 26.4 median): worse. Following a wrong model moves the road to a wrong vector instead of a zero one. The patch is not in the tree.
 
 **What blocks it.** The road carries no evidence at the scale V3 matches (high-pass features, 8 x 8 windows): at 1/30 s the asphalt is smeared, dark and low in contrast, and the lane lines run along the motion. The informative blocks of the lower regions are the car and the overlay, both still. A model fitted from the blocks cannot know the road, and neither can a vote. What would: a model with geometry (the ground plane's motion about the focus of expansion: in Forza 000560 the truth fits d_y ~ (y - 470)^2 within 2 % at two points), or matching the road on raw luma at coarse levels, where the true half-motion is a distinct minimum (error 2.1 against 4.3 at zero and a median of 6.8, at (1500, 800), prev -> mid) while V3's high-pass channels have nothing left. Neither is a rule of the regularisation; neither was started.
+
+## The real ground (task 162)
+
+The question of task 161's last section: which matching can find the motion of a blurred road at the coarse levels? This task measured it offline against the whole frame, then tried the best answer inside V3.5. **The study is committed; the V3.5 change is not** (it meets every number below except one test threshold, see "What blocks it"): `census_candidate/` holds the shader and the patch against the library files, for whoever decides to take the last step.
+
+### The extended truth and the offline study
+
+- `common.frame_truth` is `road_truth` over the whole frame (64 px grid, 64 x 64 px patches, a margin of 32 px, prev -> mid and mid -> curr agree within 3 px, distinct match, texture), `ground.py --truth-only` writes it for every pair of a list that has a real in-between frame. Groups: **ground** = the lower half of the driving pairs (the 12 Forza held-out pairs, the 12 `road` pairs, the Forza scene pairs; 2158 patches in 26 pairs), **drive-up** = their upper half (4704), **tp** = the third-person pairs (1791), **game** = the other real pairs (cs2, Minecraft, Battlefield, first person; 1618).
+- `study_match.py` computes, per pair, level (L5 .. L1 of V3's pyramid at `flowScale` 2) and patch, the cost over an exhaustive +-12 level px search of each feature x window variant and reports whether the cost minimum lies within 1 level px of the rounded truth ("findable"). Variants: V3's own feature (raw minus a 5x5 mean) with 4, 8, 12, 16 px windows (`v3_N`), a 9- and 17-tap high-pass (`hp9`, `hp17`, `hpup`), zero-mean SAD with the lighting gain (`zs`), zero-mean normalised correlation (`zncc`), and a census transform (`census`: ternary code of the 8 neighbours at +-2 level px on the raw luma, Hamming cost). `study_table.py` aggregates the result; `--light up|down` repeats the study with the second frame brightened (gain 1.10, +14 levels) or darkened (0.90, -14) to test the lighting tolerance (the rows below are the unchanged case; on the ground pairs alone, with the second frame brightened / darkened, the census with window 8 / 12 still finds 82 / 86 % and 83 / 84 % of the moving patches at L2, V3's feature 63 / 67 % and 55 / 58 %).
+
+Share findable among the moving patches (true vector at least 1 level px), per level, ground / rest (rest = every patch outside the ground group), window 8 and 12 level px:
+
+| feature, window | L4 | L3 | L2 | L1 |
+|---|---|---|---|---|
+| V3's feature, 4 | 59 / 82 | 58 / 78 | 56 / 76 | 54 / 71 |
+| V3's feature, 8 | 64 / 90 | 62 / 92 | 72 / 90 | 71 / 86 |
+| V3's feature, 12 | 67 / 90 | 60 / 94 | 69 / 94 | 78 / 91 |
+| high-pass 9, 8 | 63 / 91 | 62 / 93 | 72 / 92 | 74 / 88 |
+| zero-mean SAD, 8 | 66 / 89 | 72 / 91 | 79 / 90 | 72 / 85 |
+| ZNCC, 12 | 69 / 89 | 65 / 93 | 74 / 94 | 78 / 90 |
+| census, 8 | 69 / 91 | 73 / 93 | 80 / 91 | 73 / 87 |
+| census, 12 | 68 / 92 | 71 / 95 | 80 / 94 | 79 / 91 |
+
+**Reading.** (1) Every variant finds more than half of the moving ground patches at the levels L2 .. L4, so the fallback of the brief (a ground-plane model) is not needed: the evidence exists, V3 does not use it. (2) The reason is not the feature: V3's own feature with an 8 px window finds 72 % at L2; V3 only searches **candidates** (parent x 2, zero, the camera, dominant motions, a ring of +-1), and the true road vector (several level px away from the parent's, from zero and from the camera, because the fits are dominated by the still blocks) is never a candidate. Exhaustive search around zero at the coarse level and around the parent's vector below is what gives the road its motion. (3) Among the features the census is the best or equal at L2 / L3 (80 / 73 % on the ground) and the one that stays best under the lighting change; its confidence (distance to the second-best vector, margin over the parent's vector) is cheap. A window of 8 is as good as 12 and a third of the memory. Choice: **census, 8 x 8 level-px window, exhaustive, a hierarchical chain** (+-12 around zero at L4, +-6 around the parent's vector at L3 and L2, +-2 at L1).
+
+### What was built (the candidate, `census_candidate/`)
+
+- `v35_gsearch.comp` (new, 64 invocations, one block per workgroup, `GMAX` 6): census codes of the window (frame f0) and of the target region (frame f1) in shared memory, the cost of all (2 R + 1)^2 candidates, best vector, confidence `smoothstep(0.03, 0.06, second_best - best) * smoothstep(0, 0.04, cost_at_centre - best)`; writes (vector, confidence, cost) into slot 1 of the level's block records (free until iteration 1).
+- `v3_search.glsl` (`#if V35` only): iteration 0 takes the record as candidate 11 (no distance penalty, a bonus of 0.6 x confidence in cost levels); `-DV35` compile of `v3_search.comp` (`v3_search_35`), so V3's SPIR-V is unchanged.
+- `framegen.cpp`: the pass runs at levels 3 and 2 (+-6 around the parent's vector x 2), before the level's search; V3.5's `v35_stats` runs only at level 3 (the level that finds the dominant motions) and level 1, `v35_reg` is dropped at levels 2 and 3 (the census vectors are the better evidence there, and the passes cost 0.3 ms); two new lazily created pipelines (`v35_gsearch`, `v3_search_35`; V3.5 has six, V3 itself is unchanged). The unconstrained chain (+-12 at L4, +-6 at L3 and L2, +-2 at L1, all of V3.5's stats and regularisation passes kept) scores better (ground median 3.9 px, within 4 px 50.4 %, still 1.1 %; synthetic mean 0.61 px) at 1.87 ms per pair and does not fit the 1.5 ms mark.
+- A first version of the chain (four passes, +-12 / 6 / 6 / 2) cost 1.48 ms more because the pass is latency bound (a block per group, large shared memory, many groups at the fine levels); smaller ranges, a 64-invocation group and a third of the shared memory brought a pass down to 0.05 .. 0.15 ms. Stride-2 sampling of the window lost 2.5 points and was dropped.
+
+### Numbers (the candidate against V3 and today's V3.5)
+
+Ground truth, `ground.py` (`mean px / median px / within 4 px / still where the truth is above 4 px`), patches as above:
+
+| group | V3 | V3.5 today | candidate |
+|---|---|---|---|
+| ground (2158) | 33.65 / 13.19 / 33.6 % / 10.2 % | 31.80 / 12.10 / 36.0 % / 4.3 % | 23.60 / 4.75 / 46.5 % / 2.6 % |
+| drive-up (4704) | 4.22 / 1.11 / 82.1 % / 0.3 % | 3.98 / 1.07 / 84.2 % / 0.1 % | 3.63 / 1.07 / 85.3 % / 0.1 % |
+| tp (1791) | 5.16 / 0.82 / 84.8 % / 0.2 % | 4.77 / 0.80 / 87.0 % / 0.2 % | 4.82 / 0.81 / 87.0 % / 0.4 % |
+| game (1618) | 7.70 / 1.36 / 75.5 % / 2.0 % | 6.06 / 1.05 / 81.0 % / 0.5 % | 5.75 / 1.05 / 83.6 % / 0.3 % |
+
+The ground median falls from 12.1 to 4.75 px (the aim was 6 px), the share within 4 px rises from 36.0 to 46.5 % (the aim was 55 %: not met), the still share on the ground from 4.3 to 2.6 % (limit 3.7 %). No other group is worse by more than 0.01 px median or 0.4 points of the still share. The 72 synthetic + 23 held-out pairs (`measure.py`, `v3Motion = 1`): end-point error lower than V3 in all 24 rows, mean 0.79 px (today 0.96, V3 3.86); real PSNR against V3 battlefield +0.68, cs2 +0.08, forza +0.36, minecraft +0.34 dB (today +0.50, 0.00, +0.10, +0.09: no group loses against today); per pair against today between -0.08 dB (a cs2 pair) and +0.90 dB (a Minecraft pair). Cost, 1080p Rgba8 2x, `fgtest --bench 200`, median of 3: V3 0.954, today's V3.5 1.471, candidate 1.432 ms per pair.
+
+### What blocks it
+
+The test program `v3test --v3-motion 1` reports 172 passes and **2 failures**, both the static-overlay check of the `hud(60,20)` scene with UI protection on: overlay error 7.15 and 7.23 levels (limit 7; today's V3.5 5.5 / 5.7). Everything else passes (the lighting marks, the switching marks, the dominant-motion checks). The cause is the level-2 census pass: without it (or with it forced to confidence 0) the scene measures 6.19 / 6.44, with it the vector of a few blocks next to the overlay becomes the background's and V3's zero-vector bonus (gated by the length of the parent's vector) no longer holds the overlay at the next level. Tried, none separates those blocks from the road's: raising the confidence thresholds (0.04 and 0.05 give 7.05 / 7.16, and cost 3 points of ground), the census cost of the zero vector, a pixel-exact still test of the zero vector (many road pixels are pixel-exact between frames in the compressed video: skipped macroblocks), a limit on the jump from the parent's vector, the stillness evidence of the HUD hold applied to the candidate, a distance penalty for the candidate, reduced ranges at level 2 (the pass then finds nothing). The ground gain needs the level-2 pass (median 9.4 px instead of 5.8 on the six-pair quick set without it).
+
+### Run the extended measure
+
+```
+python motion/ground.py --pairs pairs.json --truth TRUTHDIR --truth-only                 # writes TRUTHDIR/<pair>.npy (once)
+python motion/ground.py --pairs pairs.json --truth TRUTHDIR --out OUT \
+       --run v3=FGTEST:algo=v3 --run new=FGTEST:algo=v3,v3Motion=1                       # OUT/ground.md, OUT/ground.json, OUT/fields/<pair>_<tag>.npz
+python motion/maps.py --ground OUT --truth TRUTHDIR --fgtest NEW --ref-fgtest TODAY --out SHEETS --pairs pairs.json --only name,name,...   # sheets 1800 px wide: prev | V3 | today; new | truth arrows (green: within 4 px) of new | of today; real | generated-vs-real error of today | of new
+python motion/study_match.py --list pairs.json --truth TRUTHDIR --out study.pkl [--light up|down]; python motion/study_table.py study.pkl --md table.md
+```
