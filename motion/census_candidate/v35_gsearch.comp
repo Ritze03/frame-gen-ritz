@@ -4,11 +4,11 @@
 // Why: on a plain road at speed V3's cost curves are flat at every level (the 5x5 high-pass leaves nothing of a smeared, low-contrast asphalt, the lane lines run along the motion)
 // and its search only ever refines around the parents' vectors (+-1 level px per iteration), so no level finds a motion the top level did not already have; the road stays at zero.
 // What it does: for every block of level pc.lvl (4 x 4 px, window 8 x 8 with the 2 px apron, as the search's) an exhaustive search over the integer vectors of +-GR level px of a
-// census cost on the raw luma: the code of a pixel says which of its 8 neighbours at +-2 level px are brighter (a second bit: darker) than it by more than GS_EPS; the cost is the
-// share of differing bits over the window's pixels whose target is inside the level (at least half of the window). A census code is blind to any monotone lighting change (gain, offset,
+// census cost on the raw luma: the code of a pixel is a thermometer code of the differences to its 8 neighbours at +-2 level px (four thresholds each, 32 bits); the cost is the share of
+// differing bits over the window's pixels whose target is inside the level (at least half of the window). A census code is blind to any monotone lighting change (gain, offset,
 // a gradient) and keeps the soft shading, tyre marks and patches a 5x5 high-pass removes; a window of 8 x 8 at a coarse level spans 64 .. 128 px.
 // Output: the block's record in slot 1 of its level (free until the level's second search iteration writes it, which is after the one iteration that reads it) =
-// (vx, vy, confidence, best cost): the best vector, its confidence (how much better it is than zero and than the best vector at least 3 px away from it, relative to the cost level),
+// (vx, vy, confidence, best cost): the best vector, its confidence (how much better it is than the centre and than the best vector at least 2 px away from it, times the still-content guard),
 // both directions (z). v3_search (-DV35) takes it as candidate 11 of iteration 0 of the level, without distance penalty and with a bonus of GB x confidence, so on a flat block
 // where V3's own cost is indifferent the census vector wins, and where V3's cost clearly objects it does not.
 #include "common.glsl"
@@ -25,14 +25,15 @@ layout(local_size_x = GS_WG) in;
 // per dispatch (pc.n = the range GR in level px, at most GMAX): NC = 2 GR + 1 candidates per axis, the target region of the window RW = 8 + 2 GR, plus the census neighbourhood (+-2) SW = RW + 4.
 // pc.mode bit 9 (512): the search is centred on the vector of the parent block (x2) instead of on zero.
 
-const float GS_EPS = 0.5;                // levels: a neighbour counts as brighter / darker above this difference
 const float BAD = 4.0;
+const float GS_D0 = 24.0, GS_D1 = 64.0;     // detail ramp of the still-content guard (sum of the 4 neighbour differences, levels)
 
 shared float slum[(12 + 2 * GMAX) * (12 + 2 * GMAX)];              // luma of frame f1 around the window, clamped to the level
 shared uint scen[(8 + 2 * GMAX) * (8 + 2 * GMAX)];               // census codes of frame f1 over the target region
 shared float sy0[144];                   // luma of frame f0 around the window (12 x 12)
 shared uint sc0[64];                     // census codes of the window pixels of frame f0
 shared int sval[64];
+shared float sz[144];                    // luma of frame f1 at the zero vector over the same 12 x 12
 shared float cc[(2 * GMAX + 1) * (2 * GMAX + 1)];
 shared float tb[GS_WG], ts[GS_WG], tsum[GS_WG];
 shared int ti[GS_WG];
@@ -41,14 +42,24 @@ float rawY(const V3Lv L, int f, ivec2 p) {
     p = clamp(p, ivec2(0), ivec2(L.w - 1, L.h - 1));
     return unpackHalf2x16(pyr[2 * L.off + f * L.w * L.h + p.y * L.w + p.x].x).x;
 }
-// the code of a pixel from a staged luma array (row length n, centre index c): 8 neighbours at +-2 (x2 bits)
+// the thermometer code of a pixel from a staged luma array (row length n, centre index c): for each of the 8 neighbours at +-2 four thresholds on the difference to the centre
+// (-GS_E1, -GS_E0, GS_E0, GS_E1 levels; 4 bits, 32 bits in all). The Hamming distance of two codes is the sum over the neighbours of the difference of their quantised differences, so a
+// value that is a rounding step off (8 / 10 bit sources) moves one threshold and costs one bit of 32, not a whole sign flip, and the cost is a popcount.
 const ivec2 NB[8] = ivec2[8](ivec2(-2, 0), ivec2(2, 0), ivec2(0, -2), ivec2(0, 2), ivec2(-2, -2), ivec2(-2, 2), ivec2(2, -2), ivec2(2, 2));
+#ifndef GSE0
+#define GSE0 0.6
+#endif
+#ifndef GSE1
+#define GSE1 2.0
+#endif
 uint codeAt(float centre, int idx, int n, bool f1) {
     uint c = 0u;
     for (int k = 0; k < 8; k++) {
         const float d = (f1 ? slum[idx + NB[k].y * n + NB[k].x] : sy0[idx + NB[k].y * n + NB[k].x]) - centre;
-        c |= (d > GS_EPS ? 1u : 0u) << uint(2 * k);
-        c |= (d < -GS_EPS ? 1u : 0u) << uint(2 * k + 1);
+        c |= (d < -GSE1 ? 1u : 0u) << uint(4 * k);
+        c |= (d < -GSE0 ? 1u : 0u) << uint(4 * k + 1);
+        c |= (d > GSE0 ? 1u : 0u) << uint(4 * k + 2);
+        c |= (d > GSE1 ? 1u : 0u) << uint(4 * k + 3);
     }
     return c;
 }
@@ -74,7 +85,7 @@ void main() {
     }
     // stage: frame f1 luma over the target region +-2, frame f0 luma over the window +-2
     for (int i = tid; i < SW * SW; i += GS_WG) slum[i] = rawY(L, f1, wo + cen - GR - 2 + ivec2(i % SW, i / SW));
-    for (int i = tid; i < 144; i += GS_WG) sy0[i] = rawY(L, f0, wo - 2 + ivec2(i % 12, i / 12));
+    for (int i = tid; i < 144; i += GS_WG) { sy0[i] = rawY(L, f0, wo - 2 + ivec2(i % 12, i / 12)); sz[i] = rawY(L, f1, wo - 2 + ivec2(i % 12, i / 12)); }
     for (int ti_ = tid; ti_ < 64; ti_ += GS_WG) {
         const ivec2 x = wo + ivec2(ti_ & 7, ti_ >> 3);
         sval[ti_] = (all(greaterThanEqual(x, ivec2(0))) && all(lessThan(x, ivec2(L.w, L.h)))) ? 1 : 0;
@@ -109,7 +120,7 @@ void main() {
             }
         }
         float cost = BAD;
-        if (n * 2 >= nWin && n > 0) cost = float(s) / float(n * 16);
+        if (n * 2 >= nWin && n > 0) cost = float(s) / float(n * 32);
         cc[c] = cost;
         if (cost < BAD) { sumc += cost; cnt += 1.0; }
         const float pen = cost + 1e-5 * float(abs(v.x) + abs(v.y));   // ties: the shorter vector
@@ -142,6 +153,19 @@ void main() {
         // confidence: distinct from the best vector elsewhere (second minimum) and better than zero, relative to the mean cost (a flat window has costs that barely differ)
         float conf = 0.0;
         if (cb < BAD && gs < BAD * 0.5) conf = smoothstep(pc.t0, pc.t1, gs - cb) * smoothstep(0.0, pc.smear, cz - cb);
+        if (pc.occlSoft >= 0.0 && float(max(abs(cen.x), abs(cen.y))) > pc.occlSoft) conf = 0.0;   // only where the parent's vector is (near) zero: the road V3 leaves still
+        {   // the still-content guard: sharp content that is the same in both frames at the zero vector (a HUD stroke, a reticle) inside or beside the window says the vector is not the whole story
+            float w = 0.0, dsum = 0.0;
+            for (int y = 1; y < 11; y++) for (int x = 1; x < 11; x++) {
+                const int i = y * 12 + x;
+                const float a = sy0[i];
+                const float g = abs(sy0[i - 1] - a) + abs(sy0[i + 1] - a) + abs(sy0[i - 12] - a) + abs(sy0[i + 12] - a);
+                const float det = smoothstep(GS_D0, GS_D1, g);
+                dsum += det;
+                w += det * (1.0 - smoothstep(1.0, 3.0, abs(sz[i] - a)));
+            }
+            conf *= 1.0 - smoothstep(pc.cx, pc.cy, w);
+        }
         const int o = v3BlkIdx(L, dir, 1, blk);
         fl[o] = float(cen.x + v0.x); fl[o + 1] = float(cen.y + v0.y); fl[o + 2] = conf; fl[o + 3] = cb;
     }
