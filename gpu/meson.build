@@ -33,7 +33,7 @@ shaders = shader_gen.process(
   'shaders/ml_zero.comp', 'shaders/ml_guard.comp',
   'shaders/v3_synth.comp', 'shaders/v3_planes.comp', 'shaders/v3_pyr.comp', 'shaders/v3_hist.comp', 'shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp', 'shaders/v3_wide.comp', 'shaders/v3_stats.comp',
   'shaders/v3_occl.comp', 'shaders/v3_fill.comp', 'shaders/v3_project.comp', 'shaders/v3_enclose.comp', 'shaders/v3_decide.comp',
-  'shaders/v3_anchor.comp', 'shaders/v3_guard.comp',
+  'shaders/v3_anchor.comp', 'shaders/v3_guard.comp', 'shaders/v35_reg.comp', 'shaders/v35_camq.comp', 'shaders/v35_stats.comp',
   'shaders/debug_motion.comp', 'shaders/debug_ui.comp')   # task 136: Settings::debugView (the motion tint for V1 / Learned, the UI views); task 104: Settings::v3Guard, V2 Quality's vectors correct V3's dense field
 
 # MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked
@@ -73,6 +73,13 @@ v3j_gen = generator(glslang,
   arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                '-DV3J=1', '--vn', '@BASENAME@_j_spv', '-o', '@OUTPUT@', '@INPUT@'])
 v3j_shaders = v3j_gen.process('shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp')
+# MotionVersion::V3 Settings::v3Motion = 1 (V3.5): the dense pass with -DV35=1, into <name>_35_spv (v3_dense_35). The plain builds keep their SPIR-V.
+v35_gen = generator(glslang,
+  output : '@BASENAME@_35_spv.h',
+  depfile : '@BASENAME@_35_spv.h.d',
+  arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+               '-DV35=1', '--vn', '@BASENAME@_35_spv', '-o', '@OUTPUT@', '@INPUT@'])
+v35_shaders = v35_gen.process('shaders/v3_dense.comp')
 # MotionVersion::V3 hook (l) (Settings::v3DetailSplit): the synthesis with the detail split, -DV3L=1, into v3_synth_l_spv (Rgba8 / Bgra8; the other formats'
 # variants are built below as v3_synth_l_<fmt>_spv). The plain v3_synth builds keep their SPIR-V (the switch off costs nothing).
 v3l_gen = generator(glslang,
@@ -158,7 +165,7 @@ foreach f : get_option('formats')
 endforeach
 
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
-framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, wide2_shaders, v3j_shaders, v3l_shaders, v3b_shaders, dbg_shaders, variant_shaders, ml_weights,
+framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, wide2_shaders, v3j_shaders, v35_shaders, v3l_shaders, v3b_shaders, dbg_shaders, variant_shaders, ml_weights,
   dependencies : vulkan.partial_dependency(compile_args : true, includes : true))
 framegen_dep = declare_dependency(link_with : framegen_lib, include_directories : include_directories('.'))
 

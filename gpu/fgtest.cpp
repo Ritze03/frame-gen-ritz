@@ -10,7 +10,7 @@
 // readback; rgb10 / f16 / p010 as PQ HDR, f16lin as scRGB, see Fmt below).
 // --seq "S0;S1;..": live-toggle test: before pair i, setSettings(--set + state min(i, n-1)) and releaseUnusedMotion() (settingsError / setSettings failures end the run).
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
-// smoothBonus searchPenalty searchRadius searchRadiusTop subpixel flowScale pyramidMinSide v2StaticMask v3Smear v3OcclSoft v3Unsure v3SceneCut v3ColourWindow v3DetailSplit v3Blend v3Guard=off|guard|v2motion (or 0|1|2); debugView=off|motion|uimask|uiclean (or 0..3); algo=v1|v2|learned|v3 = motionVersion; v2Mode=quality|performance;
+// smoothBonus searchPenalty searchRadius searchRadiusTop subpixel flowScale pyramidMinSide v2StaticMask v3Smear v3OcclSoft v3Unsure v3SceneCut v3ColourWindow v3DetailSplit v3Blend v3Motion v3Guard=off|guard|v2motion (or 0|1|2); debugView=off|motion|uimask|uiclean (or 0..3); algo=v1|v2|learned|v3 = motionVersion; v2Mode=quality|performance;
 // learnedNet=e2v5 (MotionVersion::Learned's net), learnedHalf, learnedZeroTest, learnedStaticGuard (0|1); ui=off|crosshair|wholescreen|crosshairv2 =
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill), passed to init.
@@ -102,6 +102,7 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         else if (k == "v3ColourWindow") s.v3ColourWindow = v != 0;
         else if (k == "v3DetailSplit") s.v3DetailSplit = v != 0;
         else if (k == "v3Blend") s.v3Blend = (uint8_t)std::min(std::max(v, 0.0), 255.0);   // learned blend (experimental): 0 = the rule, 1 Fluidity, 2 Consistency = the nets (> kV3BlendMax is refused by settingsError)
+        else if (k == "v3Motion") s.v3Motion = (uint8_t)std::min(std::max(v, 0.0), 255.0);   // 0 = V3 as is, 1 = V3.5 (> kV3MotionMax is refused)
         else if (k == "debugView") {   // Settings::debugView: off | motion | uimask | uiclean (or 0..3; a value above is refused by validate)
             std::string a = eq + 1;
             if (a == "off") s.debugView = framegen::DebugView::Off;

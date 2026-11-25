@@ -149,6 +149,9 @@ struct Frame {
 // gpu/shaders/v3_blend_weights.glsl (gpu/meson.build stops the configure otherwise); at most 15 (the synth's variant field is 4 bits). Values above it are refused by settingsError / validate.
 // These values replaced the earlier 1..15 (old 6 is now 1, old 15 is now 2).
 constexpr uint8_t kV3BlendMax = 2;
+constexpr uint8_t kV3MotionMax = 1;       // the highest Settings::v3Motion value
+constexpr uint8_t kV3MotionClassic = 0;   // V3's motion detection as it was
+constexpr uint8_t kV3MotionV35 = 1;       // V3.5
 constexpr uint8_t kV3BlendFluidity = 1;      // blend/weights/forza-rx9070xt/C.npz: smoother in-between motion
 constexpr uint8_t kV3BlendConsistency = 2;   // blend/weights/ar4/C.npz: fewest ghost edges, the most stable picture; softer edges, motion closer to repeated frames
 
@@ -407,6 +410,11 @@ struct Settings {
     // to the library before the setting). Other versions ignore it. Runtime: setSettings() at any time, no GPU wait, no allocation.
     // Cost: one full-res pass per generated frame (RX 7900 XTX 1080p: see MotionVersion::Learned's cost note); no memory.
     bool learnedStaticGuard = false;
+    // v3Motion (0..kV3MotionMax, default 0): V3's motion detection. 0 = V3's own, exactly as without the setting (byte-identical output); 1 = V3.5, the block search with
+    // confidence-weighted regularisation of the block fields and the dense field blended against a locally linear field. Only MotionVersion::V3 reads it (others ignore it).
+    // Runtime: setSettings() at any time, from the next recordEstimate; the first time it is 1, setSettings creates V3.5's pipelines (no GPU wait).
+    // The field sits in the padding byte before flowScale: sizeof(Settings) stays 164.
+    uint8_t v3Motion = 0;
 
     // ---- structural: init() or reconfigure() only (re-creates buffers; retire rule of resize()) ----
     // Motion estimation runs at 1/flowScale of the frame size: 1, 2 or 4. 2 = quality (default);

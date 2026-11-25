@@ -10,6 +10,13 @@ the truth in px, inferno, 0 .. scale/8, dark grey = not valid (hidden in a frame
 estimated field's Jacobian, grey = (g / 2 px per flow px)^0.6, black = smooth, white = a step of 2 px or more between neighbours.
 Layout, synthetic pairs: row 1 true middle frame | true motion | estimated motion, row 2 steps of the estimate | error | steps of the truth.
 Real pairs: row 1 prev frame | estimated motion | steps, row 2 real in-between frame (or curr) | generated t = 0.5 frame | |generated - real| x 4.
+
+Before / after sheets (task 157): `--ref-fgtest PATH [--ref-set 'algo=v3']` runs a second build / setting on the same pairs and writes DIR/compare/<name>.png instead
+(the same 1800 px width), one fixed error scale and one fixed wheel scale for both sides.
+Synthetic: true motion | REF estimate | estimate  /  middle frame | REF error | error  /  the falsely still pixels (estimate under 0.5 px where the truth is above 2 px) of
+REF | of the estimate | relative error |e| / max(|true|, 1 px) of the estimate (0..1).
+Real: prev | REF estimate | estimate  /  real in-between (curr when there is none) | REF generated-vs-real x4 | generated-vs-real x4; without a real in-between frame the
+panels show the warp residual |prev - curr warped back by the field| x 4 instead.  Each side's numbers are in the caption.
 """
 import argparse
 import os
@@ -90,6 +97,81 @@ def sheet(r, setstr, label, outdir):
     return path
 
 
+def _warp_residual(prev, curr, F):
+    """|prev - curr sampled at p + F(p)| x 4 (F full-res px on the flow grid, resized to the frame)"""
+    h, w = prev.shape[:2]
+    Fu = cv2.resize(F.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    wc = cv2.remap(np.ascontiguousarray(curr), gx + Fu[..., 0], gy + Fu[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return np.clip(np.abs(prev.astype(np.int16) - wc.astype(np.int16)) * 4, 0, 255).astype(np.uint8)
+
+
+def _caption(m, fm, synthetic):
+    if synthetic:
+        s = "EPE %.2f / p95 %.2f px, false still %.1f%%, blk16 %.3f" % (fm["epe_mean"], fm["epe_p95"], 100 * fm["false_still"], fm["blk16"])
+    else:
+        s = "blk16 %.3f" % fm["blk16"]
+    if "psnr" in m:
+        s += ", PSNR %.2f / edge %.2f" % (m["psnr"], m["psnr_edge"])
+    return s
+
+
+def compare_sheet(rr, rn, ref_set, setstr, ref_label, label, outdir):
+    """before / after sheet of one pair: rr = the reference run (ref_set), rn = the run under test (setstr)"""
+    import json
+    p = rn["pair"]
+    name, scale = p["name"], float(p["scale"])
+    fr, fn = C.fields(rr, ref_set), C.fields(rn, setstr)
+    Fr, Fn, fs = fr[fr["main"]]["F"], fn[fn["main"]]["F"], fn[fn["main"]]["fs"]
+    mr, mn = C.pair_metrics(rr, ref_set), C.pair_metrics(rn, setstr)
+    fmr, fmn = mr["fields"][fr["main"]], mn["fields"][fn["main"]]
+    size = (PW, PH)
+    os.makedirs(os.path.join(outdir, "compare"), exist_ok=True)
+    if p["truth"]:
+        spec = json.load(open(os.path.join(p["dir"], "spec.json")))
+        ft, valid = mkpairs.truth(spec, p["dir"], fs, fn[fn["main"]]["grid"])
+        er, okr = C.epe(Fr, ft, valid)
+        en, okn = C.epe(Fn, ft, valid)
+        vmax = max(scale / 8, 1.0)
+        tm = np.hypot(ft[..., 0], ft[..., 1])
+        def still(F):
+            m = (np.hypot(F[..., 0], F[..., 1]) < 0.5) & (tm > 2.0) & valid
+            img = np.full(F.shape[:2] + (3,), 30, np.uint8)
+            img[valid] = (70, 70, 80)
+            img[m] = (255, 60, 60)
+            return img
+        rel = np.clip(en / np.maximum(tm, 1.0), 0, 1)
+        panels = [
+            [C.motion_panel(ft, scale, size, "true motion"), C.motion_panel(Fr, scale, size, "%s estimate" % ref_label), C.motion_panel(Fn, scale, size, "%s estimate" % label)],
+            [C.image_panel(C.read_rgba(p["mid"], p["W"], p["H"]), size, "true middle frame"), C.heat_panel(er, okr, vmax, size, "%s error 0..%g px" % (ref_label, vmax)),
+             C.heat_panel(en, okn, vmax, size, "%s error 0..%g px" % (label, vmax))],
+            [C.image_panel(still(Fr), size, "%s falsely still (est < 0.5 px, true > 2 px) %.1f%%" % (ref_label, 100 * fmr["false_still"])),
+             C.image_panel(still(Fn), size, "%s falsely still %.1f%%" % (label, 100 * fmn["false_still"])),
+             C.heat_panel(rel, okn, 1.0, size, "%s relative error |e| / max(|true|, 1) 0..1" % label)]]
+        sub = ["%s: %s" % (ref_label, _caption(mr, fmr, True)), "%s: %s" % (label, _caption(mn, fmn, True))]
+    else:
+        prev, curr = C.read_rgba(p["prev"], p["W"], p["H"]), C.read_rgba(p["curr"], p["W"], p["H"])
+        if p.get("mid"):
+            real = C.read_rgba(p["mid"], p["W"], p["H"])
+            d = lambda g: np.clip(np.abs(g.astype(np.int16) - real.astype(np.int16)) * 4, 0, 255).astype(np.uint8)
+            second = [C.image_panel(real, size, "real in-between frame"), C.image_panel(d(rr["out"]), size, "%s generated vs real x4" % ref_label),
+                      C.image_panel(d(rn["out"]), size, "%s generated vs real x4" % label)]
+        else:
+            second = [C.image_panel(curr, size, "curr frame (no real in-between)"),
+                      C.image_panel(_warp_residual(prev, curr, Fr), size, "%s warp residual x4" % ref_label),
+                      C.image_panel(_warp_residual(prev, curr, Fn), size, "%s warp residual x4" % label)]
+        panels = [[C.image_panel(prev, size, "prev frame"), C.motion_panel(Fr, scale, size, "%s estimate" % ref_label), C.motion_panel(Fn, scale, size, "%s estimate" % label)], second]
+        sub = ["%s: %s" % (ref_label, _caption(mr, fmr, False)), "%s: %s" % (label, _caption(mn, fmn, False))]
+    body = np.concatenate([np.concatenate(row, 1) for row in panels], 0)
+    head = np.full((TITLE + 24, body.shape[1], 3), 24, np.uint8)
+    cv2.putText(head, name, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(head, sub[0], (10, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(head, sub[1], (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 255, 120), 1, cv2.LINE_AA)
+    path = os.path.join(outdir, "compare", name + ".png")
+    cv2.imwrite(path, cv2.cvtColor(np.concatenate([head, body], 0), cv2.COLOR_RGB2BGR))
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fgtest", required=True)
@@ -98,12 +180,21 @@ def main():
     ap.add_argument("--pairs", action="append", required=True)
     ap.add_argument("--only")
     ap.add_argument("--label", help="text on the sheet (default: the --set string)")
+    ap.add_argument("--ref-fgtest", help="before / after sheets: the reference build (runs the same pairs twice; writes DIR/compare/<name>.png)")
+    ap.add_argument("--ref-set", default="algo=v3", help="the reference's --set string")
+    ap.add_argument("--ref-label", default="V3")
     a = ap.parse_args()
     pairs = []
     for p in a.pairs:
         pairs += C.load_pairs(p, a.only)
     label = a.label or a.setstr or "defaults"
-    for i, r in enumerate(C.run_fgtest(a.fgtest, a.setstr, pairs, os.path.join(a.out, "work"))):
+    if a.ref_fgtest:
+        refs = C.run_fgtest(a.ref_fgtest, a.ref_set, pairs, os.path.join(a.out, "work_ref"))
+        news = C.run_fgtest(a.fgtest, a.setstr, pairs, os.path.join(a.out, "work"))
+        for i, (rr, rn) in enumerate(zip(refs, news)):
+            print("%3d/%d" % (i + 1, len(pairs)), compare_sheet(rr, rn, a.ref_set, a.setstr, a.ref_label, a.label or "V3.5", a.out), flush=True)
+        return
+    for i, (r) in enumerate(C.run_fgtest(a.fgtest, a.setstr, pairs, os.path.join(a.out, "work"))):
         print("%3d/%d" % (i + 1, len(pairs)), sheet(r, a.setstr, label, a.out), flush=True)
 
 

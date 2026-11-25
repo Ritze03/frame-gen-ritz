@@ -16,6 +16,13 @@
 #ifndef V3J
 #define V3J 0
 #endif
+// V35 = 1 (the v3_dense_35 build, Settings::v3Motion = 1, V3.5): where the 4x4 blocks around the tile form one smooth motion (no neighbouring pair differs by more than
+// V35_EDGE flow px) the vector is the Catmull-Rom interpolation of the block vectors (C1: no kink at the block centres, and a locally linear field, rotation or zoom, is
+// reproduced exactly, where the bilinear blend of the 4 nearest has a kink at every centre and the "agree within 0.5" test sends such a field into the soft pick);
+// the cost is the bilinear blend of the blocks' costs as before. Every other tile is the unchanged code. The zero-vector bonus (hudBonus) is not used by V3.5.
+#ifndef V35
+#define V35 0
+#endif
 #include "common.glsl"
 #include "v3_common.glsl"
 #include "v3_est.glsl"
@@ -24,6 +31,12 @@ layout(local_size_x = 8, local_size_y = 8) in;
 const float TAU = 1.5;
 const float BAD = 255.0;
 const int M_FF = 2, M_INJECT = 4;
+const float V35_EDGE = 2.0;   // flow px: a neighbouring pair of block vectors further apart than this is a motion edge, not a smooth field
+
+float cr1(float t, int k) {   // Catmull-Rom weight k (0..3) at t
+    const float t2 = t * t, t3 = t2 * t;
+    return k == 0 ? -0.5 * t3 + t2 - 0.5 * t : k == 1 ? 1.5 * t3 - 2.5 * t2 + 1.0 : k == 2 ? -1.5 * t3 + 2.0 * t2 + 0.5 * t : 0.5 * t3 - 0.5 * t2;
+}
 
 // mean cost of vector v at pixel p over the 5x5 window (invalid, 255, when fewer than half of the window's pixels have their target inside).
 // The bilinear weights are the same for every window pixel (one sub-pixel offset), so the 6x6 integer texels under the window's targets are read
@@ -99,6 +112,36 @@ void main() {
         for (int j = i + 1; j < 4; j++) spread = max(spread, length(rec[i].xy - rec[j].xy));
     }
     // task 105: the zero vector as a candidate (hudBonus > 0; not where every block vector is nearly zero: it adds nothing there)
+#if V35
+    {   // the smooth-field test over the 4x4 blocks around the tile (uniform over the workgroup)
+        vec2 g[16];
+        bool isSmooth = true;
+        for (int k = 0; k < 16; k++) {
+            const int o = v3BlkIdx(L, dir, 0, t0 + ivec2(k & 3, k >> 2) - 1);
+            g[k] = vec2(fl[o], fl[o + 1]);
+        }
+        for (int j = 0; j < 4; j++)
+            for (int i = 0; i < 4; i++) {
+                if (i < 3 && length(g[j * 4 + i] - g[j * 4 + i + 1]) > V35_EDGE) isSmooth = false;
+                if (j < 3 && length(g[j * 4 + i] - g[(j + 1) * 4 + i]) > V35_EDGE) isSmooth = false;
+            }
+        if (isSmooth) {
+            if (!inFrame) return;
+            const vec2 u = (vec2(p) - 3.5) * 0.125;
+            const vec2 a = u - vec2(floor(u));
+            vec2 vv = vec2(0.0);
+            for (int j = 0; j < 4; j++)
+                for (int i = 0; i < 4; i++) vv += cr1(a.x, i) * cr1(a.y, j) * g[j * 4 + i];
+            const float bw4[4] = float[4]((1.0 - a.x) * (1.0 - a.y), a.x * (1.0 - a.y), (1.0 - a.x) * a.y, a.x * a.y);
+            float cc = 0.0;
+            for (int k = 0; k < 4; k++) cc += bw4[k] * rec[k].z;
+            fl[fd] = vv.x; fl[fd + 1] = vv.y;
+            if ((pc.mode & M_FF) != 0) { fl[ff] = vv.x; fl[ff + 1] = vv.y; }
+            ax[mapI] = uint(min(255.0, floor(8.0 * cc + 0.5)));
+            return;
+        }
+    }
+#endif
     bool needZ = pc.hudB > 0.0 && vmax * float(pc.fscale) >= pc.hp[3];
     if (needZ && Bw > 0 && nLev > 1) {   // the pre-test: some block of the 4 has evidence of a still part (level 0's slot 1, .z)
         float zmax = 0.0;

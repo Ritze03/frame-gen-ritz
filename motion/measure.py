@@ -59,7 +59,7 @@ def tables(allm, setstr, label):
                "`blk` = blockiness (0 smooth .. 1 per-block constant) at 16 px blocks, `ctrl` = the same at a period that is no harmonic of the block "
                "(period 11 flow px instead of 8: no harmonic, should be near 0). `truth` / `truth-bc` = the true field and its per-block-constant version (the two "
                "reference values). PSNR of the generated t = 0.5 frame against the true one: whole / edge pixels, pooled.", "",
-               "| case | str | EPE mean | EPE p95 | EPE tex | bad>4px | blk | ctrl | truth blk | truth-bc blk | PSNR | PSNR edge |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+               "| case | str | EPE mean | EPE p95 | EPE tex | bad>4px | false still | blk | ctrl | truth blk | truth-bc blk | PSNR | PSNR edge |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for c in CASES:
             for s in STRENGTHS:
                 ms = [m for m in syn if m["case"] == c and m["strength"] == s]
@@ -67,13 +67,13 @@ def tables(allm, setstr, label):
                     continue
                 a = agg(ms)
                 res["synthetic"]["%s_%s" % (c, s)] = a
-                md.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
-                    c, s, fmt(a.get("epe_mean")), fmt(a.get("epe_p95")), fmt(a.get("epe_tex_mean")), fmt(a.get("bad4"), 3), fmt(a["blk16"], 3), fmt(a["ctrl16"], 3),
+                md.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                    c, s, fmt(a.get("epe_mean")), fmt(a.get("epe_p95")), fmt(a.get("epe_tex_mean")), fmt(a.get("bad4"), 3), fmt(a.get("false_still"), 3), fmt(a["blk16"], 3), fmt(a["ctrl16"], 3),
                     fmt(a.get("truth_blk16"), 3), fmt(a.get("truthbc_blk16"), 3), fmt(a.get("psnr")), fmt(a.get("psnr_edge"))))
         a = agg(syn)
         res["synthetic"]["all"] = a
-        md.append("| **all** | | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
-            fmt(a.get("epe_mean")), fmt(a.get("epe_p95")), fmt(a.get("epe_tex_mean")), fmt(a.get("bad4"), 3), fmt(a["blk16"], 3), fmt(a["ctrl16"], 3),
+        md.append("| **all** | | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            fmt(a.get("epe_mean")), fmt(a.get("epe_p95")), fmt(a.get("epe_tex_mean")), fmt(a.get("bad4"), 3), fmt(a.get("false_still"), 3), fmt(a["blk16"], 3), fmt(a["ctrl16"], 3),
             fmt(a.get("truth_blk16"), 3), fmt(a.get("truthbc_blk16"), 3), fmt(a.get("psnr")), fmt(a.get("psnr_edge"))))
         md += ["", "Blockiness at other block sizes (all synthetic pairs; px = full-resolution): " +
                ", ".join("blk%d %s (ctrl %s)" % (b, fmt(a["blk%d" % b], 3), fmt(a["ctrl%d" % b], 3)) for b in C.BLOCKS_FULL), ""]

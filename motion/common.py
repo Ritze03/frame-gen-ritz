@@ -315,6 +315,8 @@ def pair_metrics(r, setstr):
             e, okv = epe(F, ft, valid)
             d["epe_mean"], d["epe_p95"] = float(e[okv].mean()), float(np.percentile(e[okv], 95))
             d["bad4"] = float((e[okv] > 4).mean())
+            # false still: the estimate is under 0.5 px where the truth is above 2 px (share of the valid pixels): flat areas that got zero motion
+            d["false_still"] = float(((np.hypot(F[..., 0], F[..., 1]) < 0.5) & (np.hypot(ft[..., 0], ft[..., 1]) > 2.0) & okv).sum() / max(okv.sum(), 1))
             src = read_rgba(p["prev"] if f["grid"] == "prev" else p["mid"], p["W"], p["H"])   # textured pixels: the 5x5-dilated top decile of the source's Sobel magnitude (edge_mask)
             tx = edge_mask(src)[(fs * np.arange(F.shape[0]) + (fs - 1) // 2)[:, None], (fs * np.arange(F.shape[1]) + (fs - 1) // 2)[None, :]] & okv
             d["epe_tex_mean"], d["epe_tex_p95"] = float(e[tx].mean()), float(np.percentile(e[tx], 95))

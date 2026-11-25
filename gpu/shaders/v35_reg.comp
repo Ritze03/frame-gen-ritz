@@ -1,0 +1,187 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, Settings::v3Motion = 1 (V3.5, round 1): confidence-weighted regularisation of one level's block field. One Jacobi step: reads the block records of
+// slot pc.iter (a) of level pc.lvl and writes slot 1 - a (the callers run it twice, a -> b and b -> a, so the result ends in a). Dispatch: tiles of 8x8 blocks,
+// ceil(gw / 8) x ceil(gh / 8) x 2 (z = direction), workgroup 64, one block per thread; the tile and a 2-block apron are staged in shared memory.
+// What a block's own search proves: its texture, from the structure tensor of the high-pass features over the block (sqrt of its two eigenvalues: r1 along the
+// dominant gradient n, r2 along the other direction t), times how well it matched (cost relative to the texture) and the level's ambiguity measure. A flat road or sky
+// proves nothing (the search tied and took the inherited vector or zero), a lane marking or any straight edge proves the motion across it (n) and nothing along it (t:
+// the aperture problem; the search leaves the along-the-line part at its bias, often zero), a corner or texture proves both.
+// The consensus of the 5x5 neighbours: the weighted medoid of their vectors (weight = their two-dimensional confidence x colour similarity to this block x distance),
+// refined by two mean-shift steps; a flat block between a still object and a moving road thereby takes the larger confident group of its own colour. The block becomes
+//   v' = consensus + n ra' (n . (own - consensus)) + t rb' (t . (own - consensus))
+// (ra', rb' = how far its own vector is believed along each axis), so a confident block is left alone, a flat one takes the consensus and a line keeps what crosses it.
+// Without confident neighbours the camera model (once v3_stats has fitted it: the levels below the stats level) is the consensus. Records keep (vx, vy, cost, amb).
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_est.glsl"
+#include "v35_cam.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const vec2 G01 = vec2(0.6, 2.5);      // sqrt(eigenvalue / pixels) of the structure tensor (feature levels per px): confidence ramp
+const vec2 CR = vec2(1.0, 2.5);       // cost / (texture + 2): a block matching worse than this ratio proves less
+const vec2 REJ = vec2(0.15, 0.05);      // a replacement is rejected when its window cost exceeds the old vector's by this much + this share
+const float COLS = 30.0;              // colour distance (L1 over Y Cb Cr) at which the vote weight is 1/e
+const float WCAM = 0.6;               // the camera model's vote when there are no confident neighbours (fades out as their weight grows to 1.5)
+const float MMIN = 0.15;              // the summed weight below which a block keeps its vector
+
+shared vec4 srec[144];      // record (vx, vy, cost, amb) of the tile's blocks with the apron
+shared vec4 scol[144];      // block mean colour (Y, Cb, Cr) and the vote weight (two-dimensional confidence)
+shared vec4 sax[144];       // n.x, n.y, ra', rb'
+shared int sok[144];
+shared float sr1[144];      // the block's own texture along its dominant gradient (0 = flat)
+
+vec3 rawAt(const V3Lv L, int f, ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(L.w - 1, L.h - 1));
+    const uvec2 t = pyr[2 * L.off + f * L.w * L.h + p.y * L.w + p.x];
+    return vec3(unpackHalf2x16(t.x), unpackHalf2x16(t.y).x);
+}
+
+// the weighted feature channels' gradient at x (central differences, clamped)
+vec4 featAt(const V3Lv L, int fOff, int f, ivec2 p) { return v3FeatC(L, fOff, f, p); }
+
+// the matching cost (v3Term over the window of the search: 8 x 8, with a 2 px apron above level 0) of block b at vector v (level px, sub-pixel)
+float winCost(const V3Lv L, int fOff, int dir, ivec2 b, vec2 v) {
+    const vec2 dMu = v3DMu(dir);
+    const ivec2 wo = pc.lvl == 0 ? b * 8 : b * 4 - 2;
+    float s = 0.0, n = 0.0;
+    const vec2 mx = vec2(float(L.w - 1), float(L.h - 1));
+    for (int k = 0; k < 64; k++) {
+        const ivec2 x = wo + ivec2(k & 7, k >> 3);
+        if (x.x < 0 || x.y < 0 || x.x >= L.w || x.y >= L.h) continue;
+        const vec2 q = vec2(x) + v;
+        if (q.x < 0.0 || q.y < 0.0 || q.x > mx.x || q.y > mx.y) continue;
+        s += v3Term(v3FeatAt(L, fOff, dir, x), v3FeatBil(L, fOff, 1 - dir, q), dMu);
+        n += 1.0;
+    }
+    return n >= 32.0 ? s / n : 255.0;
+}
+
+void main() {
+    const int dir = int(gl_WorkGroupID.z);
+    const int lid = int(gl_LocalInvocationIndex);
+    const int l = pc.lvl;
+    const V3Lv L = v3Lv(l);
+    int P, Bw, nLev;
+    v3Totals(P, Bw, nLev);
+    const int fOff = 2 * P;
+    const int sa = pc.iter, sb = 1 - sa;
+    const ivec2 org = ivec2(gl_WorkGroupID.xy) * 8 - 2;
+    const int bs = l == 0 ? 8 : 4;
+    for (int idx = lid; idx < 144; idx += 64) {
+        const ivec2 b = org + ivec2(idx % 12, idx / 12);
+        const bool ok = all(greaterThanEqual(b, ivec2(0))) && all(lessThan(b, ivec2(L.gw, L.gh)));
+        sok[idx] = ok ? 1 : 0;
+        if (!ok) { srec[idx] = vec4(0.0); scol[idx] = vec4(0.0); sax[idx] = vec4(1.0, 0.0, 0.0, 0.0); sr1[idx] = 0.0; continue; }
+        const int o = v3BlkIdx(L, dir, sa, b);
+        const vec4 r = vec4(fl[o], fl[o + 1], fl[o + 2], fl[o + 3]);
+        srec[idx] = r;
+        // the block's pixels (4 x 4 samples at stride bs / 4): colour, detail, structure tensor of the weighted channels
+        const ivec2 x0 = b * bs;
+        const int st = bs / 4;
+        float en = 0.0, n = 0.0, gxx = 0.0, gxy = 0.0, gyy = 0.0;
+        vec3 col = vec3(0.0);
+        for (int j = 0; j < 4; j++)
+            for (int i = 0; i < 4; i++) {
+                const ivec2 x = x0 + ivec2(i, j) * st;
+                if (x.x >= L.w || x.y >= L.h) continue;
+                const vec4 f0 = featAt(L, fOff, dir, x);
+                en += v3Detail(f0);
+                col += rawAt(L, dir, x);
+                const vec4 dx = featAt(L, fOff, dir, x + ivec2(1, 0)) - featAt(L, fOff, dir, x - ivec2(1, 0));
+                const vec4 dy = featAt(L, fOff, dir, x + ivec2(0, 1)) - featAt(L, fOff, dir, x - ivec2(0, 1));
+                const vec3 w3 = V3_CW.xyz;
+                gxx += dot(w3 * dx.xyz, dx.xyz); gxy += dot(w3 * dx.xyz, dy.xyz); gyy += dot(w3 * dy.xyz, dy.xyz);
+                n += 1.0;
+            }
+        en /= max(n, 1.0);
+        col /= max(n, 1.0);
+        const float inv = 0.25 / max(n, 1.0);   // (central differences span 2 px: /2, squared: /4)
+        gxx *= inv; gxy *= inv; gyy *= inv;
+        const float tr = gxx + gyy, df = sqrt(max(0.25 * (gxx - gyy) * (gxx - gyy) + gxy * gxy, 0.0));
+        const float l1 = 0.5 * tr + df, l2 = max(0.5 * tr - df, 0.0);
+        // principal direction (the larger eigenvalue's eigenvector)
+        vec2 nv = abs(gxy) > 1e-9 ? normalize(vec2(l1 - gyy, gxy)) : (gxx >= gyy ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
+        const float r1 = smoothstep(G01.x, G01.y, sqrt(l1)), r2 = smoothstep(G01.x, G01.y, sqrt(l2));
+        const float bconf = (1.0 - smoothstep(CR.x, CR.y, r.z / (en + 2.0))) * (1.0 - 0.7 * r.w);
+        scol[idx] = vec4(col, bconf * max(r2, 0.15 * r1));
+        sr1[idx] = r1;
+        sax[idx] = vec4(nv, smoothstep(0.05, 0.45, r1), smoothstep(0.05, 0.45, r2));
+    }
+    barrier();
+    const ivec2 lp = ivec2(lid & 7, lid >> 3);
+    const ivec2 b = ivec2(gl_WorkGroupID.xy) * 8 + lp;
+    if (b.x >= L.gw || b.y >= L.gh) return;
+    const int ci = (lp.y + 2) * 12 + lp.x + 2;
+    const vec4 own = srec[ci];
+    // neighbour votes
+    float w[26];
+    vec2 v[26];
+    float mass = 0.0;
+    for (int k = 0; k < 25; k++) {
+        const ivec2 d = ivec2(k % 5 - 2, k / 5 - 2);
+        const int ni = (lp.y + 2 + d.y) * 12 + lp.x + 2 + d.x;
+        v[k] = srec[ni].xy;
+        float ww = 0.0;
+        if (sok[ni] != 0 && k != 12) {
+            const vec3 dc = abs(scol[ni].xyz - scol[ci].xyz);
+            ww = scol[ni].w * exp(-(dc.x + dc.y + dc.z) * (1.0 / COLS)) * (max(abs(d.x), abs(d.y)) == 1 ? 1.0 : 0.5);
+        }
+        w[k] = ww;
+        mass += ww;
+    }
+    v[25] = vec2(0.0);
+    w[25] = 0.0;
+    if (camVote(L, l, dir, b, v[25])) {
+        // a flat block trusts the camera model by its quality; the neighbours that agree with the model then count more, those that do not (a still car beside a zooming
+        // road, a different object) less, so that the road next to the car follows the road
+        const float cq = camQuality() * (1.0 - smoothstep(0.1, 0.6, sr1[ci]));
+        const float tol = max(1.0, 0.2 * length(v[25]));
+        mass = 0.0;
+        for (int k = 0; k < 25; k++) {
+            if (w[k] <= 0.0) continue;
+            w[k] *= mix(1.0, length(v[k] - v[25]) < tol ? 1.6 : 0.4, cq);
+            mass += w[k];
+        }
+        w[25] = WCAM * cq * (1.0 - smoothstep(0.3, 1.5, mass));
+    }
+    mass += w[25];
+    vec2 res = own.xy;
+    if (mass >= MMIN) {
+        // the weighted medoid
+        int bi = 12;
+        float bc = 1e9;
+        for (int a = 0; a < 26; a++) {
+            if (w[a] <= 0.0) continue;
+            float c = 0.0;
+            for (int k = 0; k < 26; k++) c += w[k] * min(length(v[a] - v[k]), 3.0);
+            if (c < bc) { bc = c; bi = a; }
+        }
+        vec2 x = v[bi];
+        for (int it = 0; it < 2; it++) {
+            const float sg = 0.8 + 0.1 * length(x);
+            vec2 s = vec2(0.0);
+            float sw = 0.0;
+            for (int k = 0; k < 26; k++) {
+                if (w[k] <= 0.0) continue;
+                const vec2 dd = (v[k] - x) / sg;
+                const float g = w[k] * exp(-dot(dd, dd));
+                s += g * v[k];
+                sw += g;
+            }
+            if (sw > 1e-6) x = s / sw;
+        }
+        const vec4 a4 = sax[ci];
+        const vec2 nv = a4.xy, tv = vec2(-nv.y, nv.x);
+        const vec2 dlt = own.xy - x;
+        res = x + nv * (a4.z * dot(dlt, nv)) + tv * (a4.w * dot(dlt, tv));
+        // the check against the image: the change is kept only where the new vector explains the block's window about as well as the old one (a flat block: equally well; a
+        // textured block whose own vector is right, a thin or fast object, parallax: clearly worse, it keeps its own)
+        if (dot(res - own.xy, res - own.xy) > 1e-6) {
+            const float c0 = winCost(L, fOff, dir, b, own.xy), c1 = winCost(L, fOff, dir, b, res);
+            if (c1 > c0 + REJ.x + REJ.y * c0) res = own.xy;
+        }
+    }
+    const int o = v3BlkIdx(L, dir, sb, b);
+    fl[o] = res.x; fl[o + 1] = res.y; fl[o + 2] = own.z; fl[o + 3] = own.w;
+}
