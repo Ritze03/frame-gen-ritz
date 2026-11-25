@@ -782,12 +782,12 @@ public:
     // uint32 each: MAP[0], MAP[1] (cost8 | e8 << 8 | amb8 << 16 | g8 << 24), S (the static-structure mask, float bits); then BLK, the block
     // records of every level (V3B_FLOW's first region: per level l, direction d, slot p, gw_l*gh_l vec4 (vx, vy, cost, amb); gpu/V3.md
     // section 4); then G words 0..63, the cells (s8, E, C), and (version 2, task 109) T-field slot 0 (fw*fh x 4 words: packHalf2x16(gA), packHalf2x16(gB),
-    // packUnorm4x8(oA, holeA, uA, 0), packUnorm4x8(oB, holeB, uB, 0): the latest synth's). Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. In the skeleton build
+    // packUnorm4x8(oA, holeA, uA, 0), packUnorm4x8(oB, holeB, uB, 0): the latest synth's), and (task 161) 200 words of G from word 3896 (V3.5: the 12 regional camera models of the last level that fitted them, words 3900 + 8 r: a0 a1 a2 b0 b1 b2 (float bits), reliability, valid; zero at v3Motion = 0; words 4000 and up: the road diagnosis counters of a V35_DIAG build). Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. In the skeleton build
     // (no estimate yet) everything is zero, except the flows of a recordDebugV3Inject, which FF and FD hold unchanged.
     struct DebugV3Layout {
         uint32_t W, H, fw, fh, bw, bh, fscale, nLevels;
         uint32_t lw[16], lh[16], lgw[16], lgh[16];   // per level: size and 8x8 / 4x4 block grid (gpu/V3.md section 2)
-        VkDeviceSize ff0, ff1, fd0, fd1, map0, map1, s, blk, blkLevel[16], g, cells, tf, size;   // g: the first 64 words of the state G, after the BLK arrays (step E2: domValid / affValid at word 6, dom[4] at 8, aff[6] at 16, wide counters at 25 / 26)   // byte offsets in dst (relative to dstOffset), blkLevel[l] = BLK of level l (4 arrays: (d, p) = (0,0), (0,1), (1,0), (1,1))
+        VkDeviceSize ff0, ff1, fd0, fd1, map0, map1, s, blk, blkLevel[16], g, cells, tf, v35, size;   // g: the first 64 words of the state G, after the BLK arrays (step E2: domValid / affValid at word 6, dom[4] at 8, aff[6] at 16, wide counters at 25 / 26)   // byte offsets in dst (relative to dstOffset), blkLevel[l] = BLK of level l (4 arrays: (d, p) = (0,0), (0,1), (1,0), (1,1))
     };
     bool debugV3Layout(DebugV3Layout& l) const;
     bool recordDebugV3(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);

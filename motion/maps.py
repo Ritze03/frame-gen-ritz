@@ -17,6 +17,10 @@ Synthetic: true motion | REF estimate | estimate  /  middle frame | REF error | 
 REF | of the estimate | relative error |e| / max(|true|, 1 px) of the estimate (0..1).
 Real: prev | REF estimate | estimate  /  real in-between (curr when there is none) | REF generated-vs-real x4 | generated-vs-real x4; without a real in-between frame the
 panels show the warp residual |prev - curr warped back by the field| x 4 instead.  Each side's numbers are in the caption.
+
+Road sheets (task 161): `maps.py --road DIR --out OUT --pairs road.json [--only ...] [--new-label TEXT]` draws one sheet per pair from the fields measure.py --road wrote (DIR/fields/<pair>.npz;
+no GPU run), 1800 px wide, 3 x 3 panels: prev frame | V3 field | V3.5 today; V3.5 new | model of today | model of new; "still against the model" of today | of new | the prev frame with the
+sparse truth of the ground (arrows from the real in-between frame, green = the V3.5 field of today is within 4 px, red = not) .
 """
 import argparse
 import os
@@ -212,9 +216,62 @@ def compare_sheet(rr, rn, ref_set, setstr, ref_label, label, outdir):
     return path
 
 
+def road_sheet(p, npz, new_label):
+    """one road sheet (see the module docstring); p = the pair entry, npz = the loaded fields file"""
+    size = (PW, PH)
+    sc = 32.0
+    prev = C.read_rgba(p["prev"], p["W"], p["H"])
+    fld = lambda k: npz[k + "_F"].astype(np.float32)
+    mod = lambda k: npz[k + "_D"].astype(np.float32)
+    fs = p["W"] // fld("v3").shape[1]
+
+    def still(tag, ref):
+        F, D, Q = fld(tag), mod(ref) * fs, npz[ref + "_Q"].astype(np.float32)
+        sel = (np.hypot(D[..., 0], D[..., 1]) > 2.0) & (Q > 0.5)
+        m = sel & (np.hypot(F[..., 0], F[..., 1]) < 0.5)
+        img = np.zeros(F.shape[:2] + (3,), np.uint8)
+        img[sel] = (70, 70, 70)
+        img[m] = (255, 0, 0)
+        return C.image_panel(cv2.resize(img, (p["W"], p["H"]), interpolation=cv2.INTER_NEAREST), size, "still against the model (red) %s: %.2f%% of the model>2px area" % (tag, 100.0 * m.sum() / max(sel.sum(), 1)))
+    pan = [C.image_panel(prev, size, "prev"), C.motion_panel(fld("v3"), sc, size, "V3"), C.motion_panel(fld("today"), sc, size, "V3.5 today"),
+           C.motion_panel(fld("new"), sc, size, new_label), C.motion_panel(mod("today") * fs, sc, size, "model of today"), C.motion_panel(mod("new") * fs, sc, size, "model of the new"),
+           still("today", "today"), still("new", "new")]
+    last = np.ascontiguousarray(prev.copy())
+    if p.get("mid"):
+        rt = C.road_truth(prev, C.read_rgba(p["mid"], p["W"], p["H"]), C.read_rgba(p["curr"], p["W"], p["H"]), y_from=0.5)
+        F = fld("today")
+        for x, y, vx, vy in rt:
+            f = F[int(y) // fs - 2:int(y) // fs + 3, int(x) // fs - 2:int(x) // fs + 3].reshape(-1, 2).mean(0)
+            good = np.hypot(f[0] - vx, f[1] - vy) < 4
+            cv2.arrowedLine(last, (int(x), int(y)), (int(x + vx), int(y + vy)), (0, 255, 0) if good else (255, 0, 0), 3, tipLength=0.3)
+            cv2.circle(last, (int(x), int(y)), 6, (255, 255, 0), -1)
+    pan.append(C.image_panel(last, size, "ground truth patches (yellow dot, arrow = prev->curr px), green = V3.5 today within 4 px"))
+    rows = [np.hstack(pan[i:i + 3]) for i in range(0, 9, 3)]
+    img = np.vstack(rows)
+    head = np.full((TITLE, img.shape[1], 3), 20, np.uint8)
+    C.put(head, p["name"], (10, 40), 0.9)
+    return np.vstack([head, img])
+
+
+def road_main(a):
+    pairs = []
+    for q in a.pairs:
+        pairs += C.load_pairs(q, a.only)
+    os.makedirs(os.path.join(a.out, "road"), exist_ok=True)
+    for p in pairs:
+        f = os.path.join(a.road, "fields", p["name"] + ".npz")
+        if not os.path.exists(f):
+            continue
+        img = road_sheet(p, np.load(f), a.new_label)
+        cv2.imwrite(os.path.join(a.out, "road", p["name"] + ".png"), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        print(p["name"], flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--fgtest", required=True)
+    ap.add_argument("--road", help="road sheets from the DIR of measure.py --road (no GPU run)")
+    ap.add_argument("--new-label", default="V3.5 new")
+    ap.add_argument("--fgtest", required=False)
     ap.add_argument("--set", default="", dest="setstr", help="fgtest --set string")
     ap.add_argument("--out", required=True)
     ap.add_argument("--pairs", action="append", required=True)
@@ -224,6 +281,10 @@ def main():
     ap.add_argument("--ref-set", default="algo=v3", help="the reference's --set string")
     ap.add_argument("--ref-label", default="V3")
     a = ap.parse_args()
+    if a.road:
+        return road_main(a)
+    if not a.fgtest:
+        ap.error("--fgtest is required")
     pairs = []
     for p in a.pairs:
         pairs += C.load_pairs(p, a.only)

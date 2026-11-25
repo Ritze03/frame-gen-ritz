@@ -52,6 +52,9 @@ def load(path):
         out["gB"] = np.stack([half(w[..., 1] & 0xffff), half(w[..., 1] >> 16)], -1)
         out["rA"] = np.stack([(w[..., 2] >> (8 * k)) & 255 for k in range(3)], -1).astype(np.float32) / 255   # oA, holeA, uA
         out["rB"] = np.stack([(w[..., 3] >> (8 * k)) & 255 for k in range(3)], -1).astype(np.float32) / 255
+        o += 16 * n
+        if len(raw) >= o + 800:   # (task 161) G words 3896..4095: g35[8 r + 4 .. 8 r + 11] = region r's model words (V3.5, regions 4 x 3), g35[104:] = the diagnosis counters of a V35_DIAG build
+            out["g35"] = np.frombuffer(raw, np.uint32, 200, o)
     return out
 
 

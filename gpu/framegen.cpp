@@ -2217,6 +2217,7 @@ bool Interpolator::debugV3Layout(DebugV3Layout& l) const {
     l.g = o; o += 64 * 4;   // G words 0..63
     l.cells = o; o += (VkDeviceSize)V.N8 * 12;   // (Y2) the static mask's cell maxima s8, enclosure E and "overlay near" bits C (N8 words each)
     l.tf = o; o += (VkDeviceSize)V.N * 16;   // (task 109) T-field slot 0: the latest synth's projected record (4 words per flow px), its t in header word 14
+    l.v35 = o; o += 200 * 4;   // (task 161) G words 3896..4095: V3.5's regional camera models (and the diagnosis counters)
     l.size = o;
     return true;
 }
@@ -2246,6 +2247,8 @@ bool Interpolator::recordDebugV3(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize 
     I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 2, ac);
     VkBufferCopy gc[2] = {{g0, dstOffset + L.g, 64 * 4}, {(VkDeviceSize)5 * V.N * 4, dstOffset + L.cells, (VkDeviceSize)V.N8 * 12}};   // the state G, words 0..63 (step E2: dominant motions, camera, wide counters); s8, E, C
     I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 2, gc);
+    VkBufferCopy rc{g0 + 3896 * 4, dstOffset + L.v35, 200 * 4};
+    I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 1, &rc);
     return true;
 }
 

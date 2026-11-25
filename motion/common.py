@@ -341,3 +341,97 @@ def pair_metrics(r, setstr):
         se, n, see, ne = se_counts(r["out"], real)
         m.update(se=se, n=n, se_e=see, n_e=ne, psnr=psnr(se, n), psnr_edge=psnr(see, ne))
     return m
+
+
+# ---------------------------------------------------------------- V3.5's camera model (task 161)
+def model_field(v3):
+    """V3.5's regional camera model at every flow pixel centre of F01 (the blend of the 4 x 3 regions' affine fits, exactly v35_cam.glsl regPredict;
+    a region without a fit of its own carries the global model, one with none does not vote): (D [fh, fw, 2] level-0 flow px prev -> curr, Q [fh, fw]
+    reliability 0..1, ok [fh, fw] bool) or None when the dump has no model (v3Motion = 0, or the model was not fitted)."""
+    g = v3.get("g35")
+    if g is None:
+        return None
+    fw, fh = v3["fw"], v3["fh"]
+    R = g[4:4 + 96].reshape(12, 8)   # words 3900 + 8 r
+    par = R[:, :6].copy().view(np.float32)
+    q = R[:, 6].copy().view(np.float32)
+    val = R[:, 7] != 0
+    if not val.any():
+        return None
+    cx, cy = 0.5 * fw, 0.5 * fh
+    yy, xx = np.mgrid[0:fh, 0:fw].astype(np.float32)
+    xx += 0.5
+    yy += 0.5
+    X, Y = (xx - cx) / cx, (yy - cy) / cy
+    u, w = xx / (2 * cx) * 4 - 0.5, yy / (2 * cy) * 3 - 0.5
+    i0, j0 = np.floor(u).astype(int), np.floor(w).astype(int)
+    fx, fy = u - i0, w - j0
+    D = np.zeros((fh, fw, 2), np.float32)
+    Q = np.zeros((fh, fw), np.float32)
+    ws = np.zeros((fh, fw), np.float32)
+    for k in range(4):
+        ri = np.clip(i0 + (k & 1), 0, 3)
+        rj = np.clip(j0 + (k >> 1), 0, 2)
+        wt = (fx if k & 1 else 1 - fx) * (fy if k >> 1 else 1 - fy)
+        r = rj * 4 + ri
+        wt = np.where(val[r] & (wt > 0), wt, 0).astype(np.float32)
+        P = par[r]   # [fh, fw, 6]
+        D[..., 0] += wt * (P[..., 0] + P[..., 1] * X + P[..., 2] * Y)
+        D[..., 1] += wt * (P[..., 3] + P[..., 4] * X + P[..., 5] * Y)
+        Q += wt * q[r]
+        ws += wt
+    ok = ws > 0
+    sw = np.maximum(ws, 1e-9)
+    return D / sw[..., None], Q / sw, ok
+
+
+def still_vs_model(F, v3, fs, thr_still=0.5, thr_model=2.0, thr_q=0.5):
+    """'still against the model': the pixels with |final field| < thr_still px where the model predicts more than thr_model px with reliability above
+    thr_q (full-resolution px; F [fh, fw, 2] full-res px prev -> curr).  Returns (mask [fh, fw], mean(|F - model|) over the mask, model field in full-res px, q) or None."""
+    m = model_field(v3)
+    if m is None:
+        return None
+    D, Q, ok = m
+    Dm = D * fs
+    mag = np.hypot(Dm[..., 0], Dm[..., 1])
+    sel = ok & (mag > thr_model) & (Q > thr_q)
+    mask = sel & (np.hypot(F[..., 0], F[..., 1]) < thr_still)
+    err = np.hypot(F[..., 0] - Dm[..., 0], F[..., 1] - Dm[..., 1])
+    return mask, sel, float(err[mask].mean()) if mask.any() else 0.0, Dm, Q
+
+
+# ---------------------------------------------------------------- sparse truth of the road from the real in-between frame (task 161)
+def _best_shift(A, B, x, y, h, R):
+    """best displacement (dx, dy) of the (2h x 2h) luma patch of A at (x, y) in B within +-R px (L2, cv2.matchTemplate), its mean abs cost, the cost at zero and the median over the search"""
+    H, W = A.shape
+    x0, x1, y0, y1 = max(x - h - R, 0), min(x + h + R, W), max(y - h - R, 0), min(y + h + R, H)
+    tpl = A[y - h:y + h, x - h:x + h]
+    srch = B[y0:y1, x0:x1]
+    sc = cv2.matchTemplate(srch, tpl, cv2.TM_SQDIFF) / float(tpl.size)   # mean squared error
+    j, i = np.unravel_index(sc.argmin(), sc.shape)
+    dx, dy = x0 + i - (x - h), y0 + j - (y - h)
+    zx, zy = (x - h) - x0, (y - h) - y0
+    c0 = sc[zy, zx] if 0 <= zy < sc.shape[0] and 0 <= zx < sc.shape[1] else np.nan
+    return dx, dy, float(sc.min()), float(c0), float(np.median(sc))
+
+
+def road_truth(prev, mid, curr, h=32, step=96, R=96, y_from=0.4):
+    """Sparse truth of the ground from three consecutive frames (prev, mid = the real in-between frame, curr; RGB uint8): patches of 2h x 2h px on a grid over the lower part of the
+    frame; the patch's best displacement prev -> mid and mid -> curr (within +-R px); a patch counts when the two agree within 3 px (constant velocity), the match is distinct (mean
+    squared error at the best below 0.6 of the search's median and below 0.8 of the zero vector's), and the patch has texture to speak of (std of luma >= 2).  Returns an array [n, 4]
+    (x, y, vx, vy) of full-resolution prev -> curr displacements at the patch centres."""
+    A, M, B = (luma(a.astype(np.float32)) for a in (prev, mid, curr))
+    H, W = A.shape
+    out = []
+    for y in range(int(H * y_from) + h, H - h, step):
+        for x in range(h + R // 2, W - h, step):
+            if A[y - h:y + h, x - h:x + h].std() < 2.0:
+                continue
+            a = _best_shift(A, M, x, y, h, R)
+            b = _best_shift(M, B, x, y, h, R)
+            if np.hypot(a[0] - b[0], a[1] - b[1]) > 3.0:
+                continue
+            ok = all(t[2] < 0.6 * t[4] and (np.isnan(t[3]) or t[2] < 0.8 * t[3]) for t in (a, b))
+            if ok:
+                out.append((x, y, a[0] + b[0], a[1] + b[1]))
+    return np.array(out, np.float32).reshape(-1, 4)

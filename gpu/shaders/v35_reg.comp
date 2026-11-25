@@ -180,6 +180,10 @@ void main() {
     }
     mass += w[25];
     vec2 res = own.xy;
+#ifdef V35_DIAG
+    vec2 vRes = own.xy;
+    bool r2Eval = false, r2Sup = false, r2Cost = false;
+#endif
     if (mass >= MMIN && !holdOwn) {
         // the weighted medoid
         int bi = 12;
@@ -208,6 +212,9 @@ void main() {
         const vec2 nv = a4.xy, tv = vec2(-nv.y, nv.x);
         const vec2 dlt = own.xy - x;
         res = x + nv * (a4.z * dot(dlt, nv)) + tv * (a4.w * dot(dlt, tv));
+#ifdef V35_DIAG
+        vRes = res;
+#endif
         // the check against the image: the change is kept only where the new vector explains the block's window about as well as the old one (a flat block: equally well; a
         // textured block whose own vector is right, a thin or fast object, parallax: clearly worse, it keeps its own)
         if (dot(res - own.xy, res - own.xy) > 1e-6) {
@@ -223,11 +230,55 @@ void main() {
         const float tolS = 1.0 + 0.1 * length(res);
         for (int k = 0; k < 25; k++) if (length(v[k] - res) < tolS) sup += w[k];
         const bool r2 = sup < MODEL_SUP * mass0;
+#ifdef V35_DIAG
+        r2Eval = true; r2Sup = !r2;
+#endif
         if (r2) {
             const float cr = winCost(L, fOff, dir, b, res), cm = winCost(L, fOff, dir, b, v[25]);
             if (cm <= cr + REJ2.x + REJ2.y * cr) res = v[25];
+#ifdef V35_DIAG
+            else r2Cost = true;
+#endif
         }
     }
+#ifdef V35_DIAG
+    // task 161 diagnosis (a build with a `#define V35_DIAG 1` at the top of this file only; the production build has none of it): the blocks of F01 where the model predicts more than
+    // 2 full-resolution px with reliability above 0.5 (denominator) and this pass (the last of the level: iter 0) leaves the vector under 0.5 px (counted). Counters in G words
+    // 3996 + 20 l (levels 0..4; the host dump carries them, gpu/v3flow.py g35[100 + 20 l + j]): j 0 denominator, 1 counted, 2..9 the rule that did it (exclusive, in this order: 2 HUD hold,
+    // 3 too little vote mass, 4 the vote is zero and the model is no voter (weight under 0.05), 5 the vote is zero although the model voted (zero neighbours outvote it), 6 the vote moved
+    // the block and the 3 % window-cost test rejected it, 7 R2 not taken: neighbours support the vector, 8 R2 not taken: the model's window cost too high, 9 other), 10..15 sums x 1000 of the window cost at the vector, at the model's,
+    // the block's detail, r1, r2, |c0 - cM| / (detail + 2), 16..18 blocks where the model's window is better / equal / worse than the vector's (3 % + 0.05), 19 the sum of the vote confidence
+    if (dir == 0 && pc.iter == 0 && l < 5 && hasM && mq > 0.5) {
+        const float sc = exp2(float(l)) * float(pc.fscale);
+        const int wo = gOff() + 3996 + 20 * l;
+        if (length(v[25]) * sc > 2.0) {
+            atomicAdd(ax[wo], 1u);
+            if (length(res) * sc < 0.5) {
+                atomicAdd(ax[wo + 1], 1u);
+                const bool voteZero = length(vRes) * sc < 0.5;
+                const bool voted = mass >= MMIN && !holdOwn;
+                int cl = 7;
+                if (holdOwn) cl = 0;
+                else if (mass < MMIN) cl = 1;
+                else if (voteZero) cl = w[25] < 0.05 ? 2 : 3;
+                else if (length(vRes - own.xy) > 1e-3 && length(own.xy) * sc < 0.5) cl = 4;
+                else if (r2Eval && r2Sup) cl = 5;
+                else if (r2Eval && r2Cost) cl = 6;
+                atomicAdd(ax[wo + 2 + cl], 1u);
+                const float c0 = winCost(L, fOff, dir, b, res), cm = winCost(L, fOff, dir, b, v[25]);
+                const float en = sen[ci];
+                atomicAdd(ax[wo + 10], uint(1000.0 * min(c0, 60.0)));
+                atomicAdd(ax[wo + 11], uint(1000.0 * min(cm, 60.0)));
+                atomicAdd(ax[wo + 12], uint(1000.0 * min(en, 60.0)));
+                atomicAdd(ax[wo + 13], uint(1000.0 * sr1[ci]));
+                atomicAdd(ax[wo + 14], uint(1000.0 * sax[ci].w));
+                atomicAdd(ax[wo + 15], uint(1000.0 * min(abs(c0 - cm) / (en + 2.0), 60.0)));
+                atomicAdd(ax[wo + (cm < c0 - 0.05 - 0.02 * c0 ? 16 : cm > c0 + 0.05 + 0.02 * c0 ? 18 : 17)], 1u);
+                atomicAdd(ax[wo + 19], uint(1000.0 * scol[ci].w));
+            }
+        }
+    }
+#endif
     const int o = v3BlkIdx(L, dir, sb, b);
     fl[o] = res.x; fl[o + 1] = res.y;
     if ((pc.mode & M35_L0) == 0) { fl[o + 2] = own.z; fl[o + 3] = own.w; }   // level 0: slot 1 keeps its z (the still-part evidence of the zero-vector bonus), slot 0 stays V3's own result
