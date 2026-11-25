@@ -77,8 +77,8 @@
 #include "v3_guard_spv.h"
 #include "v3_dense_35_spv.h"
 #include "v35_reg_spv.h"
-#include "v35_camq_spv.h"
-#include "v35_stats_spv.h"      // Settings::v3Motion = 1 (V3.5): the block field regularisation
+#include "v35_stats_spv.h"
+#include "v35_rgn_spv.h"      // Settings::v3Motion = 1 (V3.5): the block field regularisation
 // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
 // generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
 // have format variants (probed per format below).
@@ -626,7 +626,7 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, 
             P_V3_SEARCH_J, P_V3_SEARCH_TOP_J, P_V3_DENSE_J,   // (hook (j) v3ColourWindow: the search and dense passes built with the colour-window weights; the plain ones stay as they are)
             P_V3_SEARCH_TOP,   // (E1: the top level's exhaustive search, its own pipeline: its shared patch must not cost the other levels' occupancy)
             P_V3_ANCHOR, P_V3_GUARD,   // (task 104, Settings::v3Guard: created with the V2 estimate passes P_DOWN / P_V2_MEDHIST* / P_V2_SEARCH* / P_V2_REPICK / P_V2_CLEAN / P_V2_QFIELD in V3's group)
-            P_V35_REG, P_V35_DENSE, P_V35_CAMQ, P_V35_STATS,   // (Settings::v3Motion = 1, V3.5: created only while it is on, v35Ensure)
+            P_V35_REG, P_V35_DENSE, P_V35_STATS, P_V35_RGN,   // (Settings::v3Motion = 1, V3.5: created only while it is on, v35Ensure)
             P_COUNT };
 // The match and conv pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF); convs per
 // shape (0 = first, 14 -> w; 1 = hidden, w -> w; 2 = last, w -> 2) and, but the last, whole or split (one output group per
@@ -1923,7 +1923,7 @@ bool Interpolator::Impl::motionEnsure() {
 // group is freed. False: a creation failed (what exists stays; nothing is half-used: the estimate checks every pipe it needs).
 bool Interpolator::Impl::v35Ensure() {
     MotionGroup& g = mo[(int)MotionVersion::V3];
-    const struct { Pipe p; Spv sp; } list[] = {{P_V35_REG, SPV(v35_reg)}, {P_V35_DENSE, SPV(v3_dense_35)}, {P_V35_CAMQ, SPV(v35_camq)}, {P_V35_STATS, SPV(v35_stats)}};
+    const struct { Pipe p; Spv sp; } list[] = {{P_V35_REG, SPV(v35_reg)}, {P_V35_DENSE, SPV(v3_dense_35)}, {P_V35_STATS, SPV(v35_stats)}, {P_V35_RGN, SPV(v35_rgn)}};
     for (const auto& e : list)
         if (!g.pipes[e.p] && !makePipe(e.sp, layout, g.pipes[e.p], nullptr)) return false;
     return true;
@@ -3133,20 +3133,19 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
                 }
                 if (v35) {
                     // V3.5: from level LH down to 1 the camera / dominant-motion fit is redone on this level's (not yet regularised) blocks, texture-weighted (v35_stats): the
-                    // coarse level's integer vectors (8 flow px apart at LH) give only a crude model, the finer levels' a precise one; its quality (v35_camq) scales the camera's vote
-                    // in the regularisation of this level, and the model is what the search below takes as candidates
+                    // coarse level's integer vectors (8 flow px apart at LH) give only a crude model, the finer levels' a precise one; the model is what the search below takes as candidates
                     const int fin = (l >= 1 && l < V.n - 1) ? 1 : 0;
                     if (V.n >= 3 && l >= 1 && l <= std::max(1, V.n - 3)) {
                         r.runV3(P_V35_STATS, sv, 1, 1, 1);
                         r.cbar();
-                        V3PC qv = sv;
-                        qv.iter = fin;
-                        r.runV3(P_V35_CAMQ, qv, 1, 1, 1);
+                        V3PC gv = sv;
+                        gv.iter = fin;
+                        r.runV3(P_V35_RGN, gv, 12, 1, 1);   // the regional camera models of this level (round 2)
                         r.cbar();
                         r.stamp("stats");
                     }
                     // the level's block field regularised (two Jacobi steps: its final slot -> the other -> back)
-                    for (int k = 0; k < 2; k++) {
+                    for (int k = 0; k < (l + 1 == V.n && V.n > 3 ? 0 : 2); k++) {   // the top level: a handful of blocks, a dispatch costs more than it gains
                         V3PC rv = sv;
                         rv.iter = k == 0 ? fin : 1 - fin;
                         r.runV3(P_V35_REG, rv, divUp(V.gw[l], 8), divUp(V.gh[l], 8), 2);

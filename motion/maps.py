@@ -116,6 +116,44 @@ def _caption(m, fm, synthetic):
     return s
 
 
+def _signed_row(real, g3, g35, ref_label, label, size, tile=(320, 180)):
+    """third row of a real before / after sheet: where the new estimate is worse (red) / better (blue) than the reference, |gen_new - real| - |gen_ref - real| (luma-ish: mean
+    over the channels, smoothed over 8 px, fixed scale +-12 levels), and the 2x crop of the tile where it loses most (or, with no loss, where the error is largest)."""
+    ea = np.abs(g3.astype(np.float32) - real.astype(np.float32)).mean(-1)
+    eb = np.abs(g35.astype(np.float32) - real.astype(np.float32)).mean(-1)
+    sd = cv2.blur(eb - ea, (8, 8))
+    img = np.zeros(sd.shape + (3,), np.uint8)
+    img[..., 0] = np.clip(sd * (255 / 12.0), 0, 255)
+    img[..., 2] = np.clip(-sd * (255 / 12.0), 0, 255)
+    img[..., 1] = 0
+    # worst tile: the largest mean signed difference over tiles stepped by half a tile
+    th, tw = tile[1], tile[0]
+    H, W = sd.shape
+    integ = cv2.integral(sd)
+    best, pos = -1e9, (0, 0)
+    for y in range(0, H - th + 1, th // 2):
+        for x in range(0, W - tw + 1, tw // 2):
+            v = (integ[y + th, x + tw] - integ[y, x + tw] - integ[y + th, x] + integ[y, x]) / (th * tw)
+            if v > best: best, pos = v, (x, y)
+    if best <= 0.3:   # no loss anywhere: the tile with the largest error of the new estimate
+        ie = cv2.integral(eb)
+        best, pos = -1e9, (0, 0)
+        for y in range(0, H - th + 1, th // 2):
+            for x in range(0, W - tw + 1, tw // 2):
+                v = (ie[y + th, x + tw] - ie[y, x + tw] - ie[y + th, x] + ie[y, x]) / (th * tw)
+                if v > best: best, pos = v, (x, y)
+        why = "largest error"
+    else:
+        why = "worst loss"
+    x, y = pos
+    crop = lambda e: cv2.resize(np.clip(e[y:y + th, x:x + tw] * 4, 0, 255).astype(np.uint8), (size[0], size[1]), interpolation=cv2.INTER_NEAREST)
+    to3 = lambda e: np.repeat(e[..., None], 3, 2) if e.ndim == 2 else e
+    c1 = C.image_panel(to3(crop(ea)), size, "%s error x4, 2x crop of the %s tile at (%d, %d)" % (ref_label, why, x, y))
+    c2 = C.image_panel(to3(crop(eb)), size, "%s error x4, same tile" % label)
+    c0 = C.image_panel(img, size, "%s worse (red) / better (blue), +-12 levels" % label)
+    return [c0, c1, c2]
+
+
 def compare_sheet(rr, rn, ref_set, setstr, ref_label, label, outdir):
     """before / after sheet of one pair: rr = the reference run (ref_set), rn = the run under test (setstr)"""
     import json
@@ -161,6 +199,8 @@ def compare_sheet(rr, rn, ref_set, setstr, ref_label, label, outdir):
                       C.image_panel(_warp_residual(prev, curr, Fr), size, "%s warp residual x4" % ref_label),
                       C.image_panel(_warp_residual(prev, curr, Fn), size, "%s warp residual x4" % label)]
         panels = [[C.image_panel(prev, size, "prev frame"), C.motion_panel(Fr, scale, size, "%s estimate" % ref_label), C.motion_panel(Fn, scale, size, "%s estimate" % label)], second]
+        if p.get("mid"):
+            panels.append(_signed_row(real, rr["out"], rn["out"], ref_label, label, size))
         sub = ["%s: %s" % (ref_label, _caption(mr, fmr, False)), "%s: %s" % (label, _caption(mn, fmn, False))]
     body = np.concatenate([np.concatenate(row, 1) for row in panels], 0)
     head = np.full((TITLE + 24, body.shape[1], 3), 24, np.uint8)

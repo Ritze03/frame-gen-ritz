@@ -33,7 +33,7 @@ shaders = shader_gen.process(
   'shaders/ml_zero.comp', 'shaders/ml_guard.comp',
   'shaders/v3_synth.comp', 'shaders/v3_planes.comp', 'shaders/v3_pyr.comp', 'shaders/v3_hist.comp', 'shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp', 'shaders/v3_wide.comp', 'shaders/v3_stats.comp',
   'shaders/v3_occl.comp', 'shaders/v3_fill.comp', 'shaders/v3_project.comp', 'shaders/v3_enclose.comp', 'shaders/v3_decide.comp',
-  'shaders/v3_anchor.comp', 'shaders/v3_guard.comp', 'shaders/v35_reg.comp', 'shaders/v35_camq.comp', 'shaders/v35_stats.comp',
+  'shaders/v3_anchor.comp', 'shaders/v3_guard.comp', 'shaders/v35_reg.comp', 'shaders/v35_stats.comp', 'shaders/v35_rgn.comp',
   'shaders/debug_motion.comp', 'shaders/debug_ui.comp')   # task 136: Settings::debugView (the motion tint for V1 / Learned, the UI views); task 104: Settings::v3Guard, V2 Quality's vectors correct V3's dense field
 
 # MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked

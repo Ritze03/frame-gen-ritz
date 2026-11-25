@@ -21,8 +21,10 @@ layout(local_size_x = 8, local_size_y = 8) in;
 const vec2 G01 = vec2(0.6, 2.5);      // sqrt(eigenvalue / pixels) of the structure tensor (feature levels per px): confidence ramp
 const vec2 CR = vec2(1.0, 2.5);       // cost / (texture + 2): a block matching worse than this ratio proves less
 const vec2 REJ = vec2(0.15, 0.05);      // a replacement is rejected when its window cost exceeds the old vector's by this much + this share
+const vec2 REJ2 = vec2(0.05, 0.02);     // the same for the outlier rule (R2): the model's vector must match nearly as well as the block's
 const float COLS = 30.0;              // colour distance (L1 over Y Cb Cr) at which the vote weight is 1/e
 const float WCAM = 0.6;               // the camera model's vote when there are no confident neighbours (fades out as their weight grows to 1.5)
+const float MODEL_SUP = 0.3;          // a block whose vector fewer than this share of the neighbour weight supports takes the model's (when the window agrees)
 const float MMIN = 0.15;              // the summed weight below which a block keeps its vector
 
 shared vec4 srec[144];      // record (vx, vy, cost, amb) of the tile's blocks with the apron
@@ -46,15 +48,15 @@ float winCost(const V3Lv L, int fOff, int dir, ivec2 b, vec2 v) {
     const ivec2 wo = pc.lvl == 0 ? b * 8 : b * 4 - 2;
     float s = 0.0, n = 0.0;
     const vec2 mx = vec2(float(L.w - 1), float(L.h - 1));
-    for (int k = 0; k < 64; k++) {
-        const ivec2 x = wo + ivec2(k & 7, k >> 3);
+    for (int k = 0; k < 16; k++) {   // every second pixel of the window (a flat or textured block alike: the comparison between vectors is what counts)
+        const ivec2 x = wo + ivec2(2 * (k & 3), 2 * (k >> 2));
         if (x.x < 0 || x.y < 0 || x.x >= L.w || x.y >= L.h) continue;
         const vec2 q = vec2(x) + v;
         if (q.x < 0.0 || q.y < 0.0 || q.x > mx.x || q.y > mx.y) continue;
         s += v3Term(v3FeatAt(L, fOff, dir, x), v3FeatBil(L, fOff, 1 - dir, q), dMu);
         n += 1.0;
     }
-    return n >= 32.0 ? s / n : 255.0;
+    return n >= 8.0 ? s / n : 255.0;
 }
 
 void main() {
@@ -132,10 +134,14 @@ void main() {
     }
     v[25] = vec2(0.0);
     w[25] = 0.0;
-    if (camVote(L, l, dir, b, v[25])) {
+    float mq = 1.0;   // the model's reliability here (regional: v35_rgn's residual measure; the global camera: 1)
+    bool hasM = regVote(L, l, dir, b, v[25], mq);
+    if (!hasM) { hasM = camVote(L, l, dir, b, v[25]); mq = 1.0; }
+    float mass0 = mass;
+    if (hasM) {
         // a flat block trusts the camera model by its quality; the neighbours that agree with the model then count more, those that do not (a still car beside a zooming
         // road, a different object) less, so that the road next to the car follows the road
-        const float cq = camQuality() * (1.0 - smoothstep(0.1, 0.6, sr1[ci]));
+        const float cq = (1.0 - smoothstep(0.1, 0.6, sr1[ci])) * mq;
         const float tol = max(1.0, 0.2 * length(v[25]));
         mass = 0.0;
         for (int k = 0; k < 25; k++) {
@@ -143,6 +149,7 @@ void main() {
             w[k] *= mix(1.0, length(v[k] - v[25]) < tol ? 1.6 : 0.4, cq);
             mass += w[k];
         }
+        mass0 = mass;
         w[25] = WCAM * cq * (1.0 - smoothstep(0.3, 1.5, mass));
     }
     mass += w[25];
@@ -180,6 +187,19 @@ void main() {
         if (dot(res - own.xy, res - own.xy) > 1e-6) {
             const float c0 = winCost(L, fOff, dir, b, own.xy), c1 = winCost(L, fOff, dir, b, res);
             if (c1 > c0 + REJ.x + REJ.y * c0) res = own.xy;
+        }
+    }
+    if (hasM && mq > 0.5 && length(res - v[25]) > 0.5) {
+        // the model decides where a confident block is not supported by its neighbours (a repeat of the texture matched at the wrong place: window grids, signs): it takes
+        // the model's vector when its window matches there nearly as well as at the vector it has now (a textured block whose own vector is right matches clearly worse at the
+        // model's: it keeps its own). Flat blocks follow their confident neighbours of their colour in the vote above, not this rule (a still object's flat body).
+        float sup = 0.0;
+        const float tolS = 1.0 + 0.1 * length(res);
+        for (int k = 0; k < 25; k++) if (length(v[k] - res) < tolS) sup += w[k];
+        const bool r2 = sup < MODEL_SUP * mass0;
+        if (r2) {
+            const float cr = winCost(L, fOff, dir, b, res), cm = winCost(L, fOff, dir, b, v[25]);
+            if (cm <= cr + REJ2.x + REJ2.y * cr) res = v[25];
         }
     }
     const int o = v3BlkIdx(L, dir, sb, b);
