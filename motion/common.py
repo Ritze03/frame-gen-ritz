@@ -116,12 +116,34 @@ def estimator(setstr):
     return "v3"
 
 
+def final_slot(lv, n, v35):
+    """The block-record slot (0 or 1) that holds level lv's final records (n levels), lv >= 1.  V3: slot 1 below the top, 0 at the top.
+    V3.5: the same mirror of Interpolator::recordEstimate (gpu/framegen.cpp, v35Fin / nReg): v35_reg runs nReg Jacobi steps from the
+    start slot (1 below the top, else 0), each step flips the slot."""
+    fin = 1 if lv < n - 1 else 0
+    if not v35:
+        return fin
+    nreg = 0 if (lv + 1 == n and n > 3) else (2 if (n <= 3 or lv + 2 == n) else 1)   # mirrors recordEstimate's nReg (lv >= 1)
+    return fin if nreg % 2 == 0 else 1 - fin
+
+
+def _selfcheck():
+    """python common.py: the slot rule for n = 3, 5, 6 levels, V3 and V3.5 (expected values written out from the schedule)"""
+    assert [final_slot(l, 3, False) for l in (1, 2)] == [1, 0]
+    assert [final_slot(l, 5, False) for l in (1, 2, 3, 4)] == [1, 1, 1, 0]
+    assert [final_slot(l, 3, True) for l in (1, 2)] == [1, 0]               # <= 3 levels: two steps everywhere
+    assert [final_slot(l, 5, True) for l in (1, 2, 3, 4)] == [0, 0, 1, 0]   # one step on 1, 2; two on n-2 = 3; none on the top
+    assert [final_slot(l, 6, True) for l in (1, 2, 3, 4, 5)] == [0, 0, 0, 1, 0]
+    print("final_slot: ok")
+
+
 def fields(r, setstr):
     """Fields of one run, each as dict(F=[fh, fw, 2] full-res px prev -> curr, grid='prev'|'mid', fs=flowScale, note).
     Stages in the dict (V3: BLK = level-0 block vectors held constant per 8x8 flow px, FD = dense field, FF = F01 after occlusion
     / fill, the field the synth projects; V1 / V2 / Learned: what their dump holds, see README)."""
     fg, v3 = r["fg"], r["v3"]
     fs = fg["fscale"]
+    v35 = any(t.startswith("v3Motion=") and float(t[9:] or 0) > 0 for t in (setstr or "").split(","))
     out = {}
     if v3 is not None:
         fw, fh = v3["fw"], v3["fh"]
@@ -132,7 +154,7 @@ def fields(r, setstr):
         out["FF"] = dict(F=v3["ff0"] * fs, grid="prev", fs=fs)
         out["main"] = "FF"
         for lv in range(1, v3["levels"]):   # the search's own result of level lv (block = 4 px of the level = 4 * 2^lv flow px), nearest-filled
-            blv = v3["blk"][lv][1 if lv < v3["levels"] - 1 else 0][:, :, 0:2]   # dir 0, final slot (iteration 1; the top level has one)
+            blv = v3["blk"][lv][final_slot(lv, v3["levels"], v35)][:, :, 0:2]   # dir 0, the slot that holds the level's final records
             s = 4 * 2 ** lv
             out["L%d" % lv] = dict(F=np.repeat(np.repeat(blv, s, 0), s, 1)[:fh, :fw] * (2 ** lv) * fs, grid="prev", fs=fs, block=s)
     else:
@@ -454,3 +476,7 @@ def frame_truth(prev, mid, curr, h=32, step=64, R=96):
             if all(t[2] < 0.6 * t[4] and (np.isnan(t[3]) or t[2] < 0.8 * t[3]) for t in (a, b)):
                 out.append((x, y, a[0] + b[0], a[1] + b[1]))
     return np.array(out, np.float32).reshape(-1, 4)
+
+
+if __name__ == "__main__":
+    _selfcheck()
